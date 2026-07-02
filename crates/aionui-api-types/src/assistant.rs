@@ -7,6 +7,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use aionui_common::AgentType;
+
+use crate::{AgentManagementStatus, AgentSource};
+
 // ---------------------------------------------------------------------------
 // Response + source enum
 // ---------------------------------------------------------------------------
@@ -16,7 +20,17 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum AssistantSource {
     Builtin,
+    Generated,
     User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantAgentResponse {
+    #[serde(rename = "type")]
+    pub r#type: AgentType,
+    pub source: AgentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_backend: Option<String>,
 }
 
 /// Wire shape returned by `GET /api/assistants` (single element) and
@@ -36,7 +50,9 @@ pub struct AssistantResponse {
     pub avatar: Option<String>,
     pub enabled: bool,
     pub sort_order: i32,
-    pub preset_agent_type: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AssistantAgentResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -55,6 +71,13 @@ pub struct AssistantResponse {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<i64>,
+    pub agent_status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_message: Option<String>,
+    pub team_selectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_block_reason: Option<String>,
+    pub deletable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +103,9 @@ pub struct AssistantStateResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantEngineResponse {
-    pub agent_backend: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AssistantAgentResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +198,13 @@ pub struct AssistantPreferencesResponse {
 pub struct AssistantDetailResponse {
     pub id: String,
     pub source: AssistantSource,
+    pub agent_status: AgentManagementStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_message: Option<String>,
+    pub team_selectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_block_reason: Option<String>,
+    pub deletable: bool,
     pub profile: AssistantProfileResponse,
     pub state: AssistantStateResponse,
     pub engine: AssistantEngineResponse,
@@ -181,6 +213,62 @@ pub struct AssistantDetailResponse {
     pub defaults: AssistantDefaultsResponse,
     pub capabilities: AssistantCapabilitiesResponse,
     pub preferences: AssistantPreferencesResponse,
+}
+
+pub fn assistant_avatar_response_value(
+    avatar_type: &str,
+    avatar_value: Option<&str>,
+    assistant_id: &str,
+) -> Option<String> {
+    if matches!(avatar_type, "builtin_asset" | "user_asset") {
+        return Some(format!("/api/assistants/{assistant_id}/avatar"));
+    }
+
+    let value = avatar_value.map(str::trim).filter(|value| !value.is_empty())?;
+
+    match avatar_type {
+        _ if is_unsupported_direct_avatar_value(value) => None,
+        _ if is_local_avatar_value(value) => None,
+        _ => Some(value.to_owned()),
+    }
+}
+
+pub fn assistant_avatar_response_value_with_version(
+    avatar_type: &str,
+    avatar_value: Option<&str>,
+    assistant_id: &str,
+    version: i64,
+) -> Option<String> {
+    if matches!(avatar_type, "builtin_asset" | "user_asset") {
+        return Some(format!("/api/assistants/{assistant_id}/avatar?v={version}"));
+    }
+
+    assistant_avatar_response_value(avatar_type, avatar_value, assistant_id)
+}
+
+pub fn is_local_avatar_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if value.starts_with("file://") {
+        return true;
+    }
+    if value.starts_with("/api/") || value.starts_with("/assets/") {
+        return false;
+    }
+    if value.starts_with("//") || value.contains("://") || value.starts_with("data:") {
+        return false;
+    }
+    if value.as_bytes().get(1) == Some(&b':') && matches!(value.as_bytes().first(), Some(b'A'..=b'Z' | b'a'..=b'z')) {
+        return true;
+    }
+    std::path::Path::new(value).is_absolute()
+}
+
+fn is_unsupported_direct_avatar_value(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +286,7 @@ pub struct CreateAssistantRequest {
     #[serde(default)]
     pub avatar: Option<String>,
     #[serde(default)]
-    pub preset_agent_type: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub enabled_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -233,7 +321,7 @@ pub struct UpdateAssistantRequest {
     #[serde(default)]
     pub avatar: Option<String>,
     #[serde(default)]
-    pub preset_agent_type: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub enabled_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -301,8 +389,71 @@ mod tests {
     fn assistant_source_serializes_lowercase() {
         let json = serde_json::to_string(&AssistantSource::Builtin).unwrap();
         assert_eq!(json, "\"builtin\"");
+        let json = serde_json::to_string(&AssistantSource::Generated).unwrap();
+        assert_eq!(json, "\"generated\"");
         let json = serde_json::to_string(&AssistantSource::User).unwrap();
         assert_eq!(json, "\"user\"");
+    }
+
+    #[test]
+    fn assistant_source_rejects_legacy_bare_value() {
+        let parsed = serde_json::from_str::<AssistantSource>("\"bare\"");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_routes_asset_values_through_backend() {
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", Some("data:image/svg+xml;base64,abc"), "custom-1").as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", None, "custom-1").as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value("user_asset", Some("https://example.invalid/avatar.png"), "custom-1")
+                .as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_with_version_routes_asset_values_through_backend() {
+        assert_eq!(
+            assistant_avatar_response_value_with_version("user_asset", Some("custom-1.png"), "custom-1", 1782714544060)
+                .as_deref(),
+            Some("/api/assistants/custom-1/avatar?v=1782714544060")
+        );
+        assert_eq!(
+            assistant_avatar_response_value_with_version("emoji", Some("🧠"), "custom-1", 1782714544060).as_deref(),
+            Some("🧠")
+        );
+    }
+
+    #[test]
+    fn assistant_avatar_response_value_never_exposes_local_paths() {
+        assert_eq!(
+            assistant_avatar_response_value(
+                "user_asset",
+                Some("/Users/veryliu/.aionui/assistant-avatars/custom-1.jpg"),
+                "custom-1",
+            )
+            .as_deref(),
+            Some("/api/assistants/custom-1/avatar")
+        );
+        assert_eq!(
+            assistant_avatar_response_value(
+                "emoji",
+                Some("file:///Users/veryliu/.aionui/assistant-avatars/custom-1.jpg"),
+                "custom-1",
+            ),
+            None
+        );
+        assert_eq!(
+            assistant_avatar_response_value("emoji", Some("https://example.invalid/avatar.png"), "custom-1"),
+            None
+        );
     }
 
     #[test]
@@ -317,7 +468,12 @@ mod tests {
             avatar: None,
             enabled: true,
             sort_order: 5,
-            preset_agent_type: "gemini".into(),
+            agent_id: "agent-gemini".into(),
+            agent: Some(AssistantAgentResponse {
+                r#type: AgentType::Acp,
+                source: AgentSource::Builtin,
+                acp_backend: Some("gemini".into()),
+            }),
             enabled_skills: vec![],
             custom_skill_names: vec![],
             disabled_builtin_skills: vec![],
@@ -327,10 +483,19 @@ mod tests {
             prompts_i18n: HashMap::new(),
             models: vec![],
             last_used_at: Some(1_234),
+            agent_status: AgentManagementStatus::Online,
+            agent_status_message: None,
+            team_selectable: true,
+            team_block_reason: None,
+            deletable: true,
         };
 
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["preset_agent_type"], "gemini");
+        assert!(json.get("preset_agent_type").is_none());
+        assert_eq!(json["agent_id"], "agent-gemini");
+        assert!(json["agent"].get("id").is_none());
+        assert!(json["agent"].get("backend").is_none());
+        assert_eq!(json["agent"]["acp_backend"], "gemini");
         assert_eq!(json["sort_order"], 5);
         assert_eq!(json["last_used_at"], 1234);
     }
@@ -341,7 +506,7 @@ mod tests {
         let req: CreateAssistantRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name, "X");
         assert!(req.id.is_none());
-        assert!(req.preset_agent_type.is_none());
+        assert!(req.agent_id.is_none());
         assert!(req.defaults.is_none());
     }
 
@@ -398,17 +563,18 @@ mod tests {
             "name": "X",
             "enabled": true,
             "sort_order": 7,                   // snake required field
-            "preset_agent_type": "gemini",     // snake required field
-            "presetAgentType": "claude",       // legacy camel — must be ignored
+            "agent_id": "agent-gemini",        // snake required field
+            "agent_status": "online",       // snake required field
+            "team_selectable": true,           // snake required field
+            "deletable": true,                 // snake required field
+            "agentId": "agent-claude",         // legacy camel — must be ignored
+            "agentId": "agent-claude",         // legacy camel — must be ignored
             "sortOrder": 99,                   // legacy camel — must be ignored
             "lastUsedAt": 111_222,             // legacy camel for optional field — must be ignored
         });
         let resp: AssistantResponse = serde_json::from_value(json).unwrap();
         // If camel were aliased, these would be the camel values.
-        assert_eq!(
-            resp.preset_agent_type, "gemini",
-            "snake_case preset_agent_type must win"
-        );
+        assert_eq!(resp.agent_id, "agent-gemini", "snake_case agent_id must win");
         assert_eq!(resp.sort_order, 7, "snake_case sort_order must win");
         assert!(
             resp.last_used_at.is_none(),

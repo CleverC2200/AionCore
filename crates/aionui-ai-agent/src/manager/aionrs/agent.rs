@@ -1,5 +1,7 @@
+use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
@@ -10,7 +12,10 @@ use aion_config::config::{CliArgs, Config};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
-use aionui_api_types::{AgentModeResponse, SlashCommandItem};
+use aionui_api_types::{
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
+    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
+};
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -29,6 +34,7 @@ use super::error::aionrs_engine_error_to_send_error;
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    runtime_env: Vec<(String, String)>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -58,6 +64,62 @@ impl Drop for AionrsAgentManager {
     }
 }
 
+static AIONRS_RUNTIME_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct RuntimeEnvGuard {
+    previous: Vec<(String, Option<OsString>)>,
+}
+
+impl RuntimeEnvGuard {
+    fn apply(runtime_env: &[(String, String)]) -> Self {
+        let previous = runtime_env
+            .iter()
+            .map(|(key, _)| (key.clone(), std::env::var_os(key)))
+            .collect();
+
+        for (key, value) in runtime_env {
+            // SAFETY: aionrs v0.1.37 has no API for per-command env injection.
+            // AIONRS_RUNTIME_ENV_LOCK serializes all aionrs turns using this bridge,
+            // and the guard restores every changed key when the future completes or
+            // is cancelled.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        Self { previous }
+    }
+}
+
+impl Drop for RuntimeEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.iter().rev() {
+            // SAFETY: see RuntimeEnvGuard::apply. Restoration happens while the
+            // same process-wide aionrs env lock is still held.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+async fn run_with_runtime_env<F, T>(runtime_env: &[(String, String)], future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if runtime_env.is_empty() {
+        return future.await;
+    }
+
+    let lock = AIONRS_RUNTIME_ENV_LOCK.get_or_init(|| Mutex::new(()));
+    let _lock = lock.lock().await;
+    let _guard = RuntimeEnvGuard::apply(runtime_env);
+    future.await
+}
+
 impl AionrsAgentManager {
     pub async fn new(
         conversation_id: String,
@@ -67,6 +129,7 @@ impl AionrsAgentManager {
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let runtime_env = config_extra.runtime_env.clone();
 
         let cli_args = CliArgs {
             provider: Some(config_extra.provider.clone()),
@@ -75,7 +138,8 @@ impl AionrsAgentManager {
             model: Some(config_extra.model.clone()),
             max_tokens: Some(config_extra.max_tokens),
             max_turns: config_extra.max_turns,
-            max_malformed_tool_call_turns: config_extra.max_malformed_tool_call_turns,
+            max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
+            max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
             system_prompt: config_extra.system_prompt.clone(),
             profile: None,
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
@@ -91,10 +155,10 @@ impl AionrsAgentManager {
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
 
         if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-            config.compat.max_tokens_field = Some(field);
+            config.compat.transport.max_tokens_field = Some(field);
         }
         if let Some(path) = config_extra.compat_overrides.api_path {
-            config.compat.api_path = Some(path);
+            config.compat.transport.api_path = Some(path);
         }
 
         if !config_extra.extra_mcp_servers.is_empty() {
@@ -162,6 +226,7 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            runtime_env,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -234,7 +299,7 @@ impl crate::agent_task::IAgentTask for AionrsAgentManager {
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = engine.run(&data.content, &data.msg_id) => Some(res),
+            res = run_with_runtime_env(&self.runtime_env, engine.run(&data.content, &data.msg_id)) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -383,8 +448,68 @@ impl AionrsAgentManager {
         Ok(())
     }
 
+    pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
+        })
+    }
+
+    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+        let option_id = option_id.trim();
+        let value = value.trim();
+
+        if option_id != AIONRS_MODE_OPTION_ID {
+            return Err(AgentError::bad_request(format!(
+                "Config option '{option_id}' is not available"
+            )));
+        }
+        if !is_aionrs_session_mode(value) {
+            return Err(AgentError::bad_request(format!(
+                "Value '{value}' is not selectable for config option '{option_id}'"
+            )));
+        }
+
+        self.set_mode(value).await?;
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::Observed,
+            config_options: Some(self.config_options().await?.config_options),
+        })
+    }
+
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(self.slash_commands.clone())
+    }
+}
+
+const AIONRS_MODE_OPTION_ID: &str = "mode";
+
+fn is_aionrs_session_mode(s: &str) -> bool {
+    matches!(s, "default" | "auto_edit" | "yolo")
+}
+
+fn aionrs_mode_config_option(current_value: String) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_MODE_OPTION_ID.to_owned(),
+        name: Some("Mode".to_owned()),
+        label: None,
+        description: None,
+        category: Some("mode".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current_value),
+        options: vec![
+            aionrs_mode_select_option("default", "Default"),
+            aionrs_mode_select_option("auto_edit", "Auto Edit"),
+            aionrs_mode_select_option("yolo", "YOLO"),
+        ],
+    }
+}
+
+fn aionrs_mode_select_option(value: &str, name: &str) -> AcpConfigSelectOptionDto {
+    AcpConfigSelectOptionDto {
+        value: value.to_owned(),
+        name: Some(name.to_owned()),
+        label: None,
+        description: None,
     }
 }
 
@@ -422,12 +547,38 @@ mod tests {
             system_prompt: None,
             max_tokens: 4096,
             max_turns: None,
-            max_malformed_tool_call_turns: None,
+            max_tool_call_malformed_turns: None,
+            max_tool_call_failure_turns: None,
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
             session_mode: None,
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
+            runtime_env: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_runtime_env_sets_values_during_future_and_restores_after() {
+        const KEY: &str = "AIONUI_TEST_RUNTIME_ENV_BRIDGE";
+        let original = std::env::var_os(KEY);
+        unsafe {
+            std::env::set_var(KEY, "original");
+        }
+
+        let observed = run_with_runtime_env(&[(KEY.to_owned(), "in-turn".to_owned())], async {
+            std::env::var(KEY).unwrap()
+        })
+        .await;
+
+        assert_eq!(observed, "in-turn");
+        assert_eq!(std::env::var(KEY).unwrap(), "original");
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
         }
     }
 

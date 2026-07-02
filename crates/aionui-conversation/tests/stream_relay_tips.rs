@@ -7,7 +7,8 @@ use aionui_ai_agent::{
 use aionui_common::now_ms;
 use aionui_conversation::stream_relay::StreamRelay;
 use aionui_db::{
-    IConversationRepository, SortOrder, SqliteConversationRepository, init_database_memory, models::ConversationRow,
+    IConversationRepository, MessagePageDirection, MessagePageParams, SqliteConversationRepository,
+    init_database_memory, models::ConversationRow,
 };
 use aionui_realtime::BroadcastEventBus;
 use serde_json::json;
@@ -51,7 +52,6 @@ async fn persist_info_tip_preserves_code_and_params() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();
@@ -66,7 +66,16 @@ async fn persist_info_tip_preserves_code_and_params() {
 
     relay.consume(rx).await;
 
-    let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     let tip = messages
         .items
         .iter()

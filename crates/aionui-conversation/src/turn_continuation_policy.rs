@@ -46,7 +46,7 @@ impl TurnContinuationPolicy {
             warn!(
                 conversation_id,
                 max = self.max_continuations,
-                "Reached cron continuation limit; ending turn early"
+                "Reached system response continuation limit; ending turn early"
             );
             return ContinuationDecision::Stop(ContinuationStopReason::LimitReached);
         }
@@ -71,6 +71,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["one".into(), "two".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -91,6 +92,7 @@ mod tests {
                 code: Some(AgentErrorCode::UnknownUpstreamError),
                 retryable: Some(true),
             },
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -105,6 +107,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["next".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(
@@ -119,6 +122,7 @@ mod tests {
         let outcome = RelayOutcome {
             system_responses: vec!["next".into()],
             terminal: RelayTerminal::Finish,
+            ..RelayOutcome::default()
         };
 
         assert_eq!(

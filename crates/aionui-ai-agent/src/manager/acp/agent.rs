@@ -23,7 +23,7 @@ use aionui_api_types::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case,
+    AgentKillReason, AgentType, ConversationStatus, ErrorChain, TimestampMs, normalize_keys_to_snake_case, now_ms,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ pub(super) fn user_facing_message(err: &AgentError) -> String {
     full.split_once(": ").map(|(_, rest)| rest.to_owned()).unwrap_or(full)
 }
 
-use super::codex_sandbox;
+use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
 
@@ -162,6 +162,29 @@ fn seed_startup_config_preferences(
         session.seed_pending_startup_config(
             SessionConfigOptionCategory::ThoughtLevel,
             ConfigValue::new(thought_level.to_owned()),
+        );
+    }
+}
+
+fn preload_metadata_catalogs(
+    session: &mut AcpSession,
+    agent_id: &str,
+    agent_backend: Option<&str>,
+    handshake: &AgentHandshake,
+) {
+    let summary = session.preload_advertised_catalogs(
+        handshake.available_modes.as_ref().and_then(extract_modes_from_value),
+        handshake.available_models.as_ref().and_then(extract_models_from_value),
+    );
+    if summary.any_preloaded() {
+        info!(
+            agent_metadata_id = %agent_id,
+            agent_backend,
+            mode_preloaded = summary.mode_preloaded,
+            model_preloaded = summary.model_preloaded,
+            mode_catalog_count = summary.mode_catalog_count,
+            model_catalog_count = summary.model_catalog_count,
+            "ACP session catalogs preloaded from agent metadata"
         );
     }
 }
@@ -348,9 +371,6 @@ impl AcpAgentManager {
         ),
         AgentError,
     > {
-        let initial_mode = initial_mode_from_params(&params);
-        codex_sandbox::sync_for_agent(&params.metadata, initial_mode.as_ref().map(|m| m.as_str())).await;
-
         let process = Arc::new(CliAgentProcess::spawn_for_sdk(params.command_spec.clone(), &params.data_dir).await?);
         register_session_process(
             &params.data_dir,
@@ -413,6 +433,7 @@ impl AcpAgentManager {
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
         let snapshot = params.session_snapshot.as_ref();
+        let initial_mode = initial_mode_from_params(&params);
 
         let (initial_model, initial_config) = (
             snapshot.and_then(|s| s.current_model_id.clone()).or_else(|| {
@@ -428,6 +449,12 @@ impl AcpAgentManager {
 
         let startup_config_seed_base = initial_config.clone();
         let mut session = AcpSession::new(initial_mode, initial_model, initial_config);
+        preload_metadata_catalogs(
+            &mut session,
+            &params.metadata.id,
+            params.metadata.backend.as_deref(),
+            &params.metadata.handshake,
+        );
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
@@ -585,10 +612,10 @@ impl AcpAgentManager {
     ) -> Result<SetConfigOptionResponse, AgentError> {
         self.ensure_protocol_connected_for_operation("set_config_option")?;
 
-        let (session_id, set_path, is_mode_option) = {
+        let (session_id, set_path) = {
             let session = self.session.read().await;
             let snapshot = session.config_snapshot();
-            let mut set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
+            let set_path = resolve_set_path(&snapshot, option_id, value).map_err(|err| match err {
                 ConfigSetPathError::OptionNotFound => {
                     AgentError::bad_request(format!("Config option '{option_id}' is not available"))
                 }
@@ -596,13 +623,6 @@ impl AcpAgentManager {
                     "Value '{value}' is not selectable for config option '{option_id}'"
                 )),
             })?;
-            if session.config_options().is_none() {
-                set_path = match option_id {
-                    "mode" => ConfigSetPath::LegacyMode,
-                    "model" => ConfigSetPath::LegacyModel,
-                    _ => set_path,
-                };
-            }
             let session_id = session.session_id().map(ToOwned::to_owned).ok_or_else(|| {
                 warn!(
                     conversation_id = %self.params.conversation_id,
@@ -612,7 +632,7 @@ impl AcpAgentManager {
                 );
                 AgentError::bad_request("No active session")
             })?;
-            (session_id, set_path, snapshot.is_mode_option(option_id))
+            (session_id, set_path)
         };
 
         tracing::info!(
@@ -622,10 +642,6 @@ impl AcpAgentManager {
             requested = %value,
             "acp_config_option_set_requested"
         );
-
-        if self.params.metadata.backend.as_deref() == Some("codex") && is_mode_option {
-            codex_sandbox::sync_for_agent(&self.params.metadata, Some(value)).await;
-        }
 
         match set_path {
             ConfigSetPath::ConfigOption { option_id: config_id } => {
@@ -898,8 +914,9 @@ impl AcpAgentManager {
                 .and_then(|commands| matched_slash_command(&raw_user_input, commands))
         };
 
-        let content = {
+        let (content, dump_first_prompt) = {
             let mut s = self.session.write().await;
+            let dump_first_prompt = s.has_pending_session_new_prelude();
             let mut ctx = PromptCtx {
                 session: &mut s,
                 params: &self.params,
@@ -908,8 +925,41 @@ impl AcpAgentManager {
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;
-            transformed
+            (transformed, dump_first_prompt)
         };
+
+        if dump_first_prompt
+            && let Some(dump_dir) =
+                crate::dev_prompt_dump::dump_dir_for_data_dir(&self.params.data_dir, self.params.dump_prompts)
+        {
+            match crate::dev_prompt_dump::dump_prompt(
+                &dump_dir,
+                crate::dev_prompt_dump::PromptDump {
+                    kind: "acp-first-prompt",
+                    backend: self.backend(),
+                    conversation_id: &self.params.conversation_id,
+                    session_id: Some(&sid),
+                    msg_id: Some(&data.msg_id),
+                    turn_id: data.turn_id.as_deref(),
+                    prompt: &content,
+                },
+            ) {
+                Ok(path) => {
+                    debug!(
+                        conversation_id = %self.params.conversation_id,
+                        path = %path.display(),
+                        "DEV prompt dump written"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        error = %error,
+                        "DEV prompt dump failed"
+                    );
+                }
+            }
+        }
 
         let data = SendMessageData {
             content,
@@ -933,6 +983,37 @@ impl AcpAgentManager {
         }
         result
     }
+}
+
+fn log_idle_acp_shutdown_started(conversation_id: &str, backend: &str, session_id: Option<&str>, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        session_id = %session_id.unwrap_or("none"),
+        pid,
+        reason = %"IdleTimeout",
+        "Idle kill: ACP shutdown started"
+    );
+}
+
+fn log_idle_acp_cancel_sent(conversation_id: &str, backend: &str, session_id: &str, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        session_id = %session_id,
+        pid,
+        "Idle kill: ACP session cancel sent"
+    );
+}
+
+fn log_idle_acp_cancel_skipped(conversation_id: &str, backend: &str, pid: u32) {
+    info!(
+        conversation_id = %conversation_id,
+        backend = %backend,
+        pid,
+        reason = %"no_session_id",
+        "Idle kill: ACP session cancel skipped"
+    );
 }
 
 #[async_trait::async_trait]
@@ -1017,7 +1098,8 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 Ok(())
             }
             Err(err) => {
-                let send_error = err.to_agent_send_error();
+                let backend = self.params.metadata.backend.as_deref();
+                let send_error = err.to_agent_send_error_for_backend(backend);
                 let agent_err = err.into_agent_error();
                 // Build a CloseReason that captures whatever context we still
                 // have. Two cases matter:
@@ -1082,34 +1164,65 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
         // Mark closing to prevent reconnect attempts
         self.permission_router.set_closing();
 
-        // Cancel the current session if active
-        if let Ok(session) = self.session.try_read()
-            && let Some(sid) = session.session_id()
-        {
+        let backend = self.params.metadata.backend.as_deref().unwrap_or("unknown");
+        let pid = self.process.pid();
+        let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
+        let session_id = self
+            .session
+            .try_read()
+            .ok()
+            .and_then(|session| session.session_id().map(ToOwned::to_owned));
+
+        if idle_timeout {
+            log_idle_acp_shutdown_started(&self.params.conversation_id, backend, session_id.as_deref(), pid);
+        }
+
+        if let Some(sid) = session_id.as_deref() {
             self.protocol.cancel(CancelNotification::new(SessionId::new(sid)));
+            if idle_timeout {
+                log_idle_acp_cancel_sent(&self.params.conversation_id, backend, sid, pid);
+            }
+        } else if idle_timeout {
+            log_idle_acp_cancel_skipped(&self.params.conversation_id, backend, pid);
         }
 
         let process = Arc::clone(&self.process);
         let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
         let conversation_id = self.params.conversation_id.clone();
-        let pid = process.pid();
+        let process_group_id = process.process_group_id();
+        let backend = backend.to_owned();
+        let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
 
         tokio::spawn(async move {
-            if let Err(e) = process.kill(grace).await {
-                // Tag the failure with conversation_id + pid so Sentry can
-                // group these and ops can correlate with the matching
-                // "Killing ACP agent" log line. ELECTRON-1E9: an unannotated
-                // failure here on Windows left the CLI subprocess running
-                // while the manager believed it had been torn down,
-                // producing the "no reply / second send hangs" symptom.
-                error!(
-                    %conversation_id,
-                    pid,
-                    error = %ErrorChain(&e),
-                    "Failed to kill ACP process"
-                );
-            } else {
-                debug!(%conversation_id, pid, "ACP process kill completed");
+            let started_at = now_ms();
+            match process.kill(grace).await {
+                Ok(()) => {
+                    if idle_timeout {
+                        info!(
+                            %conversation_id,
+                            backend,
+                            pid,
+                            process_group_id,
+                            elapsed_ms = now_ms().saturating_sub(started_at),
+                            result = "ok",
+                            "Idle kill: ACP process shutdown completed"
+                        );
+                    } else {
+                        debug!(%conversation_id, pid, process_group_id, "ACP process kill completed");
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        %conversation_id,
+                        backend,
+                        pid,
+                        process_group_id,
+                        elapsed_ms = now_ms().saturating_sub(started_at),
+                        result = "error",
+                        error = %ErrorChain(&e),
+                        "Idle kill: ACP process shutdown completed"
+                    );
+                }
             }
         });
 
@@ -1184,10 +1297,49 @@ mod tests {
     use crate::error::AgentError;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
-    use crate::shared_kernel::{ConfigKey, ConfigValue, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{AvailableCommand, SessionConfigOptionCategory};
+    use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
+    use agent_client_protocol::schema::{
+        AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+    use aionui_api_types::AgentHandshake;
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
     fn exit_status_parts_handles_missing_status() {
@@ -1223,6 +1375,69 @@ mod tests {
     fn rate_limited_has_no_colon_returns_full_string() {
         let err = AgentError::RateLimited;
         assert_eq!(user_facing_message(&err), "Rate limited");
+    }
+
+    #[test]
+    fn preload_metadata_catalogs_seeds_mode_catalog_for_partial_session_config_options() {
+        let mut session = AcpSession::new(Some(ModeId::new("full-access")), None, HashMap::new());
+        let handshake = AgentHandshake {
+            available_modes: Some(json!({
+                "current_mode_id": "auto",
+                "available_modes": [
+                    {"id": "read-only", "name": "Read Only"},
+                    {"id": "auto", "name": "Default"},
+                    {"id": "full-access", "name": "Full Access"}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        super::preload_metadata_catalogs(&mut session, "codex-agent", Some("codex"), &handshake);
+        session.apply_advertised_config_options(vec![
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning Effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ]);
+
+        let snapshot = session.config_snapshot();
+        let mode = snapshot
+            .options
+            .iter()
+            .find(|option| option.id == "mode")
+            .expect("metadata catalog should supplement missing mode");
+        assert_eq!(mode.current_value.as_deref(), Some("full-access"));
+        assert_eq!(mode.options.len(), 3);
+    }
+
+    #[test]
+    fn idle_acp_shutdown_started_log_contains_diagnostic_context() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_idle_acp_shutdown_started("conv_openclaw", "openclaw", Some("session_123"), 4242);
+        });
+
+        assert!(captured.contains("Idle kill: ACP shutdown started"));
+        assert!(captured.contains("conversation_id=conv_openclaw"));
+        assert!(captured.contains("backend=openclaw"));
+        assert!(captured.contains("session_id=session_123"));
+        assert!(captured.contains("pid=4242"));
+        assert!(captured.contains("reason=IdleTimeout"));
+    }
+
+    #[test]
+    fn idle_acp_cancel_skipped_log_contains_reason() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_idle_acp_cancel_skipped("conv_openclaw", "openclaw", 4242);
+        });
+
+        assert!(captured.contains("Idle kill: ACP session cancel skipped"));
+        assert!(captured.contains("conversation_id=conv_openclaw"));
+        assert!(captured.contains("backend=openclaw"));
+        assert!(captured.contains("pid=4242"));
+        assert!(captured.contains("reason=no_session_id"));
     }
 
     #[test]
@@ -1288,22 +1503,15 @@ mod tests {
     // count, or extractor module path) update this helper to match.
 
     use super::CliAgentProcess;
+    use aionui_common::CommandSpec;
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Spawn a sh subprocess that writes `stderr_payload` to stderr then
+    /// Spawn a subprocess that writes `stderr_payload` to stderr then
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits in
-    /// close-path tests. Lines containing `'` are escaped for the heredoc.
+    /// close-path tests.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
-        use aionui_common::CommandSpec;
-        let payload = stderr_payload.replace('\'', "'\\''");
-        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
+        let config = stderr_exit_command_spec(stderr_payload, exit_code);
         let data_dir = tempfile::tempdir().unwrap();
         let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
@@ -1311,6 +1519,37 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         Arc::new(proc)
+    }
+
+    #[cfg(not(windows))]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "'\\''");
+        let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
+        CommandSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn stderr_exit_command_spec(stderr_payload: &str, exit_code: u8) -> CommandSpec {
+        let payload = stderr_payload.replace('\'', "''");
+        let script = format!("[Console]::Error.WriteLine('{payload}'); exit {exit_code}");
+        CommandSpec {
+            command: "powershell.exe".into(),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                script,
+            ],
+            env: vec![],
+            cwd: None,
+        }
     }
 
     async fn spawn_with_stderr(stderr_payload: &str) -> Arc<CliAgentProcess> {

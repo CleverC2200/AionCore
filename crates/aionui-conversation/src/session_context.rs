@@ -12,6 +12,7 @@ use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
+use chrono::Datelike;
 use tracing::{debug, warn};
 
 use crate::convert::string_to_enum;
@@ -84,6 +85,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            runtime_env: Vec::new(),
             team,
             kind,
         })
@@ -200,17 +202,18 @@ impl<'a> SessionContextBuilder<'a> {
             config.session_mode = Some(mode.to_owned());
         }
 
-        self.resolve_acp_identity(row, &mut config, &extra).await?;
-
         let belongs_to_team = team.is_some();
-
         let session_row = self
             .acp_session_repo
             .get(&row.id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
-        let session_id = session_row.and_then(|row| row.session_id);
-        let session_snapshot = self.load_acp_session_snapshot(row, &config).await?;
+        self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
+            .await?;
+        let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
+        let session_snapshot = self
+            .load_acp_session_snapshot(row, &config, session_id.as_deref())
+            .await?;
 
         Ok(AcpSessionBuildContext {
             config,
@@ -226,9 +229,28 @@ impl<'a> SessionContextBuilder<'a> {
         row: &ConversationRow,
         config: &mut AcpBuildExtra,
         extra: &serde_json::Value,
+        session_row: Option<&aionui_db::models::AcpSessionRow>,
     ) -> Result<(), ConversationError> {
         let agent_id = config.agent_id.as_deref().filter(|value| !value.is_empty());
         if agent_id.is_some() {
+            return Ok(());
+        }
+
+        if let Some(session_row) = session_row.filter(|row| !row.agent_id.is_empty()) {
+            let metadata = self
+                .agent_metadata_repo
+                .get(&session_row.agent_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?;
+            debug!(
+                conversation_id = %row.id,
+                agent_id = %session_row.agent_id,
+                "session_context: restored ACP identity from persisted acp_session row"
+            );
+            config.agent_id = Some(session_row.agent_id.clone());
+            if let Some(metadata) = metadata {
+                config.backend = metadata.backend;
+            }
             return Ok(());
         }
 
@@ -275,7 +297,16 @@ impl<'a> SessionContextBuilder<'a> {
         &self,
         row: &ConversationRow,
         config: &AcpBuildExtra,
+        session_id: Option<&str>,
     ) -> Result<Option<PersistedSessionState>, ConversationError> {
+        if session_id.is_none() {
+            debug!(
+                conversation_id = %row.id,
+                "session_context: skipping ACP runtime snapshot before session assignment"
+            );
+            return Ok(None);
+        }
+
         let db_state = self
             .acp_session_repo
             .load_runtime_state(&row.id)
@@ -427,10 +458,19 @@ fn expected_auto_workspace_path(
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    workspace_root.join("conversations").join(format!(
+    auto_workspace_parent(workspace_root).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
+}
+
+fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+    let now = chrono::Local::now();
+    workspace_root
+        .join("conversations")
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -622,10 +662,14 @@ mod tests {
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
-                agent_backend: "claude",
                 agent_source: "builtin",
                 agent_id: "builtin-claude-test",
             })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id("conv-1", "sess-1")
             .await
             .unwrap();
         repos
@@ -658,6 +702,71 @@ mod tests {
         assert_eq!(snapshot.current_model_id.unwrap().as_str(), "persisted-model");
         assert_eq!(acp.config.session_mode.as_deref(), Some("legacy-mode"));
         assert_eq!(acp.config.current_model_id.as_deref(), Some("legacy-model"));
+    }
+
+    #[tokio::test]
+    async fn acp_unassigned_session_runtime_is_startup_seed_not_resume_snapshot() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-codex-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .save_runtime_state(
+                "conv-1",
+                &SaveRuntimeStateParams {
+                    current_mode_id: Some(Some("full-access")),
+                    current_model_id: Some(Some("gpt-5.5")),
+                    config_selections_json: None,
+                    context_usage_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "current_mode_id": "full-access",
+                "current_model_id": "gpt-5.5"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.session_mode.as_deref(), Some("full-access"));
+        assert_eq!(acp.config.current_model_id.as_deref(), Some("gpt-5.5"));
+        assert!(acp.session_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_session_identity_takes_priority_over_legacy_backend_seed() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-codex-test",
+            })
+            .await
+            .unwrap();
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-codex-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("codex"));
     }
 
     #[tokio::test]

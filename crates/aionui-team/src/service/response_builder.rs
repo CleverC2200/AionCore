@@ -11,8 +11,8 @@ impl TeamSessionService {
             id: team.id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
-            agents,
-            lead_agent_id: team.lead_agent_id.clone(),
+            assistants: agents,
+            leader_assistant_id: team.lead_agent_id.clone(),
             created_at: team.created_at,
             updated_at: team.updated_at,
         })
@@ -36,11 +36,15 @@ impl TeamSessionService {
     }
 
     async fn resolve_agent_icon(&self, agent: &TeamAgent) -> Result<Option<String>, TeamError> {
-        if let Some(custom_agent_id) = agent.custom_agent_id.as_deref()
-            && let Some(row) = self.agent_metadata_repo.get(custom_agent_id).await?
-            && row.icon.is_some()
+        if let Some(assistant_id) = agent.assistant_id.as_deref()
+            && let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await?
+            && let Some(icon) = assistant_icon(
+                definition.assistant_id.as_str(),
+                &definition.avatar_type,
+                definition.avatar_value.as_deref(),
+            )
         {
-            return Ok(row.icon);
+            return Ok(Some(icon));
         }
 
         if let Some(row) = self
@@ -62,5 +66,39 @@ impl TeamSessionService {
         }
 
         Ok(None)
+    }
+}
+
+fn assistant_icon(assistant_id: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
+    aionui_api_types::assistant_avatar_response_value(avatar_type, avatar_value, assistant_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_icon_routes_user_asset_through_backend_even_without_value() {
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", None).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_icon_does_not_pass_through_direct_asset_values() {
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", Some("data:image/png;base64,abc")).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+        assert_eq!(
+            assistant_icon("assistant-1", "user_asset", Some("https://example.invalid/avatar.png")).as_deref(),
+            Some("/api/assistants/assistant-1/avatar")
+        );
+    }
+
+    #[test]
+    fn assistant_icon_returns_none_for_none_avatar_type() {
+        assert_eq!(assistant_icon("assistant-1", "none", None), None);
     }
 }

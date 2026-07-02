@@ -1,137 +1,99 @@
 # Default: list available recipes
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+cargo_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cargo.ps1" } else { "bash scripts/just/cargo.sh" }
+build_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/build.ps1" } else { "bash scripts/just/build.sh" }
+install_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/install.ps1" } else { "bash scripts/just/install.sh" }
+migration_check_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.ps1" } else { "bash scripts/migration/check-immutability.sh" }
+migration_check_test_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.test.ps1" } else { "bash scripts/migration/check-immutability.test.sh" }
+auto_commit_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/auto-commit-fixes.ps1" } else { "bash scripts/just/auto-commit-fixes.sh" }
+update_aionrs_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/update-aionrs.ps1" } else { "bash scripts/just/update-aionrs.sh" }
+cat_config_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cat-config.ps1" } else { "bash scripts/just/cat-config.sh" }
+
 default:
     @just --list
 
 # Enable pre-commit hooks (run once after clone)
 setup:
     git config core.hooksPath .githooks
-    @echo "✅ Git hooks enabled"
+    @echo "Git hooks enabled"
 
-# Build in release mode and install to ~/.cargo/bin
+# Run cargo with optional local aionrs SDK patches.
+_cargo *ARGS:
+    @{{cargo_script}} {{ARGS}}
+
+# Build in release mode and install to cargo bin
 # Use `just build --force` to skip cache check
 build *FLAGS: lint-fix fmt
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release
-    new_sum=$(shasum -a 256 target/release/aioncore | cut -d' ' -f1)
-    force=false
-    for flag in {{FLAGS}}; do
-        if [[ "$flag" == "--force" || "$flag" == "-f" ]]; then
-            force=true
-        fi
-    done
-    old_sum=""
-    if [[ -f target/.build-sum ]] && [[ "$force" == "false" ]]; then
-        old_sum=$(cat target/.build-sum)
-    fi
-    if [[ "$new_sum" == "$old_sum" ]]; then
-        echo -e "\n⏭️  Binary unchanged — skipping install (sha256: ${new_sum:0:16}…)"
-    else
-        cp target/release/aioncore ~/.cargo/bin/
-        codesign --force --sign - ~/.cargo/bin/aioncore
-        echo "$new_sum" > target/.build-sum
-        echo -e "\n✅ Build complete — sha256: ${new_sum:0:16}…"
-    fi
+    @{{build_script}} release {{FLAGS}}
 
 # Build in debug mode
 # Use `just build-debug --force` to skip cache check
 build-debug *FLAGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build
-    new_sum=$(shasum -a 256 target/debug/aioncore | cut -d' ' -f1)
-    force=false
-    for flag in {{FLAGS}}; do
-        if [[ "$flag" == "--force" || "$flag" == "-f" ]]; then
-            force=true
-        fi
-    done
-    old_sum=""
-    if [[ -f target/.build-debug-sum ]] && [[ "$force" == "false" ]]; then
-        old_sum=$(cat target/.build-debug-sum)
-    fi
-    if [[ "$new_sum" == "$old_sum" ]]; then
-        echo -e "\n⏭️  Debug binary unchanged (sha256: ${new_sum:0:16}…)"
-    else
-        echo "$new_sum" > target/.build-debug-sum
-        echo -e "\n✅ Debug build complete — sha256: ${new_sum:0:16}…"
-    fi
+    @{{build_script}} debug {{FLAGS}}
 
 install:
-    cp target/release/aioncore ~/.cargo/bin/
-    codesign --force --sign - ~/.cargo/bin/aioncore
+    @{{install_script}} release
 
 # Run all tests
 test:
-    cargo nextest run --workspace
+    @just _cargo nextest run --workspace
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
-    scripts/check-migration-immutability.sh
+    @{{migration_check_script}}
 
 # Test the migration immutability guard itself
 migration-check-test:
-    scripts/check-migration-immutability.test.sh
+    @{{migration_check_test_script}}
 
 # Lint (warnings = errors)
 lint:
-    cargo clippy --workspace -- -D warnings
+    @just _cargo clippy --workspace -- -D warnings
 
 lint-fix:
-    cargo fix --allow-dirty --allow-staged
-    cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
+    @just _cargo fix --allow-dirty --allow-staged
+    @just _cargo clippy --fix --workspace --allow-dirty --allow-staged -- -D warnings
 
 # Format code
 fmt:
-    cargo fmt --all
+    @cargo fmt --all
 
 # Check formatting (CI)
 fmt-check:
-    cargo fmt --all -- --check
+    @cargo fmt --all -- --check
 
 # Lint + format check + migration check + test
 check: migration-check lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:
-    cargo run --bin aioncore -- {{ARGS}}
+    @just _cargo run --bin aioncore -- {{ARGS}}
 
 # Run the server (release)
 run-release *ARGS:
-    cargo run --release --bin aioncore -- {{ARGS}}
+    @just _cargo run --release --bin aioncore -- {{ARGS}}
 
 # Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
 push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
-    git push {{ ARGS }}
+    git push {{ARGS}}
 
 # Auto-commit any formatting/lint fixes if there are changes
 _auto-commit-fixes:
-    #!/usr/bin/env bash
-    if [ -n "$(git diff --name-only)" ]; then
-        git add -A
-        git commit -m "chore: apply auto-fixes (fmt + clippy)"
-    fi
+    @{{auto_commit_script}}
 
 # Update aionrs dependency (e.g. just update-aionrs or just update-aionrs v0.1.19)
 update-aionrs *TAG:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tag="{{ TAG }}"
-    if [ -z "$tag" ]; then
-        tag=$(git ls-remote --tags https://github.com/iOfficeAI/aionrs.git | awk -F/ '{print $NF}' | grep -v '\\^{}' | sort -V | tail -1)
-        echo "Using latest tag: $tag"
-    fi
-    sed -i '' "s|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"[^\"]*\"|git = \"https://github.com/iOfficeAI/aionrs.git\", tag = \"$tag\"|g" Cargo.toml
-    cargo check --workspace
+    @{{update_aionrs_script}} {{TAG}}
 
 # Security audit
 audit:
-    cargo audit
+    @cargo audit
 
 # Clean build artifacts
 clean:
-    cargo clean
+    @cargo clean
 
-# Decode dev config and copy to clipboard
+# Decode dev config and copy to clipboard when possible
 cat-config:
-    @base64 -D -i ~/.aionui-config-dev/aionui-config.txt | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))' | pbcopy
+    @{{cat_config_script}}

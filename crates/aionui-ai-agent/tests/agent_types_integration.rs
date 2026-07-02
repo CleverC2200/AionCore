@@ -97,12 +97,14 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         system_prompt: None,
         max_tokens: 4096,
         max_turns: None,
-        max_malformed_tool_call_turns: None,
+        max_tool_call_malformed_turns: None,
+        max_tool_call_failure_turns: None,
         compat_overrides: Default::default(),
         session_directory: std::env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
         extra_mcp_servers: Default::default(),
         bedrock_config: None,
+        runtime_env: Vec::new(),
     }
 }
 
@@ -213,6 +215,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            runtime_env: vec![],
             team: None,
             kind,
         })

@@ -12,6 +12,15 @@ pub(crate) enum CliBoundaryCode {
     CliDoctorDatabaseFailed,
     CliDoctorRegistryHydrateFailed,
     CliPrepareManagedResourcesFailed,
+    CronEnvMissing,
+    CronBackendUnavailable,
+    CronPayloadMissing,
+    CronPayloadInvalid,
+    CronHttpRequestFailed,
+    CronHttpStatusError,
+    CronResponseReadFailed,
+    CronResponseJsonInvalid,
+    CronStdoutWriteFailed,
     McpEnvMissing,
     McpEnvInvalidPort,
     McpStdinTty,
@@ -41,6 +50,15 @@ impl CliBoundaryCode {
             Self::CliDoctorDatabaseFailed => "CLI_DOCTOR_DATABASE_FAILED",
             Self::CliDoctorRegistryHydrateFailed => "CLI_DOCTOR_REGISTRY_HYDRATE_FAILED",
             Self::CliPrepareManagedResourcesFailed => "CLI_PREPARE_MANAGED_RESOURCES_FAILED",
+            Self::CronEnvMissing => "CRON_ENV_MISSING",
+            Self::CronBackendUnavailable => "CRON_BACKEND_UNAVAILABLE",
+            Self::CronPayloadMissing => "CRON_PAYLOAD_MISSING",
+            Self::CronPayloadInvalid => "CRON_PAYLOAD_INVALID",
+            Self::CronHttpRequestFailed => "CRON_HTTP_REQUEST_FAILED",
+            Self::CronHttpStatusError => "CRON_HTTP_STATUS_ERROR",
+            Self::CronResponseReadFailed => "CRON_RESPONSE_READ_FAILED",
+            Self::CronResponseJsonInvalid => "CRON_RESPONSE_JSON_INVALID",
+            Self::CronStdoutWriteFailed => "CRON_STDOUT_WRITE_FAILED",
             Self::McpEnvMissing => "MCP_ENV_MISSING",
             Self::McpEnvInvalidPort => "MCP_ENV_INVALID_PORT",
             Self::McpStdinTty => "MCP_STDIN_TTY",
@@ -66,6 +84,10 @@ impl CliBoundaryCode {
 
     fn exit_kind(self) -> ExitKind {
         match self {
+            Self::CronEnvMissing | Self::CronPayloadMissing | Self::CronPayloadInvalid => ExitKind::Config,
+            Self::CronBackendUnavailable | Self::CronHttpRequestFailed | Self::CronHttpStatusError => {
+                ExitKind::Unavailable
+            }
             Self::McpEnvMissing
             | Self::McpEnvInvalidPort
             | Self::McpStdinTty
@@ -156,12 +178,12 @@ mod tests {
 
     #[test]
     fn missing_env_renders_stable_stderr_and_exit_2() {
-        let err = missing_env("mcp-guide-stdio", "AION_MCP_PORT");
+        let err = missing_env("mcp-team-stdio", "TEAM_MCP_PORT");
         assert_eq!(err.code(), CliBoundaryCode::McpEnvMissing);
         assert_eq!(err.exit_code(), ExitCode::from(2));
         assert_eq!(
             err.stderr_line(),
-            "MCP_ENV_MISSING subcommand=mcp-guide-stdio env=AION_MCP_PORT: missing required environment variable"
+            "MCP_ENV_MISSING subcommand=mcp-team-stdio env=TEAM_MCP_PORT: missing required environment variable"
         );
     }
 

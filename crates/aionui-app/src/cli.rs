@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "aioncore", about = "AionUi Backend Server", version)]
@@ -48,6 +48,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub log_level: Option<String>,
 
+    /// Dump prompt diagnostics to {data-dir}/prompt-dumps.
+    #[arg(long)]
+    pub dump_prompts: bool,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -72,15 +76,15 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 }
 
 // `Mcp` prefix is load-bearing on Mcp* variants — clap derives kebab-case
-// subcommand names (`mcp-bridge`, `mcp-guide-stdio`, `mcp-team-stdio`)
+// subcommand names (`mcp-bridge`, `mcp-team-stdio`)
 // that external callers (ACP agent CLI, team MCP bridge spec) depend on
 // verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Manage cron jobs for the current conversation from an agent skill.
+    CronHelper(CronHelperArgs),
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
-    /// MCP stdio server for team-guide tools (spawned by the ACP agent CLI).
-    McpGuideStdio,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
@@ -96,8 +100,8 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            Self::CronHelper(_) => "cron-helper",
             Self::McpBridge => "mcp-bridge",
-            Self::McpGuideStdio => "mcp-guide-stdio",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
@@ -109,7 +113,32 @@ impl Command {
     }
 }
 
-#[derive(clap::Args, Debug, Clone)]
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CronHelperArgs {
+    #[command(subcommand)]
+    pub command: CronHelperCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum CronHelperCommand {
+    /// Print the configured aioncore base URL after validating cron helper routes.
+    Discover,
+    /// List cron jobs linked to the current conversation.
+    List,
+    /// Create a cron job from a JSON payload on stdin.
+    Create,
+    /// Update a cron job from a JSON payload on stdin.
+    Update(CronHelperUpdateArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CronHelperUpdateArgs {
+    /// Cron job id to update.
+    #[arg(long)]
+    pub job_id: String,
+}
+
+#[derive(Args, Debug, Clone)]
 pub(crate) struct PrepareManagedResourcesArgs {
     /// Bundle output root. Aioncore writes the managed resources under
     /// `<bundle-out>/{node,acp}/...` for packaging.
@@ -124,7 +153,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
+    use super::{Cli, Command, CronHelperCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -186,6 +215,19 @@ mod tests {
     }
 
     #[test]
+    fn cron_helper_accepts_update_job_id() {
+        let cli = Cli::parse_from(["aioncore", "cron-helper", "update", "--job-id", "cron_1"]);
+
+        let Some(Command::CronHelper(args)) = cli.command else {
+            panic!("expected cron-helper command");
+        };
+        let CronHelperCommand::Update(update) = args.command else {
+            panic!("expected update subcommand");
+        };
+        assert_eq!(update.job_id, "cron_1");
+    }
+
+    #[test]
     fn managed_resources_mode_defaults_to_download() {
         let cli = Cli::parse_from(["aioncore"]);
         assert_eq!(cli.managed_resources_mode, ManagedResourcesModeArg::Download);
@@ -204,6 +246,18 @@ mod tests {
     }
 
     #[test]
+    fn dump_prompts_defaults_to_false() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert!(!cli.dump_prompts);
+    }
+
+    #[test]
+    fn dump_prompts_accepts_flag() {
+        let cli = Cli::parse_from(["aioncore", "--dump-prompts"]);
+        assert!(cli.dump_prompts);
+    }
+
+    #[test]
     fn command_as_str_returns_clap_subcommand_names() {
         let prepare_args = PrepareManagedResourcesArgs {
             bundle_out: PathBuf::from("/tmp/aioncore-bundle"),
@@ -211,9 +265,14 @@ mod tests {
 
         let cases = [
             (Command::McpBridge, "mcp-bridge"),
-            (Command::McpGuideStdio, "mcp-guide-stdio"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
             (Command::Doctor, "doctor"),
+            (
+                Command::CronHelper(super::CronHelperArgs {
+                    command: CronHelperCommand::List,
+                }),
+                "cron-helper",
+            ),
             (
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",

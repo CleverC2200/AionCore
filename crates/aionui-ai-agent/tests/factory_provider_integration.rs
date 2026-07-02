@@ -74,9 +74,9 @@ fn make_factory(
         agent_registry,
         acp_agent_service,
         data_dir: PathBuf::from("/tmp/aionrs-test"),
+        dump_prompts: false,
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
-        guide_mcp_config: None,
         mcp_server_repo: None,
     })
 }
@@ -101,6 +101,7 @@ fn make_aionrs_options(
         },
         model,
         skills: vec![],
+        runtime_env: vec![],
         team: None,
         kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {
             config,

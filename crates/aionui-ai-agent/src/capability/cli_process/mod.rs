@@ -92,38 +92,44 @@ impl CliAgentProcess {
         }
     }
 
-    /// Gracefully terminate the subprocess.
+    /// Gracefully terminate the subprocess **and any descendants in its
+    /// process group**.
     ///
     /// 1. Close stdin
-    /// 2. Wait up to `grace_period` for the process to exit on its own
-    /// 3. If still running after grace period, send SIGKILL
+    /// 2. Wait up to `grace_period` for the leader to exit on its own
+    /// 3. SIGKILL the whole process group regardless of whether the leader
+    ///    has already exited — wrapper CLIs (`npm exec ...`) routinely fork
+    ///    a grandchild (`openclaw-acp`) that survives leader exit, and only
+    ///    a group-wide kill reaps it
     pub async fn kill(&self, grace_period: Duration) -> Result<(), AgentError> {
         // Close stdin first to signal the child
         self.close_stdin().await;
 
-        // Wait for graceful exit within the grace period
+        // Wait up to the grace period for the leader to exit on its own.
+        // Even if it does, we still issue a group-wide SIGKILL below — the
+        // leader exiting tells us nothing about its grandchildren.
         let mut rx = self.exit_rx.clone();
-        let exited = tokio::time::timeout(grace_period, async {
-            // If already exited, return immediately
+        let _ = tokio::time::timeout(grace_period, async {
             if rx.borrow().is_some() {
                 return;
             }
-            // Wait for state change
             let _ = rx.changed().await;
         })
         .await;
 
-        if exited.is_ok() && self.exit_rx.borrow().is_some() {
-            debug!(pid = self.pid, "CLI process exited gracefully");
-            return Ok(());
+        // Always sweep the process group. `force_kill` treats ESRCH as
+        // success, so this is idempotent when the leader (and group) are
+        // already gone.
+        if self.exit_rx.borrow().is_some() {
+            debug!(pid = self.pid, "CLI leader already exited; sweeping process group");
+        } else {
+            warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         }
-
-        // Force kill
-        warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
         force_kill(self.pid, self.process_group_id)?;
 
         // Wait for the exit monitor to observe process termination so callers
-        // do not race a still-live child after force-kill returns.
+        // do not race a still-live leader after force-kill returns. Skip the
+        // wait if the leader had already exited before our sweep.
         let mut rx = self.exit_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             if rx.borrow().is_some() {
@@ -135,6 +141,24 @@ impl CliAgentProcess {
         .map_err(|_| AgentError::internal(format!("Process {} did not exit after force_kill", self.pid)))?;
 
         Ok(())
+    }
+
+    /// Unconditionally force-kill this process and its entire process group.
+    ///
+    /// Unlike [`kill`](Self::kill), this neither closes stdin first nor waits
+    /// for a graceful exit, and it does **not** short-circuit when the direct
+    /// child has already exited. It always signals the process *group*, so a
+    /// descendant reparented to init after the launcher exited (e.g. an
+    /// npx-spawned ACP grandchild) is still reaped.
+    ///
+    /// Used by throwaway probe connections: the node/npx launcher exits on its
+    /// own once the ACP transport closes, but `kill_on_drop` reaps only the
+    /// direct child, leaving the grandchild (`codex-acp`, `codebuddy --acp`, …)
+    /// to leak as an orphan.
+    pub fn force_kill_tree(&self) {
+        if let Err(e) = force_kill(self.pid, self.process_group_id) {
+            warn!(pid = self.pid, error = %e, "force_kill_tree failed");
+        }
     }
 
     /// Check whether the subprocess is still running.
@@ -237,12 +261,57 @@ pub(super) mod tests {
     use tokio::time::timeout;
 
     pub(super) fn simple_script_config(script: &str) -> CommandSpec {
+        let (command, args) = script_command(script);
         CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script.into()],
+            command: command.into(),
+            args,
             env: vec![],
             cwd: None,
         }
+    }
+
+    #[cfg(not(windows))]
+    fn script_command(script: &str) -> (String, Vec<String>) {
+        ("sh".into(), vec!["-c".into(), script.into()])
+    }
+
+    #[cfg(windows)]
+    fn script_command(script: &str) -> (String, Vec<String>) {
+        let powershell = match script.trim() {
+            "sleep 10" => "Start-Sleep -Seconds 10",
+            "read line" => "$null = [Console]::In.ReadLine()",
+            "trap '' TERM; while true; do sleep 1; done" => "while ($true) { Start-Sleep -Seconds 1 }",
+            "true" => "exit 0",
+            "echo ready" => "Write-Output 'ready'",
+            "read line && echo \"$line\"" => "$line = [Console]::In.ReadLine(); Write-Output $line",
+            "echo 'error line 1' >&2 && echo 'error line 2' >&2" => {
+                "[Console]::Error.WriteLine('error line 1'); [Console]::Error.WriteLine('error line 2')"
+            }
+            "echo 'hello' >&2" => "[Console]::Error.WriteLine('hello')",
+            "for i in 1 2 3 4 5; do echo \"line $i\" >&2; done" => {
+                "1..5 | ForEach-Object { [Console]::Error.WriteLine(\"line $_\") }"
+            }
+            "echo 'first' >&2 && echo 'second' >&2" => {
+                "[Console]::Error.WriteLine('first'); [Console]::Error.WriteLine('second')"
+            }
+            "echo 'noise' >&2" => "[Console]::Error.WriteLine('noise')",
+            script if script.contains("HTTP 402: stale turn failure") => {
+                "while (($line = [Console]::In.ReadLine()) -ne $null) { if ($line -like '*first*') { [Console]::Error.WriteLine('HTTP 402: stale turn failure') }; Write-Output '{\"type\":\"ack\",\"data\":{}}' }"
+            }
+            other => panic!("missing Windows test script mapping for: {other}"),
+        };
+
+        (
+            "powershell.exe".into(),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-Command".into(),
+                powershell.into(),
+            ],
+        )
     }
 
     pub(super) async fn spawn_sdk_test_process(config: CommandSpec) -> CliAgentProcess {
@@ -330,25 +399,18 @@ pub(super) mod tests {
         assert!(!proc.is_running());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn spawn_rejects_unavailable_cwd_with_trailing_whitespace_in_request() {
+    async fn spawn_allows_existing_cwd_with_trailing_whitespace() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("workspace");
+        let cwd = dir.path().join("workspace ");
         fs::create_dir(&cwd).unwrap();
-        let cwd_with_trailing_space = format!("{} ", cwd.to_string_lossy());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(cwd_with_trailing_space.clone()),
-        };
-        let data_dir = tempfile::tempdir().unwrap();
-        let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
-        assert!(matches!(
-            result,
-            Err(AgentError::WorkspacePathRuntimeUnavailable(message)) if message == cwd_with_trailing_space
-        ));
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
+
+        let proc = spawn_sdk_test_process(config).await;
+        proc.kill(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
@@ -359,12 +421,8 @@ pub(super) mod tests {
         let cwd = workspace_parent.join("project");
         fs::create_dir(&cwd).unwrap();
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
 
         let proc = spawn_sdk_test_process(config).await;
         proc.kill(Duration::from_millis(100)).await.unwrap();
@@ -379,12 +437,8 @@ pub(super) mod tests {
         fs::create_dir(&cwd).unwrap();
         let data_dir = tempfile::tempdir().unwrap();
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo ready".into()],
-            env: vec![],
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(cwd.to_string_lossy().into_owned());
 
         let proc = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await.unwrap();
         proc.kill(Duration::from_millis(100)).await.unwrap();
@@ -396,12 +450,8 @@ pub(super) mod tests {
         let missing_cwd = dir.path().join("missing").join("workspace");
         assert!(!missing_cwd.exists());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
-            env: vec![],
-            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("echo ready");
+        config.cwd = Some(missing_cwd.to_string_lossy().into_owned());
 
         let data_dir = tempfile::tempdir().unwrap();
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
@@ -420,12 +470,8 @@ pub(super) mod tests {
         let missing_cwd = dir.path().join("missing-sdk").join("workspace");
         assert!(!missing_cwd.exists());
 
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), "sleep 10".into()],
-            env: vec![],
-            cwd: Some(missing_cwd.to_string_lossy().into_owned()),
-        };
+        let mut config = simple_script_config("sleep 10");
+        config.cwd = Some(missing_cwd.to_string_lossy().into_owned());
 
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(matches!(
@@ -447,6 +493,64 @@ pub(super) mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let result = CliAgentProcess::spawn_for_sdk(config, data_dir.path()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_kill_tree_reaps_grandchild_after_leader_exits() {
+        // Reproduces the probe leak: the spawned launcher backgrounds a
+        // long-lived grandchild then exits 0 on its own (mirrors node/npx
+        // forking the real ACP binary then returning once the transport
+        // closes). `kill_on_drop` would only reap the direct child; the
+        // grandchild reparents to init and leaks. `force_kill_tree` must
+        // signal the whole process group and take the grandchild with it.
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_string_lossy().into_owned();
+
+        let config = CommandSpec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 0".into(),
+                "probe-grandchild-cleanup".into(),
+                marker_path.clone(),
+            ],
+            env: vec![],
+            cwd: None,
+        };
+        let proc = spawn_sdk_test_process(config).await;
+
+        // Leader exits on its own; wait for the exit monitor to observe it.
+        timeout(Duration::from_secs(5), proc.wait_for_exit())
+            .await
+            .expect("leader should exit promptly");
+
+        let child_pid: u32 = std::fs::read_to_string(marker.path())
+            .expect("grandchild pid marker should exist")
+            .trim()
+            .parse()
+            .expect("grandchild pid should be numeric");
+
+        fn is_pid_alive(pid: u32) -> bool {
+            let result = unsafe { libc::kill(pid as i32, 0) };
+            if result == 0 {
+                return true;
+            }
+            !matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+        }
+
+        assert!(is_pid_alive(child_pid), "grandchild pid={child_pid} should be alive");
+
+        proc.force_kill_tree();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_pid_alive(child_pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !is_pid_alive(child_pid),
+            "grandchild pid={child_pid} should be reaped by force_kill_tree",
+        );
     }
 
     #[tokio::test]

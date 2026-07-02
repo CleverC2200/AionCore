@@ -1,6 +1,7 @@
 ---
 name: aionui-troubleshooting
-description: Diagnose a running AionUi installation — locate and inspect conversations (including stuck/running ones), read aioncore logs, check LLM provider health, list scheduled cron jobs and their last run status, inspect teams and member state, and check MCP server health. Use when the user reports that AionUi is misbehaving: a conversation is stuck or errored, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they just ask "what's wrong with AionUi" / "排查一下 aionui". Engine-agnostic — works the same for claude / aionrs / gemini / openclaw conversations.
+description: >-
+  Diagnose a running AionUi installation — locate and inspect conversations (including stuck/running ones), read aioncore logs, check LLM provider health, list scheduled cron jobs and their last run status, inspect teams and member state, and check MCP server health. Use when the user reports that AionUi is misbehaving: a conversation is stuck or errored, an LLM/provider call is failing, a scheduled task did not run, an MCP server has no tools, a team member is hung, or they just ask "what's wrong with AionUi" / "排查一下 aionui". Engine-agnostic — works the same for claude / aionrs / gemini / openclaw conversations.
 ---
 
 > **⚠️ Platform note — read before running any command.** The shell snippets in this skill are written for **macOS / Linux** (bash/zsh). Always check which OS you are on first. On **Windows** do **not** run them verbatim — the underlying tool/CLI commands are usually cross-platform, but the surrounding shell syntax is not. Translate it to PowerShell before running:
@@ -63,8 +64,8 @@ python3 scripts/aion_diag.py discover
 ```
 
 How discovery works (and why it's robust):
-- Finds the aioncore process started with `--data-dir` (the long-lived backend,
-  not the short-lived `mcp-guide-stdio` / `mcp-team-stdio` helper subprocesses).
+- The long-lived backend process is `aioncore`; short-lived helper subprocesses
+  may include `mcp-team-stdio` for active Team sessions.
 - Reads `--log-dir`, `--data-dir`, `--app-version` straight from its argv — so
   if the user changed the log directory, **we follow it**, never hardcode it.
 - The REST port is NOT in argv (`--port 0`), so the script probes every port the
@@ -103,14 +104,20 @@ python3 scripts/aion_diag.py messages <id> [--limit N] [--errors]   # message hi
 ```
 
 - `conversation <id>` is the workhorse. It returns the live `runtime` block
-  (`state`, `task_status`, `is_processing`, `turn_id`), the 5 most recent
-  **error** messages, and a `stuck_hint` when `state=running` +
-  `is_processing=true`.
+  (`state`, `task_status`, `is_processing`, `turn_id`, plus `can_send_message`,
+  `has_task`, `pending_confirmations`), the 5 most recent **error** messages, and
+  a `stuck_hint` when `state=running` + `is_processing=true`. Note `state` (the
+  runtime machine state) and `task_status` are different fields — stuck detection
+  keys off `state`.
 - **Stuck detection is comparative, not absolute.** A single `running` snapshot
   is normal — that may just be the active turn. To confirm a hang, run
   `conversation <id>` a few times seconds apart: if `turn_id` and runtime never
   change while no new messages arrive, it's stuck. Cross-check with
   `logs --conv <id>`.
+- **Not every non-progressing turn is stuck.** `state=waiting_confirmation` (or
+  `pending_confirmations > 0`) means the turn is *blocked on a user approval*,
+  not hung — the fix is to answer the pending confirmation, not to restart the
+  conversation. The `stuck_hint` distinguishes these two cases.
 - `messages <id> --errors` pulls just the failed messages/tool-calls for that
   conversation from the unified `messages` table (engine-agnostic).
 
@@ -121,8 +128,9 @@ python3 scripts/aion_diag.py providers
 ```
 
 Lists every configured provider with its `model_health` (`status`, `latency`,
-`last_check`) and an `unhealthy_models` summary. A provider whose models show
-non-`healthy` status, huge `latency`, or a stale `last_check` is the suspect.
+`last_check`, and an `error` string on the last failed check) and an
+`unhealthy_models` summary. A provider whose models show non-`healthy` status,
+huge `latency`, or a stale `last_check` is the suspect.
 Then confirm with the log (filter by the provider's base_url or id):
 
 ```bash
@@ -139,9 +147,11 @@ python3 scripts/aion_diag.py logs --errors --lines 100
 python3 scripts/aion_diag.py crons
 ```
 
-There is **no REST API for crons** — this reads the `cron_jobs` table from the
-SQLite store directly (read-only). It surfaces a `failing` list (jobs whose
-`last_status` is `error` or `missed`) plus every job's `schedule_*`,
+This reads the `cron_jobs` table from the SQLite store directly (read-only). A
+REST API for crons does exist (`/api/cron/jobs`, used by the `aionui-config`
+skill to *create/manage* jobs), but for diagnosis the table read is more direct
+and surfaces the run-state columns in one shot. It surfaces a `failing` list
+(jobs whose `last_status` is `error` or `missed`) plus every job's `schedule_*`,
 `last_status`, `last_error`, `next_run_at`, `last_run_at`, `run_count`,
 `retry_count`. Check `enabled`, compare `next_run_at` to now, and read
 `last_error` for failed jobs.
@@ -202,7 +212,7 @@ python3 scripts/aion_diag.py logs [--lines N] [--errors] [--conv <id>]
 | Conversation list + runtime state | `GET /api/conversations[/{id}]` | REST |
 | Conversation messages / errors | `messages` table (by `conversation_id`) | SQLite (read-only) |
 | LLM provider health | `GET /api/providers` → `model_health` | REST (api_key redacted) |
-| Scheduled jobs | `cron_jobs` table | SQLite (no REST API) |
+| Scheduled jobs | `cron_jobs` table (REST `/api/cron/jobs` exists too) | SQLite (read-only) |
 | Teams + members | `GET /api/teams` | REST |
 | MCP servers | `GET /api/mcp/servers` | REST |
 | Logs | `*.aioncore.log` in `--log-dir` | File tail |

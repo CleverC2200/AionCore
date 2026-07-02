@@ -44,6 +44,8 @@ pub fn row_to_response_with_extra(
         !ws.is_empty() && Path::new(ws).starts_with(data_dir)
     };
     if let Some(obj) = extra.as_object_mut() {
+        obj.remove("preset_context");
+        obj.remove("preset_rules");
         obj.insert(
             "is_temporary_workspace".to_owned(),
             serde_json::Value::Bool(is_temporary_workspace),
@@ -71,6 +73,7 @@ pub fn row_to_response_with_extra(
         pinned: row.pinned,
         pinned_at: row.pinned_at,
         channel_chat_id: row.channel_chat_id,
+        assistant: None,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,

@@ -14,8 +14,8 @@ use aionui_conversation::{
     stream_relay::StreamRelay,
 };
 use aionui_db::{
-    IConversationRepository, SortOrder, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteConversationRepository, init_database_memory, models::ConversationRow,
+    IConversationRepository, MessagePageDirection, MessagePageParams, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteConversationRepository, init_database_memory, models::ConversationRow,
 };
 use aionui_realtime::BroadcastEventBus;
 use serde_json::json;
@@ -81,7 +81,6 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();
@@ -99,7 +98,16 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
 
     relay.consume(rx).await;
 
-    let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
 
     assert!(
         messages.items.iter().all(|row| row.r#type != "tool_call"),
@@ -120,7 +128,6 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         "system_default_user".into(),
         repo.clone(),
         bus,
-        None,
     );
 
     let rx = tx.subscribe();
@@ -148,7 +155,16 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
 
     relay.consume(rx).await;
 
-    let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     let msg = messages
         .items
         .iter()
@@ -306,13 +322,24 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
             content: "run glob".into(),
             files: Vec::new(),
             inject_skills: Vec::new(),
+            persist_user_message: false,
+            user_message_hidden: false,
             on_started: None,
         })
         .await
         .unwrap();
     assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
 
-    let messages = repo.get_messages("conv-1", 1, 100, SortOrder::Asc).await.unwrap();
+    let messages = repo
+        .list_messages_page(
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         messages.items.iter().all(|row| row.r#type != "tool_call"),
         "empty call_id tool_call must not be persisted through run_agent_turn"

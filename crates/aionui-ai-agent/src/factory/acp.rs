@@ -4,6 +4,7 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
@@ -17,7 +18,7 @@ use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
     ensure_runtime_command_with_reporter, resolve_command_path,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
 
@@ -26,7 +27,6 @@ pub(super) async fn build(
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let belongs_to_team = build_context.team.is_some();
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
@@ -50,47 +50,17 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    // Inject Guide MCP config for solo (non-team) sessions.
-    // Team sessions already carry `team_mcp_stdio_config`; the
-    // two are mutually exclusive per the build_new_session_request guard.
-    if config.team_mcp_stdio_config.is_some() {
-        debug!(ctx.conversation_id, "guide_mcp: skipped: has team_mcp");
-    } else if belongs_to_team {
-        debug!(
-            ctx.conversation_id,
-            "guide_mcp: skipped: conversation belongs to a team"
-        );
-    } else if config.guide_mcp_config.is_some() {
-        debug!(
-            ctx.conversation_id,
-            "guide_mcp: skipped: caller already set guide_mcp_config"
-        );
-    } else if deps.guide_mcp_config.is_none() {
-        debug!(ctx.conversation_id, "guide_mcp: skipped: guide server not running");
-    } else {
-        config.guide_mcp_config.clone_from(&deps.guide_mcp_config);
-        info!(
-            ctx.conversation_id,
-            guide_mcp_port = deps.guide_mcp_config.as_ref().map(|c| c.port),
-            "guide_mcp: injected into solo session"
-        );
-    }
-
     let mut command_spec =
         resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
-    if meta.backend.as_deref() == Some("claude") {
-        let cc_switch_env = crate::cc_switch::read_claude_provider_env();
-        if !cc_switch_env.is_empty() {
-            let keys: Vec<&str> = cc_switch_env.keys().map(|k| k.as_str()).collect();
-            for (name, value) in &cc_switch_env {
-                command_spec.env.push(aionui_common::EnvVar {
-                    name: name.clone(),
-                    value: value.clone(),
-                });
-            }
-            tracing::info!(?keys, "cc-switch: env vars injected");
-        }
-    }
+    apply_acp_launch_policy(
+        &mut command_spec,
+        AcpLaunchPolicyInput {
+            metadata: &meta,
+            config: &config,
+            session_snapshot: build_context.session_snapshot.as_ref(),
+            runtime_env: &ctx.runtime_env,
+        },
+    );
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -154,6 +124,7 @@ pub(super) async fn build(
             session_mcp_servers,
             session_snapshot,
             deps.data_dir.clone(),
+            deps.dump_prompts,
         )
         .await,
     );
@@ -582,6 +553,10 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    fn is_npx_command_path(command: &str) -> bool {
+        command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
+    }
+
     #[cfg(unix)]
     fn test_runtime_data_dir() -> &'static PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -677,7 +652,19 @@ mod tests {
             yolo_id: None,
             sort_order: 0,
             team_capable: false,
+            last_check_status: None,
+            last_check_kind: None,
+            last_check_error_code: None,
+            last_check_error_message: None,
+            last_check_error_details: None,
+            last_check_guidance: None,
+            last_check_latency_ms: None,
+            last_check_at: None,
+            last_success_at: None,
+            last_failure_at: None,
             handshake: aionui_api_types::AgentHandshake::default(),
+            has_command_override: false,
+            env_override_key_count: 0,
         };
 
         let spec = resolve_agent_command_spec(
@@ -713,7 +700,7 @@ mod tests {
                 assert_eq!(s.name, "ctx7");
                 let command = s.command.to_string_lossy();
                 assert!(
-                    command == "npx" || command.ends_with("/npx"),
+                    is_npx_command_path(&command),
                     "unexpected stdio command path: {command}",
                 );
                 assert_eq!(s.args, vec!["-y".to_owned(), "@upstash/context7-mcp".to_owned()]);

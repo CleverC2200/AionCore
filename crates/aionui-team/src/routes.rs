@@ -11,13 +11,13 @@ use axum::routing::{get, post};
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
-use crate::error::TeamError;
+use crate::error::{TeamError, classify_public_error};
 use crate::service::TeamSessionService;
 
 #[derive(Clone)]
@@ -41,7 +41,13 @@ impl From<TeamError> for ApiError {
             TeamError::TeamNotFound(msg) => ApiError::NotFound(msg),
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
             TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
-            TeamError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            TeamError::InvalidRequest(msg) => {
+                if let Some(public) = classify_public_error(&msg) {
+                    ApiError::coded(StatusCode::BAD_REQUEST, public.code, msg, public.details)
+                } else {
+                    ApiError::BadRequest(msg)
+                }
+            }
             TeamError::SlotBusy(msg) => ApiError::Conflict(format!("Team slot is busy: {msg}")),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
@@ -61,6 +67,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -109,6 +116,15 @@ async fn get_team(
 ) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
     let team = state.service.get_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(team)))
+}
+
+async fn get_run_state(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamRunStateResponse>>, ApiError> {
+    let run_state = state.service.get_run_state(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(run_state)))
 }
 
 async fn remove_team(
@@ -295,6 +311,7 @@ async fn stop_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn team_router_state_is_clone() {
@@ -324,6 +341,38 @@ mod tests {
     fn invalid_request_maps_to_bad_request() {
         let err: ApiError = TeamError::InvalidRequest("empty agents".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn invalid_request_maps_missing_assistant_identity_to_coded_api_error() {
+        let err: ApiError = TeamError::InvalidRequest("spawn_agent.assistant_id is required".into()).into();
+        assert_eq!(err.error_code(), "TEAM_ASSISTANT_ID_REQUIRED");
+        assert_eq!(err.error_details(), Some(json!({ "field": "assistant_id" })));
+    }
+
+    #[test]
+    fn invalid_request_maps_unknown_assistant_to_coded_api_error() {
+        let err: ApiError = TeamError::InvalidRequest("Preset assistant not found: bare:deadbeef".into()).into();
+        assert_eq!(err.error_code(), "TEAM_ASSISTANT_NOT_FOUND");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "assistant_id": "bare:deadbeef",
+            }))
+        );
+    }
+
+    #[test]
+    fn invalid_request_maps_legacy_identity_field_to_coded_api_error() {
+        let err: ApiError = TeamError::InvalidRequest("backend is no longer accepted; use assistant_id".into()).into();
+        assert_eq!(err.error_code(), "TEAM_ASSISTANT_FIELD_UNSUPPORTED");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "field": "backend",
+                "required_field": "assistant_id",
+            }))
+        );
     }
 
     #[test]

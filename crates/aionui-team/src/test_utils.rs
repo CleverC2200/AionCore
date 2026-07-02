@@ -205,14 +205,16 @@ pub(crate) mod workspace_harness {
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{CreateTeamRequest, WebSocketMessage};
-    use aionui_common::{AgentKillReason, PaginatedResult, now_ms};
+    use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
-        AgentMetadataRow, ConversationRow, MessageRow, TeamRow, TeamTaskRow, UpdateAgentHandshakeParams,
-        UpsertAgentMetadataParams,
+        AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
+        TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        UpsertAssistantOverlayParams,
     };
     use aionui_db::{
-        ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IConversationRepository,
-        IProviderRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow, SortOrder, UpdateTeamParams,
+        ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
+        IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
+        MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -222,8 +224,7 @@ pub(crate) mod workspace_harness {
         AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationLookupPort,
     };
     use crate::provisioning::{
-        TeamConversationAdoptRequest, TeamConversationCreateRequest, TeamConversationCreateResult,
-        TeamConversationProvisioningPort,
+        TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
     };
     use crate::{TeamError, TeamProjectionMessageStore, TeamSessionService};
 
@@ -322,17 +323,15 @@ pub(crate) mod workspace_harness {
             Ok(vec![])
         }
 
-        async fn get_messages(
+        async fn list_messages_page(
             &self,
             _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
-            _order: SortOrder,
-        ) -> Result<PaginatedResult<MessageRow>, DbError> {
-            Ok(PaginatedResult {
+            _params: &MessagePageParams,
+        ) -> Result<MessagePageResult, DbError> {
+            Ok(MessagePageResult {
                 items: vec![],
-                total: 0,
-                has_more: false,
+                has_more_before: false,
+                has_more_after: false,
             })
         }
 
@@ -545,7 +544,7 @@ pub(crate) mod workspace_harness {
                     id: id.clone(),
                     user_id: request.user_id,
                     name: request.name,
-                    r#type: request.agent_type.serde_name().to_owned(),
+                    r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
                     pinned: false,
                     pinned_at: None,
                     source: None,
@@ -565,15 +564,23 @@ pub(crate) mod workspace_harness {
             })
         }
 
-        async fn adopt_team_conversation(&self, _request: TeamConversationAdoptRequest) -> Result<(), TeamError> {
-            Ok(())
-        }
-
         async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
             Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
                 extra
                     .get("workspace")
                     .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }))
+        }
+
+        async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
+                extra
+                    .get("assistant_id")
+                    .or_else(|| extra.get("preset_assistant_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
                     .map(str::to_owned)
             }))
         }
@@ -744,11 +751,85 @@ pub(crate) mod workspace_harness {
             Ok(None)
         }
 
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn update_agent_overrides(
+            &self,
+            _id: &str,
+            _command_override: Option<&str>,
+            _env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
             Ok(false)
         }
 
         async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyAssistantDefinitionRepo;
+
+    #[async_trait]
+    impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_by_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct EmptyAssistantOverlayRepo;
+
+    #[async_trait]
+    impl IAssistantOverlayRepository for EmptyAssistantOverlayRepo {
+        async fn get(&self, _definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
             Ok(false)
         }
     }
@@ -836,21 +917,20 @@ pub(crate) mod workspace_harness {
         let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
         let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-        let lookup_port: Arc<dyn TeamConversationLookupPort> = conversation_ports;
         let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
         let svc = TeamSessionService::new(
             team_repo_dyn,
             Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
             Arc::new(EmptyProviderRepo),
             conversation_port,
             projection_store,
-            lookup_port,
             broadcaster,
             task_manager.clone(),
             Arc::new(NoopTurnPort),
             Arc::new(NoopCancellationPort),
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
-            None,
         );
         (svc, team_repo, task_manager, conv_repo)
     }
@@ -873,9 +953,9 @@ pub(crate) mod workspace_harness {
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),
                 role: "lead".into(),
-                backend: "acp".into(),
+                backend: Some("acp".into()),
                 model: "claude".into(),
-                custom_agent_id: None,
+                assistant_id: None,
                 conversation_id: None,
             }],
             workspace: None,

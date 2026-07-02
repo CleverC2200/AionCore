@@ -7,11 +7,15 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
+use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
-use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AcpError, AgentError, AgentSendError, IWorkerTaskManager};
+use aionui_ai_agent::types::{
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
+};
+use aionui_ai_agent::{
+    AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+};
 
-use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdateParams, ICronService};
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
@@ -33,18 +37,20 @@ use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SortOrder, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
+    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
+    init_database_memory,
 };
+use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::ConversationError;
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -164,6 +170,36 @@ impl EventBroadcaster for MockBroadcaster {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedAvailabilityFailure {
+    agent_id: String,
+    code: String,
+    message: String,
+}
+
+#[derive(Default)]
+struct RecordingAvailabilityFeedback {
+    successes: Mutex<Vec<String>>,
+    failures: Mutex<Vec<RecordedAvailabilityFailure>>,
+}
+
+#[async_trait::async_trait]
+impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
+    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+        self.successes.lock().unwrap().push(agent_id.to_owned());
+        Ok(())
+    }
+
+    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
+        self.failures.lock().unwrap().push(RecordedAvailabilityFailure {
+            agent_id: agent_id.to_owned(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+        });
+        Ok(())
+    }
+}
+
 // ── Mock Repository ────────────────────────────────────────────────
 
 struct MockRepo {
@@ -182,6 +218,27 @@ impl MockRepo {
             assistant_snapshots: Mutex::new(vec![]),
         }
     }
+}
+
+fn message_is_before_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at < cursor.created_at || (message.created_at == cursor.created_at && message.id < cursor.id)
+}
+
+fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> bool {
+    message.created_at > cursor.created_at || (message.created_at == cursor.created_at && message.id > cursor.id)
+}
+
+async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> Vec<MessageRow> {
+    repo.list_messages_page(
+        conv_id,
+        &MessagePageParams {
+            limit,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
 }
 
 #[async_trait::async_trait]
@@ -303,12 +360,9 @@ impl IConversationRepository for MockRepo {
         let row = ConversationAssistantSnapshotRow {
             conversation_id: params.conversation_id.to_owned(),
             assistant_definition_id: params.assistant_definition_id.to_owned(),
-            assistant_key: params.assistant_key.to_owned(),
+            assistant_id: params.assistant_id.to_owned(),
             assistant_source: params.assistant_source.to_owned(),
-            assistant_name: params.assistant_name.to_owned(),
-            assistant_avatar_type: params.assistant_avatar_type.to_owned(),
-            assistant_avatar_value: params.assistant_avatar_value.map(ToOwned::to_owned),
-            agent_backend: params.agent_backend.to_owned(),
+            agent_id: params.agent_id.to_owned(),
             rules_content: params.rules_content.to_owned(),
             default_model_mode: params.default_model_mode.to_owned(),
             resolved_model_id: params.resolved_model_id.map(ToOwned::to_owned),
@@ -335,40 +389,90 @@ impl IConversationRepository for MockRepo {
         Ok(rows.len() != before)
     }
 
-    async fn get_messages(
+    async fn list_messages_page(
         &self,
         conv_id: &str,
-        page: u32,
-        page_size: u32,
-        order: SortOrder,
-    ) -> Result<PaginatedResult<MessageRow>, aionui_db::DbError> {
+        params: &MessagePageParams,
+    ) -> Result<MessagePageResult, aionui_db::DbError> {
         let messages = self.messages.lock().unwrap();
         let mut matched: Vec<_> = messages
             .iter()
             .filter(|message| message.conversation_id == conv_id)
+            .filter(|message| !matches!(message.r#type.as_str(), "cron_trigger" | "skill_suggest"))
             .cloned()
             .collect();
-        matched.sort_by_key(|message| message.created_at);
-        if matches!(order, SortOrder::Desc) {
-            matched.reverse();
-        }
+        matched.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 
-        let start = page.saturating_sub(1) as usize * page_size as usize;
-        let end = (start + page_size as usize).min(matched.len());
-        let items = if start < matched.len() {
-            matched[start..end].to_vec()
-        } else {
-            Vec::new()
+        let limit = params.limit.max(1) as usize;
+        let items = match &params.direction {
+            MessagePageDirection::InitialLatest => {
+                let start = matched.len().saturating_sub(limit);
+                matched[start..].to_vec()
+            }
+            MessagePageDirection::Before { cursor } => matched
+                .iter()
+                .filter(|message| message_is_before_cursor(message, cursor))
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            MessagePageDirection::After { cursor } => matched
+                .iter()
+                .filter(|message| message_is_after_cursor(message, cursor))
+                .take(limit)
+                .cloned()
+                .collect(),
+            MessagePageDirection::Anchor { message_id } => {
+                let anchor = matched
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                    .cloned()
+                    .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {message_id}")))?;
+                let before_take = (limit.saturating_sub(1)) / 2;
+                let anchor_cursor = MessagePageCursor::from(&anchor);
+                let before = matched
+                    .iter()
+                    .filter(|message| message_is_before_cursor(message, &anchor_cursor))
+                    .rev()
+                    .take(before_take)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let after = matched
+                    .iter()
+                    .filter(|message| message_is_after_cursor(message, &anchor_cursor))
+                    .take(limit.saturating_sub(1 + before.len()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                before
+                    .into_iter()
+                    .rev()
+                    .chain(std::iter::once(anchor))
+                    .chain(after)
+                    .collect()
+            }
         };
-        Ok(PaginatedResult {
+        let has_more_before = items.first().is_some_and(|first| {
+            let cursor = MessagePageCursor::from(first);
+            matched.iter().any(|message| message_is_before_cursor(message, &cursor))
+        });
+        let has_more_after = items.last().is_some_and(|last| {
+            let cursor = MessagePageCursor::from(last);
+            matched.iter().any(|message| message_is_after_cursor(message, &cursor))
+        });
+
+        Ok(MessagePageResult {
             items,
-            total: matched.len() as u64,
-            has_more: end < matched.len(),
+            has_more_before,
+            has_more_after,
         })
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
-        self.messages.lock().unwrap().push(message.clone());
+        let mut messages = self.messages.lock().unwrap();
+        messages.push(message.clone());
         Ok(())
     }
 
@@ -543,17 +647,71 @@ impl IConversationRepository for MockRepo {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/// Stub repository for tests — every lookup returns `None` so the
-/// service falls back to `AgentType::native_skills_dirs()` paths.
+/// Stub repository for tests. Builtin rows mirror the ids used by the
+/// migration seed so assistant id-resolution tests exercise the same
+/// boundary as the SQLite repository.
 struct StubAgentMetadataRepo;
+
+fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
+    [
+        ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
+        ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
+        ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
+        ("632f31d2", None, "aionrs", "Aion CLI", 200),
+        ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
+        ("f9f61666", None, "openclaw-gateway", "OpenClaw Gateway", 3150),
+        ("custom-acp-1", None, "acp", "My Custom ACP", 1500),
+    ]
+    .into_iter()
+    .map(|(id, backend, agent_type, name, sort_order)| AgentMetadataRow {
+        id: id.to_owned(),
+        icon: None,
+        name: name.to_owned(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: backend.map(ToOwned::to_owned),
+        agent_type: agent_type.to_owned(),
+        agent_source: if id.starts_with("custom-") { "custom" } else { "builtin" }.to_owned(),
+        agent_source_info: None,
+        enabled: true,
+        command: backend.map(ToOwned::to_owned),
+        args: Some("[]".to_owned()),
+        env: Some("[]".to_owned()),
+        native_skills_dirs: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        command_override: None,
+        env_override: None,
+        created_at: 1,
+        updated_at: 1,
+    })
+    .collect()
+}
 
 #[async_trait::async_trait]
 impl IAgentMetadataRepository for StubAgentMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
-        Ok(Vec::new())
+        Ok(stub_agent_metadata_rows())
     }
-    async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        Ok(None)
+    async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(stub_agent_metadata_rows().into_iter().find(|row| row.id == id))
     }
     async fn find_by_source_and_name(
         &self,
@@ -562,8 +720,10 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
-    async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        Ok(None)
+    async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(stub_agent_metadata_rows()
+            .into_iter()
+            .find(|row| row.agent_source == "builtin" && row.backend.as_deref() == Some(backend)))
     }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
@@ -574,6 +734,118 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
         _params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_agent_overrides(
+        &self,
+        _id: &str,
+        _command_override: Option<&str>,
+        _env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+        Ok(false)
+    }
+    async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+}
+
+/// Metadata repo used by custom-workspace skill-link tests. It models the
+/// builtin Claude ACP row whose native skill directory is `.claude/skills`.
+struct ClaudeNativeSkillMetadataRepo;
+
+fn claude_metadata_row() -> AgentMetadataRow {
+    AgentMetadataRow {
+        id: "agent-claude".into(),
+        icon: None,
+        name: "Claude Code".into(),
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: Some("claude".into()),
+        agent_type: "acp".into(),
+        agent_source: "builtin".into(),
+        agent_source_info: Some("{}".into()),
+        enabled: true,
+        command: Some("claude".into()),
+        args: Some("[]".into()),
+        env: Some("[]".into()),
+        native_skills_dirs: Some(r#"[".claude/skills"]"#.into()),
+        behavior_policy: Some("{}".into()),
+        yolo_id: Some("bypassPermissions".into()),
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 0,
+        last_check_status: None,
+        last_check_kind: None,
+        last_check_error_code: None,
+        last_check_error_message: None,
+        last_check_guidance: None,
+        last_check_latency_ms: None,
+        last_check_at: None,
+        last_success_at: None,
+        last_failure_at: None,
+        command_override: None,
+        env_override: None,
+        created_at: 1,
+        updated_at: 1,
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
+    async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+        Ok(vec![claude_metadata_row()])
+    }
+    async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((id == "agent-claude").then(claude_metadata_row))
+    }
+    async fn find_by_source_and_name(
+        &self,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((agent_source == "builtin" && name == "Claude Code").then(claude_metadata_row))
+    }
+    async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok((backend == "claude").then(claude_metadata_row))
+    }
+    async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+        Err(DbError::Init("stub".into()))
+    }
+    async fn apply_handshake(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_availability_snapshot(
+        &self,
+        _id: &str,
+        _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_agent_overrides(
+        &self,
+        _id: &str,
+        _command_override: Option<&str>,
+        _env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        Ok(())
     }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
@@ -586,42 +858,82 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeStateSaveCall {
     conversation_id: String,
+    current_mode_id: Option<Option<String>>,
     current_model_id: Option<Option<String>>,
 }
 
 #[derive(Default)]
 struct StubAcpSessionRepo {
+    create_calls: Mutex<Vec<CreateAcpSessionCall>>,
     runtime_state_saves: Mutex<Vec<RuntimeStateSaveCall>>,
+    session_id: Mutex<Option<String>>,
 }
 
 impl StubAcpSessionRepo {
+    fn create_calls(&self) -> Vec<CreateAcpSessionCall> {
+        self.create_calls.lock().unwrap().clone()
+    }
+
+    fn with_session_id(session_id: impl Into<String>) -> Self {
+        Self {
+            create_calls: Mutex::new(Vec::new()),
+            runtime_state_saves: Mutex::new(Vec::new()),
+            session_id: Mutex::new(Some(session_id.into())),
+        }
+    }
+
     fn runtime_state_saves(&self) -> Vec<RuntimeStateSaveCall> {
         self.runtime_state_saves.lock().unwrap().clone()
     }
+
+    fn row_for(&self, conversation_id: &str) -> AcpSessionRow {
+        AcpSessionRow {
+            conversation_id: conversation_id.to_owned(),
+            agent_source: "builtin".into(),
+            agent_id: "codex".into(),
+            session_id: self.session_id.lock().unwrap().clone(),
+            session_status: "idle".into(),
+            session_config: "{}".into(),
+            last_active_at: None,
+            suspended_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateAcpSessionCall {
+    conversation_id: String,
+    agent_source: String,
+    agent_id: String,
 }
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, _conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        Ok(None)
+    async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        Ok(Some(self.row_for(conversation_id)))
     }
-    async fn create(&self, _params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+    async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
+        self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
+            conversation_id: params.conversation_id.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
+        });
         // Return a synthetic row so `ConversationService::create` can
         // succeed for ACP conversations in unit tests.
         Ok(AcpSessionRow {
-            conversation_id: "stub".into(),
-            agent_backend: "stub".into(),
-            agent_source: "stub".into(),
-            agent_id: "stub".into(),
-            session_id: None,
+            conversation_id: params.conversation_id.to_owned(),
+            agent_source: params.agent_source.to_owned(),
+            agent_id: params.agent_id.to_owned(),
+            session_id: self.session_id.lock().unwrap().clone(),
             session_status: "idle".into(),
             session_config: "{}".into(),
             last_active_at: None,
             suspended_at: None,
         })
     }
-    async fn update_session_id(&self, _conversation_id: &str, _session_id: &str) -> Result<bool, DbError> {
-        Ok(false)
+    async fn update_session_id(&self, _conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+        Ok(true)
     }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
@@ -639,6 +951,7 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     ) -> Result<bool, DbError> {
         self.runtime_state_saves.lock().unwrap().push(RuntimeStateSaveCall {
             conversation_id: conversation_id.to_owned(),
+            current_mode_id: params.current_mode_id.map(|outer| outer.map(ToOwned::to_owned)),
             current_model_id: params.current_model_id.map(|outer| outer.map(ToOwned::to_owned)),
         });
         Ok(true)
@@ -686,6 +999,54 @@ fn make_service_with_resolver_and_acp_session_repo(
         repo.clone(),
         agent_metadata_repo,
         acp_session_repo,
+    );
+    (svc, broadcaster, repo, task_mgr)
+}
+
+fn make_service_with_workspace_root(
+    workspace_root: PathBuf,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        workspace_root,
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo, task_mgr)
+}
+
+fn make_service_with_resolver_and_agent_metadata_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        skill_resolver,
+        task_mgr.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
     );
     (svc, broadcaster, repo, task_mgr)
 }
@@ -759,11 +1120,61 @@ async fn make_service_with_assistant_support(
     (svc, broadcaster, repo, definition_repo, state_repo, preference_repo)
 }
 
+async fn make_service_with_assistant_support_and_acp_session_repo(
+    skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
+    dispatcher: Arc<dyn AssistantRuleDispatcher>,
+    acp_session_repo: Arc<StubAcpSessionRepo>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantOverlayRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+    Arc<StubAcpSessionRepo>,
+) {
+    let (svc, broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(skill_resolver, acp_session_repo.clone());
+    let db = init_database_memory().await.unwrap();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(state_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+    svc.with_assistant_dispatcher(dispatcher);
+
+    (
+        svc,
+        broadcaster,
+        repo,
+        definition_repo,
+        state_repo,
+        preference_repo,
+        acp_session_repo,
+    )
+}
+
 fn make_create_req() -> CreateConversationRequest {
     let workspace = ensure_test_workspace_path();
     serde_json::from_value(json!({
         "type": "acp",
         "extra": { "workspace": workspace }
+    }))
+    .unwrap()
+}
+
+fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "custom_workspace": true,
+            "backend": backend
+        }
     }))
     .unwrap()
 }
@@ -774,31 +1185,58 @@ fn ensure_test_workspace_path() -> String {
     workspace.to_string_lossy().to_string()
 }
 
+fn unique_test_workspace_path(label: &str) -> PathBuf {
+    let workspace = std::env::temp_dir()
+        .join(format!("aionui-conversation-service-test-{label}"))
+        .join(ConversationService::mint_msg_id());
+    std::fs::create_dir_all(&workspace).unwrap();
+    workspace
+}
+
+fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected_file_name: &str) {
+    let relative = workspace
+        .strip_prefix(workspace_root.join("conversations"))
+        .expect("workspace should be under the conversations root");
+    let parts = relative
+        .iter()
+        .map(|part| part.to_str().expect("workspace path should be utf-8"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0].len(), 4);
+    assert_eq!(parts[1].len(), 2);
+    assert_eq!(parts[2].len(), 2);
+    assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(parts[3], expected_file_name);
+}
+
 async fn upsert_test_assistant_definition(
     repo: &SqliteAssistantDefinitionRepository,
     definition_id: &str,
-    assistant_key: &str,
-    agent_backend: &str,
+    assistant_id: &str,
+    agent_id: &str,
     default_model_mode: &str,
     default_permission_mode: &str,
 ) {
     repo.upsert(&UpsertAssistantDefinitionParams {
-        definition_id,
-        assistant_key,
+        id: definition_id,
+        assistant_id,
         source: "builtin",
         owner_type: "system",
-        source_ref: Some(assistant_key),
+        source_ref: Some(assistant_id),
         source_version: None,
         source_hash: None,
-        name: assistant_key,
+        name: assistant_id,
         name_i18n: "{}",
         description: Some("desc"),
         description_i18n: "{}",
         avatar_type: "emoji",
         avatar_value: Some("🤖"),
-        agent_backend,
+        agent_id,
         rule_resource_type: "builtin_asset",
-        rule_resource_ref: Some(assistant_key),
+        rule_resource_ref: Some(assistant_id),
         rule_inline_content: None,
         recommended_prompts: "[]",
         recommended_prompts_i18n: "{}",
@@ -820,13 +1258,12 @@ async fn upsert_test_assistant_definition(
 async fn create_assistant_backed_conversation(
     svc: &ConversationService,
     user_id: &str,
-    conversation_type: &str,
+    conversation_type: Option<&str>,
     backend: &str,
     assistant_id: &str,
 ) -> ConversationResponse {
     let workspace = ensure_test_workspace_path();
     let mut payload = json!({
-        "type": conversation_type,
         "name": "assistant conversation",
         "assistant": {
             "id": assistant_id,
@@ -838,7 +1275,11 @@ async fn create_assistant_backed_conversation(
         }
     });
 
-    if conversation_type == "aionrs" {
+    if let Some(conversation_type) = conversation_type {
+        payload["type"] = json!(conversation_type);
+    }
+
+    if conversation_type == Some("aionrs") {
         payload["model"] = json!({
             "provider_id": "provider-1",
             "model": "model-a",
@@ -918,7 +1359,7 @@ async fn create_rejects_deprecated_agent_types_for_new_conversations() {
         AgentType::Remote,
     ] {
         let mut req = make_create_req();
-        req.r#type = agent_type;
+        req.r#type = Some(agent_type);
         req.model = None;
         req.extra = json!({
             "workspace": ensure_test_workspace_path()
@@ -933,6 +1374,37 @@ async fn create_rejects_deprecated_agent_types_for_new_conversations() {
             agent_type.serde_name()
         );
     }
+}
+
+#[tokio::test]
+async fn create_auto_provisions_workspace_under_date_partition() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = Path::new(conv.extra["workspace"].as_str().unwrap());
+
+    assert_dated_workspace_path(&workspace_root, workspace, &format!("acp-temp-{}", conv.id));
+    assert!(workspace.is_dir());
+}
+
+#[test]
+fn create_team_temp_workspace_uses_date_partition() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+
+    let workspace = svc.create_team_temp_workspace("team_1").unwrap();
+
+    let workspace = Path::new(&workspace);
+    assert_dated_workspace_path(&workspace_root, workspace, "team-temp-team_1");
+    assert!(workspace.is_dir());
 }
 
 #[tokio::test]
@@ -1033,6 +1505,300 @@ async fn create_stores_model_as_json() {
     let model = resp.model.unwrap();
     assert_eq!(model.provider_id, "p1");
     assert_eq!(model.model, "m1");
+}
+
+#[tokio::test]
+async fn create_derives_aionrs_type_from_assistant_backend_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_aionrs_missing_type",
+        "assistant-aionrs-missing-type",
+        "aionrs",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_aionrs_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-aionrs-missing-type",
+            "locale": "en-US"
+        },
+        "model": {
+            "provider_id": "provider-1",
+            "model": "model-a",
+            "use_model": "model-a"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Aionrs);
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_missing_type",
+        "assistant-acp-missing-type",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-acp-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_openclaw_agent_metadata_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_openclaw_missing_type",
+        "assistant-openclaw-missing-type",
+        "b7e8a9c4",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_openclaw_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-openclaw-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert_eq!(resp.extra["agent_id"], json!("b7e8a9c4"));
+    assert_eq!(resp.extra["backend"], json!("openclaw"));
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_derives_acp_type_from_custom_agent_metadata_when_type_is_missing() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_custom_acp_missing_type",
+        "assistant-custom-acp-missing-type",
+        "custom-acp-1",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_custom_acp_missing_type",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-custom-acp-missing-type",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.r#type, AgentType::Acp);
+    assert_eq!(resp.extra["agent_id"], json!("custom-acp-1"));
+    assert_eq!(resp.extra["agent_source"], json!("custom"));
+    assert_eq!(resp.extra["backend"], json!("acp"));
+    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn create_rejects_assistant_bound_to_deprecated_agent_metadata() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_openclaw_gateway_deprecated",
+        "assistant-openclaw-gateway-deprecated",
+        "f9f61666",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_openclaw_gateway_deprecated",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-openclaw-gateway-deprecated",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let err = svc.create("user_1", req).await.unwrap_err();
+    assert_eq!(err.error_code(), "BAD_REQUEST");
+    assert!(
+        err.to_string()
+            .contains("This agent type is no longer supported for new conversations."),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_assistant_with_unregistered_agent_metadata() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_missing_agent",
+        "assistant-missing-agent",
+        "missing-agent",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_missing_agent",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "assistant": {
+            "id": "assistant-missing-agent",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace
+        }
+    }))
+    .unwrap();
+
+    let err = svc.create("user_1", req).await.unwrap_err();
+    assert_eq!(err.error_code(), "BAD_REQUEST");
+    assert!(
+        err.to_string()
+            .contains("assistant agent `missing-agent` is not registered in agent_metadata"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── Get tests ──────────────────────────────────────────────────────
@@ -1344,6 +2110,81 @@ async fn delete_invokes_registered_hook_before_row_delete() {
         assert_eq!(observations.as_slice(), &[true]);
     }
     assert!(repo.get(&conv.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_removes_auto_provisioned_workspace_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = conv.extra["workspace"].as_str().unwrap();
+    assert!(Path::new(workspace).is_dir());
+
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(!Path::new(workspace).exists());
+}
+
+#[tokio::test]
+async fn delete_removes_empty_date_workspace_parents() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let make_req = || {
+        serde_json::from_value::<CreateConversationRequest>(json!({
+            "type": "acp",
+            "extra": {}
+        }))
+        .unwrap()
+    };
+
+    let first = svc.create("user_1", make_req()).await.unwrap();
+    let second = svc.create("user_1", make_req()).await.unwrap();
+    let first_workspace = PathBuf::from(first.extra["workspace"].as_str().unwrap());
+    let second_workspace = PathBuf::from(second.extra["workspace"].as_str().unwrap());
+    let day_dir = first_workspace.parent().unwrap().to_path_buf();
+    let month_dir = day_dir.parent().unwrap().to_path_buf();
+    let year_dir = month_dir.parent().unwrap().to_path_buf();
+
+    svc.delete("user_1", &first.id).await.unwrap();
+
+    assert!(day_dir.is_dir());
+    assert!(second_workspace.is_dir());
+
+    svc.delete("user_1", &second.id).await.unwrap();
+
+    assert!(!day_dir.exists());
+    assert!(!month_dir.exists());
+    assert!(!year_dir.exists());
+}
+
+#[tokio::test]
+async fn delete_preserves_user_supplied_workspace_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(&user_workspace).unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(user_workspace.is_dir());
 }
 
 // ── Broadcast payload tests ────────────────────────────────────────
@@ -1902,6 +2743,81 @@ impl MockTaskManager {
     }
 }
 
+struct RebuildingScriptedTaskManager {
+    agents: Mutex<VecDeque<AgentInstance>>,
+    build_count: AtomicUsize,
+    kill_count: AtomicUsize,
+    captured_options: Mutex<Vec<BuildTaskOptions>>,
+}
+
+impl RebuildingScriptedTaskManager {
+    fn new(agents: Vec<AgentInstance>) -> Self {
+        Self {
+            agents: Mutex::new(agents.into()),
+            build_count: AtomicUsize::new(0),
+            kill_count: AtomicUsize::new(0),
+            captured_options: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn build_count(&self) -> usize {
+        self.build_count.load(Ordering::SeqCst)
+    }
+
+    fn kill_count(&self) -> usize {
+        self.kill_count.load(Ordering::SeqCst)
+    }
+
+    fn captured_options(&self) -> Vec<BuildTaskOptions> {
+        self.captured_options.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for RebuildingScriptedTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        self.build_count.fetch_add(1, Ordering::SeqCst);
+        self.captured_options.lock().unwrap().push(options);
+        self.agents
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| AgentError::bad_gateway("no scripted agent left"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.kill_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 struct FailingBuildTaskManager {
     error: String,
 }
@@ -1909,6 +2825,18 @@ struct FailingBuildTaskManager {
 impl FailingBuildTaskManager {
     fn new(error: impl Into<String>) -> Self {
         Self { error: error.into() }
+    }
+}
+
+struct AgentErrorFailingBuildTaskManager {
+    error: Mutex<Option<AgentError>>,
+}
+
+impl AgentErrorFailingBuildTaskManager {
+    fn new(error: AgentError) -> Self {
+        Self {
+            error: Mutex::new(Some(error)),
+        }
     }
 }
 
@@ -1923,6 +2851,48 @@ impl DelayedFailingBuildTaskManager {
             delay,
             error: error.into(),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for AgentErrorFailingBuildTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        None
+    }
+
+    async fn get_or_build_task(
+        &self,
+        _conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        Err(self
+            .error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test build error should be consumed once"))
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        _conversation_id: &str,
+        _reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {}
+
+    fn active_count(&self) -> usize {
+        0
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        vec![]
     }
 }
 
@@ -2273,44 +3243,6 @@ impl IAgentTask for ScriptedAgent {
 
 impl IMockAgent for ScriptedAgent {}
 
-struct MockCronContinuationService;
-
-#[async_trait::async_trait]
-impl ICronService for MockCronContinuationService {
-    async fn create_job(&self, _user_id: &str, _conversation_id: &str, params: &CronCreateParams) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: format!("Created cron job '{}'", params.name),
-        }
-    }
-
-    async fn update_job(
-        &self,
-        _user_id: &str,
-        _conversation_id: &str,
-        _params: &CronUpdateParams,
-    ) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "Updated cron job".into(),
-        }
-    }
-
-    async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "No scheduled tasks".into(),
-        }
-    }
-
-    async fn delete_job(&self, _user_id: &str, _job_id: &str) -> CronCommandResult {
-        CronCommandResult {
-            success: true,
-            message: "Deleted cron job".into(),
-        }
-    }
-}
-
 // ── send_message tests ──────────────────────────────────────────
 
 fn make_send_req() -> SendMessageRequest {
@@ -2318,6 +3250,27 @@ fn make_send_req() -> SendMessageRequest {
         "content": "Hello"
     }))
     .unwrap()
+}
+
+fn assert_conversation_runtime_context(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
+    assert!(
+        options
+            .context
+            .runtime_env
+            .contains(&("AIONUI_USER_ID".to_owned(), user_id.to_owned())),
+        "runtime env should include AIONUI_USER_ID"
+    );
+    assert!(
+        options
+            .context
+            .runtime_env
+            .contains(&("AIONUI_CONVERSATION_ID".to_owned(), conversation_id.to_owned())),
+        "runtime env should include AIONUI_CONVERSATION_ID"
+    );
+    assert_eq!(
+        options.runtime_capabilities.conversation_runtime_context_version,
+        Some(CONVERSATION_RUNTIME_CONTEXT_VERSION)
+    );
 }
 
 async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str) {
@@ -2348,6 +3301,99 @@ async fn send_message_returns_accepted() {
     assert_eq!(response.msg_id.len(), 8, "msg_id should be an 8-char short hex ID");
     assert!(response.turn_id.starts_with("turn_"), "turn_id must use turn_ prefix");
     assert_ne!(response.msg_id, response.turn_id, "turn_id must not reuse msg_id");
+}
+
+#[tokio::test]
+async fn send_message_injects_conversation_runtime_context() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn send_message_injects_configured_runtime_helper_context() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let svc = svc.with_runtime_helper_context(
+        "/Applications/AionUi/aioncore".to_owned(),
+        "http://127.0.0.1:51234".to_owned(),
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert!(
+        options[0].context.runtime_env.contains(&(
+            AIONUI_HELPER_BIN_ENV.to_owned(),
+            "/Applications/AionUi/aioncore".to_owned()
+        )),
+        "runtime env should include AIONUI_HELPER_BIN"
+    );
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:51234".to_owned())),
+        "runtime env should include AIONUI_BASE_URL"
+    );
+}
+
+#[tokio::test]
+async fn run_agent_turn_injects_conversation_runtime_context() {
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new("placeholder"),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let repo = Arc::new(MockRepo::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "run scheduled task".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
 }
 
 #[tokio::test]
@@ -2543,17 +3589,17 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_auto",
+            assistant_definition_id: "asstdef_acp_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_auto",
+            assistant_definition_id: "asstdef_acp_auto",
             last_model_id: Some("legacy-acp-model"),
             last_permission_value: Some("legacy-mode"),
             last_skill_ids: "[]",
@@ -2563,7 +3609,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "codex", "assistant-acp-auto").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
 
     let agent = Arc::new(MockAgent::new(&conv.id));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
@@ -2633,17 +3679,17 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_fixed",
+            assistant_definition_id: "asstdef_acp_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_fixed",
+            assistant_definition_id: "asstdef_acp_fixed",
             last_model_id: Some("legacy-fixed-model"),
             last_permission_value: Some("legacy-fixed-mode"),
             last_skill_ids: "[]",
@@ -2653,7 +3699,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "codex", "assistant-acp-fixed").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-fixed").await;
     let agent = Arc::new(MockAgent::new(&conv.id));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
 
@@ -2703,17 +3749,17 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_acp_ack",
+            assistant_definition_id: "asstdef_acp_ack",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_acp_ack",
+            assistant_definition_id: "asstdef_acp_ack",
             last_model_id: Some("legacy-ack-model"),
             last_permission_value: Some("legacy-ack-mode"),
             last_skill_ids: "[]",
@@ -2723,7 +3769,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", "acp", "codex", "assistant-acp-ack").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-ack").await;
     let agent = Arc::new(
         MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
             confirmation: ConfigOptionConfirmation::CommandAck,
@@ -2766,17 +3812,17 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_aionrs_auto",
+            assistant_definition_id: "asstdef_aionrs_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_aionrs_auto",
+            assistant_definition_id: "asstdef_aionrs_auto",
             last_model_id: Some("legacy-aionrs-model"),
             last_permission_value: None,
             last_skill_ids: "[]",
@@ -2787,7 +3833,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
 
     let auto_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-auto").await;
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "assistant-aionrs-auto").await;
     let updated = svc
         .update(
             "user_1",
@@ -2827,17 +3873,17 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
     .await;
     overlay_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_aionrs_fixed",
+            assistant_definition_id: "asstdef_aionrs_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: None,
+            agent_id_override: None,
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_aionrs_fixed",
+            assistant_definition_id: "asstdef_aionrs_fixed",
             last_model_id: Some("legacy-aionrs-fixed-model"),
             last_permission_value: None,
             last_skill_ids: "[]",
@@ -2848,7 +3894,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .unwrap();
 
     let fixed_conv =
-        create_assistant_backed_conversation(&svc, "user_1", "aionrs", "aionrs", "assistant-aionrs-fixed").await;
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "assistant-aionrs-fixed").await;
     let _ = svc
         .update(
             "user_1",
@@ -2912,7 +3958,17 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips")
                 && messages.iter().any(|message| message.r#type == "text")
             {
@@ -3031,7 +4087,17 @@ async fn send_message_persists_hidden_user_message_when_requested() {
 
     svc.send_message("user_1", &conv.id, req, &task_mgr).await.unwrap();
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     // The user message is the only hidden text row written by the service.
     let user_message = messages
         .iter()
@@ -3061,7 +4127,17 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
 
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+            let messages = repo
+                .list_messages_page(
+                    &conv.id,
+                    &MessagePageParams {
+                        limit: 20,
+                        direction: MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .unwrap()
+                .items;
             if messages.iter().any(|message| message.r#type == "tips") {
                 return messages;
             }
@@ -3086,7 +4162,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
     assert_eq!(content["error"]["code"], "UNKNOWN_UPSTREAM_ERROR");
     assert_eq!(content["error"]["ownership"], "unknown_upstream");
     assert_eq!(content["error"]["retryable"], true);
-    assert_eq!(content["error"]["feedback_recommended"], true);
+    assert_eq!(content["error"]["feedback_recommended"], false);
     assert_eq!(content["error"]["detail"], "ACP init failed: config file is invalid");
     assert_eq!(
         content["content"],
@@ -3107,6 +4183,159 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         .expect("agent build failure should broadcast the error tips message");
     assert_eq!(error_tip_event.data["status"], "error");
     assert_eq!(error_tip_event.data["data"]["code"], "BAD_GATEWAY");
+    assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(FailingBuildTaskManager::new("ACP init failed: config file is invalid"));
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster,
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id,
+            content: "run scheduled task".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(
+        outcome.error_message.as_deref(),
+        Some("ACP init failed: config file is invalid")
+    );
+}
+
+#[tokio::test]
+async fn latest_conversation_error_message_prefers_error_detail() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.insert_message(&MessageRow {
+        id: "msg_error".into(),
+        conversation_id: conv.id.clone(),
+        msg_id: None,
+        r#type: "tips".into(),
+        content: serde_json::json!({
+            "content": "Current agent failed",
+            "type": "error",
+            "details": {
+                "detail": "Cannot resume Claude session with Codex assistant"
+            },
+            "error": {
+                "message": "Current agent failed",
+                "detail": "Codex cannot resume a conversation created by Claude"
+            }
+        })
+        .to_string(),
+        position: Some("center".into()),
+        status: Some("error".into()),
+        hidden: false,
+        created_at: 10,
+    })
+    .await
+    .unwrap();
+
+    let message = svc.latest_conversation_error_message(&conv.id).await.unwrap();
+
+    assert_eq!(
+        message.as_deref(),
+        Some("Codex cannot resume a conversation created by Claude")
+    );
+}
+
+#[tokio::test]
+async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_fails() {
+    let (svc, broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message(
+            "user_1",
+            &conv.id,
+            SendMessageRequest {
+                content: "hello".into(),
+                hidden: false,
+                files: vec![],
+                inject_skills: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
+    let tip = messages
+        .iter()
+        .find(|row| row.r#type == "tips" && row.status.as_deref() == Some("error"))
+        .expect("send failure tip should be persisted");
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+
+    assert_eq!(content["source"], "send_failed");
+    assert_eq!(content["error"]["code"], "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE");
+    assert_eq!(content["error"]["ownership"], "user_agent");
+    assert!(
+        content["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("openclaw gateway start")
+    );
+
+    let events = broadcaster.take_events();
+    let error_tip_event = events
+        .iter()
+        .find(|event| event.name == "message.stream" && event.data["type"] == "tips")
+        .expect("OpenClaw Gateway build failure should broadcast the error tips message");
+    assert_eq!(error_tip_event.data["status"], "error");
+    assert_eq!(
+        error_tip_event.data["data"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
+    assert_eq!(
+        error_tip_event.data["data"]["error"]["code"],
+        "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE"
+    );
     assert_eq!(error_tip_event.data["turn_id"], response.turn_id);
 }
 
@@ -3215,7 +4444,17 @@ async fn send_message_rejects_when_runtime_is_shutting_down() {
         .unwrap_err();
     assert!(matches!(err, ConversationError::Busy { .. }));
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.is_empty(),
         "shutdown rejection must not persist a user message"
@@ -3242,7 +4481,17 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
     svc.runtime_state().mark_deleting(&conv.id);
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     assert!(
         messages.iter().all(|message| message.r#type != "tips"),
         "deleting conversation must skip build-failure tips"
@@ -3333,7 +4582,17 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
 
     svc.recover_stale_runtime_state_on_startup().await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let visible = messages.iter().find(|message| message.id == "visible-stale").unwrap();
     assert_eq!(visible.status.as_deref(), Some("finish"));
     assert!(!visible.hidden);
@@ -3346,73 +4605,6 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
         messages.iter().all(|message| message.r#type != "tips"),
         "startup recovery must not write failure tips"
     );
-}
-
-#[tokio::test]
-async fn send_message_continues_cron_system_responses() {
-    let (svc, broadcaster, _repo, _default_task_mgr) = make_service();
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let conv = svc.create("user_1", make_create_req()).await.unwrap();
-
-    let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
-        vec![
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "I'll check. [CRON_LIST]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "[CRON_CREATE]\nname: Daily Greeting\nschedule: 0 9 * * *\nschedule_description: Daily at 9:00 AM\nmessage: Say good morning\n[/CRON_CREATE]".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-            vec![
-                AgentStreamEvent::Text(TextEventData {
-                    content: "Done. The task is scheduled.".into(),
-                }),
-                AgentStreamEvent::Finish(FinishEventData::default()),
-            ],
-        ],
-    ));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent.clone()));
-    svc.with_cron_service(Some(Arc::new(MockCronContinuationService)));
-
-    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
-    let req: SendMessageRequest = serde_json::from_value(json!({
-        "content": "Create the task now"
-    }))
-    .unwrap();
-
-    svc.send_message("user_1", &conv.id, req, &task_mgr_dyn).await.unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if scripted_agent.sent_contents().len() >= 3 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-
-    let sends = scripted_agent.sent_contents();
-    assert_eq!(sends.len(), 3);
-    assert_eq!(sends[0], "Create the task now");
-    assert_eq!(sends[1], "[System: No scheduled tasks]");
-    assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
-
-    let finished = svc.get("user_1", &conv.id).await.unwrap();
-    assert_eq!(finished.status, ConversationStatus::Finished);
-
-    let events = broadcaster.take_events();
-    let turn_events: Vec<_> = events.iter().filter(|evt| evt.name == "turn.completed").collect();
-    assert_eq!(turn_events.len(), 1);
-    assert_eq!(turn_events[0].data["runtime"]["is_processing"], false);
-    assert_eq!(turn_events[0].data["runtime"]["can_send_message"], true);
 }
 
 #[tokio::test]
@@ -3491,7 +4683,17 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
@@ -3519,12 +4721,438 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
         .unwrap();
     wait_for_turn_released(&svc, &conv.id).await;
 
-    let messages = repo.get_messages(&conv.id, 1, 20, SortOrder::Asc).await.unwrap().items;
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(tips.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
     assert_eq!(content["type"], "error");
     assert_eq!(content["error"]["code"], "USER_LLM_PROVIDER_AUTH_FAILED");
+}
+
+#[tokio::test]
+async fn send_message_records_agent_availability_feedback_on_send_failure() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let feedback = Arc::new(RecordingAvailabilityFeedback::default());
+    svc.with_agent_availability_feedback(feedback.clone());
+
+    let mut create_req = make_create_req();
+    create_req.name = Some("Feedback Conversation".into());
+    create_req.source = Some(ConversationSource::Aionui);
+    create_req.extra = json!({
+        "backend": "claude",
+        "agent_id": "agent-feedback-1",
+        "agent_source": "custom",
+        "workspace": ensure_test_workspace_path()
+    });
+
+    let conv = svc.create("user_1", create_req).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(None)
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "provider returned 401 invalid api key",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let failures = feedback.failures.lock().unwrap().clone();
+    assert_eq!(
+        failures,
+        vec![RecordedAvailabilityFailure {
+            agent_id: "agent-feedback-1".into(),
+            code: "session_send_failed".into(),
+            message: "provider returned 401 invalid api key".into(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn send_message_records_agent_availability_feedback_on_send_success() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let feedback = Arc::new(RecordingAvailabilityFeedback::default());
+    svc.with_agent_availability_feedback(feedback.clone());
+
+    let mut create_req = make_create_req();
+    create_req.name = Some("Feedback Success Conversation".into());
+    create_req.source = Some(ConversationSource::Aionui);
+    create_req.extra = json!({
+        "backend": "claude",
+        "agent_id": "agent-feedback-success",
+        "agent_source": "custom",
+        "workspace": ensure_test_workspace_path()
+    });
+
+    let conv = svc.create("user_1", create_req).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let successes = feedback.successes.lock().unwrap().clone();
+    assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
+    assert!(feedback.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(Some(ConversationStatus::Finished))
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "acp protocol not connected",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(task_mgr.active_count(), 1);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert!(tips.is_empty());
+}
+
+#[tokio::test]
+async fn send_message_auto_replays_clean_retryable_acp_error_once() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "done".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(first.sent_contents(), vec!["Hello"]);
+    assert_eq!(second.sent_contents(), vec!["Hello"]);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("right"))
+        .collect();
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(users.len(), 1, "auto replay must not insert the user message again");
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        tips.len(),
+        0,
+        "first clean retryable error stays hidden when replay succeeds"
+    );
+}
+
+#[tokio::test]
+async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 2);
+    for options in options {
+        match options.context.kind {
+            AgentSessionKind::Acp(ctx) => {
+                assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
+            }
+            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_visible_output() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData {
+                content: "partial".into(),
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg.r#type == "text" && msg.position.as_deref() == Some("left"))
+        .collect();
+    assert_eq!(assistants.len(), 1);
+    assert!(assistants[0].content.contains("partial"));
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_after_tool_side_effect() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "call-1".into(),
+                name: "write_file".into(),
+                args: serde_json::json!({ "path": "a.txt" }),
+                status: ToolCallStatus::Running,
+                input: None,
+                output: None,
+                description: None,
+            }),
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "temporary provider failure".into(),
+                code: Some(AgentErrorCode::UnknownUpstreamError),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(true),
+                feedback_recommended: None,
+                resolution: None,
+            }),
+        ]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_model_not_found() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "model not found".into(),
+            code: Some(AgentErrorCode::UserLlmProviderModelNotFound),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(
+        tips.len(),
+        1,
+        "model_not_found should remain visible and must not be swallowed by replay deferral"
+    );
+}
+
+#[tokio::test]
+async fn send_message_auto_replay_stops_after_second_retryable_failure() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure one".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "temporary provider failure two".into(),
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(true),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let third = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second),
+        AgentInstance::Mock(third),
+    ]));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 2);
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1, "second failure is final and visible");
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["content"], "temporary provider failure two");
 }
 
 // ── stop_stream tests ───────────────────────────────────────────
@@ -3752,6 +5380,22 @@ async fn warmup_creates_agent_task() {
 }
 
 #[tokio::test]
+async fn warmup_injects_conversation_runtime_context() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
 async fn warmup_rejects_legacy_runtime_conversations_as_archived() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
@@ -3819,6 +5463,58 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
         ConversationError::WorkspacePathRuntimeUnavailable { path: message }
             if message == legacy_workspace
     ));
+}
+
+#[tokio::test]
+async fn warmup_returns_openclaw_gateway_unreachable_when_startup_stderr_matches() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("openclaw"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::OpenClawGatewayUnreachable { detail } => {
+            assert!(detail.contains("127.0.0.1:18789"));
+            assert!(detail.contains("openclaw gateway status"));
+            assert!(detail.contains("openclaw gateway start"));
+        }
+        other => panic!("expected OpenClawGatewayUnreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn warmup_keeps_generic_error_for_non_openclaw_gateway_signature() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(AgentErrorFailingBuildTaskManager::new(AgentError::from(
+        AcpError::StartupCrash {
+            exit_code: Some(1),
+            signal: None,
+            stderr: "ACP bridge failed: connect ECONNREFUSED 127.0.0.1:18789".into(),
+        },
+    )));
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("codex"))
+        .await
+        .unwrap();
+
+    let err = svc.warmup("user_1", &conv.id, &task_mgr).await.unwrap_err();
+
+    assert!(
+        !matches!(err, ConversationError::OpenClawGatewayUnreachable { .. }),
+        "non-OpenClaw backend must not receive the OpenClaw Gateway error"
+    );
 }
 
 // ── Confirmation system tests ────────────────────────────────────
@@ -4173,8 +5869,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_1",
-            assistant_key: "preset-1",
+            id: "asstdef_preset_1",
+            assistant_id: "preset-1",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-1"),
@@ -4186,7 +5882,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-1"),
             rule_inline_content: None,
@@ -4207,17 +5903,17 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_1",
+            assistant_definition_id: "asstdef_preset_1",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_1",
+            assistant_definition_id: "asstdef_preset_1",
             last_model_id: Some("old-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["legacy-skill"]"#,
@@ -4247,17 +5943,32 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
 
-    assert_eq!(resp.extra["assistant_id"], json!("preset-1"));
-    assert_eq!(resp.extra["preset_assistant_id"], json!("preset-1"));
-    assert_eq!(resp.extra["preset_context"], json!("assistant rule body"));
+    assert_eq!(
+        resp.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
+    assert!(resp.extra.get("assistant_id").is_none());
+    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
+    assert_eq!(resp.extra["agent_source"], json!("builtin"));
+    assert!(resp.extra.get("preset_assistant_id").is_none());
+    assert!(resp.extra.get("preset_context").is_none());
+    assert!(resp.extra.get("preset_rules").is_none());
+    assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
+    assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
     assert_eq!(resp.extra["current_model_id"], json!("new-model"));
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("assistant_snapshot").is_none());
 
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
-    assert_eq!(snapshot.assistant_key, "preset-1");
-    assert_eq!(snapshot.agent_backend, "codex");
+    assert_eq!(snapshot.assistant_id, "preset-1");
+    assert_eq!(snapshot.agent_id, "8e1acf31");
     assert_eq!(snapshot.rules_content, "assistant rule body");
     assert_eq!(snapshot.default_model_mode, "auto");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
@@ -4268,6 +5979,489 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
     assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
+
+    let fetched = svc.get("user-1", &resp.id).await.unwrap();
+    assert_eq!(
+        fetched.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
+
+    let listed = svc
+        .list(
+            "user-1",
+            ListConversationsQuery {
+                cursor: None,
+                limit: Some(20),
+                source: None,
+                cron_job_id: None,
+                pinned: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.items[0].assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "preset-1".into(),
+            source: "builtin".into(),
+            name: "Preset".into(),
+            avatar: "🤖".into(),
+            backend: "codex".into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn existing_conversation_reads_current_assistant_identity() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_live_identity",
+            assistant_id: "live-identity",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("live-identity"),
+            source_version: None,
+            source_hash: None,
+            name: "Old Name",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_live_identity",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": { "id": "live-identity" },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let created = svc.create("user-1", req).await.unwrap();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_live_identity",
+            assistant_id: "live-identity",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("live-identity"),
+            source_version: None,
+            source_hash: None,
+            name: "New Name",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🧪"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let fetched = svc.get("user-1", &created.id).await.unwrap();
+    assert_eq!(
+        fetched.assistant,
+        Some(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: "live-identity".into(),
+            source: "user".into(),
+            name: "New Name".into(),
+            avatar: "🧪".into(),
+            backend: "claude".into(),
+        })
+    );
+
+    let listed = svc
+        .list(
+            "user-1",
+            ListConversationsQuery {
+                cursor: None,
+                limit: Some(20),
+                source: None,
+                cron_job_id: None,
+                pinned: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.items[0].assistant, fetched.assistant);
+}
+
+#[tokio::test]
+async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(Arc::new(FixedSkillResolver { names: vec![] }), dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_data_avatar",
+            assistant_id: "custom-data-avatar",
+            source: "user",
+            owner_type: "user",
+            source_ref: Some("custom-data-avatar"),
+            source_version: None,
+            source_hash: None,
+            name: "Data Avatar",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "user_asset",
+            avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
+            agent_id: "claude",
+            rule_resource_type: "none",
+            rule_resource_ref: None,
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_data_avatar",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": { "id": "custom-data-avatar" },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(
+        resp.assistant.as_ref().map(|assistant| assistant.avatar.as_str()),
+        Some("/api/assistants/custom-data-avatar/avatar")
+    );
+}
+
+#[tokio::test]
+async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_context() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-acp-rule".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_preset_acp_rule",
+        "preset-acp-rule",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_preset_acp_rule",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "preset-acp-rule").await;
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    match options.context.kind {
+        AgentSessionKind::Acp(ctx) => {
+            assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
+        }
+        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+    }
+}
+
+#[tokio::test]
+async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_rules() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-aionrs-rule".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_preset_aionrs_rule",
+        "preset-aionrs-rule",
+        "aionrs",
+        "auto",
+        "auto",
+    )
+    .await;
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_preset_aionrs_rule",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv =
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "preset-aionrs-rule").await;
+    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+
+    match options.context.kind {
+        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Aionrs(ctx) => {
+            assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["cron".into(), "todo-tracker".into()],
+    });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("preset-1".to_string(), "assistant rule body".to_string())]),
+    });
+    let (svc, _broadcaster, repo, definition_repo, state_repo, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_preset_legacy_seed",
+            assistant_id: "preset-1",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("preset-1"),
+            source_version: None,
+            source_hash: None,
+            name: "Preset",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_id: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("preset-1"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+    state_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_preset_legacy_seed",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: Some("codex"),
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert(&UpsertAssistantPreferenceParams {
+            assistant_definition_id: "asstdef_preset_legacy_seed",
+            last_model_id: Some("preferred-model"),
+            last_permission_value: Some("workspace-write"),
+            last_skill_ids: r#"["legacy-skill"]"#,
+            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+            last_mcp_ids: r#"["legacy-mcp"]"#,
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "preset-1",
+            "locale": "zh-CN",
+            "conversation_overrides": {
+                "model": "override-model"
+            }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "current_model_id": "legacy-model",
+            "session_mode": "legacy-mode",
+            "current_mode_id": "legacy-mode"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["current_model_id"], json!("override-model"));
+    assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
+    assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
+
+    let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.agent_id, "8e1acf31");
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("override-model"));
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
+}
+
+#[tokio::test]
+async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    let (svc, _broadcaster, _repo, definition_repo, overlay_repo, _preference_repo, acp_repo) =
+        make_service_with_assistant_support_and_acp_session_repo(resolver, dispatcher, acp_repo).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_snapshot_identity",
+        "preset-snapshot-identity",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_snapshot_identity",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "assistant": {
+            "id": "preset-snapshot-identity",
+            "locale": "en-US"
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "agent_source": "custom",
+            "agent_id": "legacy-custom-agent"
+        },
+    }))
+    .unwrap();
+
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(
+        resp.assistant.as_ref().map(|assistant| assistant.backend.as_str()),
+        Some("codex")
+    );
+    assert_eq!(resp.extra["backend"], json!("codex"));
+    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
+
+    let create_calls = acp_repo.create_calls();
+    assert_eq!(create_calls.len(), 1);
+    assert_eq!(create_calls[0].agent_id, "8e1acf31");
+    assert_eq!(create_calls[0].agent_source, "builtin");
+    assert_eq!(create_calls[0].agent_id, "8e1acf31");
 }
 
 #[tokio::test]
@@ -4284,8 +6478,8 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_fixed",
-            assistant_key: "preset-fixed",
+            id: "asstdef_preset_fixed",
+            assistant_id: "preset-fixed",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-fixed"),
@@ -4297,7 +6491,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-fixed"),
             rule_inline_content: None,
@@ -4318,17 +6512,17 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_fixed",
+            assistant_definition_id: "asstdef_preset_fixed",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_fixed",
+            assistant_definition_id: "asstdef_preset_fixed",
             last_model_id: Some("legacy-model"),
             last_permission_value: Some("workspace-write"),
             last_skill_ids: r#"["legacy-skill"]"#,
@@ -4382,8 +6576,8 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
 
     definition_repo
         .upsert(&UpsertAssistantDefinitionParams {
-            definition_id: "asstdef_preset_auto",
-            assistant_key: "preset-auto",
+            id: "asstdef_preset_auto",
+            assistant_id: "preset-auto",
             source: "builtin",
             owner_type: "system",
             source_ref: Some("preset-auto"),
@@ -4395,7 +6589,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             description_i18n: "{}",
             avatar_type: "emoji",
             avatar_value: Some("🤖"),
-            agent_backend: "claude",
+            agent_id: "claude",
             rule_resource_type: "builtin_asset",
             rule_resource_ref: Some("preset-auto"),
             rule_inline_content: None,
@@ -4416,17 +6610,17 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
         .unwrap();
     state_repo
         .upsert(&UpsertAssistantOverlayParams {
-            definition_id: "asstdef_preset_auto",
+            assistant_definition_id: "asstdef_preset_auto",
             enabled: true,
             sort_order: 0,
-            agent_backend_override: Some("codex"),
+            agent_id_override: Some("codex"),
             last_used_at: None,
         })
         .await
         .unwrap();
     preference_repo
         .upsert(&UpsertAssistantPreferenceParams {
-            definition_id: "asstdef_preset_auto",
+            assistant_definition_id: "asstdef_preset_auto",
             last_model_id: None,
             last_permission_value: None,
             last_skill_ids: "[]",
@@ -4478,6 +6672,33 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
 }
 
 #[tokio::test]
+async fn create_links_skills_into_custom_workspace_for_native_acp_agent() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("custom-create");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["skills"], json!(["cron"]));
+    assert!(workspace.join(".claude/skills/cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workspace, workspace);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
 async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let links = resolver.links.clone();
@@ -4505,6 +6726,40 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].workspace, workspace);
     assert_eq!(calls[0].rel_dirs, vec![".aionrs/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
+async fn warmup_restores_skill_links_for_custom_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("custom-warmup");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    std::fs::remove_dir_all(workspace.join(".claude")).unwrap();
+    assert!(!workspace.join(".claude/skills/cron").exists());
+    links.lock().unwrap().clear();
+
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert!(workspace.join(".claude/skills/cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workspace, workspace);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 

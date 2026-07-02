@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
-use crate::types::BuildTaskOptions;
+use crate::types::{BuildTaskOptions, RuntimeCapabilities};
 
 /// Factory function that creates an [`AgentInstance`] from build options.
 ///
@@ -68,11 +68,17 @@ pub trait IWorkerTaskManager: Send + Sync {
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
+#[derive(Clone)]
+struct ManagedAgentTask {
+    agent: AgentInstance,
+    runtime_capabilities: RuntimeCapabilities,
+}
+
 /// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
 /// initialises by running the factory, and that every subsequent caller
 /// awaits. Failed initialisations leave the cell empty so the next caller
 /// may retry; the slot itself is only removed on `kill` / `clear`.
-type TaskSlot = Arc<OnceCell<AgentInstance>>;
+type TaskSlot = Arc<OnceCell<ManagedAgentTask>>;
 
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
@@ -90,6 +96,12 @@ impl WorkerTaskManagerImpl {
 
     /// Look up a fully-initialised instance by conversation id.
     fn initialised_instance(&self, conversation_id: &str) -> Option<AgentInstance> {
+        self.tasks
+            .get(conversation_id)
+            .and_then(|slot| slot.get().map(|managed| managed.agent.clone()))
+    }
+
+    fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
     }
 }
@@ -105,6 +117,16 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        if let Some(existing) = self.initialised_managed_task(conversation_id)
+            && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
+        {
+            info!(
+                conversation_id,
+                "Rebuilding agent task because runtime capabilities changed"
+            );
+            self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+        }
+
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
         // synchronous and side-effect-free — only an empty OnceCell is
         // allocated on the miss path, so concurrent callers for the same id
@@ -120,15 +142,34 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // awaits the same future and ends up with the same instance. On
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
-        let instance = slot.get_or_try_init(|| async move { factory(options).await }).await?;
-        Ok(instance.clone())
+        let runtime_capabilities = options.runtime_capabilities.clone();
+        let managed = slot
+            .get_or_try_init(|| async move {
+                let agent = factory(options).await?;
+                Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
+                    agent,
+                    runtime_capabilities,
+                })
+            })
+            .await?;
+        Ok(managed.agent.clone())
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Killing agent task");
-            if let Some(agent) = slot.get() {
-                agent.kill(reason)?;
+            let agent_type = slot.get().map(|managed| managed.agent.agent_type());
+            if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
+                info!(
+                    conversation_id = %id,
+                    ?agent_type,
+                    reason = %"IdleTimeout",
+                    "Idle kill: task removed from manager"
+                );
+            } else {
+                info!(conversation_id = %id, ?reason, "Killing agent task");
+            }
+            if let Some(managed) = slot.get() {
+                managed.agent.kill(reason)?;
             }
         }
         Ok(())
@@ -140,9 +181,19 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
-            if let Some(agent) = slot.get() {
-                return agent.kill_and_wait(reason);
+            let agent_type = slot.get().map(|managed| managed.agent.agent_type());
+            if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
+                info!(
+                    conversation_id = %id,
+                    ?agent_type,
+                    reason = %"IdleTimeout",
+                    "Idle kill: task removed from manager"
+                );
+            } else {
+                info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
+            }
+            if let Some(managed) = slot.get() {
+                return managed.agent.kill_and_wait(reason);
             }
         }
         Box::pin(std::future::ready(()))
@@ -154,8 +205,8 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 info!(conversation_id = %id, "Clearing agent task");
-                if let Some(agent) = slot.get() {
-                    waits.push(agent.kill_and_wait(None));
+                if let Some(managed) = slot.get() {
+                    waits.push(managed.agent.kill_and_wait(None));
                 }
             }
         }
@@ -171,12 +222,29 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         self.tasks
             .iter()
             .filter_map(|entry| {
-                let agent = entry.value().get()?;
-                // Only ACP agents participate in idle cleanup per API Spec
-                (agent.agent_type() == AgentType::Acp
-                    && agent.status() == Some(ConversationStatus::Finished)
-                    && (now - agent.last_activity_at()) > idle_threshold_ms)
-                    .then(|| entry.key().clone())
+                let agent = &entry.value().get()?.agent;
+                let agent_type = agent.agent_type();
+                let status = agent.status();
+                let last_activity_at = agent.last_activity_at();
+                let idle_ms = now.saturating_sub(last_activity_at);
+
+                let selected = agent_type == AgentType::Acp
+                    && status == Some(ConversationStatus::Finished)
+                    && idle_ms > idle_threshold_ms;
+                if selected {
+                    info!(
+                        conversation_id = %entry.key(),
+                        ?agent_type,
+                        ?status,
+                        idle_ms,
+                        threshold_ms = idle_threshold_ms,
+                        last_activity_at,
+                        "Idle scan: selected idle agent"
+                    );
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -207,7 +275,7 @@ mod tests {
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
-    use crate::types::SendMessageData;
+    use crate::types::{CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -305,6 +373,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            runtime_env: vec![],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
                 config: Default::default(),
@@ -320,11 +389,54 @@ mod tests {
         AgentInstance::Mock(Arc::new(agent))
     }
 
+    fn managed_instance(agent: AgentInstance) -> ManagedAgentTask {
+        ManagedAgentTask {
+            agent,
+            runtime_capabilities: RuntimeCapabilities::default(),
+        }
+    }
+
     fn make_manager() -> WorkerTaskManagerImpl {
         let factory: AgentFactory = Arc::new(|opts: BuildTaskOptions| {
             async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
+    }
+
+    fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let make_writer = {
+            let buffer = Arc::clone(&buffer);
+            move || SharedBuf(Arc::clone(&buffer))
+        };
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_max_level(max_level)
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
     }
 
     /// Two [`AgentInstance`]s point to the same underlying agent iff they
@@ -356,6 +468,19 @@ mod tests {
         let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         let h2 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert!(same_mock(&h1, &h2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_build_rebuilds_when_existing_task_lacks_requested_runtime_context_capability() {
+        let mgr = make_manager();
+        let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+        let mut options = make_options("conv-1");
+        options.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+
+        let h2 = mgr.get_or_build_task("conv-1", options).await.unwrap();
+
+        assert!(!same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
     }
 
@@ -470,8 +595,8 @@ mod tests {
 
         // Helper: insert a pre-initialised slot bypassing the async factory path.
         let insert = |id: &str, instance: AgentInstance| {
-            let cell: OnceCell<AgentInstance> = OnceCell::new();
-            cell.set(instance).ok();
+            let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+            cell.set(managed_instance(instance)).ok();
             mgr.tasks.insert(id.into(), Arc::new(cell));
         };
 
@@ -513,6 +638,53 @@ mod tests {
         let idle = mgr.collect_idle(300_000); // 5-min threshold
         assert_eq!(idle.len(), 1);
         assert_eq!(idle[0], "conv-stale");
+    }
+
+    #[test]
+    fn collect_idle_logs_selected_agent_with_idle_fields() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
+            async { Err(AgentError::bad_gateway("not used")) }.boxed()
+        }));
+        let now = now_ms();
+        let agent =
+            Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)).with_last_activity(now - 10_000));
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(managed_instance(AgentInstance::Mock(agent))).is_ok());
+        manager.tasks.insert("conv_idle".to_owned(), slot);
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let ids = manager.collect_idle(5_000);
+            assert_eq!(ids, vec!["conv_idle".to_owned()]);
+        });
+
+        assert!(captured.contains("Idle scan: selected idle agent"));
+        assert!(captured.contains("conversation_id=conv_idle"));
+        assert!(captured.contains("agent_type=Acp"));
+        assert!(captured.contains("status=Some(Finished)"));
+        assert!(captured.contains("idle_ms="));
+        assert!(captured.contains("threshold_ms=5000"));
+        assert!(captured.contains("last_activity_at="));
+    }
+
+    #[test]
+    fn kill_and_wait_logs_idle_task_removed_with_agent_type() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_options| {
+            async { Err(AgentError::bad_gateway("not used")) }.boxed()
+        }));
+        let agent = Arc::new(MockAgent::new("conv_idle", Some(ConversationStatus::Finished)));
+        let slot = Arc::new(OnceCell::new());
+        assert!(slot.set(managed_instance(AgentInstance::Mock(agent))).is_ok());
+        manager.tasks.insert("conv_idle".to_owned(), slot);
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let wait = manager.kill_and_wait("conv_idle", Some(AgentKillReason::IdleTimeout));
+            drop(wait);
+        });
+
+        assert!(captured.contains("Idle kill: task removed from manager"));
+        assert!(captured.contains("conversation_id=conv_idle"));
+        assert!(captured.contains("agent_type=Some(Acp)"));
+        assert!(captured.contains("reason=IdleTimeout"));
     }
 
     #[test]
