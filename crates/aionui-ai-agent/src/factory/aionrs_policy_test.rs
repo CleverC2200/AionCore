@@ -1,7 +1,7 @@
 use aion_agent::tool_policy::ToolPolicy;
-use aionui_api_types::{AionrsBuildExtra, TeamRuntimeSeed, TeamSessionBinding};
+use aionui_api_types::{TeamRuntimeSeed, TeamSessionBinding};
 
-use super::{TEAM_LEAD_MAX_TURNS, apply_team_runtime_policy};
+use super::team_runtime_tool_policy;
 
 fn team_binding(role: Option<&str>) -> TeamSessionBinding {
     TeamSessionBinding {
@@ -15,9 +15,7 @@ fn team_binding(role: Option<&str>) -> TeamSessionBinding {
 
 #[test]
 fn team_lead_can_only_coordinate_and_inspect() {
-    let mut config = AionrsBuildExtra::default();
-
-    let policy = apply_team_runtime_policy(Some(&team_binding(Some("lead"))), &mut config);
+    let policy = team_runtime_tool_policy(Some(&team_binding(Some("lead"))));
 
     assert!(policy.allows("Read"));
     assert!(policy.allows("Grep"));
@@ -29,39 +27,13 @@ fn team_lead_can_only_coordinate_and_inspect() {
     assert!(!policy.allows("Write"));
     assert!(!policy.allows("Edit"));
     assert!(!policy.allows("Skill"));
-    assert_eq!(config.max_turns, Some(TEAM_LEAD_MAX_TURNS));
-}
-
-#[test]
-fn team_lead_preserves_lower_turn_limit_and_caps_higher_limit() {
-    let team = team_binding(Some("lead"));
-    let mut lower = AionrsBuildExtra {
-        max_turns: Some(8),
-        ..Default::default()
-    };
-    let mut higher = AionrsBuildExtra {
-        max_turns: Some(100),
-        ..Default::default()
-    };
-
-    apply_team_runtime_policy(Some(&team), &mut lower);
-    apply_team_runtime_policy(Some(&team), &mut higher);
-
-    assert_eq!(lower.max_turns, Some(8));
-    assert_eq!(higher.max_turns, Some(TEAM_LEAD_MAX_TURNS));
 }
 
 #[test]
 fn non_leader_sessions_remain_unrestricted() {
     for team in [None, Some(team_binding(Some("teammate"))), Some(team_binding(None))] {
-        let mut config = AionrsBuildExtra {
-            max_turns: None,
-            ..Default::default()
-        };
-
-        let policy = apply_team_runtime_policy(team.as_ref(), &mut config);
+        let policy = team_runtime_tool_policy(team.as_ref());
 
         assert_eq!(policy, ToolPolicy::Unrestricted);
-        assert_eq!(config.max_turns, None);
     }
 }

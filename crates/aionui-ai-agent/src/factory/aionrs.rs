@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
-use crate::factory::aionrs_policy::apply_team_runtime_policy;
+use crate::factory::aionrs_policy::team_runtime_tool_policy;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
@@ -34,7 +34,7 @@ pub(super) async fn build(
         team,
         ..
     } = build_context;
-    let tool_policy = apply_team_runtime_policy(team.as_ref(), &mut overrides);
+    let tool_policy = team_runtime_tool_policy(team.as_ref());
     let resolved_skills = overrides.skills.clone();
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
