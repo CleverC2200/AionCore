@@ -27,6 +27,7 @@ fn team_lead_can_only_coordinate_and_inspect() {
     assert!(!policy.allows("Write"));
     assert!(!policy.allows("Edit"));
     assert!(!policy.allows("Skill"));
+    assert!(!policy.allows("Spawn"));
 }
 
 #[test]
@@ -36,4 +37,14 @@ fn non_leader_sessions_remain_unrestricted() {
 
         assert_eq!(policy, ToolPolicy::Unrestricted);
     }
+}
+
+#[test]
+fn team_teammate_retains_execution_and_spawn_tools() {
+    let policy = team_runtime_tool_policy(Some(&team_binding(Some("teammate"))));
+
+    assert!(policy.allows("ExecCommand"));
+    assert!(policy.allows("Write"));
+    assert!(policy.allows("Edit"));
+    assert!(policy.allows("Spawn"));
 }
