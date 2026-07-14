@@ -3,7 +3,7 @@ use aionui_api_types::TeamSessionBinding;
 use aionui_team_prompts::visible_team_tool_descriptors;
 use tracing::info;
 
-const TEAM_LEAD_READ_ONLY_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
+const TEAM_LEAD_WORKSPACE_TOOLS: [&str; 5] = ["Read", "Grep", "Glob", "Edit", "Write"];
 
 pub(super) fn team_runtime_tool_policy(team: Option<&TeamSessionBinding>) -> ToolPolicy {
     let Some(binding) = team.filter(|binding| {
@@ -20,10 +20,10 @@ pub(super) fn team_runtime_tool_policy(team: Option<&TeamSessionBinding>) -> Too
         event = "feedback.team.lead_runtime_policy_applied",
         team_id = %binding.team_id,
         slot_id = binding.slot_id.as_deref().unwrap_or("none"),
-        "Applied Team Leader coordination-only runtime policy"
+        "Applied Team Leader coordination-first runtime policy"
     );
 
-    let tool_names = TEAM_LEAD_READ_ONLY_TOOLS
+    let tool_names = TEAM_LEAD_WORKSPACE_TOOLS
         .into_iter()
         .map(str::to_owned)
         .chain(visible_team_tool_descriptors(true).into_iter().map(|tool| tool.name));

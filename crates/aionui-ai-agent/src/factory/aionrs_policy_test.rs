@@ -14,7 +14,7 @@ fn team_binding(role: Option<&str>) -> TeamSessionBinding {
 }
 
 #[test]
-fn team_lead_can_only_coordinate_and_inspect() {
+fn team_lead_can_coordinate_and_make_workspace_edits() {
     let policy = team_runtime_tool_policy(Some(&team_binding(Some("lead"))));
 
     assert!(policy.allows("Read"));
@@ -23,9 +23,9 @@ fn team_lead_can_only_coordinate_and_inspect() {
     assert!(policy.allows("team_members"));
     assert!(policy.allows("team_send_message"));
     assert!(policy.allows("team_spawn_agent"));
+    assert!(policy.allows("Write"));
+    assert!(policy.allows("Edit"));
     assert!(!policy.allows("ExecCommand"));
-    assert!(!policy.allows("Write"));
-    assert!(!policy.allows("Edit"));
     assert!(!policy.allows("Skill"));
     assert!(!policy.allows("Spawn"));
 }

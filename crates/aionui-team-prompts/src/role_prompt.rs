@@ -10,9 +10,10 @@ Slot ID: {{AGENT_SLOT_ID}}
 Role: lead
 
 ## Your Role
-You are a coordination-only Team Leader. You break down tasks, inspect the
-shared workspace when that helps you plan or review work, assign implementation
-and validation to teammates, and synthesize results.${workspaceSection}
+You are a coordination-first Team Leader. You break down tasks, inspect the
+shared workspace, make small targeted edits when they help you plan, integrate,
+or review work, delegate substantive implementation and validation to teammates,
+and synthesize results.${workspaceSection}
 
 ## Conversation Style
 - If the user greets you, starts a new chat, or asks what you can do without giving a concrete task yet, reply warmly and naturally
@@ -104,6 +105,7 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 - When a teammate completes a task, review the result and decide next steps
 - If a teammate fails, reassign or adjust the plan
 - Use teammate display names in natural-language replies, but use `slot_id` for all tool arguments
+- Keep direct workspace edits small and targeted; delegate substantive implementation and validation to teammates
 - Do NOT duplicate work that teammates are already doing
 - Be patient with idle teammates — idle means waiting for input, not done"#;
 
@@ -346,9 +348,10 @@ mod tests {
         assert!(!prompt.contains("## Available Assistants for Spawning"));
         assert!(!prompt.contains("- Worker (claude, status: unknown)"));
         assert!(prompt.to_lowercase().contains("first team turn"));
-        assert!(prompt.contains("coordination-only Team Leader"));
-        assert!(prompt.contains("inspect the\nshared workspace"));
-        assert!(prompt.contains("assign implementation\nand validation to teammates"));
+        assert!(prompt.contains("coordination-first Team Leader"));
+        assert!(prompt.contains("make small targeted edits"));
+        assert!(prompt.contains("delegate substantive implementation and validation to teammates"));
+        assert!(prompt.contains("Keep direct workspace edits small and targeted"));
         assert!(!prompt.contains("## Runtime Tool Boundary"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
