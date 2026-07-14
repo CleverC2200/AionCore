@@ -3,6 +3,7 @@ pub mod acp_assembler;
 mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
+mod aionrs_policy;
 mod context;
 
 use std::path::PathBuf;

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use aion_agent::tool_policy::ToolPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
@@ -133,6 +134,8 @@ pub struct AionrsResolvedConfig {
     pub session_mode: Option<String>,
     /// Resolved skill names from the conversation snapshot.
     pub skills: Vec<String>,
+    /// Runtime authorization policy for registered Aionrs tools.
+    pub tool_policy: ToolPolicy,
     /// Extra MCP servers to inject (team coordination or guide).
     pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
     /// AWS Bedrock credentials (region + access key or profile).

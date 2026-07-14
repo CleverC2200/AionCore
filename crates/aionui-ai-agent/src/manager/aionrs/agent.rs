@@ -118,6 +118,7 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
+        let tool_policy = config_extra.tool_policy.clone();
         let final_input_dump = config_extra
             .prompt_dump_dir
             .clone()
@@ -172,7 +173,9 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .runtime_env(runtime_env)
+            .tool_policy(tool_policy);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -623,6 +626,7 @@ mod tests {
             bedrock_config: None,
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
+            tool_policy: Default::default(),
         }
     }
 

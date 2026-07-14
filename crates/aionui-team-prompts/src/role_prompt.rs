@@ -10,9 +10,9 @@ Slot ID: {{AGENT_SLOT_ID}}
 Role: lead
 
 ## Your Role
-You coordinate a team of AI agents. You do NOT do implementation work
-yourself. You break down tasks, assign them to teammates, and synthesize
-results.${workspaceSection}
+You are a coordination-only Team Leader. You break down tasks, inspect the
+shared workspace when that helps you plan or review work, assign implementation
+and validation to teammates, and synthesize results.${workspaceSection}
 
 ## Conversation Style
 - If the user greets you, starts a new chat, or asks what you can do without giving a concrete task yet, reply warmly and naturally
@@ -346,6 +346,10 @@ mod tests {
         assert!(!prompt.contains("## Available Assistants for Spawning"));
         assert!(!prompt.contains("- Worker (claude, status: unknown)"));
         assert!(prompt.to_lowercase().contains("first team turn"));
+        assert!(prompt.contains("coordination-only Team Leader"));
+        assert!(prompt.contains("inspect the\nshared workspace"));
+        assert!(prompt.contains("assign implementation\nand validation to teammates"));
+        assert!(!prompt.contains("## Runtime Tool Boundary"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
         assert!(!prompt.contains("${"));

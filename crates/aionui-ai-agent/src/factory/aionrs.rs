@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
+use crate::factory::aionrs_policy::apply_team_runtime_policy;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
@@ -28,7 +29,12 @@ pub(super) async fn build(
     model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
-    let mut overrides = build_context.config;
+    let AionrsSessionBuildContext {
+        config: mut overrides,
+        team,
+        ..
+    } = build_context;
+    let tool_policy = apply_team_runtime_policy(team.as_ref(), &mut overrides);
     let resolved_skills = overrides.skills.clone();
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt
@@ -172,6 +178,7 @@ pub(super) async fn build(
         bedrock_config,
         runtime_env: ctx.runtime_env,
         prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+        tool_policy,
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()
