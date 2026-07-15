@@ -31,6 +31,17 @@ fn team_lead_can_coordinate_and_make_workspace_edits() {
 }
 
 #[test]
+fn legacy_team_leader_alias_uses_restricted_policy() {
+    let policy = team_runtime_tool_policy(Some(&team_binding(Some("leader"))));
+
+    assert!(policy.allows("Edit"));
+    assert!(policy.allows("Write"));
+    assert!(policy.allows("team_spawn_agent"));
+    assert!(!policy.allows("ExecCommand"));
+    assert!(!policy.allows("Spawn"));
+}
+
+#[test]
 fn non_leader_sessions_remain_unrestricted() {
     for team in [None, Some(team_binding(Some("teammate"))), Some(team_binding(None))] {
         let policy = team_runtime_tool_policy(team.as_ref());

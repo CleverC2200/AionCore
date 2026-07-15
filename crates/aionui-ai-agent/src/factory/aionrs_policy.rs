@@ -10,7 +10,7 @@ pub(super) fn team_runtime_tool_policy(team: Option<&TeamSessionBinding>) -> Too
         binding
             .role
             .as_deref()
-            .is_some_and(|role| role.eq_ignore_ascii_case("lead"))
+            .is_some_and(|role| role.eq_ignore_ascii_case("lead") || role.eq_ignore_ascii_case("leader"))
     }) else {
         return ToolPolicy::Unrestricted;
     };
