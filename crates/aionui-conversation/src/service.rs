@@ -1199,7 +1199,7 @@ impl ConversationService {
             });
         }
 
-        self.broadcast_list_changed(&response.id, "created", response.source.as_ref());
+        self.broadcast_list_changed(user_id, &response.id, "created", response.source.as_ref());
 
         log_conversation_created(&response, &extra);
 
@@ -1992,7 +1992,7 @@ impl ConversationService {
         let response = row_to_response(updated, &self.workspace_root)?;
 
         info!("Conversation updated");
-        self.broadcast_list_changed(id, "updated", response.source.as_ref());
+        self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
 
         Ok(response)
     }
@@ -2136,7 +2136,7 @@ impl ConversationService {
         }
 
         info!("Conversation deleted");
-        self.broadcast_list_changed(id, "deleted", source.as_ref());
+        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
 
         Ok(())
     }
@@ -2450,11 +2450,13 @@ impl ConversationService {
             })?;
 
         let response = row_to_artifact_response(row)?;
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "conversation.artifact",
-            serde_json::to_value(&response)
-                .map_err(|e| ConversationError::internal(format!("Failed to serialize artifact event: {e}")))?,
-        ));
+        let mut payload = serde_json::to_value(&response)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize artifact event: {e}")))?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
+        }
+        self.broadcaster
+            .broadcast(WebSocketMessage::new("conversation.artifact", payload));
 
         Ok(response)
     }
@@ -2553,6 +2555,7 @@ impl ConversationService {
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": conversation_id,
                 "id": conf_id,
             });
@@ -2675,6 +2678,7 @@ impl ConversationService {
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
             serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": conversation_id,
                 "msg_id": &user_msg_id,
                 "content": &req.content,
@@ -2905,6 +2909,7 @@ impl ConversationService {
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.stream",
             serde_json::json!({
+                "user_id": user_id,
                 "conversation_id": row.conversation_id,
                 "msg_id": msg_id,
                 "turn_id": turn_id,
@@ -2932,6 +2937,7 @@ impl ConversationService {
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
         let payload = serde_json::json!({
+            "user_id": user_id,
             "conversation_id": row.conversation_id,
             "msg_id": msg_id,
             "type": row.r#type,
@@ -3445,11 +3451,13 @@ impl ConversationService {
     /// Broadcast a `conversation.listChanged` WebSocket event.
     pub(crate) fn broadcast_list_changed(
         &self,
+        user_id: &str,
         conversation_id: &str,
         action: &str,
         source: Option<&ConversationSource>,
     ) {
         let payload = serde_json::json!({
+            "user_id": user_id,
             "conversation_id": conversation_id,
             "action": action,
             "source": source,

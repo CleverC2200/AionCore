@@ -123,7 +123,7 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|value| string_to_enum::<ConversationSource>(value).ok());
-        self.broadcast_list_changed(conversation_id, "updated", source.as_ref());
+        self.broadcast_list_changed(user_id, conversation_id, "updated", source.as_ref());
         info!(
             conversation_id,
             ?previous_model_id,

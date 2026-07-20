@@ -768,6 +768,8 @@ impl StreamRelay {
 
     fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
         if let Some(obj) = payload.as_object_mut() {
+            obj.entry("user_id")
+                .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
             obj.entry("turn_id")
                 .or_insert_with(|| serde_json::Value::String(self.turn_id.clone()));
         }

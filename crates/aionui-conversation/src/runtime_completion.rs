@@ -81,6 +81,7 @@ impl RuntimeCompletionPublisher {
         }
 
         let payload = json!({
+            "user_id": self.user_id,
             "conversation_id": conversation_id,
             "session_id": conversation_id,
             "turn_id": turn_id,

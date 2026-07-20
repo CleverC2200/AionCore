@@ -124,6 +124,7 @@ impl StreamPersistenceAdapter {
         }
 
         let payload = json!({
+            "user_id": self.user_id,
             "conversation_id": self.conversation_id,
             "session_id": self.conversation_id,
             "turn_id": turn_id,
