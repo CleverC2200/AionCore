@@ -693,6 +693,7 @@ name = "aionui-mcp"
 version = "0.1.50"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
