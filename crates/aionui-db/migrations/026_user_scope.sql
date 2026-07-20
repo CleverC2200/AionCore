@@ -274,4 +274,199 @@ FROM client_preferences;
 DROP TABLE client_preferences;
 ALTER TABLE client_preferences_new RENAME TO client_preferences;
 
+ALTER TABLE agent_metadata
+    ADD COLUMN user_id TEXT REFERENCES users(id);
+CREATE INDEX IF NOT EXISTS idx_agent_metadata_user_sort
+    ON agent_metadata(user_id, sort_order, name);
+
+ALTER TABLE assistants
+    ADD COLUMN user_id TEXT REFERENCES users(id);
+UPDATE assistants
+SET user_id = 'system_default_user'
+WHERE user_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_assistants_user_updated_at
+    ON assistants(user_id, updated_at DESC);
+
+CREATE TABLE assistant_overrides_new (
+    user_id           TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    assistant_id      TEXT NOT NULL,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    sort_order        INTEGER NOT NULL DEFAULT 0,
+    last_used_at      INTEGER,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (user_id, assistant_id)
+);
+
+INSERT INTO assistant_overrides_new (
+    user_id, assistant_id, enabled, sort_order, last_used_at, updated_at
+)
+SELECT
+    'system_default_user', assistant_id, enabled, sort_order, last_used_at, updated_at
+FROM assistant_overrides;
+
+DROP TABLE assistant_overrides;
+ALTER TABLE assistant_overrides_new RENAME TO assistant_overrides;
+CREATE INDEX IF NOT EXISTS idx_assistant_overrides_user_sort
+    ON assistant_overrides(user_id, sort_order);
+
+ALTER TABLE assistant_definitions
+    ADD COLUMN user_id TEXT REFERENCES users(id);
+UPDATE assistant_definitions
+SET user_id = 'system_default_user'
+WHERE user_id IS NULL
+  AND NOT (source = 'builtin' AND owner_type = 'system');
+DROP INDEX IF EXISTS idx_assistant_definitions_source_ref;
+DROP INDEX IF EXISTS idx_assistant_definitions_assistant_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_global_source_ref
+    ON assistant_definitions(source, source_ref)
+    WHERE user_id IS NULL AND source_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_user_source_ref
+    ON assistant_definitions(user_id, source, source_ref)
+    WHERE user_id IS NOT NULL AND source_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_global_assistant_id
+    ON assistant_definitions(assistant_id)
+    WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_user_assistant_id
+    ON assistant_definitions(user_id, assistant_id)
+    WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_assistant_definitions_user_updated_at
+    ON assistant_definitions(user_id, updated_at DESC);
+
+CREATE TABLE assistant_overlays_new (
+    user_id                 TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    assistant_definition_id TEXT NOT NULL,
+    enabled                 INTEGER NOT NULL DEFAULT 1,
+    sort_order              INTEGER NOT NULL DEFAULT 0,
+    agent_id_override       TEXT,
+    last_used_at            INTEGER,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL,
+    PRIMARY KEY (user_id, assistant_definition_id),
+    FOREIGN KEY (assistant_definition_id) REFERENCES assistant_definitions(id) ON DELETE CASCADE
+);
+
+INSERT INTO assistant_overlays_new (
+    user_id, assistant_definition_id, enabled, sort_order, agent_id_override,
+    last_used_at, created_at, updated_at
+)
+SELECT
+    'system_default_user', assistant_definition_id, enabled, sort_order,
+    agent_id_override, last_used_at, created_at, updated_at
+FROM assistant_overlays;
+
+DROP TABLE assistant_overlays;
+ALTER TABLE assistant_overlays_new RENAME TO assistant_overlays;
+CREATE INDEX IF NOT EXISTS idx_assistant_overlays_user_enabled
+    ON assistant_overlays(user_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_assistant_overlays_user_sort_order
+    ON assistant_overlays(user_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_assistant_overlays_agent_id_override
+    ON assistant_overlays(agent_id_override)
+    WHERE agent_id_override IS NOT NULL;
+
+CREATE TABLE assistant_preferences_new (
+    user_id                              TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    assistant_definition_id              TEXT NOT NULL,
+    last_model_id                        TEXT,
+    last_permission_value                TEXT,
+    last_skill_ids                       TEXT    NOT NULL DEFAULT '[]',
+    last_disabled_builtin_skill_ids      TEXT    NOT NULL DEFAULT '[]',
+    last_mcp_ids                         TEXT    NOT NULL DEFAULT '[]',
+    created_at                           INTEGER NOT NULL,
+    updated_at                           INTEGER NOT NULL,
+    last_thought_level_value             TEXT,
+    PRIMARY KEY (user_id, assistant_definition_id),
+    FOREIGN KEY (assistant_definition_id) REFERENCES assistant_definitions(id) ON DELETE CASCADE
+);
+
+INSERT INTO assistant_preferences_new (
+    user_id, assistant_definition_id, last_model_id, last_permission_value,
+    last_skill_ids, last_disabled_builtin_skill_ids, last_mcp_ids,
+    created_at, updated_at, last_thought_level_value
+)
+SELECT
+    'system_default_user', assistant_definition_id, last_model_id, last_permission_value,
+    last_skill_ids, last_disabled_builtin_skill_ids, last_mcp_ids,
+    created_at, updated_at, last_thought_level_value
+FROM assistant_preferences;
+
+DROP TABLE assistant_preferences;
+ALTER TABLE assistant_preferences_new RENAME TO assistant_preferences;
+
+CREATE TABLE skills_new (
+    id          TEXT    PRIMARY KEY NOT NULL,
+    user_id     TEXT    REFERENCES users(id),
+    name        TEXT    NOT NULL,
+    description TEXT,
+    path        TEXT    NOT NULL,
+    source      TEXT    NOT NULL DEFAULT 'user'
+                            CHECK (source IN ('user', 'builtin', 'extension', 'cron')),
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    deleted_at  INTEGER,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+INSERT INTO skills_new (
+    id, user_id, name, description, path, source, enabled, deleted_at, created_at, updated_at
+)
+SELECT
+    id,
+    CASE WHEN source = 'builtin' THEN NULL ELSE 'system_default_user' END,
+    name, description, path, source, enabled, deleted_at, created_at, updated_at
+FROM skills;
+
+DROP TABLE skills;
+ALTER TABLE skills_new RENAME TO skills;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_global_name
+    ON skills(name)
+    WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_user_name
+    ON skills(user_id, name)
+    WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_skills_user_deleted_at ON skills(user_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_skills_source ON skills(source);
+CREATE INDEX IF NOT EXISTS idx_skills_updated_at ON skills(updated_at DESC);
+
+ALTER TABLE skill_import_records
+    ADD COLUMN user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE INDEX IF NOT EXISTS idx_skill_import_records_user_created_at
+    ON skill_import_records(user_id, created_at DESC);
+
+ALTER TABLE assistant_plugins
+    ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE INDEX IF NOT EXISTS idx_assistant_plugins_owner_created_at
+    ON assistant_plugins(owner_user_id, created_at ASC);
+
+CREATE TABLE assistant_users_new (
+    id               TEXT PRIMARY KEY NOT NULL,
+    owner_user_id    TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    platform_user_id TEXT NOT NULL,
+    platform_type    TEXT NOT NULL,
+    display_name     TEXT,
+    authorized_at    INTEGER NOT NULL,
+    last_active      INTEGER,
+    session_id       TEXT,
+    UNIQUE (owner_user_id, platform_user_id, platform_type)
+);
+
+INSERT INTO assistant_users_new (
+    id, owner_user_id, platform_user_id, platform_type, display_name,
+    authorized_at, last_active, session_id
+)
+SELECT
+    id, 'system_default_user', platform_user_id, platform_type, display_name,
+    authorized_at, last_active, session_id
+FROM assistant_users;
+
+DROP TABLE assistant_users;
+ALTER TABLE assistant_users_new RENAME TO assistant_users;
+CREATE INDEX IF NOT EXISTS idx_assistant_users_owner_authorized_at
+    ON assistant_users(owner_user_id, authorized_at DESC);
+
+ALTER TABLE assistant_pairing_codes
+    ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE INDEX IF NOT EXISTS idx_pairing_codes_owner_status
+    ON assistant_pairing_codes(owner_user_id, status);
+
 PRAGMA foreign_keys = ON;

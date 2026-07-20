@@ -14,6 +14,8 @@ use crate::repository::assistant::{
     IAssistantPreferenceRepository, IAssistantRepository,
 };
 
+const DEFAULT_USER_ID: &str = "system_default_user";
+
 /// SQLite-backed implementation of [`IAssistantRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteAssistantRepository {
@@ -269,15 +271,19 @@ impl SqliteAssistantOverrideRepository {
 #[async_trait::async_trait]
 impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     async fn get(&self, assistant_id: &str) -> Result<Option<AssistantOverrideRow>, DbError> {
-        let row = sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE assistant_id = ?")
-            .bind(assistant_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, AssistantOverrideRow>(
+            "SELECT * FROM assistant_overrides WHERE user_id = ? AND assistant_id = ?",
+        )
+        .bind(DEFAULT_USER_ID)
+        .bind(assistant_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
     async fn get_all(&self) -> Result<Vec<AssistantOverrideRow>, DbError> {
-        let rows = sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides")
+        let rows = sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE user_id = ?")
+            .bind(DEFAULT_USER_ID)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
@@ -289,14 +295,15 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
 
         sqlx::query(
             "INSERT INTO assistant_overrides \
-                (assistant_id, enabled, sort_order, last_used_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(assistant_id) DO UPDATE SET \
+                (user_id, assistant_id, enabled, sort_order, last_used_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, assistant_id) DO UPDATE SET \
                 enabled = excluded.enabled, \
                 sort_order = excluded.sort_order, \
                 last_used_at = COALESCE(excluded.last_used_at, assistant_overrides.last_used_at), \
                 updated_at = excluded.updated_at",
         )
+        .bind(DEFAULT_USER_ID)
         .bind(params.assistant_id)
         .bind(params.enabled)
         .bind(params.sort_order)
@@ -315,7 +322,8 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     }
 
     async fn delete(&self, assistant_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM assistant_overrides WHERE assistant_id = ?")
+        let result = sqlx::query("DELETE FROM assistant_overrides WHERE user_id = ? AND assistant_id = ?")
+            .bind(DEFAULT_USER_ID)
             .bind(assistant_id)
             .execute(&self.pool)
             .await?;
@@ -324,15 +332,16 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
 
     async fn delete_orphans(&self, valid_ids: &[&str]) -> Result<u64, DbError> {
         if valid_ids.is_empty() {
-            let result = sqlx::query("DELETE FROM assistant_overrides")
+            let result = sqlx::query("DELETE FROM assistant_overrides WHERE user_id = ?")
+                .bind(DEFAULT_USER_ID)
                 .execute(&self.pool)
                 .await?;
             return Ok(result.rows_affected());
         }
 
         let placeholders = std::iter::repeat_n("?", valid_ids.len()).collect::<Vec<_>>().join(",");
-        let sql = format!("DELETE FROM assistant_overrides WHERE assistant_id NOT IN ({placeholders})");
-        let mut q = sqlx::query(&sql);
+        let sql = format!("DELETE FROM assistant_overrides WHERE user_id = ? AND assistant_id NOT IN ({placeholders})");
+        let mut q = sqlx::query(&sql).bind(DEFAULT_USER_ID);
         for id in valid_ids {
             q = q.bind(*id);
         }
@@ -550,8 +559,9 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
 impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
     async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantOverlayRow>(
-            "SELECT * FROM assistant_overlays WHERE assistant_definition_id = ?",
+            "SELECT * FROM assistant_overlays WHERE user_id = ? AND assistant_definition_id = ?",
         )
+        .bind(DEFAULT_USER_ID)
         .bind(assistant_definition_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -560,8 +570,9 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
 
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
         let rows = sqlx::query_as::<_, AssistantOverlayRow>(
-            "SELECT * FROM assistant_overlays ORDER BY sort_order, updated_at",
+            "SELECT * FROM assistant_overlays WHERE user_id = ? ORDER BY sort_order, updated_at",
         )
+        .bind(DEFAULT_USER_ID)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -571,15 +582,17 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_overlays (
-                assistant_definition_id, enabled, sort_order, agent_id_override, last_used_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(assistant_definition_id) DO UPDATE SET
+                user_id, assistant_definition_id, enabled, sort_order, agent_id_override,
+                last_used_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, assistant_definition_id) DO UPDATE SET
                 enabled = excluded.enabled,
                 sort_order = excluded.sort_order,
                 agent_id_override = excluded.agent_id_override,
                 last_used_at = excluded.last_used_at,
                 updated_at = excluded.updated_at",
         )
+        .bind(DEFAULT_USER_ID)
         .bind(params.assistant_definition_id)
         .bind(params.enabled)
         .bind(params.sort_order)
@@ -599,7 +612,8 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
     }
 
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM assistant_overlays WHERE assistant_definition_id = ?")
+        let result = sqlx::query("DELETE FROM assistant_overlays WHERE user_id = ? AND assistant_definition_id = ?")
+            .bind(DEFAULT_USER_ID)
             .bind(assistant_definition_id)
             .execute(&self.pool)
             .await?;
@@ -611,8 +625,9 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
 impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
     async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantPreferenceRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantPreferenceRow>(
-            "SELECT * FROM assistant_preferences WHERE assistant_definition_id = ?",
+            "SELECT * FROM assistant_preferences WHERE user_id = ? AND assistant_definition_id = ?",
         )
+        .bind(DEFAULT_USER_ID)
         .bind(assistant_definition_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -623,10 +638,10 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_preferences (
-                assistant_definition_id, last_model_id, last_permission_value, last_thought_level_value, last_skill_ids,
+                user_id, assistant_definition_id, last_model_id, last_permission_value, last_thought_level_value, last_skill_ids,
                 last_disabled_builtin_skill_ids, last_mcp_ids, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(assistant_definition_id) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, assistant_definition_id) DO UPDATE SET
                 last_model_id = excluded.last_model_id,
                 last_permission_value = excluded.last_permission_value,
                 last_thought_level_value = excluded.last_thought_level_value,
@@ -635,6 +650,7 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
                 last_mcp_ids = excluded.last_mcp_ids,
                 updated_at = excluded.updated_at",
         )
+        .bind(DEFAULT_USER_ID)
         .bind(params.assistant_definition_id)
         .bind(params.last_model_id)
         .bind(params.last_permission_value)
@@ -656,7 +672,8 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
     }
 
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM assistant_preferences WHERE assistant_definition_id = ?")
+        let result = sqlx::query("DELETE FROM assistant_preferences WHERE user_id = ? AND assistant_definition_id = ?")
+            .bind(DEFAULT_USER_ID)
             .bind(assistant_definition_id)
             .execute(&self.pool)
             .await?;

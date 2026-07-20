@@ -4,6 +4,8 @@ use crate::error::DbError;
 use crate::models::{SkillImportRecordRow, SkillRow};
 use crate::repository::skill::{CreateSkillImportRecordParams, ISkillRepository, UpsertSkillParams};
 
+const DEFAULT_USER_ID: &str = "system_default_user";
+
 /// SQLite-backed implementation of [`ISkillRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteSkillRepository {
@@ -20,27 +22,41 @@ impl SqliteSkillRepository {
 impl ISkillRepository for SqliteSkillRepository {
     async fn list(&self) -> Result<Vec<SkillRow>, DbError> {
         let rows = sqlx::query_as::<_, SkillRow>(
-            "SELECT * FROM skills WHERE deleted_at IS NULL AND enabled = 1 ORDER BY updated_at DESC, name ASC",
+            "SELECT * FROM skills \
+             WHERE (user_id IS NULL OR user_id = ?) AND deleted_at IS NULL AND enabled = 1 \
+             ORDER BY updated_at DESC, name ASC",
         )
+        .bind(DEFAULT_USER_ID)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
     async fn find_by_name(&self, name: &str) -> Result<Option<SkillRow>, DbError> {
-        let row =
-            sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE name = ? AND deleted_at IS NULL AND enabled = 1")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query_as::<_, SkillRow>(
+            "SELECT * FROM skills \
+             WHERE (user_id IS NULL OR user_id = ?) AND name = ? AND deleted_at IS NULL AND enabled = 1 \
+             ORDER BY user_id IS NULL ASC \
+             LIMIT 1",
+        )
+        .bind(DEFAULT_USER_ID)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
     async fn find_by_name_any(&self, name: &str) -> Result<Option<SkillRow>, DbError> {
-        let row = sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, SkillRow>(
+            "SELECT * FROM skills \
+             WHERE (user_id IS NULL OR user_id = ?) AND name = ? \
+             ORDER BY user_id IS NULL ASC \
+             LIMIT 1",
+        )
+        .bind(DEFAULT_USER_ID)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
@@ -55,9 +71,9 @@ impl ISkillRepository for SqliteSkillRepository {
 
         sqlx::query(
             "INSERT INTO skills \
-                (id, name, description, path, source, enabled, deleted_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?) \
-             ON CONFLICT(name) DO UPDATE SET \
+                (id, user_id, name, description, path, source, enabled, deleted_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) \
+             ON CONFLICT(user_id, name) WHERE user_id IS NOT NULL DO UPDATE SET \
                 description = excluded.description, \
                 path = excluded.path, \
                 source = excluded.source, \
@@ -66,6 +82,7 @@ impl ISkillRepository for SqliteSkillRepository {
                 updated_at = excluded.updated_at",
         )
         .bind(&id)
+        .bind(DEFAULT_USER_ID)
         .bind(params.name)
         .bind(params.description)
         .bind(params.path)
@@ -84,10 +101,12 @@ impl ISkillRepository for SqliteSkillRepository {
     async fn delete_by_name(&self, name: &str) -> Result<SkillRow, DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
-            "UPDATE skills SET enabled = 0, deleted_at = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL",
+            "UPDATE skills SET enabled = 0, deleted_at = ?, updated_at = ? \
+             WHERE user_id = ? AND name = ? AND deleted_at IS NULL",
         )
         .bind(now)
         .bind(now)
+        .bind(DEFAULT_USER_ID)
         .bind(name)
         .execute(&self.pool)
         .await?;
