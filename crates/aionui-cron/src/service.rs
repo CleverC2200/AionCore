@@ -257,7 +257,10 @@ impl CronService {
         validate_schedule(&schedule)?;
         let resolved_agent_type = match runtime_agent_type {
             Some(agent_type) => agent_type,
-            None => self.resolve_new_job_agent_type(req.agent_config.as_ref()).await?,
+            None => {
+                self.resolve_new_job_agent_type(user_id, req.agent_config.as_ref())
+                    .await?
+            }
         };
         validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
@@ -284,6 +287,7 @@ impl CronService {
         let agent_config = match req.agent_config {
             Some(config) => Some(
                 self.build_cron_agent_config(
+                    user_id,
                     &resolved_agent_type,
                     sanitize_agent_config_dto(config),
                     assistant_backend_override.as_deref(),
@@ -392,9 +396,12 @@ impl CronService {
         }
         if let Some(config_dto) = &req.agent_config {
             let config_dto = sanitize_agent_config_dto(config_dto.clone());
-            job.agent_type = self.resolve_new_job_agent_type(Some(&config_dto)).await?;
+            job.agent_type = self.resolve_new_job_agent_type(&job.user_id, Some(&config_dto)).await?;
             validate_aionrs_agent_config(&job.agent_type, Some(&config_dto))?;
-            job.agent_config = Some(self.build_cron_agent_config(&job.agent_type, config_dto, None).await?);
+            job.agent_config = Some(
+                self.build_cron_agent_config(&job.user_id, &job.agent_type, config_dto, None)
+                    .await?,
+            );
         }
         if let Some(title) = &req.conversation_title
             && !clear_conversation_binding
@@ -812,6 +819,7 @@ impl CronService {
 
     async fn resolve_new_job_agent_type(
         &self,
+        user_id: &str,
         agent_config: Option<&aionui_api_types::CronAgentConfigWriteDto>,
     ) -> Result<String, CronError> {
         let Some(assistant_id) = agent_config.and_then(|config| config.assistant_id.as_deref()) else {
@@ -820,7 +828,7 @@ impl CronService {
             ));
         };
 
-        self.resolve_agent_type_for_assistant_id(assistant_id).await
+        self.resolve_agent_type_for_assistant_id(user_id, assistant_id).await
     }
 
     async fn resolve_job_agent_type(&self, job: &CronJob) -> Result<String, CronError> {
@@ -839,10 +847,15 @@ impl CronService {
             ));
         };
 
-        self.resolve_agent_type_for_assistant_id(assistant_id).await
+        self.resolve_agent_type_for_assistant_id(&job.user_id, assistant_id)
+            .await
     }
 
     async fn owner_user_id_for_job(&self, job: &CronJob) -> Option<String> {
+        if !job.user_id.trim().is_empty() {
+            return Some(job.user_id.clone());
+        }
+
         let conversation_id = job.conversation_id.trim();
         if conversation_id.is_empty() {
             warn!(job_id = %job.id, "Cron event skipped because job has no conversation owner");
@@ -896,18 +909,25 @@ impl CronService {
             .is_some_and(|value| !value.trim().is_empty()))
     }
 
-    async fn resolve_agent_type_for_assistant_id(&self, assistant_id: &str) -> Result<String, CronError> {
+    async fn resolve_agent_type_for_assistant_id(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<String, CronError> {
         let definition = self
             .assistant_definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await?
             .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
-        let effective_backend = self.runtime_backend_for_agent_id(effective_agent_id).await?;
+        let effective_backend = self.runtime_backend_for_agent_id(user_id, effective_agent_id).await?;
 
         Ok(runtime_agent_type_for_backend(&effective_backend).to_owned())
     }
@@ -1572,7 +1592,7 @@ impl CronService {
             extra_assistant_id.as_ref(),
             legacy_agent_label,
         ) {
-            (None, None, Some(label)) => self.resolve_assistant_id_for_agent_label(&label).await,
+            (None, None, Some(label)) => self.resolve_assistant_id_for_agent_label(&row.user_id, &label).await,
             _ => None,
         };
         let fallback_assistant_id = match (
@@ -1580,7 +1600,7 @@ impl CronService {
             extra_assistant_id.as_ref(),
             legacy_assistant_id.as_ref(),
         ) {
-            (None, None, None) => self.resolve_default_assistant_id().await,
+            (None, None, None) => self.resolve_default_assistant_id(&row.user_id).await,
             _ => None,
         };
         let uses_default_assistant_fallback = fallback_assistant_id.is_some();
@@ -1589,7 +1609,7 @@ impl CronService {
             .or(legacy_assistant_id)
             .or(fallback_assistant_id);
         let assistant_name = match assistant_id.as_deref() {
-            Some(assistant_id) => match self.resolve_assistant_name(Some(assistant_id)).await {
+            Some(assistant_id) => match self.resolve_assistant_name(&row.user_id, Some(assistant_id)).await {
                 Ok(value) => value,
                 Err(err) => {
                     warn!(
@@ -1604,7 +1624,10 @@ impl CronService {
             None => None,
         };
         let snapshot_backend = match assistant_snapshot.as_ref() {
-            Some(snapshot) => match self.runtime_backend_for_agent_id(snapshot.agent_id.trim()).await {
+            Some(snapshot) => match self
+                .runtime_backend_for_agent_id(&row.user_id, snapshot.agent_id.trim())
+                .await
+            {
                 Ok(value) => Some(value).filter(|value| !value.is_empty()),
                 Err(err) => {
                     warn!(
@@ -1621,7 +1644,7 @@ impl CronService {
             None
         } else {
             snapshot_backend.clone().or(self
-                .resolve_assistant_backend(assistant_id.as_deref())
+                .resolve_assistant_backend(&row.user_id, assistant_id.as_deref())
                 .await
                 .unwrap_or(None))
         };
@@ -1652,6 +1675,7 @@ impl CronService {
         };
         let full_auto_mode = match self
             .resolve_cron_full_auto_mode(
+                &row.user_id,
                 &row.r#type,
                 assistant_id_for_mode,
                 assistant_snapshot.as_ref().map(|snapshot| snapshot.agent_id.as_str()),
@@ -1708,6 +1732,7 @@ impl CronService {
 
     async fn build_cron_agent_config(
         &self,
+        user_id: &str,
         runtime_agent_type: &str,
         config: aionui_api_types::CronAgentConfigWriteDto,
         _assistant_backend_override: Option<&str>,
@@ -1719,7 +1744,7 @@ impl CronService {
         };
 
         let assistant_backend = self
-            .resolve_assistant_backend(Some(assistant_id))
+            .resolve_assistant_backend(user_id, Some(assistant_id))
             .await?
             .ok_or_else(|| {
                 CronError::InvalidAgentConfig(format!(
@@ -1728,6 +1753,7 @@ impl CronService {
             })?;
         let full_auto_mode = self
             .resolve_cron_full_auto_mode(
+                user_id,
                 runtime_agent_type,
                 Some(assistant_id),
                 None,
@@ -1749,41 +1775,58 @@ impl CronService {
         })
     }
 
-    async fn resolve_assistant_backend(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+    async fn resolve_assistant_backend(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<Option<String>, CronError> {
         let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
 
-        Ok(Some(self.runtime_backend_for_agent_id(effective_agent_id).await?))
+        Ok(Some(
+            self.runtime_backend_for_agent_id(user_id, effective_agent_id).await?,
+        ))
     }
 
-    async fn resolve_assistant_name(&self, assistant_id: Option<&str>) -> Result<Option<String>, CronError> {
+    async fn resolve_assistant_name(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<Option<String>, CronError> {
         let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
         Ok(self
             .assistant_definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await?
             .map(|definition| definition.name.trim().to_owned())
             .filter(|value| !value.is_empty()))
     }
 
-    async fn resolve_assistant_id_for_agent_label(&self, agent_label: &str) -> Option<String> {
-        let rows = self.agent_metadata_repo.list_all().await.ok()?;
+    async fn resolve_assistant_id_for_agent_label(&self, user_id: &str, agent_label: &str) -> Option<String> {
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await.ok()?;
         let binding = resolve_agent_binding_from_rows(&rows, agent_label)?;
         self.assistant_definition_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .ok()?
             .into_iter()
@@ -1800,9 +1843,9 @@ impl CronService {
             .map(|definition| definition.assistant_id)
     }
 
-    async fn resolve_default_assistant_id(&self) -> Option<String> {
+    async fn resolve_default_assistant_id(&self, user_id: &str) -> Option<String> {
         self.assistant_definition_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .ok()?
             .into_iter()
@@ -1819,8 +1862,8 @@ impl CronService {
             .map(|definition| definition.assistant_id)
     }
 
-    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, CronError> {
-        let rows = self.agent_metadata_repo.list_all().await?;
+    async fn runtime_backend_for_agent_id(&self, user_id: &str, agent_id: &str) -> Result<String, CronError> {
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
         Ok(resolve_agent_binding_from_rows(&rows, agent_id)
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| agent_id.to_owned()))
@@ -1828,20 +1871,21 @@ impl CronService {
 
     async fn resolve_cron_full_auto_mode(
         &self,
+        user_id: &str,
         runtime_agent_type: &str,
         assistant_id: Option<&str>,
         agent_id_hint: Option<&str>,
         backend_hint: Option<&str>,
     ) -> Result<String, CronError> {
-        if let Some(row) = self.resolve_agent_metadata_for_assistant(assistant_id).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_assistant(user_id, assistant_id).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
-        if let Some(row) = self.resolve_agent_metadata_for_value(agent_id_hint).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_value(user_id, agent_id_hint).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
-        if let Some(row) = self.resolve_agent_metadata_for_value(backend_hint).await? {
+        if let Some(row) = self.resolve_agent_metadata_for_value(user_id, backend_hint).await? {
             return Ok(full_auto_mode_from_metadata(&row, runtime_agent_type));
         }
 
@@ -1850,33 +1894,43 @@ impl CronService {
 
     async fn resolve_agent_metadata_for_assistant(
         &self,
+        user_id: &str,
         assistant_id: Option<&str>,
     ) -> Result<Option<AgentMetadataRow>, CronError> {
         let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let Some(definition) = self.assistant_definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+        let overlay = self
+            .assistant_overlay_repo
+            .get_for_user(user_id, &definition.id)
+            .await?;
         let effective_agent_id = overlay
             .as_ref()
             .and_then(|item| item.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
 
-        self.resolve_agent_metadata_for_value(Some(effective_agent_id)).await
+        self.resolve_agent_metadata_for_value(user_id, Some(effective_agent_id))
+            .await
     }
 
     async fn resolve_agent_metadata_for_value(
         &self,
+        user_id: &str,
         value: Option<&str>,
     ) -> Result<Option<AgentMetadataRow>, CronError> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
 
-        let rows = self.agent_metadata_repo.list_all().await?;
+        let rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
         let Some(binding) = resolve_agent_binding_from_rows(&rows, value) else {
             return Ok(None);
         };
