@@ -404,11 +404,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IProviderRepository for SingleProviderRepo {
-        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
             Ok(self.rows.clone())
         }
 
-        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
             Ok(None)
         }
 
@@ -416,11 +416,16 @@ mod tests {
             Err(DbError::NotFound("not implemented".into()))
         }
 
-        async fn update(&self, _id: &str, _params: aionui_db::UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: aionui_db::UpdateProviderParams<'_>,
+        ) -> Result<Provider, DbError> {
             Err(DbError::NotFound("not implemented".into()))
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Err(DbError::NotFound("not implemented".into()))
         }
     }
@@ -428,6 +433,7 @@ mod tests {
     fn provider_row(id: &str, models: &[&str]) -> Provider {
         Provider {
             id: id.into(),
+            user_id: "user1".into(),
             platform: "openai".into(),
             name: id.into(),
             base_url: "https://example.com".into(),

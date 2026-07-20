@@ -917,19 +917,24 @@ mod tests {
 
     #[async_trait]
     impl IProviderRepository for EmptyProviderRepo {
-        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
             Ok(Vec::new())
         }
-        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
             Ok(None)
         }
         async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
             Err(DbError::Init("unused".into()))
         }
-        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: UpdateProviderParams<'_>,
+        ) -> Result<Provider, DbError> {
             Err(DbError::Init("unused".into()))
         }
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
     }
