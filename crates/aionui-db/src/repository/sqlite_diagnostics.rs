@@ -528,17 +528,22 @@ impl SqliteFeedbackDiagnosticsRepository {
         let provider_id = self.resolve_provider_id(request).await?;
         let mut query = "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                             context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
-                         FROM providers"
+                         FROM providers \
+                         WHERE user_id = ?"
             .to_owned();
         if provider_id.is_some() {
-            query.push_str(" WHERE id = ?");
+            query.push_str(" AND id = ?");
         }
         query.push_str(" ORDER BY updated_at DESC LIMIT 20");
 
         let rows = if let Some(provider_id) = provider_id.as_deref() {
-            sqlx::query(&query).bind(provider_id).fetch_all(&self.pool).await?
+            sqlx::query(&query)
+                .bind(&request.user_id)
+                .bind(provider_id)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query(&query).fetch_all(&self.pool).await?
+            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
         };
 
         let providers = rows
@@ -726,7 +731,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                             original_json, builtin, deleted_at, created_at, updated_at, length(transport_config) AS transport_config_bytes, \
                             length(original_json) AS original_json_bytes \
                          FROM mcp_servers \
-                         WHERE deleted_at IS NULL"
+                         WHERE user_id = ? AND deleted_at IS NULL"
             .to_owned();
         if request.context.mcp_server_id.is_some() {
             query.push_str(" AND id = ?");
@@ -734,9 +739,13 @@ impl SqliteFeedbackDiagnosticsRepository {
         query.push_str(" ORDER BY updated_at DESC LIMIT 30");
 
         let rows = if let Some(mcp_server_id) = request.context.mcp_server_id.as_deref() {
-            sqlx::query(&query).bind(mcp_server_id).fetch_all(&self.pool).await?
+            sqlx::query(&query)
+                .bind(&request.user_id)
+                .bind(mcp_server_id)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query(&query).fetch_all(&self.pool).await?
+            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
         };
 
         let servers = rows
@@ -774,18 +783,20 @@ impl SqliteFeedbackDiagnosticsRepository {
         ))
     }
 
-    async fn collect_client_ui_settings(&self) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
+    async fn collect_client_ui_settings(&self, user_id: &str) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
         let preference_rows = sqlx::query(
             "SELECT key, value, updated_at \
              FROM client_preferences \
-             WHERE key LIKE 'appearance.%' \
+             WHERE user_id = ? \
+               AND (key LIKE 'appearance.%' \
                 OR key LIKE 'window.%' \
                 OR key LIKE 'display.%' \
                 OR key LIKE 'workspace.%' \
-                OR key LIKE 'settings.%' \
+                OR key LIKE 'settings.%') \
              ORDER BY updated_at DESC, key ASC \
              LIMIT 50",
         )
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -805,8 +816,9 @@ impl SqliteFeedbackDiagnosticsRepository {
         let settings = sqlx::query(
             "SELECT language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at \
              FROM system_settings \
-             WHERE id = 1",
+             WHERE user_id = ?",
         )
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -962,15 +974,18 @@ impl SqliteFeedbackDiagnosticsRepository {
         .bind(&request.user_id)
         .fetch_one(&self.pool)
         .await?;
-        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers")
+        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE user_id = ?")
+            .bind(&request.user_id)
             .fetch_one(&self.pool)
             .await?;
         let agent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata")
             .fetch_one(&self.pool)
             .await?;
-        let active_mcp_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE deleted_at IS NULL")
-            .fetch_one(&self.pool)
-            .await?;
+        let active_mcp_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL")
+                .bind(&request.user_id)
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(profile_result(
             FeedbackDiagnosticsProfile::GlobalSummary,
@@ -985,7 +1000,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "recent_conversations": self.collect_global_recent_conversations(&request.user_id).await?,
                 "recent_errors": self.collect_global_recent_errors(&request.user_id).await?,
                 "agent_health": self.collect_global_agent_health().await?,
-                "provider_health": self.collect_global_provider_health().await?,
+                "provider_health": self.collect_global_provider_health(&request.user_id).await?,
             }),
         ))
     }
@@ -1451,14 +1466,16 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_provider_health(&self) -> Result<Value, DbError> {
+    async fn collect_global_provider_health(&self, user_id: &str) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                     context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
              FROM providers \
+             WHERE user_id = ? \
              ORDER BY updated_at DESC, id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(GLOBAL_HEALTH_LIMIT)
         .fetch_all(&self.pool)
         .await?;
@@ -1514,7 +1531,9 @@ impl IFeedbackDiagnosticsRepository for SqliteFeedbackDiagnosticsRepository {
                 FeedbackDiagnosticsProfile::ModelAuth => self.collect_model_auth(request).await?,
                 FeedbackDiagnosticsProfile::AgentTeam => self.collect_agent_team(request).await?,
                 FeedbackDiagnosticsProfile::McpTools => self.collect_mcp_tools(request).await?,
-                FeedbackDiagnosticsProfile::ClientUiSettings => self.collect_client_ui_settings().await?,
+                FeedbackDiagnosticsProfile::ClientUiSettings => {
+                    self.collect_client_ui_settings(&request.user_id).await?
+                }
                 FeedbackDiagnosticsProfile::WorkspaceSummary => self.collect_workspace_summary(request).await?,
                 FeedbackDiagnosticsProfile::GlobalSummary => self.collect_global_summary(request).await?,
             };

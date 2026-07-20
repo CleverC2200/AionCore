@@ -11,12 +11,13 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     let pool = db.pool();
     sqlx::query(
         "INSERT INTO providers \
-            (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            (id, user_id, platform, name, base_url, api_key_encrypted, models, enabled, \
              capabilities, context_limit, model_protocols, model_enabled, model_health, \
              bedrock_config, is_full_url, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("prov-secret")
+    .bind("system_default_user")
     .bind("openrouter")
     .bind("OpenRouter")
     .bind("https://sk-live-secret@example.invalid/v1/chat/completions?api_key=sk-query")
@@ -510,9 +511,10 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     }
 
     sqlx::query(
-        "INSERT INTO client_preferences (key, value, updated_at) VALUES (?, ?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        "INSERT INTO client_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
+    .bind("system_default_user")
     .bind("appearance.uiScale")
     .bind("1.25")
     .bind(ANCHOR_UPDATED_AT + 100)
@@ -522,9 +524,9 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO system_settings \
-            (id, language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at) \
-         VALUES (1, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET \
+            (user_id, language, notification_enabled, cron_notification_enabled, command_queue_enabled, save_upload_to_workspace, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(user_id) DO UPDATE SET \
             language = excluded.language, \
             notification_enabled = excluded.notification_enabled, \
             cron_notification_enabled = excluded.cron_notification_enabled, \
@@ -532,6 +534,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
             save_upload_to_workspace = excluded.save_upload_to_workspace, \
             updated_at = excluded.updated_at",
     )
+    .bind("system_default_user")
     .bind("zh-CN")
     .bind(true)
     .bind(false)
@@ -612,11 +615,12 @@ async fn insert_mcp_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO mcp_servers \
-            (id, name, description, enabled, transport_type, transport_config, tools, \
+            (id, user_id, name, description, enabled, transport_type, transport_config, tools, \
              last_test_status, last_connected, original_json, builtin, deleted_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("mcp-raw-config")
+    .bind("system_default_user")
     .bind("raw-config-mcp")
     .bind(None::<String>)
     .bind(true)
