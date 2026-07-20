@@ -784,8 +784,13 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("run-now should return created conversation id");
 
     let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = conversation_repo
+        .owner_user_id(conversation_id)
+        .await
+        .expect("load conversation owner")
+        .expect("conversation should have an owner");
     let conversation = conversation_repo
-        .get(conversation_id)
+        .get(&user_id, conversation_id)
         .await
         .expect("load conversation")
         .expect("conversation should exist");
@@ -805,7 +810,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     assert_ne!(fixed_mcp.id, extra_mcp.id, "fixture should seed two distinct MCP rows");
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(conversation_id)
+        .get_assistant_snapshot(&user_id, conversation_id)
         .await
         .expect("load assistant snapshot")
         .expect("preset assistant cron conversation should persist snapshot");
