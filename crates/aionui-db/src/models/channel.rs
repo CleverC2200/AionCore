@@ -25,7 +25,7 @@ pub struct ChannelPluginRow {
 /// Row mapping for the `assistant_users` table.
 ///
 /// Represents an IM user authorized to chat with the assistant.
-/// UNIQUE constraint on (platform_user_id, platform_type).
+/// UNIQUE constraint on (owner_user_id, platform_user_id, platform_type).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantUserRow {
     pub id: String,

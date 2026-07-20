@@ -586,18 +586,84 @@ ALTER TABLE skill_import_records
 CREATE INDEX IF NOT EXISTS idx_skill_import_records_user_created_at
     ON skill_import_records(user_id, created_at DESC);
 
-ALTER TABLE assistant_plugins
-    ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE TABLE assistant_plugins_new (
+    id             TEXT    NOT NULL,
+    owner_user_id  TEXT    NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    type           TEXT    NOT NULL,
+    name           TEXT    NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 0,
+    config         TEXT    NOT NULL,
+    status         TEXT,
+    last_connected INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (owner_user_id, id)
+);
+
+INSERT INTO assistant_plugins_new (
+    id, owner_user_id, type, name, enabled, config, status, last_connected,
+    created_at, updated_at
+)
+SELECT
+    id, 'system_default_user', type, name, enabled, config, status,
+    last_connected, created_at, updated_at
+FROM assistant_plugins;
+
+DROP TABLE assistant_plugins;
+ALTER TABLE assistant_plugins_new RENAME TO assistant_plugins;
 CREATE INDEX IF NOT EXISTS idx_assistant_plugins_owner_created_at
     ON assistant_plugins(owner_user_id, created_at ASC);
 
-ALTER TABLE assistant_users
-    ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE TABLE assistant_users_new (
+    id               TEXT PRIMARY KEY NOT NULL,
+    owner_user_id    TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    platform_user_id TEXT NOT NULL,
+    platform_type    TEXT NOT NULL,
+    display_name     TEXT,
+    authorized_at    INTEGER NOT NULL,
+    last_active      INTEGER,
+    session_id       TEXT,
+    UNIQUE (owner_user_id, platform_user_id, platform_type)
+);
+
+INSERT INTO assistant_users_new (
+    id, owner_user_id, platform_user_id, platform_type, display_name,
+    authorized_at, last_active, session_id
+)
+SELECT
+    id, 'system_default_user', platform_user_id, platform_type, display_name,
+    authorized_at, last_active, session_id
+FROM assistant_users;
+
+DROP TABLE assistant_users;
+ALTER TABLE assistant_users_new RENAME TO assistant_users;
 CREATE INDEX IF NOT EXISTS idx_assistant_users_owner_authorized_at
     ON assistant_users(owner_user_id, authorized_at DESC);
 
-ALTER TABLE assistant_pairing_codes
-    ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id);
+CREATE TABLE assistant_pairing_codes_new (
+    code             TEXT NOT NULL,
+    owner_user_id    TEXT NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    platform_user_id TEXT NOT NULL,
+    platform_type    TEXT NOT NULL,
+    display_name     TEXT,
+    requested_at     INTEGER NOT NULL,
+    expires_at       INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    PRIMARY KEY (owner_user_id, code)
+);
+
+INSERT INTO assistant_pairing_codes_new (
+    code, owner_user_id, platform_user_id, platform_type, display_name,
+    requested_at, expires_at, status
+)
+SELECT
+    code, 'system_default_user', platform_user_id, platform_type, display_name,
+    requested_at, expires_at, status
+FROM assistant_pairing_codes;
+
+DROP TABLE assistant_pairing_codes;
+ALTER TABLE assistant_pairing_codes_new RENAME TO assistant_pairing_codes;
 CREATE INDEX IF NOT EXISTS idx_pairing_codes_owner_status
     ON assistant_pairing_codes(owner_user_id, status);
 
