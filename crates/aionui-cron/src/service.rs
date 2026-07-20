@@ -265,13 +265,14 @@ impl CronService {
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
         let conversation_id = req.conversation_id.trim();
-        if conversation_id.is_empty()
-            || self
-                .executor
-                .get_conversation_row(conversation_id)
-                .await?
-                .filter(|row| row.user_id == user_id)
-                .is_none()
+        if matches!(execution_mode, ExecutionMode::Existing)
+            && (conversation_id.is_empty()
+                || self
+                    .executor
+                    .get_conversation_row(conversation_id)
+                    .await?
+                    .filter(|row| row.user_id == user_id)
+                    .is_none())
         {
             return Err(CronError::Conversation(
                 aionui_conversation::ConversationError::NotFound {
@@ -297,6 +298,7 @@ impl CronService {
 
         let job = CronJob {
             id: generate_prefixed_id("cron"),
+            user_id: user_id.to_owned(),
             name: req.name,
             enabled: true,
             schedule,
@@ -2314,6 +2316,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_test".into(),
+            user_id: "user1".into(),
             name: "Test".into(),
             enabled: true,
             schedule: CronSchedule::Every {

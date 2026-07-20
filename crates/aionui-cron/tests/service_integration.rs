@@ -1445,6 +1445,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
     cron_repo
         .insert(&CronJobRow {
             id: "cron_legacy_custom_agent".into(),
+            user_id: "user1".into(),
             name: "Legacy custom agent job".into(),
             enabled: true,
             schedule_kind: "every".into(),

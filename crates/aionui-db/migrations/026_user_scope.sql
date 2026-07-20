@@ -121,51 +121,9 @@ BEGIN
     SELECT RAISE(ABORT, 'team_tasks.team_id must reference teams.id');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_cron_jobs_conversation_parent_insert
-BEFORE INSERT ON cron_jobs
-FOR EACH ROW
-WHEN NEW.conversation_id IS NULL
-  OR NEW.conversation_id = ''
-  OR NOT EXISTS (SELECT 1 FROM conversations WHERE id = NEW.conversation_id)
-BEGIN
-    SELECT RAISE(ABORT, 'cron_jobs.conversation_id must reference conversations.id');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_cron_jobs_conversation_parent_update
-BEFORE UPDATE OF conversation_id ON cron_jobs
-FOR EACH ROW
-WHEN NEW.conversation_id IS NULL
-  OR NEW.conversation_id = ''
-  OR NOT EXISTS (SELECT 1 FROM conversations WHERE id = NEW.conversation_id)
-BEGIN
-    SELECT RAISE(ABORT, 'cron_jobs.conversation_id must reference conversations.id');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_cron_job_runs_job_parent_insert
-BEFORE INSERT ON cron_job_runs
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1
-    FROM cron_jobs j
-    JOIN conversations c ON c.id = j.conversation_id
-    WHERE j.id = NEW.job_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'cron_job_runs.job_id must reference cron_jobs.id with conversation parent');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_cron_job_runs_job_parent_update
-BEFORE UPDATE OF job_id ON cron_job_runs
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1
-    FROM cron_jobs j
-    JOIN conversations c ON c.id = j.conversation_id
-    WHERE j.id = NEW.job_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'cron_job_runs.job_id must reference cron_jobs.id with conversation parent');
-END;
+ALTER TABLE cron_jobs
+    ADD COLUMN user_id TEXT NOT NULL DEFAULT 'system_default_user';
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_next_run ON cron_jobs(user_id, next_run_at);
 
 ALTER TABLE providers
     ADD COLUMN user_id TEXT NOT NULL DEFAULT 'system_default_user';

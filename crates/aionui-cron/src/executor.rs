@@ -611,6 +611,10 @@ impl JobExecutor {
     }
 
     async fn resolve_conversation_owner_user_id(&self, job: &CronJob) -> Result<String, CronError> {
+        if !job.user_id.trim().is_empty() {
+            return Ok(job.user_id.clone());
+        }
+
         if job.conversation_id.trim().is_empty() {
             return Err(CronError::Scheduler(format!(
                 "cron job {} has no conversation owner",
@@ -1282,6 +1286,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_test1".into(),
+            user_id: "user1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule: CronSchedule::Every {

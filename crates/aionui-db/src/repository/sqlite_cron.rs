@@ -24,16 +24,17 @@ impl ICronRepository for SqliteCronRepository {
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO cron_jobs (\
-                id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
+                id, user_id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
+        .bind(&row.user_id)
         .bind(&row.name)
         .bind(row.enabled)
         .bind(&row.schedule_kind)
@@ -86,10 +87,7 @@ impl ICronRepository for SqliteCronRepository {
         let result = sqlx::query(
             "DELETE FROM cron_jobs \
              WHERE id = ? \
-               AND EXISTS (\
-                   SELECT 1 FROM conversations c \
-                   WHERE c.id = cron_jobs.conversation_id AND c.user_id = ?\
-               )",
+               AND user_id = ?",
         )
         .bind(id)
         .bind(user_id)
@@ -110,15 +108,11 @@ impl ICronRepository for SqliteCronRepository {
     }
 
     async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError> {
-        let row = sqlx::query_as::<_, CronJobRow>(
-            "SELECT j.* FROM cron_jobs j \
-             JOIN conversations c ON c.id = j.conversation_id \
-             WHERE c.user_id = ? AND j.id = ?",
-        )
-        .bind(user_id)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -130,27 +124,17 @@ impl ICronRepository for SqliteCronRepository {
     }
 
     async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError> {
-        let rows = sqlx::query_as::<_, CronJobRow>(
-            "SELECT j.* FROM cron_jobs j \
-             JOIN conversations c ON c.id = j.conversation_id \
-             WHERE c.user_id = ? \
-             ORDER BY j.created_at ASC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE user_id = ? ORDER BY created_at ASC")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
     async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError> {
-        let rows = sqlx::query_as::<_, CronJobRow>(
-            "SELECT j.* FROM cron_jobs j \
-             JOIN conversations c ON c.id = j.conversation_id \
-             WHERE j.enabled = 1 \
-             ORDER BY j.created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE enabled = 1 ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -170,10 +154,9 @@ impl ICronRepository for SqliteCronRepository {
         conversation_id: &str,
     ) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>(
-            "SELECT j.* FROM cron_jobs j \
-             JOIN conversations c ON c.id = j.conversation_id \
-             WHERE c.user_id = ? AND j.conversation_id = ? \
-             ORDER BY j.created_at ASC",
+            "SELECT * FROM cron_jobs \
+             WHERE user_id = ? AND conversation_id = ? \
+             ORDER BY created_at ASC",
         )
         .bind(user_id)
         .bind(conversation_id)
@@ -197,9 +180,8 @@ impl ICronRepository for SqliteCronRepository {
         let result = async {
             let job_has_owner: bool = sqlx::query_scalar(
                 "SELECT EXISTS(\
-                    SELECT 1 FROM cron_jobs j \
-                    JOIN conversations c ON c.id = j.conversation_id \
-                    WHERE j.id = ?\
+                    SELECT 1 FROM cron_jobs \
+                    WHERE id = ? AND user_id IS NOT NULL AND user_id != ''\
                 )",
             )
             .bind(params.job_id)
@@ -315,8 +297,7 @@ impl ICronRepository for SqliteCronRepository {
              WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
                AND EXISTS (\
                    SELECT 1 FROM cron_jobs j \
-                   JOIN conversations c ON c.id = j.conversation_id \
-                   WHERE j.id = cron_job_runs.job_id\
+                   WHERE j.id = cron_job_runs.job_id AND j.user_id IS NOT NULL AND j.user_id != ''\
                )",
         )
         .bind(lease_until)
@@ -342,8 +323,7 @@ impl ICronRepository for SqliteCronRepository {
              WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
                AND EXISTS (\
                    SELECT 1 FROM cron_jobs j \
-                   JOIN conversations c ON c.id = j.conversation_id \
-                   WHERE j.id = cron_job_runs.job_id\
+                   WHERE j.id = cron_job_runs.job_id AND j.user_id IS NOT NULL AND j.user_id != ''\
                )",
         )
         .bind(retry_at)
@@ -363,8 +343,7 @@ impl ICronRepository for SqliteCronRepository {
              WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
                AND EXISTS (\
                    SELECT 1 FROM cron_jobs j \
-                   JOIN conversations c ON c.id = j.conversation_id \
-                   WHERE j.id = cron_job_runs.job_id\
+                   WHERE j.id = cron_job_runs.job_id AND j.user_id IS NOT NULL AND j.user_id != ''\
                )",
         )
         .bind(params.status)
@@ -393,8 +372,8 @@ impl ICronRepository for SqliteCronRepository {
         let row = sqlx::query_as::<_, (TimestampMs, TimestampMs)>(
             "SELECT r.scheduled_at, MAX(r.lease_until, ?) AS wake_at FROM cron_job_runs r \
              JOIN cron_jobs j ON j.id = r.job_id \
-             JOIN conversations c ON c.id = j.conversation_id \
-             WHERE r.job_id = ? AND r.status IN ('running', 'retrying') AND r.lease_until IS NOT NULL \
+             WHERE r.job_id = ? AND j.user_id IS NOT NULL AND j.user_id != '' \
+               AND r.status IN ('running', 'retrying') AND r.lease_until IS NOT NULL \
              ORDER BY r.lease_until ASC LIMIT 1",
         )
         .bind(now)
@@ -482,7 +461,9 @@ impl SqliteCronRepository {
         set_parts.push("updated_at = ?".to_string());
         binds.push(BindValue::I64(now_ms()));
 
-        if let (Some(user_id), Some(conversation_id)) = (user_id, params.conversation_id.as_deref()) {
+        if let (Some(user_id), Some(conversation_id)) = (user_id, params.conversation_id.as_deref())
+            && !conversation_id.trim().is_empty()
+        {
             let owns_new_conversation: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
                     .bind(user_id)
@@ -496,11 +477,7 @@ impl SqliteCronRepository {
 
         let sql = if user_id.is_some() {
             format!(
-                "UPDATE cron_jobs SET {} WHERE id = ? \
-                 AND EXISTS (\
-                     SELECT 1 FROM conversations c \
-                     WHERE c.id = cron_jobs.conversation_id AND c.user_id = ?\
-                 )",
+                "UPDATE cron_jobs SET {} WHERE id = ? AND user_id = ?",
                 set_parts.join(", ")
             )
         } else {
@@ -580,6 +557,7 @@ mod tests {
         let now = now_ms();
         CronJobRow {
             id: id.into(),
+            user_id: "user1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule_kind: "every".into(),

@@ -103,6 +103,7 @@ mod tests {
     fn sample_job() -> CronJob {
         CronJob {
             id: "cron_1".into(),
+            user_id: "user1".into(),
             name: "Daily Report".into(),
             enabled: true,
             schedule: CronSchedule::Every {

@@ -44,6 +44,7 @@ fn make_job(id: &str) -> CronJobRow {
     let now = now_ms();
     CronJobRow {
         id: id.into(),
+        user_id: "user1".into(),
         name: "Test Job".into(),
         enabled: true,
         schedule_kind: "every".into(),
