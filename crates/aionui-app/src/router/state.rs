@@ -1073,13 +1073,18 @@ mod tests {
             .unwrap();
 
         let conversation_repo = SqliteConversationRepository::new(pool);
+        let user_id = conversation_repo
+            .owner_user_id(&first.conversation_id)
+            .await
+            .unwrap()
+            .expect("channel-created conversation should have an owner");
         let snapshot = conversation_repo
-            .get_assistant_snapshot(&first.conversation_id)
+            .get_assistant_snapshot(&user_id, &first.conversation_id)
             .await
             .unwrap()
             .expect("channel-created conversation should persist assistant snapshot");
         let conversation = conversation_repo
-            .get(&first.conversation_id)
+            .get(&user_id, &first.conversation_id)
             .await
             .unwrap()
             .expect("channel-created conversation should be persisted");
