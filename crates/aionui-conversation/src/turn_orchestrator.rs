@@ -136,6 +136,7 @@ impl ConversationTurnOrchestrator {
                 .await;
                 self.service
                     .persist_and_broadcast_send_failure_tip(
+                        &input.user_id,
                         &input.conv_id,
                         &input.turn_id,
                         &send_error,
@@ -151,7 +152,12 @@ impl ConversationTurnOrchestrator {
 
         if let Err(err) = self
             .service
-            .maybe_persist_workspace(&input.conv_id, &input.stored_workspace, agent.workspace())
+            .maybe_persist_workspace(
+                &input.user_id,
+                &input.conv_id,
+                &input.stored_workspace,
+                agent.workspace(),
+            )
             .await
         {
             let top_level_code = err.error_code();
@@ -166,6 +172,7 @@ impl ConversationTurnOrchestrator {
             );
             self.service
                 .persist_and_broadcast_send_failure_tip(
+                    &input.user_id,
                     &input.conv_id,
                     &input.turn_id,
                     &send_error,
@@ -244,6 +251,7 @@ impl ConversationTurnOrchestrator {
                         );
                         self.service
                             .persist_and_broadcast_send_failure_tip(
+                                &input.user_id,
                                 &input.conv_id,
                                 &input.turn_id,
                                 &send_error,
@@ -311,6 +319,7 @@ impl ConversationTurnOrchestrator {
                 persist_session_key(
                     self.service.conversation_repo(),
                     &persistence,
+                    &input.user_id,
                     &input.conv_id,
                     &session_key,
                 )
@@ -451,6 +460,7 @@ impl ConversationTurnOrchestrator {
                     );
                     self.service
                         .evict_acp_task_after_terminal_error(
+                            &input.user_id,
                             &conv_id,
                             attempt_result.agent_type,
                             &attempt_result.outcome,
@@ -466,7 +476,13 @@ impl ConversationTurnOrchestrator {
                     {
                         let send_error = AgentSendError::from_stream_error_data(data);
                         self.service
-                            .persist_and_broadcast_send_failure_tip(&conv_id, &turn_id, &send_error, None)
+                            .persist_and_broadcast_send_failure_tip(
+                                &input.user_id,
+                                &conv_id,
+                                &turn_id,
+                                &send_error,
+                                None,
+                            )
                             .await;
                     }
 
@@ -475,6 +491,7 @@ impl ConversationTurnOrchestrator {
                         AgentHealthAction::EvictAcpTask { .. } => {
                             self.service
                                 .evict_acp_task_after_terminal_error(
+                                    &input.user_id,
                                     &conv_id,
                                     attempt_result.agent_type,
                                     &attempt_result.outcome,
@@ -507,7 +524,7 @@ impl ConversationTurnOrchestrator {
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);
         self.service
-            .complete_released_turn(&conv_id, &turn_id, was_deleting)
+            .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
 
         ConversationTurnResult {

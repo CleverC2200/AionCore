@@ -37,6 +37,7 @@ impl ConversationService {
 
     pub async fn set_config_option(
         &self,
+        user_id: &str,
         conversation_id: &str,
         option_id: &str,
         req: SetConfigOptionRequest,
@@ -103,7 +104,10 @@ impl ConversationService {
                 _ => None,
             };
             if let Some(updates) = updates {
-                if let Err(err) = self.persist_runtime_assistant_snapshot(conversation_id, updates).await {
+                if let Err(err) = self
+                    .persist_runtime_assistant_snapshot(user_id, conversation_id, updates)
+                    .await
+                {
                     warn!(
                         conversation_id,
                         option_id,
@@ -112,7 +116,7 @@ impl ConversationService {
                     );
                 }
                 if let Err(err) = self
-                    .persist_runtime_assistant_preferences(conversation_id, updates)
+                    .persist_runtime_assistant_preferences(user_id, conversation_id, updates)
                     .await
                 {
                     warn!(
@@ -167,6 +171,7 @@ impl ConversationService {
     /// depth cap of [`MAX_DIR_DEPTH`].
     pub async fn browse_workspace(
         &self,
+        user_id: &str,
         conversation_id: &str,
         query: WorkspaceBrowseQuery,
     ) -> Result<Vec<WorkspaceEntry>, ConversationError> {
@@ -178,7 +183,7 @@ impl ConversationService {
 
         let row = self
             .conversation_repo()
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
             .ok_or_else(|| ConversationError::NotFound {

@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 use aionui_common::PaginatedResult;
 
@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -23,7 +23,27 @@ impl SqliteConversationRepository {
         Self { pool }
     }
 
-    async fn insert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+    async fn conversation_exists_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
+        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+            .bind(user_id)
+            .bind(conversation_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(exists != 0)
+    }
+
+    async fn ensure_conversation_for_user(&self, user_id: &str, conversation_id: &str) -> Result<(), DbError> {
+        if self.conversation_exists_for_user(user_id, conversation_id).await? {
+            Ok(())
+        } else {
+            Err(DbError::NotFound(format!("Conversation '{conversation_id}' not found")))
+        }
+    }
+
+    async fn insert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        self.ensure_conversation_for_user(user_id, &message.conversation_id)
+            .await?;
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
@@ -45,7 +65,9 @@ impl SqliteConversationRepository {
         Ok(())
     }
 
-    async fn upsert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
+    async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        self.ensure_conversation_for_user(user_id, &message.conversation_id)
+            .await?;
         sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
@@ -91,15 +113,23 @@ impl SqliteConversationRepository {
         Ok(())
     }
 
-    async fn visible_message_exists_before(&self, conv_id: &str, cursor: &MessagePageCursor) -> Result<bool, DbError> {
+    async fn visible_message_exists_before(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        cursor: &MessagePageCursor,
+    ) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM messages \
-                WHERE conversation_id = ? \
-                  AND (created_at < ? OR (created_at = ? AND id < ?)) \
-                  AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                SELECT 1 FROM messages m \
+                INNER JOIN conversations c ON c.id = m.conversation_id \
+                WHERE c.user_id = ? \
+                  AND m.conversation_id = ? \
+                  AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?)) \
+                  AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
              )",
         )
+        .bind(user_id)
         .bind(conv_id)
         .bind(cursor.created_at)
         .bind(cursor.created_at)
@@ -110,15 +140,23 @@ impl SqliteConversationRepository {
         Ok(exists != 0)
     }
 
-    async fn visible_message_exists_after(&self, conv_id: &str, cursor: &MessagePageCursor) -> Result<bool, DbError> {
+    async fn visible_message_exists_after(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        cursor: &MessagePageCursor,
+    ) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM messages \
-                WHERE conversation_id = ? \
-                  AND (created_at > ? OR (created_at = ? AND id > ?)) \
-                  AND type NOT IN ('cron_trigger', 'skill_suggest') \
+                SELECT 1 FROM messages m \
+                INNER JOIN conversations c ON c.id = m.conversation_id \
+                WHERE c.user_id = ? \
+                  AND m.conversation_id = ? \
+                  AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?)) \
+                  AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
              )",
         )
+        .bind(user_id)
         .bind(conv_id)
         .bind(cursor.created_at)
         .bind(cursor.created_at)
@@ -129,7 +167,12 @@ impl SqliteConversationRepository {
         Ok(exists != 0)
     }
 
-    async fn page_with_flags(&self, conv_id: &str, items: Vec<MessageRow>) -> Result<MessagePageResult, DbError> {
+    async fn page_with_flags(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        items: Vec<MessageRow>,
+    ) -> Result<MessagePageResult, DbError> {
         let Some(first) = items.first() else {
             return Ok(MessagePageResult {
                 items,
@@ -142,8 +185,12 @@ impl SqliteConversationRepository {
             .last()
             .map(MessagePageCursor::from)
             .unwrap_or(first_cursor.clone());
-        let has_more_before = self.visible_message_exists_before(conv_id, &first_cursor).await?;
-        let has_more_after = self.visible_message_exists_after(conv_id, &last_cursor).await?;
+        let has_more_before = self
+            .visible_message_exists_before(user_id, conv_id, &first_cursor)
+            .await?;
+        let has_more_after = self
+            .visible_message_exists_after(user_id, conv_id, &last_cursor)
+            .await?;
 
         Ok(MessagePageResult {
             items,
@@ -157,13 +204,23 @@ impl SqliteConversationRepository {
 impl IConversationRepository for SqliteConversationRepository {
     // ── Conversation CRUD ───────────────────────────────────────────
 
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, DbError> {
-        let row = sqlx::query_as::<_, ConversationRow>("SELECT * FROM conversations WHERE id = ?")
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
+        let row = sqlx::query_as::<_, ConversationRow>("SELECT * FROM conversations WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
 
         Ok(row)
+    }
+
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError> {
+        let user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(user_id)
     }
 
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError> {
@@ -192,7 +249,7 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
+    async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
         // Build dynamic SET clause
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
@@ -230,12 +287,16 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(());
         }
 
-        let sql = format!("UPDATE conversations SET {} WHERE id = ?", set_parts.join(", "));
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?",
+            set_parts.join(", ")
+        );
 
         let mut query = sqlx::query(&sql);
         for bind in &binds {
             query = bind_value(query, bind);
         }
+        query = query.bind(user_id);
         query = query.bind(id);
 
         let result = query.execute(&self.pool).await?;
@@ -247,8 +308,9 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM conversations WHERE id = ?")
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -403,11 +465,15 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn get_assistant_snapshot(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
         let row = sqlx::query_as::<_, ConversationAssistantSnapshotRow>(
-            "SELECT * FROM conversation_assistant_snapshots WHERE conversation_id = ?",
+            "SELECT s.* FROM conversation_assistant_snapshots s \
+             INNER JOIN conversations c ON c.id = s.conversation_id \
+             WHERE c.user_id = ? AND s.conversation_id = ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -417,8 +483,11 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn upsert_assistant_snapshot(
         &self,
+        user_id: &str,
         params: &UpsertConversationAssistantSnapshotParams<'_>,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
+        self.ensure_conversation_for_user(user_id, params.conversation_id)
+            .await?;
         let now = aionui_common::now_ms();
         sqlx::query(
             "INSERT INTO conversation_assistant_snapshots (
@@ -483,14 +552,23 @@ impl IConversationRepository for SqliteConversationRepository {
         .execute(&self.pool)
         .await?;
 
-        self.get_assistant_snapshot(params.conversation_id).await
+        self.get_assistant_snapshot(user_id, params.conversation_id).await
     }
 
-    async fn delete_assistant_snapshot(&self, conversation_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM conversation_assistant_snapshots WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
+    async fn delete_assistant_snapshot(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM conversation_assistant_snapshots \
+             WHERE conversation_id = ? \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = conversation_assistant_snapshots.conversation_id \
+                      AND c.user_id = ? \
+               )",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -499,21 +577,26 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn list_messages_page(
         &self,
+        user_id: &str,
         conv_id: &str,
         params: &MessagePageParams,
     ) -> Result<MessagePageResult, DbError> {
+        self.ensure_conversation_for_user(user_id, conv_id).await?;
         let limit = params.limit.max(1) as i64;
         let fetch_limit = limit + 1;
 
         let mut rows = match &params.direction {
             MessagePageDirection::InitialLatest => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                      WHERE conversation_id = ? \
-                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                      ORDER BY created_at DESC, id DESC \
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at DESC, m.id DESC \
                       LIMIT ?",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(fetch_limit)
                 .fetch_all(&self.pool)
@@ -524,13 +607,16 @@ impl IConversationRepository for SqliteConversationRepository {
             }
             MessagePageDirection::Before { cursor } => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                      WHERE conversation_id = ? \
-                        AND (created_at < ? OR (created_at = ? AND id < ?)) \
-                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                      ORDER BY created_at DESC, id DESC \
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?)) \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at DESC, m.id DESC \
                       LIMIT ?",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(cursor.created_at)
                 .bind(cursor.created_at)
@@ -544,13 +630,16 @@ impl IConversationRepository for SqliteConversationRepository {
             }
             MessagePageDirection::After { cursor } => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                      WHERE conversation_id = ? \
-                        AND (created_at > ? OR (created_at = ? AND id > ?)) \
-                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                      ORDER BY created_at ASC, id ASC \
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?)) \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at ASC, m.id ASC \
                       LIMIT ?",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(cursor.created_at)
                 .bind(cursor.created_at)
@@ -563,11 +652,14 @@ impl IConversationRepository for SqliteConversationRepository {
             }
             MessagePageDirection::Anchor { message_id } => {
                 let anchor = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                     WHERE conversation_id = ? \
-                       AND id = ? \
-                       AND type NOT IN ('cron_trigger', 'skill_suggest')",
+                    "SELECT m.* FROM messages m \
+                     INNER JOIN conversations c ON c.id = m.conversation_id \
+                     WHERE c.user_id = ? \
+                       AND m.conversation_id = ? \
+                       AND m.id = ? \
+                       AND m.type NOT IN ('cron_trigger', 'skill_suggest')",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(message_id)
                 .fetch_optional(&self.pool)
@@ -576,13 +668,16 @@ impl IConversationRepository for SqliteConversationRepository {
 
                 let side_limit = limit;
                 let mut before = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                      WHERE conversation_id = ? \
-                        AND (created_at < ? OR (created_at = ? AND id < ?)) \
-                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                      ORDER BY created_at DESC, id DESC \
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?)) \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at DESC, m.id DESC \
                       LIMIT ?",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(anchor.created_at)
                 .bind(anchor.created_at)
@@ -593,13 +688,16 @@ impl IConversationRepository for SqliteConversationRepository {
                 before.reverse();
 
                 let after = sqlx::query_as::<_, MessageRow>(
-                    "SELECT * FROM messages \
-                      WHERE conversation_id = ? \
-                        AND (created_at > ? OR (created_at = ? AND id > ?)) \
-                        AND type NOT IN ('cron_trigger', 'skill_suggest') \
-                      ORDER BY created_at ASC, id ASC \
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?)) \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at ASC, m.id ASC \
                       LIMIT ?",
                 )
+                .bind(user_id)
                 .bind(conv_id)
                 .bind(anchor.created_at)
                 .bind(anchor.created_at)
@@ -630,16 +728,19 @@ impl IConversationRepository for SqliteConversationRepository {
             }
         };
         rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-        self.page_with_flags(conv_id, rows).await
+        self.page_with_flags(user_id, conv_id, rows).await
     }
 
-    async fn get_message(&self, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
+    async fn get_message(&self, user_id: &str, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
         let row = sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages \
-             WHERE conversation_id = ? \
-               AND id = ? \
-               AND type NOT IN ('cron_trigger', 'skill_suggest')",
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? \
+               AND m.conversation_id = ? \
+               AND m.id = ? \
+               AND m.type NOT IN ('cron_trigger', 'skill_suggest')",
         )
+        .bind(user_id)
         .bind(conv_id)
         .bind(message_id)
         .fetch_optional(&self.pool)
@@ -648,15 +749,21 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
-    async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        self.insert_message_once(message).await.map_err(DbError::from)
+    async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        self.insert_message_once(user_id, message).await
     }
 
-    async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        self.upsert_message_once(message).await.map_err(DbError::from)
+    async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        self.upsert_message_once(user_id, message).await
     }
 
-    async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError> {
+    async fn update_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        id: &str,
+        updates: &MessageRowUpdate,
+    ) -> Result<(), DbError> {
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
 
@@ -677,13 +784,23 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(());
         }
 
-        let sql = format!("UPDATE messages SET {} WHERE id = ?", set_parts.join(", "));
+        let sql = format!(
+            "UPDATE messages SET {} \
+             WHERE conversation_id = ? AND id = ? \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = messages.conversation_id AND c.user_id = ? \
+               )",
+            set_parts.join(", ")
+        );
 
         let mut query = sqlx::query(&sql);
         for bind in &binds {
             query = bind_value(query, bind);
         }
+        query = query.bind(conversation_id);
         query = query.bind(id);
+        query = query.bind(user_id);
 
         let result = query.execute(&self.pool).await?;
 
@@ -694,25 +811,36 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
-    async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
-            .bind(conv_id)
-            .execute(&self.pool)
-            .await?;
+    async fn delete_messages_by_conversation(&self, user_id: &str, conv_id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "DELETE FROM messages \
+             WHERE conversation_id = ? \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = messages.conversation_id AND c.user_id = ? \
+               )",
+        )
+        .bind(conv_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
     async fn get_message_by_msg_id(
         &self,
+        user_id: &str,
         conv_id: &str,
         msg_id: &str,
         msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError> {
         let row = sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages \
-             WHERE conversation_id = ? AND msg_id = ? AND type = ?",
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.msg_id = ? AND m.type = ?",
         )
+        .bind(user_id)
         .bind(conv_id)
         .bind(msg_id)
         .bind(msg_type)
@@ -722,9 +850,9 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
-    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, DbError> {
-        let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT m.* FROM messages m \
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<StaleRuntimeMessageRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT c.user_id, m.* FROM messages m \
              INNER JOIN conversations c ON c.id = m.conversation_id \
              WHERE m.position = 'left' \
                AND m.status IN ('work', 'pending') \
@@ -734,7 +862,25 @@ impl IConversationRepository for SqliteConversationRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                Ok(StaleRuntimeMessageRow {
+                    user_id: row.try_get("user_id")?,
+                    message: MessageRow {
+                        id: row.try_get("id")?,
+                        conversation_id: row.try_get("conversation_id")?,
+                        msg_id: row.try_get("msg_id")?,
+                        r#type: row.try_get("type")?,
+                        content: row.try_get("content")?,
+                        position: row.try_get("position")?,
+                        status: row.try_get("status")?,
+                        hidden: row.try_get("hidden")?,
+                        created_at: row.try_get("created_at")?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?)
     }
 
     async fn search_messages(
@@ -803,12 +949,18 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(PaginatedResult { items, total, has_more })
     }
 
-    async fn list_artifacts(&self, conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
+    async fn list_artifacts(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
         let rows = sqlx::query_as::<_, ConversationArtifactRow>(
-            "SELECT * FROM conversation_artifacts \
-             WHERE conversation_id = ? \
-             ORDER BY created_at ASC, id ASC",
+            "SELECT a.* FROM conversation_artifacts a \
+             INNER JOIN conversations c ON c.id = a.conversation_id \
+             WHERE c.user_id = ? AND a.conversation_id = ? \
+             ORDER BY a.created_at ASC, a.id ASC",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -818,12 +970,16 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn get_artifact(
         &self,
+        user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
     ) -> Result<Option<ConversationArtifactRow>, DbError> {
         let row = sqlx::query_as::<_, ConversationArtifactRow>(
-            "SELECT * FROM conversation_artifacts WHERE conversation_id = ? AND id = ?",
+            "SELECT a.* FROM conversation_artifacts a \
+             INNER JOIN conversations c ON c.id = a.conversation_id \
+             WHERE c.user_id = ? AND a.conversation_id = ? AND a.id = ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .bind(artifact_id)
         .fetch_optional(&self.pool)
@@ -832,7 +988,13 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
-    async fn upsert_artifact(&self, artifact: &ConversationArtifactRow) -> Result<ConversationArtifactRow, DbError> {
+    async fn upsert_artifact(
+        &self,
+        user_id: &str,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, DbError> {
+        self.ensure_conversation_for_user(user_id, &artifact.conversation_id)
+            .await?;
         sqlx::query(
             "INSERT INTO conversation_artifacts \
                 (id, conversation_id, cron_job_id, kind, status, payload, created_at, updated_at) \
@@ -856,13 +1018,14 @@ impl IConversationRepository for SqliteConversationRepository {
         .execute(&self.pool)
         .await?;
 
-        self.get_artifact(&artifact.conversation_id, &artifact.id)
+        self.get_artifact(user_id, &artifact.conversation_id, &artifact.id)
             .await?
             .ok_or_else(|| DbError::Init(format!("upsert artifact did not produce row for id '{}'", artifact.id)))
     }
 
     async fn update_artifact_status(
         &self,
+        user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
         status: &str,
@@ -871,12 +1034,17 @@ impl IConversationRepository for SqliteConversationRepository {
         let result = sqlx::query(
             "UPDATE conversation_artifacts \
              SET status = ?, updated_at = ? \
-             WHERE conversation_id = ? AND id = ?",
+             WHERE conversation_id = ? AND id = ? \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = conversation_artifacts.conversation_id AND c.user_id = ? \
+               )",
         )
         .bind(status)
         .bind(updated_at)
         .bind(conversation_id)
         .bind(artifact_id)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
 
@@ -884,29 +1052,37 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(None);
         }
 
-        self.get_artifact(conversation_id, artifact_id).await
+        self.get_artifact(user_id, conversation_id, artifact_id).await
     }
 
     async fn mark_skill_suggest_artifacts_saved(
         &self,
+        user_id: &str,
         cron_job_id: &str,
         updated_at: i64,
     ) -> Result<Vec<ConversationArtifactRow>, DbError> {
         sqlx::query(
             "UPDATE conversation_artifacts \
              SET status = 'saved', updated_at = ? \
-             WHERE kind = 'skill_suggest' AND cron_job_id = ? AND status != 'saved'",
+             WHERE kind = 'skill_suggest' AND cron_job_id = ? AND status != 'saved' \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = conversation_artifacts.conversation_id AND c.user_id = ? \
+               )",
         )
         .bind(updated_at)
         .bind(cron_job_id)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
 
         let rows = sqlx::query_as::<_, ConversationArtifactRow>(
-            "SELECT * FROM conversation_artifacts \
-             WHERE kind = 'skill_suggest' AND cron_job_id = ? \
-             ORDER BY created_at ASC, id ASC",
+            "SELECT a.* FROM conversation_artifacts a \
+             INNER JOIN conversations c ON c.id = a.conversation_id \
+             WHERE c.user_id = ? AND a.kind = 'skill_suggest' AND a.cron_job_id = ? \
+             ORDER BY a.created_at ASC, a.id ASC",
         )
+        .bind(user_id)
         .bind(cron_job_id)
         .fetch_all(&self.pool)
         .await?;
@@ -914,21 +1090,35 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
-    async fn delete_artifacts_by_conversation(&self, conversation_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM conversation_artifacts WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
+    async fn delete_artifacts_by_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "DELETE FROM conversation_artifacts \
+             WHERE conversation_id = ? \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = conversation_artifacts.conversation_id AND c.user_id = ? \
+               )",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
-    async fn list_legacy_cron_trigger_messages(&self, conversation_id: &str) -> Result<Vec<MessageRow>, DbError> {
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT * FROM messages \
-             WHERE conversation_id = ? AND type = 'cron_trigger' \
-             ORDER BY created_at ASC, id ASC",
+            "SELECT m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.type = 'cron_trigger' \
+             ORDER BY m.created_at ASC, m.id ASC",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1078,7 +1268,7 @@ mod tests {
         let conv = sample_conversation(SYSTEM_USER_ID);
 
         repo.create(&conv).await.unwrap();
-        let found = repo.get(&conv.id).await.unwrap().unwrap();
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
 
         assert_eq!(found.id, conv.id);
         assert_eq!(found.name, "Test Conversation");
@@ -1090,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn get_nonexistent_returns_none() {
         let (repo, _db) = setup().await;
-        assert!(repo.get("no_such_id").await.unwrap().is_none());
+        assert!(repo.get("user_1", "no_such_id").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1101,6 +1291,7 @@ mod tests {
 
         let now = aionui_common::now_ms();
         repo.update(
+            &conv.user_id,
             &conv.id,
             &ConversationRowUpdate {
                 name: Some("Updated Name".to_string()),
@@ -1111,7 +1302,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = repo.get(&conv.id).await.unwrap().unwrap();
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
         assert_eq!(found.name, "Updated Name");
         assert!(found.updated_at >= conv.updated_at);
     }
@@ -1124,6 +1315,7 @@ mod tests {
 
         let pin_time = aionui_common::now_ms();
         repo.update(
+            &conv.user_id,
             &conv.id,
             &ConversationRowUpdate {
                 pinned: Some(true),
@@ -1135,7 +1327,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = repo.get(&conv.id).await.unwrap().unwrap();
+        let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
         assert!(found.pinned);
         assert_eq!(found.pinned_at, Some(pin_time));
     }
@@ -1145,6 +1337,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let err = repo
             .update(
+                "user_1",
                 "no_id",
                 &ConversationRowUpdate {
                     name: Some("x".to_string()),
@@ -1163,7 +1356,9 @@ mod tests {
         repo.create(&conv).await.unwrap();
 
         // Empty update should succeed without error
-        repo.update(&conv.id, &ConversationRowUpdate::default()).await.unwrap();
+        repo.update(&conv.user_id, &conv.id, &ConversationRowUpdate::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1172,39 +1367,33 @@ mod tests {
         let conv = sample_conversation(SYSTEM_USER_ID);
         repo.create(&conv).await.unwrap();
 
-        repo.delete(&conv.id).await.unwrap();
-        assert!(repo.get(&conv.id).await.unwrap().is_none());
+        repo.delete(&conv.user_id, &conv.id).await.unwrap();
+        assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_cascades_messages() {
-        let (repo, _db) = setup().await;
+        let (repo, db) = setup().await;
         let conv = sample_conversation(SYSTEM_USER_ID);
         repo.create(&conv).await.unwrap();
 
         let msg = sample_message(&conv.id);
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
-        repo.delete(&conv.id).await.unwrap();
+        repo.delete(&conv.user_id, &conv.id).await.unwrap();
 
-        // Messages should be gone due to CASCADE
-        let result = repo
-            .list_messages_page(
-                &conv.id,
-                &MessagePageParams {
-                    limit: 50,
-                    direction: MessagePageDirection::InitialLatest,
-                },
-            )
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+            .bind(&conv.id)
+            .fetch_one(db.pool())
             .await
             .unwrap();
-        assert!(result.items.is_empty());
+        assert_eq!(remaining, 0);
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete("no_id").await.unwrap_err();
+        let err = repo.delete("user_1", "no_id").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -1518,10 +1707,11 @@ mod tests {
         repo.create(&conv).await.unwrap();
 
         let msg = sample_message(&conv.id);
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         let result = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 50,
@@ -1545,11 +1735,12 @@ mod tests {
             let mut msg = sample_message(&conv.id);
             msg.id = aionui_common::generate_prefixed_id("msg");
             msg.created_at = (i + 1) * 1000;
-            repo.insert_message(&msg).await.unwrap();
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
         let page1 = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 3,
@@ -1577,11 +1768,12 @@ mod tests {
             let mut msg = sample_message(&conv.id);
             msg.id = aionui_common::generate_prefixed_id("msg");
             msg.created_at = (i + 1) * 1000;
-            repo.insert_message(&msg).await.unwrap();
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
         let latest = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 3,
@@ -1592,6 +1784,7 @@ mod tests {
             .unwrap();
         let older = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 3,
@@ -1618,9 +1811,11 @@ mod tests {
         repo.create(&conv).await.unwrap();
 
         let msg = sample_message(&conv.id);
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         repo.update_message(
+            &conv.user_id,
+            &conv.id,
             &msg.id,
             &MessageRowUpdate {
                 content: Some(r#"{"content":"Updated"}"#.to_string()),
@@ -1632,6 +1827,7 @@ mod tests {
 
         let result = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 50,
@@ -1648,6 +1844,8 @@ mod tests {
         let (repo, _db) = setup().await;
         let err = repo
             .update_message(
+                "user_1",
+                "conv_1",
                 "no_id",
                 &MessageRowUpdate {
                     hidden: Some(true),
@@ -1668,13 +1866,16 @@ mod tests {
         for _ in 0..3 {
             let mut msg = sample_message(&conv.id);
             msg.id = aionui_common::generate_prefixed_id("msg");
-            repo.insert_message(&msg).await.unwrap();
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
-        repo.delete_messages_by_conversation(&conv.id).await.unwrap();
+        repo.delete_messages_by_conversation(&conv.user_id, &conv.id)
+            .await
+            .unwrap();
 
         let result = repo
             .list_messages_page(
+                &conv.user_id,
                 &conv.id,
                 &MessagePageParams {
                     limit: 50,
@@ -1693,10 +1894,10 @@ mod tests {
         repo.create(&conv).await.unwrap();
 
         let msg = sample_message(&conv.id);
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         let found = repo
-            .get_message_by_msg_id(&conv.id, "client_msg_1", "text")
+            .get_message_by_msg_id(&conv.user_id, &conv.id, "client_msg_1", "text")
             .await
             .unwrap();
         assert!(found.is_some());
@@ -1704,7 +1905,7 @@ mod tests {
 
         // Wrong type → not found
         let not_found = repo
-            .get_message_by_msg_id(&conv.id, "client_msg_1", "tips")
+            .get_message_by_msg_id(&conv.user_id, &conv.id, "client_msg_1", "tips")
             .await
             .unwrap();
         assert!(not_found.is_none());
@@ -1718,12 +1919,12 @@ mod tests {
 
         let mut msg1 = sample_message(&conv.id);
         msg1.content = r#"{"content":"Rust 审查报告"}"#.to_string();
-        repo.insert_message(&msg1).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg1).await.unwrap();
 
         let mut msg2 = sample_message(&conv.id);
         msg2.id = aionui_common::generate_prefixed_id("msg");
         msg2.content = r#"{"content":"Python 测试"}"#.to_string();
-        repo.insert_message(&msg2).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg2).await.unwrap();
 
         let result = repo.search_messages(SYSTEM_USER_ID, "审查", 1, 20).await.unwrap();
         assert_eq!(result.items.len(), 1);
@@ -1738,7 +1939,7 @@ mod tests {
         repo.create(&conv).await.unwrap();
 
         let msg = sample_message(&conv.id);
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         let result = repo
             .search_messages(SYSTEM_USER_ID, "xxxxnotexist", 1, 20)
@@ -1759,7 +1960,7 @@ mod tests {
             msg.id = aionui_common::generate_prefixed_id("msg");
             msg.content = format!(r#"{{"content":"match keyword item {i}"}}"#);
             msg.created_at = (i + 1) * 1000;
-            repo.insert_message(&msg).await.unwrap();
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
         let result = repo.search_messages(SYSTEM_USER_ID, "keyword", 1, 2).await.unwrap();

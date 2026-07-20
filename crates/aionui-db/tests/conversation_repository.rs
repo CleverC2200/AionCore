@@ -76,13 +76,14 @@ async fn create_get_update_delete_lifecycle() {
     repo.create(&conv).await.unwrap();
 
     // Get
-    let found = repo.get(&conv.id).await.unwrap().unwrap();
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     assert_eq!(found.name, "Conversation lifecycle");
     assert_eq!(found.status.as_deref(), Some("pending"));
 
     // Update
     let now = aionui_common::now_ms();
     repo.update(
+        &conv.user_id,
         &conv.id,
         &ConversationRowUpdate {
             name: Some("Updated Name".to_string()),
@@ -94,30 +95,31 @@ async fn create_get_update_delete_lifecycle() {
     .await
     .unwrap();
 
-    let updated = repo.get(&conv.id).await.unwrap().unwrap();
+    let updated = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     assert_eq!(updated.name, "Updated Name");
     assert_eq!(updated.status.as_deref(), Some("running"));
 
     // Delete
-    repo.delete(&conv.id).await.unwrap();
-    assert!(repo.get(&conv.id).await.unwrap().is_none());
+    repo.delete(&conv.user_id, &conv.id).await.unwrap();
+    assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn delete_conversation_cascades_messages() {
-    let (repo, _db) = setup().await;
+    let (repo, db) = setup().await;
     let conv = make_conversation("cascade");
     repo.create(&conv).await.unwrap();
 
     // Insert messages
     for i in 0..3 {
         let msg = make_message(&conv.id, &format!("msg {i}"));
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     // Verify messages exist
     let msgs = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 50,
@@ -129,19 +131,14 @@ async fn delete_conversation_cascades_messages() {
     assert_eq!(msgs.items.len(), 3);
 
     // Delete conversation → messages cascade
-    repo.delete(&conv.id).await.unwrap();
+    repo.delete(&conv.user_id, &conv.id).await.unwrap();
 
-    let msgs = repo
-        .list_messages_page(
-            &conv.id,
-            &MessagePageParams {
-                limit: 50,
-                direction: MessagePageDirection::InitialLatest,
-            },
-        )
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(&conv.id)
+        .fetch_one(db.pool())
         .await
         .unwrap();
-    assert!(msgs.items.is_empty());
+    assert_eq!(remaining, 0);
 }
 
 // ── Cursor pagination ───────────────────────────────────────────────
@@ -414,11 +411,12 @@ async fn initial_latest_returns_latest_limit_in_ascending_order() {
     for i in 0..10 {
         let mut msg = make_message(&conv.id, &format!("item {i}"));
         msg.created_at = (i + 1) as i64 * 1000;
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     let p1 = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 3,
@@ -446,11 +444,12 @@ async fn before_pages_walk_history_without_duplicates() {
         let mut msg = make_message(&conv.id, &format!("item {i}"));
         msg.id = format!("msg-{i}");
         msg.created_at = (i + 1) as i64 * 1000;
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     let latest = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 3,
@@ -461,6 +460,7 @@ async fn before_pages_walk_history_without_duplicates() {
         .unwrap();
     let older = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 3,
@@ -499,11 +499,12 @@ async fn after_returns_newer_rows_with_same_timestamp_tie_breaker() {
         let mut msg = make_message(&conv.id, id);
         msg.id = id.to_string();
         msg.created_at = 1000;
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     let page = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 2,
@@ -537,20 +538,21 @@ async fn created_at_id_ordering_is_scoped_per_conversation() {
     let mut a1 = make_message(&conv_a.id, "a1");
     a1.id = "a1".to_string();
     a1.created_at = 1000;
-    repo.insert_message(&a1).await.unwrap();
+    repo.insert_message(&conv_a.user_id, &a1).await.unwrap();
 
     let mut a2 = make_message(&conv_a.id, "a2");
     a2.id = "a2".to_string();
     a2.created_at = 2000;
-    repo.insert_message(&a2).await.unwrap();
+    repo.insert_message(&conv_a.user_id, &a2).await.unwrap();
 
     let mut b1 = make_message(&conv_b.id, "b1");
     b1.id = "b1".to_string();
     b1.created_at = 1000;
-    repo.insert_message(&b1).await.unwrap();
+    repo.insert_message(&conv_b.user_id, &b1).await.unwrap();
 
     let page_a = repo
         .list_messages_page(
+            &conv_a.user_id,
             &conv_a.id,
             &MessagePageParams {
                 limit: 10,
@@ -561,6 +563,7 @@ async fn created_at_id_ordering_is_scoped_per_conversation() {
         .unwrap();
     let page_b = repo
         .list_messages_page(
+            &conv_b.user_id,
             &conv_b.id,
             &MessagePageParams {
                 limit: 10,
@@ -593,13 +596,14 @@ async fn concurrent_insert_message_does_not_require_sequence_allocation() {
     for i in 0..48 {
         let repo = repo.clone();
         let conv_id = conv.id.clone();
+        let user_id = conv.user_id.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut msg = make_message(&conv_id, &format!("concurrent {i}"));
             msg.id = format!("msg-concurrent-{i}");
             msg.msg_id = Some(format!("cmsg-concurrent-{i}"));
-            repo.insert_message(&msg).await
+            repo.insert_message(&user_id, &msg).await
         }));
     }
 
@@ -609,6 +613,7 @@ async fn concurrent_insert_message_does_not_require_sequence_allocation() {
 
     let page = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 100,
@@ -635,11 +640,12 @@ async fn anchor_window_contains_anchor_and_sets_flags() {
         let mut msg = make_message(&conv.id, &format!("item {i}"));
         msg.id = format!("msg-{i}");
         msg.created_at = i as i64 * 1000;
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     let page = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 5,
@@ -665,22 +671,26 @@ async fn anchor_rejects_legacy_artifact_rows() {
     let conv = make_conversation("anchor-artifact");
     repo.create(&conv).await.unwrap();
 
-    repo.insert_message(&MessageRow {
-        id: "legacy-cron".into(),
-        conversation_id: conv.id.clone(),
-        msg_id: None,
-        r#type: "cron_trigger".into(),
-        content: "{}".into(),
-        position: Some("center".into()),
-        status: Some("finish".into()),
-        hidden: false,
-        created_at: 1000,
-    })
+    repo.insert_message(
+        &conv.user_id,
+        &MessageRow {
+            id: "legacy-cron".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: None,
+            r#type: "cron_trigger".into(),
+            content: "{}".into(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1000,
+        },
+    )
     .await
     .unwrap();
 
     let err = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 5,
@@ -703,15 +713,16 @@ async fn upsert_preserves_existing_created_at() {
 
     let mut msg = make_message(&conv.id, "first");
     msg.id = "msg-stable".to_string();
-    repo.upsert_message(&msg).await.unwrap();
+    repo.upsert_message(&conv.user_id, &msg).await.unwrap();
 
     let mut updated = msg.clone();
     updated.content = r#"{"content":"updated"}"#.to_string();
     updated.created_at = msg.created_at + 5000;
-    repo.upsert_message(&updated).await.unwrap();
+    repo.upsert_message(&conv.user_id, &updated).await.unwrap();
 
     let page = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 10,
@@ -733,9 +744,11 @@ async fn update_message_fields() {
     repo.create(&conv).await.unwrap();
 
     let msg = make_message(&conv.id, "original");
-    repo.insert_message(&msg).await.unwrap();
+    repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
     repo.update_message(
+        &conv.user_id,
+        &conv.id,
         &msg.id,
         &MessageRowUpdate {
             content: Some(r#"{"content":"modified"}"#.to_string()),
@@ -748,6 +761,7 @@ async fn update_message_fields() {
 
     let msgs = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 50,
@@ -770,13 +784,16 @@ async fn delete_messages_by_conversation_clears_all() {
 
     for i in 0..5 {
         let msg = make_message(&conv.id, &format!("msg {i}"));
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
-    repo.delete_messages_by_conversation(&conv.id).await.unwrap();
+    repo.delete_messages_by_conversation(&conv.user_id, &conv.id)
+        .await
+        .unwrap();
 
     let result = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 50,
@@ -797,25 +814,25 @@ async fn get_message_by_msg_id_triple() {
     let mut msg = make_message(&conv.id, "findable");
     msg.msg_id = Some("unique_msg_123".to_string());
     msg.r#type = "tool_call".to_string();
-    repo.insert_message(&msg).await.unwrap();
+    repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
     // Match
     let found = repo
-        .get_message_by_msg_id(&conv.id, "unique_msg_123", "tool_call")
+        .get_message_by_msg_id(&conv.user_id, &conv.id, "unique_msg_123", "tool_call")
         .await
         .unwrap();
     assert!(found.is_some());
 
     // Wrong type → None
     let not_found = repo
-        .get_message_by_msg_id(&conv.id, "unique_msg_123", "text")
+        .get_message_by_msg_id(&conv.user_id, &conv.id, "unique_msg_123", "text")
         .await
         .unwrap();
     assert!(not_found.is_none());
 
     // Wrong conv → None
     let not_found = repo
-        .get_message_by_msg_id("other_conv", "unique_msg_123", "tool_call")
+        .get_message_by_msg_id(&conv.user_id, "other_conv", "unique_msg_123", "tool_call")
         .await
         .unwrap();
     assert!(not_found.is_none());
@@ -833,13 +850,13 @@ async fn search_messages_across_conversations() {
     repo.create(&c2).await.unwrap();
 
     let msg1 = make_message(&c1.id, "Rust 代码审查报告");
-    repo.insert_message(&msg1).await.unwrap();
+    repo.insert_message(&c1.user_id, &msg1).await.unwrap();
 
     let msg2 = make_message(&c2.id, "Python 代码审查总结");
-    repo.insert_message(&msg2).await.unwrap();
+    repo.insert_message(&c2.user_id, &msg2).await.unwrap();
 
     let msg3 = make_message(&c1.id, "unrelated content");
-    repo.insert_message(&msg3).await.unwrap();
+    repo.insert_message(&c1.user_id, &msg3).await.unwrap();
 
     let result = repo.search_messages(USER_ID, "审查", 1, 20).await.unwrap();
     assert_eq!(result.total, 2);
@@ -858,7 +875,7 @@ async fn search_messages_empty_result() {
     repo.create(&conv).await.unwrap();
 
     let msg = make_message(&conv.id, "hello world");
-    repo.insert_message(&msg).await.unwrap();
+    repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
     let result = repo
         .search_messages(USER_ID, "nonexistent_keyword", 1, 20)
@@ -878,7 +895,7 @@ async fn search_messages_pagination() {
     for i in 0..5 {
         let mut msg = make_message(&conv.id, &format!("searchable item {i}"));
         msg.created_at = (i + 1) as i64 * 1000;
-        repo.insert_message(&msg).await.unwrap();
+        repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
     let p1 = repo.search_messages(USER_ID, "searchable", 1, 2).await.unwrap();
@@ -906,6 +923,7 @@ async fn pin_and_unpin_conversation() {
     // Pin
     let pin_time = aionui_common::now_ms();
     repo.update(
+        &conv.user_id,
         &conv.id,
         &ConversationRowUpdate {
             pinned: Some(true),
@@ -917,13 +935,14 @@ async fn pin_and_unpin_conversation() {
     .await
     .unwrap();
 
-    let pinned = repo.get(&conv.id).await.unwrap().unwrap();
+    let pinned = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     assert!(pinned.pinned);
     assert_eq!(pinned.pinned_at, Some(pin_time));
 
     // Unpin
     let now = aionui_common::now_ms();
     repo.update(
+        &conv.user_id,
         &conv.id,
         &ConversationRowUpdate {
             pinned: Some(false),
@@ -935,7 +954,7 @@ async fn pin_and_unpin_conversation() {
     .await
     .unwrap();
 
-    let unpinned = repo.get(&conv.id).await.unwrap().unwrap();
+    let unpinned = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
@@ -947,6 +966,7 @@ async fn update_nonexistent_conversation_returns_not_found() {
     let (repo, _db) = setup().await;
     let err = repo
         .update(
+            "user_1",
             "nonexistent_id",
             &ConversationRowUpdate {
                 name: Some("x".to_string()),
@@ -961,7 +981,7 @@ async fn update_nonexistent_conversation_returns_not_found() {
 #[tokio::test]
 async fn delete_nonexistent_conversation_returns_not_found() {
     let (repo, _db) = setup().await;
-    let err = repo.delete("nonexistent_id").await.unwrap_err();
+    let err = repo.delete("user_1", "nonexistent_id").await.unwrap_err();
     assert!(matches!(err, aionui_db::DbError::NotFound(_)));
 }
 
@@ -977,6 +997,8 @@ async fn update_message_nonexistent_returns_not_found() {
     let (repo, _db) = setup().await;
     let err = repo
         .update_message(
+            "user_1",
+            "conv_1",
             "nonexistent_id",
             &MessageRowUpdate {
                 hidden: Some(true),
@@ -998,6 +1020,7 @@ async fn update_extra_replaces_json() {
 
     let now = aionui_common::now_ms();
     repo.update(
+        &conv.user_id,
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(r#"{"workspace":"/new","flag":true}"#.to_string()),
@@ -1008,7 +1031,7 @@ async fn update_extra_replaces_json() {
     .await
     .unwrap();
 
-    let found = repo.get(&conv.id).await.unwrap().unwrap();
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     assert_eq!(found.extra, r#"{"workspace":"/new","flag":true}"#);
 }
 
@@ -1018,26 +1041,32 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let conv = make_conversation("message-filter");
     repo.create(&conv).await.unwrap();
 
-    repo.insert_message(&make_message(&conv.id, "visible")).await.unwrap();
+    repo.insert_message(&conv.user_id, &make_message(&conv.id, "visible"))
+        .await
+        .unwrap();
 
     for (id, ty) in [("legacy-cron", "cron_trigger"), ("legacy-skill", "skill_suggest")] {
-        repo.insert_message(&MessageRow {
-            id: id.into(),
-            conversation_id: conv.id.clone(),
-            msg_id: None,
-            r#type: ty.into(),
-            content: "{}".into(),
-            position: Some("center".into()),
-            status: Some("finish".into()),
-            hidden: false,
-            created_at: 2000,
-        })
+        repo.insert_message(
+            &conv.user_id,
+            &MessageRow {
+                id: id.into(),
+                conversation_id: conv.id.clone(),
+                msg_id: None,
+                r#type: ty.into(),
+                content: "{}".into(),
+                position: Some("center".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 2000,
+            },
+        )
         .await
         .unwrap();
     }
 
     let rows = repo
         .list_messages_page(
+            &conv.user_id,
             &conv.id,
             &MessagePageParams {
                 limit: 50,
@@ -1056,24 +1085,30 @@ async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
     let conv = make_conversation("legacy-cron-trigger");
     repo.create(&conv).await.unwrap();
 
-    repo.insert_message(&MessageRow {
-        id: aionui_common::generate_prefixed_id("msg"),
-        conversation_id: conv.id.clone(),
-        msg_id: Some("legacy-trigger".into()),
-        r#type: "cron_trigger".into(),
-        content: r#"{"cron_job_id":"cron_1","cron_job_name":"Daily Report"}"#.into(),
-        position: Some("center".into()),
-        status: Some("finish".into()),
-        hidden: false,
-        created_at: 1000,
-    })
+    repo.insert_message(
+        &conv.user_id,
+        &MessageRow {
+            id: aionui_common::generate_prefixed_id("msg"),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("legacy-trigger".into()),
+            r#type: "cron_trigger".into(),
+            content: r#"{"cron_job_id":"cron_1","cron_job_name":"Daily Report"}"#.into(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1000,
+        },
+    )
     .await
     .unwrap();
-    repo.insert_message(&make_message(&conv.id, "plain text"))
+    repo.insert_message(&conv.user_id, &make_message(&conv.id, "plain text"))
         .await
         .unwrap();
 
-    let rows = repo.list_legacy_cron_trigger_messages(&conv.id).await.unwrap();
+    let rows = repo
+        .list_legacy_cron_trigger_messages(&conv.user_id, &conv.id)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].r#type, "cron_trigger");
 }
@@ -1086,24 +1121,27 @@ async fn artifact_upsert_list_and_mark_saved() {
 
     let artifact_id = format!("{}:skill_suggest:cron_1", conv.id);
     let inserted = repo
-        .upsert_artifact(&make_artifact(&conv.id, &artifact_id))
+        .upsert_artifact(&conv.user_id, &make_artifact(&conv.id, &artifact_id))
         .await
         .unwrap();
     assert_eq!(inserted.status, "pending");
 
-    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    let listed = repo.list_artifacts(&conv.user_id, &conv.id).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, artifact_id);
 
     let dismissed = repo
-        .update_artifact_status(&conv.id, &artifact_id, "dismissed", 2000)
+        .update_artifact_status(&conv.user_id, &conv.id, &artifact_id, "dismissed", 2000)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(dismissed.status, "dismissed");
     assert_eq!(dismissed.updated_at, 2000);
 
-    let saved = repo.mark_skill_suggest_artifacts_saved("cron_1", 3000).await.unwrap();
+    let saved = repo
+        .mark_skill_suggest_artifacts_saved(&conv.user_id, "cron_1", 3000)
+        .await
+        .unwrap();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].status, "saved");
     assert_eq!(saved[0].updated_at, 3000);
@@ -1116,13 +1154,15 @@ async fn delete_artifacts_by_conversation_removes_rows() {
     repo.create(&conv).await.unwrap();
 
     let artifact_id = format!("{}:skill_suggest:cron_1", conv.id);
-    repo.upsert_artifact(&make_artifact(&conv.id, &artifact_id))
+    repo.upsert_artifact(&conv.user_id, &make_artifact(&conv.id, &artifact_id))
         .await
         .unwrap();
 
-    repo.delete_artifacts_by_conversation(&conv.id).await.unwrap();
+    repo.delete_artifacts_by_conversation(&conv.user_id, &conv.id)
+        .await
+        .unwrap();
 
-    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    let listed = repo.list_artifacts(&conv.user_id, &conv.id).await.unwrap();
     assert!(listed.is_empty());
 }
 

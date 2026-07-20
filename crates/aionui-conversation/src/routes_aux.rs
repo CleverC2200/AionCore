@@ -31,7 +31,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
 
 async fn set_config_option(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path((id, option_id)): Path<(String, String)>,
     body: Result<Json<SetConfigOptionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SetConfigOptionResponse>>, ApiError> {
@@ -39,7 +39,7 @@ async fn set_config_option(
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .set_config_option(&id, &option_id, req)
+            .set_config_option(&user.id, &id, &option_id, req)
             .await
             .map_err(ApiError::from)?,
     )))
@@ -82,14 +82,14 @@ async fn get_slash_commands(
 
 async fn browse_workspace(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<WorkspaceBrowseQuery>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .browse_workspace(&id, query)
+            .browse_workspace(&user.id, &id, query)
             .await
             .map_err(ApiError::from)?,
     )))

@@ -15,6 +15,7 @@ use crate::runtime_persistence::RuntimeWriteKind;
 impl ConversationService {
     async fn clear_conversation_model_seed_after_model_not_found(
         &self,
+        user_id: &str,
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
@@ -28,7 +29,7 @@ impl ConversationService {
             return;
         }
 
-        let row = match self.conversation_repo().get(conversation_id).await {
+        let row = match self.conversation_repo().get(user_id, conversation_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
                 warn!(
@@ -106,7 +107,7 @@ impl ConversationService {
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        if let Err(err) = self.conversation_repo().update(conversation_id, &update).await {
+        if let Err(err) = self.conversation_repo().update(user_id, conversation_id, &update).await {
             warn!(
                 conversation_id,
                 ?previous_model_id,
@@ -202,6 +203,7 @@ impl ConversationService {
 
     pub(crate) async fn evict_acp_task_after_terminal_error(
         &self,
+        user_id: &str,
         conversation_id: &str,
         agent_type: AgentType,
         outcome: &RelayOutcome,
@@ -227,7 +229,7 @@ impl ConversationService {
             .await;
         self.clear_persisted_acp_model_after_model_not_found(conversation_id, error_code)
             .await;
-        self.clear_conversation_model_seed_after_model_not_found(conversation_id, error_code)
+        self.clear_conversation_model_seed_after_model_not_found(user_id, conversation_id, error_code)
             .await;
         info!(
             conversation_id,

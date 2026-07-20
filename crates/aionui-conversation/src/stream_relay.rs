@@ -123,7 +123,8 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter = StreamPersistenceAdapter::new(conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter =
+            StreamPersistenceAdapter::new(user_id.clone(), conversation_id.clone(), msg_id.clone(), repo, None);
         Self {
             conversation_id,
             msg_id,
@@ -2048,7 +2049,8 @@ mod tests {
         repo.set_not_found(true);
         let repo: Arc<dyn IConversationRepository> = repo;
         let bus: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
-        let adapter = StreamPersistenceAdapter::new("deleted-conv".into(), "msg-1".into(), repo, None);
+        let adapter =
+            StreamPersistenceAdapter::new("user-test".into(), "deleted-conv".into(), "msg-1".into(), repo, None);
 
         adapter.complete_conversation(&bus, "turn-1", None).await;
     }
@@ -2252,19 +2254,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
-        async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
+        async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
             Ok(None)
+        }
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, DbError> {
+            Ok(Some("user-1".into()))
         }
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update(&self, _id: &str, _updates: &aionui_db::ConversationRowUpdate) -> Result<(), DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _updates: &aionui_db::ConversationRowUpdate,
+        ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound("Conversation deleted-conv not found".into()));
             }
             Ok(())
         }
-        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
         async fn list_paginated(
@@ -2303,6 +2313,7 @@ mod tests {
         }
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &aionui_db::MessagePageParams,
         ) -> Result<aionui_db::MessagePageResult, DbError> {
@@ -2312,7 +2323,7 @@ mod tests {
                 has_more_after: false,
             })
         }
-        async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+        async fn insert_message(&self, _user_id: &str, row: &MessageRow) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{}'", row.id)));
             }
@@ -2322,7 +2333,7 @@ mod tests {
             self.inserts.lock().unwrap().push(row.clone());
             Ok(())
         }
-        async fn upsert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+        async fn upsert_message(&self, _user_id: &str, row: &MessageRow) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{}'", row.id)));
             }
@@ -2346,18 +2357,25 @@ mod tests {
             }
             Ok(())
         }
-        async fn update_message(&self, id: &str, updates: &aionui_db::MessageRowUpdate) -> Result<(), DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            id: &str,
+            updates: &aionui_db::MessageRowUpdate,
+        ) -> Result<(), DbError> {
             if self.not_found.load(Ordering::Acquire) {
                 return Err(DbError::NotFound(format!("Message '{id}' not found")));
             }
             self.updates.lock().unwrap().push((id.to_owned(), updates.clone()));
             Ok(())
         }
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), DbError> {
+        async fn delete_messages_by_conversation(&self, _user_id: &str, _conv_id: &str) -> Result<(), DbError> {
             Ok(())
         }
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             msg_id: &str,
             msg_type: &str,
