@@ -354,7 +354,7 @@ impl TeamSessionService {
             }
         };
         for team in &teams {
-            if let Err(e) = self.ensure_session_inner(&team.id).await {
+            if let Err(e) = self.ensure_session_inner(&team.id, None).await {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
                 continue;
             }
@@ -432,7 +432,7 @@ impl TeamSessionService {
             "Team created"
         );
 
-        self.broadcast_team_created(&team.id, &team.name);
+        self.broadcast_team_created(user_id, &team.id, &team.name);
 
         self.build_team_response(&team).await
     }
@@ -495,7 +495,7 @@ impl TeamSessionService {
         self.add_agent_locks.remove(team_id);
 
         info!(team_id = %team_id, "Team removed");
-        self.broadcast_team_removed(team_id);
+        self.broadcast_team_removed(user_id, team_id);
         Ok(())
     }
 
@@ -512,7 +512,7 @@ impl TeamSessionService {
                 },
             )
             .await?;
-        self.broadcast_team_renamed(team_id, name);
+        self.broadcast_team_renamed(user_id, team_id, name);
         Ok(())
     }
 
@@ -544,7 +544,7 @@ impl TeamSessionService {
                 .self_ref
                 .upgrade()
                 .ok_or_else(|| TeamError::InvalidRequest("add_agent requires a live TeamSessionService".into()))?;
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_attach_agent_process_bg(
                 service,
                 session,
@@ -563,7 +563,8 @@ impl TeamSessionService {
                 "manual teammate added"
             );
         } else {
-            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_spawned(&agent);
+            TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
+                .broadcast_agent_spawned(&agent);
             info!(
                 team_id = %team_id,
                 slot_id = %agent.slot_id,
@@ -722,7 +723,8 @@ impl TeamSessionService {
                 "manual teammate removed"
             );
         } else {
-            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_removed(slot_id);
+            TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
+                .broadcast_agent_removed(slot_id);
             info!(
                 team_id = %team_id,
                 slot_id = %removed.slot_id,
@@ -808,10 +810,10 @@ impl TeamSessionService {
             .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        self.ensure_session_inner(team_id).await
+        self.ensure_session_inner(team_id, Some(user_id)).await
     }
 
-    async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
+    async fn ensure_session_inner(&self, team_id: &str, requested_user_id: Option<&str>) -> Result<(), TeamError> {
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -822,25 +824,31 @@ impl TeamSessionService {
         let row = match self.repo.get_team_for_restore(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                self.broadcast_session_status(
-                    team_id,
-                    TeamSessionStatus::Failed,
-                    Some(TeamSessionPhase::LoadingTeam),
-                    |p| {
-                        p.error = Some(format!("team not found: {team_id}"));
-                    },
-                );
+                if let Some(user_id) = requested_user_id {
+                    self.broadcast_session_status(
+                        user_id,
+                        team_id,
+                        TeamSessionStatus::Failed,
+                        Some(TeamSessionPhase::LoadingTeam),
+                        |p| {
+                            p.error = Some(format!("team not found: {team_id}"));
+                        },
+                    );
+                }
                 return Err(TeamError::TeamNotFound(team_id.into()));
             }
             Err(e) => {
-                self.broadcast_session_status(
-                    team_id,
-                    TeamSessionStatus::Failed,
-                    Some(TeamSessionPhase::LoadingTeam),
-                    |p| {
-                        p.error = Some(e.to_string());
-                    },
-                );
+                if let Some(user_id) = requested_user_id {
+                    self.broadcast_session_status(
+                        user_id,
+                        team_id,
+                        TeamSessionStatus::Failed,
+                        Some(TeamSessionPhase::LoadingTeam),
+                        |p| {
+                            p.error = Some(e.to_string());
+                        },
+                    );
+                }
                 return Err(e.into());
             }
         };
@@ -877,6 +885,7 @@ impl TeamSessionService {
         }
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::LoadingTeam),
@@ -884,6 +893,7 @@ impl TeamSessionService {
         );
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::StartingBridge),
@@ -908,6 +918,7 @@ impl TeamSessionService {
             Ok(session) => Arc::new(session),
             Err(e) => {
                 self.broadcast_session_status(
+                    &user_id,
                     team_id,
                     TeamSessionStatus::Failed,
                     Some(TeamSessionPhase::StartingBridge),
@@ -920,6 +931,7 @@ impl TeamSessionService {
         };
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::AttachingAgents),
@@ -931,6 +943,7 @@ impl TeamSessionService {
             .await
         {
             self.broadcast_session_status(
+                &user_id,
                 team_id,
                 TeamSessionStatus::Failed,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -953,6 +966,7 @@ impl TeamSessionService {
             session.stop();
             self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
             self.broadcast_session_status(
+                &user_id,
                 team_id,
                 TeamSessionStatus::Failed,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -985,10 +999,11 @@ impl TeamSessionService {
         drop(membership_guard);
 
         for agent in &agents_snapshot {
-            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Ready, None);
+            self.broadcast_agent_runtime_status(&user_id, team_id, agent, TeamAgentRuntimeStatus::Ready, None);
         }
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::Recovering),
@@ -1003,7 +1018,7 @@ impl TeamSessionService {
             );
         }
 
-        self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |p| {
+        self.broadcast_session_status(&user_id, team_id, TeamSessionStatus::Ready, None, |p| {
             p.server_count = Some(agents_snapshot.len());
         });
 
@@ -1039,6 +1054,7 @@ impl TeamSessionService {
             match reservation {
                 ReserveAttach::Start(owner) => {
                     self.broadcast_agent_runtime_status(
+                        session.user_id(),
                         session.team_id(),
                         agent,
                         TeamAgentRuntimeStatus::Pending,
@@ -1143,6 +1159,7 @@ impl TeamSessionService {
                 AttachOutcome::Ready | AttachOutcome::Removed => {}
                 AttachOutcome::Failed(failure) => {
                     self.broadcast_session_status(
+                        user_id,
                         team_id,
                         TeamSessionStatus::Failed,
                         Some(TeamSessionPhase::AttachingAgents),
@@ -1163,7 +1180,7 @@ impl TeamSessionService {
             }
         }
 
-        self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |payload| {
+        self.broadcast_session_status(user_id, team_id, TeamSessionStatus::Ready, None, |payload| {
             payload.server_count = Some(current_agents.len());
         });
         Ok(())
@@ -1223,6 +1240,7 @@ impl TeamSessionService {
 
     fn broadcast_session_status<F>(
         &self,
+        user_id: &str,
         team_id: &str,
         status: TeamSessionStatus,
         phase: Option<TeamSessionPhase>,
@@ -1238,10 +1256,9 @@ impl TeamSessionService {
             error: None,
         };
         customize(&mut payload);
-        let event = WebSocketMessage::new(
-            TEAM_SESSION_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team session status payload"),
-        );
+        let mut value = serde_json::to_value(payload).expect("serialize team session status payload");
+        value["user_id"] = serde_json::Value::String(user_id.to_owned());
+        let event = WebSocketMessage::new(TEAM_SESSION_STATUS_CHANGED_EVENT, value);
         self.broadcaster.broadcast(event);
     }
 
@@ -1257,49 +1274,50 @@ impl TeamSessionService {
         })
     }
 
-    fn broadcast_team_created(&self, team_id: &str, team_name: &str) {
+    fn broadcast_team_created(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_CREATED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_CREATED_EVENT,
-            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
         ));
-        self.broadcast_team_list_changed(team_id, "created");
+        self.broadcast_team_list_changed(user_id, team_id, "created");
     }
 
-    fn broadcast_team_removed(&self, team_id: &str) {
+    fn broadcast_team_removed(&self, user_id: &str, team_id: &str) {
         info!(team_id = %team_id, event_name = TEAM_REMOVED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_REMOVED_EVENT,
-            serde_json::json!({ "team_id": team_id }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id }),
         ));
-        self.broadcast_team_list_changed(team_id, "removed");
+        self.broadcast_team_list_changed(user_id, team_id, "removed");
     }
 
-    fn broadcast_team_renamed(&self, team_id: &str, team_name: &str) {
+    fn broadcast_team_renamed(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_RENAMED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_RENAMED_EVENT,
-            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
         ));
-        self.broadcast_team_list_changed(team_id, "renamed");
+        self.broadcast_team_list_changed(user_id, team_id, "renamed");
     }
 
-    fn broadcast_team_list_changed(&self, team_id: &str, action: &str) {
+    fn broadcast_team_list_changed(&self, user_id: &str, team_id: &str, action: &str) {
         info!(team_id = %team_id, event_name = crate::events::TEAM_LIST_CHANGED_EVENT, action, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             crate::events::TEAM_LIST_CHANGED_EVENT,
-            serde_json::json!({ "team_id": team_id, "action": action }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "action": action }),
         ));
     }
 
     pub(crate) fn broadcast_agent_runtime_status(
         &self,
+        user_id: &str,
         team_id: &str,
         agent: &TeamAgent,
         status: TeamAgentRuntimeStatus,
         error: Option<String>,
     ) {
-        TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone())
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
             .broadcast_agent_runtime_status(agent, status, error);
     }
 
@@ -1368,7 +1386,7 @@ impl TeamSessionService {
             }
 
             let cfg = session.mcp_stdio_config(&agent.slot_id);
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_rebuild_agent_process(
                 &mut jobs,
                 provisioner.clone(),
@@ -1428,6 +1446,7 @@ impl TeamSessionService {
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "unknown rebuild failure".to_owned());
             self.broadcast_agent_runtime_status(
+                user_id,
                 team_id,
                 &failure.agent,
                 TeamAgentRuntimeStatus::Failed,
@@ -1560,7 +1579,13 @@ impl TeamSessionService {
 
     pub(crate) fn publish_member_runtime_ready_if_current(&self, expected: &TeamSession, agent: &TeamAgent) -> bool {
         self.with_published_session(expected, |_| {
-            self.broadcast_agent_runtime_status(expected.team_id(), agent, TeamAgentRuntimeStatus::Ready, None);
+            self.broadcast_agent_runtime_status(
+                expected.user_id(),
+                expected.team_id(),
+                agent,
+                TeamAgentRuntimeStatus::Ready,
+                None,
+            );
         })
         .is_some()
     }
@@ -1568,6 +1593,7 @@ impl TeamSessionService {
     pub(crate) fn publish_member_runtime_starting_if_current(&self, expected: &TeamSession) -> bool {
         self.with_published_session(expected, |_| {
             self.broadcast_session_status(
+                expected.user_id(),
                 expected.team_id(),
                 TeamSessionStatus::Starting,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -1580,6 +1606,7 @@ impl TeamSessionService {
     pub(crate) fn publish_member_runtime_failed_if_current(&self, expected: &TeamSession, reason: &str) -> bool {
         self.with_published_session(expected, |_| {
             self.broadcast_session_status(
+                expected.user_id(),
                 expected.team_id(),
                 TeamSessionStatus::Failed,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -1624,9 +1651,15 @@ impl TeamSessionService {
             self.publish_member_runtime_starting_if_current(expected);
         } else {
             let _ = self.with_published_session(expected, |_| {
-                self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
-                    payload.server_count = Some(team.agents.len());
-                });
+                self.broadcast_session_status(
+                    expected.user_id(),
+                    expected.team_id(),
+                    TeamSessionStatus::Ready,
+                    None,
+                    |payload| {
+                        payload.server_count = Some(team.agents.len());
+                    },
+                );
             });
         }
     }
@@ -1859,7 +1892,15 @@ impl TeamSessionService {
                 "team idle cleanup stopping idle team session"
             );
             info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
-            self.broadcast_session_status(&team_id, TeamSessionStatus::Stopped, None, |_| {});
+            if let Some(entry) = self.sessions.get(&team_id) {
+                self.broadcast_session_status(
+                    entry.session.user_id(),
+                    &team_id,
+                    TeamSessionStatus::Stopped,
+                    None,
+                    |_| {},
+                );
+            }
             self.stop_session_unchecked(&team_id);
             for agent in agents {
                 self.task_manager
@@ -1882,7 +1923,7 @@ impl TeamSessionService {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1902,7 +1943,7 @@ impl TeamSessionService {
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1922,7 +1963,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1942,7 +1983,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1962,7 +2003,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions

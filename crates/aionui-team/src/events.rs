@@ -5,6 +5,8 @@ use aionui_api_types::{
     TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
+use serde::Serialize;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::types::{TeamAgent, TeammateStatus};
@@ -34,16 +36,27 @@ pub const TEAM_CHILD_TURN_CANCELLED_EVENT: &str = "team.childTurnCancelled";
 
 pub struct TeamEventEmitter {
     team_id: String,
+    user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl TeamEventEmitter {
-    pub fn new(team_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
-        Self { team_id, broadcaster }
+    pub fn new(team_id: String, user_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        Self {
+            team_id,
+            user_id,
+            broadcaster,
+        }
     }
 
     pub fn team_id(&self) -> &str {
         &self.team_id
+    }
+
+    fn scoped_payload<T: Serialize>(&self, payload: T) -> Value {
+        let mut value = serde_json::to_value(payload).expect("serialize team event payload");
+        value["user_id"] = Value::String(self.user_id.clone());
+        value
     }
 
     pub fn broadcast_agent_status(&self, slot_id: &str, status: TeammateStatus) {
@@ -52,10 +65,7 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
             status: status.to_string(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize status payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_STATUS_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -64,10 +74,7 @@ impl TeamEventEmitter {
             team_id: self.team_id.clone(),
             assistant: agent.to_response(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_SPAWNED_EVENT,
-            serde_json::to_value(payload).expect("serialize spawned payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_SPAWNED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -76,10 +83,7 @@ impl TeamEventEmitter {
             team_id: self.team_id.clone(),
             slot_id: slot_id.to_owned(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_REMOVED_EVENT,
-            serde_json::to_value(payload).expect("serialize removed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_REMOVED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -89,10 +93,7 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
             name: name.to_owned(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_RENAMED_EVENT,
-            serde_json::to_value(payload).expect("serialize renamed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_RENAMED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -109,10 +110,7 @@ impl TeamEventEmitter {
             status,
             error,
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize agent runtime status payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -131,10 +129,7 @@ impl TeamEventEmitter {
             slot_work_count = payload.slot_work.len(),
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            event_name,
-            serde_json::to_value(payload).expect("serialize team run payload"),
-        );
+        let event = WebSocketMessage::new(event_name, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -150,10 +145,7 @@ impl TeamEventEmitter {
             status = ?payload.status,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            event_name,
-            serde_json::to_value(payload).expect("serialize team child turn payload"),
-        );
+        let event = WebSocketMessage::new(event_name, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 }
@@ -191,7 +183,7 @@ mod tests {
 
     fn make_emitter() -> (TeamEventEmitter, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = TeamEventEmitter::new("team-1".into(), bc.clone());
+        let emitter = TeamEventEmitter::new("team-1".into(), "user-1".into(), bc.clone());
         (emitter, bc)
     }
 
@@ -203,6 +195,7 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.agentStatusChanged");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
