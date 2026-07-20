@@ -1187,7 +1187,8 @@ impl ConversationService {
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
-            self.persist_assistant_preferences_from_snapshot(snapshot).await?;
+            self.persist_assistant_preferences_from_snapshot(user_id, snapshot)
+                .await?;
         }
 
         let mut response = row_to_response(row, &self.workspace_root)?;
@@ -1480,6 +1481,7 @@ impl ConversationService {
 
     async fn persist_assistant_preferences_from_snapshot(
         &self,
+        user_id: &str,
         snapshot: &AssistantSnapshot,
     ) -> Result<(), ConversationError> {
         let Some(preference_repo) = self.assistant_preference_repo() else {
@@ -1487,7 +1489,7 @@ impl ConversationService {
         };
 
         let existing_preference = preference_repo
-            .get(&snapshot.assistant_definition_id)
+            .get_for_user(user_id, &snapshot.assistant_definition_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
         let last_model_id = if snapshot.default_modes.model == "auto" {
@@ -1538,15 +1540,18 @@ impl ConversationService {
         };
 
         preference_repo
-            .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                assistant_definition_id: &snapshot.assistant_definition_id,
-                last_model_id: last_model_id.as_deref(),
-                last_permission_value: last_permission_value.as_deref(),
-                last_thought_level_value: last_thought_level_value.as_deref(),
-                last_skill_ids: &last_skill_ids,
-                last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
-                last_mcp_ids: &last_mcp_ids,
-            })
+            .upsert_for_user(
+                user_id,
+                &aionui_db::UpsertAssistantPreferenceParams {
+                    assistant_definition_id: &snapshot.assistant_definition_id,
+                    last_model_id: last_model_id.as_deref(),
+                    last_permission_value: last_permission_value.as_deref(),
+                    last_thought_level_value: last_thought_level_value.as_deref(),
+                    last_skill_ids: &last_skill_ids,
+                    last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids,
+                    last_mcp_ids: &last_mcp_ids,
+                },
+            )
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
@@ -1706,7 +1711,7 @@ impl ConversationService {
         };
 
         let existing_preference = preference_repo
-            .get(&definition_id)
+            .get_for_user(user_id, &definition_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
@@ -1742,24 +1747,27 @@ impl ConversationService {
         };
 
         preference_repo
-            .upsert(&aionui_db::UpsertAssistantPreferenceParams {
-                assistant_definition_id: &definition_id,
-                last_model_id: last_model_id.as_deref(),
-                last_permission_value: last_permission_value.as_deref(),
-                last_thought_level_value: last_thought_level_value.as_deref(),
-                last_skill_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_skill_ids.as_str())
-                    .unwrap_or("[]"),
-                last_disabled_builtin_skill_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_disabled_builtin_skill_ids.as_str())
-                    .unwrap_or("[]"),
-                last_mcp_ids: existing_preference
-                    .as_ref()
-                    .map(|row| row.last_mcp_ids.as_str())
-                    .unwrap_or("[]"),
-            })
+            .upsert_for_user(
+                user_id,
+                &aionui_db::UpsertAssistantPreferenceParams {
+                    assistant_definition_id: &definition_id,
+                    last_model_id: last_model_id.as_deref(),
+                    last_permission_value: last_permission_value.as_deref(),
+                    last_thought_level_value: last_thought_level_value.as_deref(),
+                    last_skill_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_skill_ids.as_str())
+                        .unwrap_or("[]"),
+                    last_disabled_builtin_skill_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_disabled_builtin_skill_ids.as_str())
+                        .unwrap_or("[]"),
+                    last_mcp_ids: existing_preference
+                        .as_ref()
+                        .map(|row| row.last_mcp_ids.as_str())
+                        .unwrap_or("[]"),
+                },
+            )
             .await
             .map_err(|e| ConversationError::internal(format!("assistant runtime preference upsert failed: {e}")))?;
 

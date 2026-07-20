@@ -1155,6 +1155,8 @@ async fn make_service_with_mock_task_manager_and_assistant_support(
 ) {
     let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr);
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1180,6 +1182,8 @@ async fn make_service_with_assistant_support(
 ) {
     let (svc, broadcaster, repo, _task_mgr) = make_service_with_resolver(skill_resolver);
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1209,6 +1213,8 @@ async fn make_service_with_assistant_support_and_acp_session_repo(
     let (svc, broadcaster, repo, _task_mgr) =
         make_service_with_resolver_and_acp_session_repo(skill_resolver, acp_session_repo.clone());
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1228,6 +1234,22 @@ async fn make_service_with_assistant_support_and_acp_session_repo(
         preference_repo,
         acp_session_repo,
     )
+}
+
+async fn seed_test_user(pool: &sqlx::SqlitePool, user_id: &str) {
+    let now = aionui_common::now_ms();
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (
+            id, user_type, username, password_hash, status, session_generation, created_at, updated_at
+         ) VALUES (?, 'local', ?, 'hash', 'active', 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -3883,15 +3905,18 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_auto",
-            last_model_id: Some("legacy-acp-model"),
-            last_permission_value: Some("legacy-mode"),
-            last_thought_level_value: Some("legacy-low"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_auto",
+                last_model_id: Some("legacy-acp-model"),
+                last_permission_value: Some("legacy-mode"),
+                last_thought_level_value: Some("legacy-low"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -3913,7 +3938,11 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .unwrap();
     assert_eq!(result.confirmation, ConfigOptionConfirmation::Observed);
 
-    let pref_after_model = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_model = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_model.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_model.last_permission_value.as_deref(), Some("legacy-mode"));
     let snapshot_after_model = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
@@ -3929,7 +3958,11 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     )
     .await
     .unwrap();
-    let pref_after_mode = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_mode = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_mode.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_mode.last_permission_value.as_deref(), Some("plan"));
     let snapshot_after_mode = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
@@ -3947,7 +3980,11 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     )
     .await
     .unwrap();
-    let pref_after_thought = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_thought = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_thought.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_thought.last_permission_value.as_deref(), Some("plan"));
     assert_eq!(pref_after_thought.last_thought_level_value.as_deref(), Some("high"));
@@ -3984,15 +4021,18 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_auto",
-            last_model_id: Some("original-model"),
-            last_permission_value: Some("original-mode"),
-            last_thought_level_value: Some("original-low"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_auto",
+                last_model_id: Some("original-model"),
+                last_permission_value: Some("original-mode"),
+                last_thought_level_value: Some("original-low"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4020,7 +4060,11 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         .await;
     assert!(result.is_err(), "conflict from agent must surface as error");
 
-    let pref_after = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         pref_after.last_model_id.as_deref(),
         Some("original-model"),
@@ -4055,15 +4099,18 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_fixed",
-            last_model_id: Some("legacy-fixed-model"),
-            last_permission_value: Some("legacy-fixed-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_fixed",
+                last_model_id: Some("legacy-fixed-model"),
+                last_permission_value: Some("legacy-fixed-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4102,7 +4149,11 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await
     .unwrap();
 
-    let pref = preference_repo.get("asstdef_acp_fixed").await.unwrap().unwrap();
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
     assert_eq!(pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
     assert_eq!(pref.last_thought_level_value.as_deref(), None);
@@ -4140,15 +4191,18 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_ack",
-            last_model_id: Some("legacy-ack-model"),
-            last_permission_value: Some("legacy-ack-mode"),
-            last_thought_level_value: Some("legacy-ack-thought"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_ack",
+                last_model_id: Some("legacy-ack-model"),
+                last_permission_value: Some("legacy-ack-mode"),
+                last_thought_level_value: Some("legacy-ack-thought"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4172,7 +4226,11 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
     .await
     .unwrap();
 
-    let pref = preference_repo.get("asstdef_acp_ack").await.unwrap().unwrap();
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_ack")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref.last_model_id.as_deref(), Some("legacy-ack-model"));
     assert_eq!(pref.last_permission_value.as_deref(), Some("legacy-ack-mode"));
     let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
@@ -4205,15 +4263,18 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_aionrs_auto",
-            last_model_id: Some("legacy-aionrs-model"),
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_aionrs_auto",
+                last_model_id: Some("legacy-aionrs-model"),
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4242,7 +4303,11 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         updated.model.as_ref().and_then(|model| model.use_model.as_deref()),
         Some("model-z")
     );
-    let auto_pref = preference_repo.get("asstdef_aionrs_auto").await.unwrap().unwrap();
+    let auto_pref = preference_repo
+        .get_for_user("user_1", "asstdef_aionrs_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-z"));
     let auto_snapshot = repo
         .get_assistant_snapshot("user_1", &auto_conv.id)
@@ -4271,15 +4336,18 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_aionrs_fixed",
-            last_model_id: Some("legacy-aionrs-fixed-model"),
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_aionrs_fixed",
+                last_model_id: Some("legacy-aionrs-fixed-model"),
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4304,7 +4372,11 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
 
-    let fixed_pref = preference_repo.get("asstdef_aionrs_fixed").await.unwrap().unwrap();
+    let fixed_pref = preference_repo
+        .get_for_user("user_1", "asstdef_aionrs_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-aionrs-fixed-model"));
     let fixed_snapshot = repo
         .get_assistant_snapshot("user_1", &fixed_conv.id)
@@ -6365,25 +6437,31 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_1",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("codex"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_1",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("codex"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_1",
-            last_model_id: Some("old-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("high"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_1",
+                last_model_id: Some("old-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("high"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -6439,7 +6517,11 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(snapshot.default_skills_mode, "auto");
     assert_eq!(snapshot.resolved_skill_ids, r#"["pdf"]"#);
 
-    let updated_pref = preference_repo.get("asstdef_preset_1").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
     assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
@@ -6492,46 +6574,52 @@ async fn existing_conversation_reads_current_assistant_identity() {
     let workspace = ensure_test_workspace_path();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_live_identity",
-            assistant_id: "live-identity",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("live-identity"),
-            name: "Old Name",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "emoji",
-            avatar_value: Some("🤖"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_live_identity",
+                assistant_id: "live-identity",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("live-identity"),
+                name: "Old Name",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "emoji",
+                avatar_value: Some("🤖"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_live_identity",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_live_identity",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -6548,36 +6636,39 @@ async fn existing_conversation_reads_current_assistant_identity() {
     let created = svc.create("user-1", req).await.unwrap();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_live_identity",
-            assistant_id: "live-identity",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("live-identity"),
-            name: "New Name",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "emoji",
-            avatar_value: Some("🧪"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_live_identity",
+                assistant_id: "live-identity",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("live-identity"),
+                name: "New Name",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "emoji",
+                avatar_value: Some("🧪"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -6619,46 +6710,52 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
     let workspace = ensure_test_workspace_path();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_data_avatar",
-            assistant_id: "custom-data-avatar",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("custom-data-avatar"),
-            name: "Data Avatar",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "user_asset",
-            avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_data_avatar",
+                assistant_id: "custom-data-avatar",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("custom-data-avatar"),
+                name: "Data Avatar",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "user_asset",
+                avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_data_avatar",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_data_avatar",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -6810,25 +6907,31 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_legacy_seed",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("codex"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_legacy_seed",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("codex"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_legacy_seed",
-            last_model_id: Some("preferred-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("medium"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_legacy_seed",
+                last_model_id: Some("preferred-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("medium"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -6883,13 +6986,16 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
     )
     .await;
     overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_snapshot_identity",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_snapshot_identity",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -6971,25 +7077,31 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_fixed",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("codex"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_fixed",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("codex"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_fixed",
-            last_model_id: Some("legacy-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("legacy-thought"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_fixed",
+                last_model_id: Some("legacy-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("legacy-thought"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -7015,7 +7127,11 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
     .unwrap();
     let _resp = svc.create("user-1", req).await.unwrap();
 
-    let updated_pref = preference_repo.get("asstdef_preset_fixed").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_permission_value.as_deref(), Some("workspace-read"));
     assert_eq!(updated_pref.last_skill_ids, r#"["legacy-skill"]"#);
@@ -7069,25 +7185,31 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_auto",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("codex"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_auto",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("codex"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_auto",
-            last_model_id: None,
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_auto",
+                last_model_id: None,
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -7110,7 +7232,11 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
     assert!(resp.extra.get("permission_mode").is_none());
     assert!(resp.extra.get("assistant_snapshot").is_none());
 
-    let updated_pref = preference_repo.get("asstdef_preset_auto").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id, None);
     assert_eq!(updated_pref.last_permission_value, None);
     assert_eq!(updated_pref.last_mcp_ids, "[]");
