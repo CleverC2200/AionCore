@@ -173,7 +173,11 @@ impl StubConvRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for StubConvRepo {
-    async fn get(&self, id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+    async fn get(
+        &self,
+        _user_id: &str,
+        id: &str,
+    ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
 
         if let Some(existing) = rows.get(id) {
@@ -481,8 +485,19 @@ impl IConversationRepository for StubConvRepo {
         Ok(Some(row))
     }
 
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, aionui_db::DbError> {
+        if let Some(existing) = self.rows.lock().unwrap().get(id) {
+            return Ok(Some(existing.user_id.clone()));
+        }
+        if id.starts_with("missing") {
+            return Ok(None);
+        }
+        Ok(Some("u1".into()))
+    }
+
     async fn get_assistant_snapshot(
         &self,
+        _user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
         Ok(self.assistant_snapshots.lock().unwrap().get(conversation_id).cloned())
@@ -490,6 +505,7 @@ impl IConversationRepository for StubConvRepo {
 
     async fn upsert_assistant_snapshot(
         &self,
+        _user_id: &str,
         params: &UpsertConversationAssistantSnapshotParams<'_>,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
         let now = now_ms();
@@ -525,7 +541,12 @@ impl IConversationRepository for StubConvRepo {
         self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
         Ok(())
     }
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+    async fn update(
+        &self,
+        _user_id: &str,
+        id: &str,
+        updates: &ConversationRowUpdate,
+    ) -> Result<(), aionui_db::DbError> {
         if self.update_failures.lock().unwrap().iter().any(|item| item == id) {
             return Err(aionui_db::DbError::Init(format!("forced update failure for {id}")));
         }
@@ -556,7 +577,7 @@ impl IConversationRepository for StubConvRepo {
         }
         Ok(())
     }
-    async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+    async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
         Ok(())
     }
     async fn list_paginated(
@@ -609,6 +630,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn list_messages_page(
         &self,
+        _user_id: &str,
         _conv_id: &str,
         _params: &MessagePageParams,
     ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -618,18 +640,29 @@ impl IConversationRepository for StubConvRepo {
             has_more_after: false,
         })
     }
-    async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+    async fn insert_message(
+        &self,
+        _user_id: &str,
+        message: &aionui_db::models::MessageRow,
+    ) -> Result<(), aionui_db::DbError> {
         self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
-    async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+    async fn update_message(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _id: &str,
+        _updates: &MessageRowUpdate,
+    ) -> Result<(), aionui_db::DbError> {
         Ok(())
     }
-    async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+    async fn delete_messages_by_conversation(&self, _user_id: &str, _conv_id: &str) -> Result<(), aionui_db::DbError> {
         Ok(())
     }
     async fn get_message_by_msg_id(
         &self,
+        _user_id: &str,
         _conv_id: &str,
         _msg_id: &str,
         _msg_type: &str,
@@ -651,6 +684,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn list_artifacts(
         &self,
+        _user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
         Ok(self
@@ -664,6 +698,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn get_artifact(
         &self,
+        _user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
     ) -> Result<Option<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
@@ -677,6 +712,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn upsert_artifact(
         &self,
+        _user_id: &str,
         artifact: &aionui_db::ConversationArtifactRow,
     ) -> Result<aionui_db::ConversationArtifactRow, aionui_db::DbError> {
         self.upsert_artifact_row(artifact.clone());
@@ -684,6 +720,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn update_artifact_status(
         &self,
+        _user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
         status: &str,
@@ -702,6 +739,7 @@ impl IConversationRepository for StubConvRepo {
     }
     async fn mark_skill_suggest_artifacts_saved(
         &self,
+        _user_id: &str,
         cron_job_id: &str,
         updated_at: TimestampMs,
     ) -> Result<Vec<aionui_db::ConversationArtifactRow>, aionui_db::DbError> {
@@ -1432,7 +1470,7 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
 
     let job = svc.add_job(req).await.unwrap();
 
-    let bound = conv_repo.get("conv_existing_bind").await.unwrap().unwrap();
+    let bound = conv_repo.get("u1", "conv_existing_bind").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
     assert_eq!(extra["cron_job_id"], job.id);
     assert_eq!(extra["cronJobId"], job.id);
@@ -1559,7 +1597,7 @@ async fn update_existing_job_to_new_conversation_removes_previous_conversation_b
     create_req.execution_mode = Some("existing".into());
     let created = svc.add_job(create_req).await.unwrap();
 
-    let bound_before = conv_repo.get("conv_mode_switch").await.unwrap().unwrap();
+    let bound_before = conv_repo.get("u1", "conv_mode_switch").await.unwrap().unwrap();
     let extra_before: serde_json::Value = serde_json::from_str(&bound_before.extra).unwrap();
     assert_eq!(extra_before["cron_job_id"], created.id);
     assert_eq!(extra_before["cronJobId"], created.id);
@@ -1589,7 +1627,7 @@ async fn update_existing_job_to_new_conversation_removes_previous_conversation_b
     assert_eq!(row.conversation_id, "");
     assert!(row.conversation_title.is_none());
 
-    let bound_after = conv_repo.get("conv_mode_switch").await.unwrap().unwrap();
+    let bound_after = conv_repo.get("u1", "conv_mode_switch").await.unwrap().unwrap();
     let extra_after: serde_json::Value = serde_json::from_str(&bound_after.extra).unwrap();
     assert!(extra_after.get("cron_job_id").is_none());
     assert!(extra_after.get("cronJobId").is_none());
@@ -1623,7 +1661,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
     create_req.agent_config.as_mut().unwrap().workspace = Some(auto_workspace);
     let created = svc.add_job(create_req).await.unwrap();
 
-    let bound_conversation = conv_repo.get(&conversation_id).await.unwrap().unwrap();
+    let bound_conversation = conv_repo.get("u1", &conversation_id).await.unwrap().unwrap();
     assert!(
         conv_service
             .auto_workspace_to_delete_for_row(&bound_conversation, &conversation_id)
@@ -2233,7 +2271,7 @@ async fn existing_job_with_missing_conversation_run_now_creates_replacement_conv
 
     assert_ne!(response.conversation_id, "missing-conv-run-now");
     assert!(
-        conv_repo.get(&response.conversation_id).await.unwrap().is_some(),
+        conv_repo.get("u1", &response.conversation_id).await.unwrap().is_some(),
         "run-now should create a replacement conversation for an existing job whose previous conversation was deleted"
     );
 
@@ -2328,7 +2366,7 @@ async fn create_for_conversation_helper_creates_claimed_conversation_job_with_mu
     assert_eq!(row.conversation_id, "conv_1");
     assert_eq!(row.created_by, "agent");
 
-    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
+    let bound = conv_repo.get("u1", "conv_1").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
     assert_eq!(extra["cron_job_id"], response.job_id);
     assert_eq!(extra["cronJobId"], response.job_id);
@@ -2359,7 +2397,7 @@ async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged(
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.mode.as_deref(), Some("yolo"));
 
-    let bound = conv_repo.get("conv_mode_default").await.unwrap().unwrap();
+    let bound = conv_repo.get("u1", "conv_mode_default").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
     assert_eq!(extra["cron_job_id"], response.job_id);
     assert_eq!(extra["cronJobId"], response.job_id);
@@ -2713,6 +2751,7 @@ async fn update_for_conversation_helper_updates_claimed_conversation_job() {
 
     conv_repo
         .update(
+            "u1",
             "conv_1",
             &ConversationRowUpdate {
                 extra: Some("{}".into()),
@@ -2737,7 +2776,7 @@ async fn update_for_conversation_helper_updates_claimed_conversation_job() {
     .await
     .unwrap();
 
-    let bound = conv_repo.get("conv_1").await.unwrap().unwrap();
+    let bound = conv_repo.get("u1", "conv_1").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
     assert_eq!(extra["cron_job_id"], created.job_id);
     assert_eq!(extra["cronJobId"], created.job_id);
@@ -2758,6 +2797,7 @@ async fn update_for_conversation_helper_fails_when_conversation_binding_fails() 
 
     conv_repo
         .update(
+            "u1",
             "conv_1",
             &ConversationRowUpdate {
                 extra: Some("{}".into()),
@@ -3068,7 +3108,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
     let job = svc.add_job(req).await.unwrap();
     bc.take_events();
 
-    let bound_conversation = conv_repo.get(&conversation_id).await.unwrap().unwrap();
+    let bound_conversation = conv_repo.get("u1", &conversation_id).await.unwrap().unwrap();
     assert!(
         conv_service
             .auto_workspace_to_delete_for_row(&bound_conversation, &conversation_id)

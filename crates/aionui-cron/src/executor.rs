@@ -50,6 +50,7 @@ pub(crate) enum PreparedRunNow {
 }
 
 struct SkillSuggestContext {
+    user_id: String,
     conversation_id: String,
     job_id: String,
     workspace: String,
@@ -212,7 +213,7 @@ impl JobExecutor {
     pub async fn conversation_exists(&self, conversation_id: &str) -> Result<bool, CronError> {
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .owner_user_id(conversation_id)
             .await
             .map_err(CronError::Database)?;
         Ok(row.is_some())
@@ -226,8 +227,16 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, CronError> {
+        let Some(user_id) = self
+            .conversation_repo
+            .owner_user_id(conversation_id)
+            .await
+            .map_err(CronError::Database)?
+        else {
+            return Ok(None);
+        };
         self.conversation_repo
-            .get(conversation_id)
+            .get(&user_id, conversation_id)
             .await
             .map_err(CronError::Database)
     }
@@ -248,8 +257,16 @@ impl JobExecutor {
         &self,
         conversation_id: &str,
     ) -> Result<Option<aionui_db::models::ConversationAssistantSnapshotRow>, CronError> {
+        let Some(user_id) = self
+            .conversation_repo
+            .owner_user_id(conversation_id)
+            .await
+            .map_err(CronError::Database)?
+        else {
+            return Ok(None);
+        };
         self.conversation_repo
-            .get_assistant_snapshot(conversation_id)
+            .get_assistant_snapshot(&user_id, conversation_id)
             .await
             .map_err(CronError::Database)
     }
@@ -298,8 +315,9 @@ impl JobExecutor {
             created_at: aionui_common::now_ms(),
         };
 
+        let user_id = self.resolve_target_conversation_user_id(conversation_id).await?;
         self.conversation_repo
-            .insert_message(&row)
+            .insert_message(&user_id, &row)
             .await
             .map_err(CronError::Database)
     }
@@ -348,7 +366,7 @@ impl JobExecutor {
                 ..Default::default()
             };
             self.conversation_repo
-                .update(conversation_id, &update)
+                .update(&row.user_id, conversation_id, &update)
                 .await
                 .map_err(CronError::Database)?;
         }
@@ -395,7 +413,7 @@ impl JobExecutor {
             ..Default::default()
         };
         self.conversation_repo
-            .update(conversation_id, &update)
+            .update(&row.user_id, conversation_id, &update)
             .await
             .map_err(CronError::Database)
     }
@@ -428,7 +446,7 @@ impl JobExecutor {
             };
             return self
                 .conversation_repo
-                .update(conversation_id, &update)
+                .update(&row.user_id, conversation_id, &update)
                 .await
                 .map_err(CronError::Database);
         };
@@ -454,7 +472,7 @@ impl JobExecutor {
             ..Default::default()
         };
         self.conversation_repo
-            .update(conversation_id, &update)
+            .update(&row.user_id, conversation_id, &update)
             .await
             .map_err(CronError::Database)
     }
@@ -595,10 +613,14 @@ impl JobExecutor {
 
     async fn resolve_conversation_owner_user_id(&self, job: &CronJob) -> Result<String, CronError> {
         if !job.conversation_id.trim().is_empty()
-            && let Some(row) = self.get_conversation_row(&job.conversation_id).await?
-            && !row.user_id.trim().is_empty()
+            && let Some(user_id) = self
+                .conversation_repo
+                .owner_user_id(&job.conversation_id)
+                .await
+                .map_err(CronError::Database)?
+            && !user_id.trim().is_empty()
         {
-            return Ok(row.user_id);
+            return Ok(user_id);
         }
 
         Ok(SYSTEM_DEFAULT_USER_ID.to_owned())
@@ -653,16 +675,18 @@ impl JobExecutor {
 
         let on_started = {
             let job = job.clone();
+            let user_id = user_id.clone();
             let conversation_repo = Arc::clone(&self.conversation_repo);
             let broadcaster = Arc::clone(&self.broadcaster);
             Some(Arc::new(move |started: ConversationAgentTurnStarted| {
                 let job = job.clone();
+                let user_id = user_id.clone();
                 let conversation_repo = Arc::clone(&conversation_repo);
                 let broadcaster = Arc::clone(&broadcaster);
                 let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(async move {
                     let created_at = now_ms();
                     let row = build_cron_trigger_artifact(&started.conversation_id, &job, created_at);
-                    match conversation_repo.upsert_artifact(&row).await {
+                    match conversation_repo.upsert_artifact(&user_id, &row).await {
                         Ok(row) => {
                             if let Err(e) = broadcast_artifact(&broadcaster, &row) {
                                 warn!(
@@ -688,7 +712,7 @@ impl JobExecutor {
         };
 
         let turn_req = ConversationAgentTurnRequest {
-            user_id,
+            user_id: user_id.clone(),
             conversation_id: conversation_id.to_owned(),
             content: prompt,
             files: vec![],
@@ -703,7 +727,9 @@ impl JobExecutor {
             Ok(outcome) => {
                 if outcome.status == ConversationAgentTurnStatus::Failed {
                     return ExecutionResult::Error {
-                        message: self.conversation_turn_failed_message(conversation_id, outcome).await,
+                        message: self
+                            .conversation_turn_failed_message(&user_id, conversation_id, outcome)
+                            .await,
                     };
                 }
                 if saved_skill.is_none() && matches!(job.execution_mode, ExecutionMode::NewConversation) {
@@ -720,6 +746,7 @@ impl JobExecutor {
                             String::new()
                         });
                     self.schedule_skill_suggest_check(SkillSuggestContext {
+                        user_id: user_id.clone(),
                         conversation_id: conversation_id.to_owned(),
                         job_id: job.id.clone(),
                         workspace,
@@ -757,6 +784,7 @@ impl JobExecutor {
 
     async fn conversation_turn_failed_message(
         &self,
+        user_id: &str,
         conversation_id: &str,
         outcome: ConversationAgentTurnOutcome,
     ) -> String {
@@ -771,7 +799,7 @@ impl JobExecutor {
 
         match self
             .conversation_service
-            .latest_conversation_error_message(conversation_id)
+            .latest_conversation_error_message(user_id, conversation_id)
             .await
         {
             Ok(Some(message)) => message,
@@ -811,7 +839,7 @@ impl JobExecutor {
     pub async fn mark_skill_suggest_artifacts_saved(&self, job_id: &str) -> Result<(), CronError> {
         let rows = self
             .conversation_repo
-            .mark_skill_suggest_artifacts_saved(job_id, now_ms())
+            .mark_skill_suggest_artifacts_saved(SYSTEM_DEFAULT_USER_ID, job_id, now_ms())
             .await
             .map_err(CronError::Database)?;
 
@@ -849,7 +877,7 @@ impl JobExecutor {
 
     fn schedule_skill_suggest_check(&self, ctx: SkillSuggestContext) {
         self.skill_suggest_detector
-            .schedule_check(ctx.conversation_id, ctx.job_id, ctx.workspace);
+            .schedule_check(ctx.user_id, ctx.conversation_id, ctx.job_id, ctx.workspace);
     }
 
     async fn prepare_saved_skill(&self, job: &CronJob) -> Result<Option<SavedSkillContext>, CronError> {
@@ -907,7 +935,10 @@ impl JobExecutor {
     async fn load_conversation_skill_names(&self, conversation_id: &str) -> Result<Vec<String>, CronError> {
         let Some(row) = self
             .conversation_repo
-            .get(conversation_id)
+            .get(
+                &self.resolve_target_conversation_user_id(conversation_id).await?,
+                conversation_id,
+            )
             .await
             .map_err(CronError::Database)?
         else {
@@ -2360,16 +2391,28 @@ mod tests {
 
         #[async_trait::async_trait]
         impl IConversationRepository for StubConvRepo {
-            async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+            async fn get(
+                &self,
+                _user_id: &str,
+                _id: &str,
+            ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+                Ok(None)
+            }
+            async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
                 Ok(None)
             }
             async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn update(&self, _id: &str, _updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+            async fn update(
+                &self,
+                _user_id: &str,
+                _id: &str,
+                _updates: &ConversationRowUpdate,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
             async fn list_paginated(
@@ -2408,6 +2451,7 @@ mod tests {
             }
             async fn list_messages_page(
                 &self,
+                _user_id: &str,
                 _conv_id: &str,
                 _params: &MessagePageParams,
             ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -2417,17 +2461,32 @@ mod tests {
                     has_more_after: false,
                 })
             }
-            async fn insert_message(&self, _message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+            async fn insert_message(
+                &self,
+                _user_id: &str,
+                _message: &aionui_db::models::MessageRow,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+            async fn update_message(
+                &self,
+                _user_id: &str,
+                _conversation_id: &str,
+                _id: &str,
+                _updates: &MessageRowUpdate,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
-            async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+            async fn delete_messages_by_conversation(
+                &self,
+                _user_id: &str,
+                _conv_id: &str,
+            ) -> Result<(), aionui_db::DbError> {
                 Ok(())
             }
             async fn get_message_by_msg_id(
                 &self,
+                _user_id: &str,
                 _conv_id: &str,
                 _msg_id: &str,
                 _msg_type: &str,
@@ -2797,7 +2856,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for ExistingConversationRepo {
-        async fn get(&self, id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+        async fn get(
+            &self,
+            _user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::ConversationRow {
                 id: id.to_owned(),
                 user_id: "cron".into(),
@@ -2818,15 +2881,24 @@ mod tests {
             }))
         }
 
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
+            Ok(Some("cron".into()))
+        }
+
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update(&self, _id: &str, _updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
@@ -2870,6 +2942,7 @@ mod tests {
 
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &MessagePageParams,
         ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -2880,20 +2953,35 @@ mod tests {
             })
         }
 
-        async fn insert_message(&self, _message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+        async fn insert_message(
+            &self,
+            _user_id: &str,
+            _message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete_messages_by_conversation(
+            &self,
+            _user_id: &str,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _msg_id: &str,
             _msg_type: &str,
@@ -3001,20 +3089,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for MissingWorkspaceConversationRepo {
-        async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
+        async fn get(
+            &self,
+            _user_id: &str,
+            _id: &str,
+        ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
             Ok(Some(self.row.clone()))
+        }
+
+        async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
+            Ok(Some(self.row.user_id.clone()))
         }
 
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn update(&self, _id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            updates: &ConversationRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             self.updates.lock().unwrap().push(updates.clone());
             Ok(())
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
@@ -3058,6 +3159,7 @@ mod tests {
 
         async fn list_messages_page(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _params: &MessagePageParams,
         ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -3068,7 +3170,11 @@ mod tests {
             })
         }
 
-        async fn insert_message(&self, message: &aionui_db::models::MessageRow) -> Result<(), aionui_db::DbError> {
+        async fn insert_message(
+            &self,
+            _user_id: &str,
+            message: &aionui_db::models::MessageRow,
+        ) -> Result<(), aionui_db::DbError> {
             self.operations.lock().unwrap().push(format!(
                 "insert_message:{}:{}",
                 message.position.as_deref().unwrap_or("none"),
@@ -3078,16 +3184,27 @@ mod tests {
             Ok(())
         }
 
-        async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+        async fn update_message(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _id: &str,
+            _updates: &MessageRowUpdate,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
-        async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete_messages_by_conversation(
+            &self,
+            _user_id: &str,
+            _conv_id: &str,
+        ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
 
         async fn get_message_by_msg_id(
             &self,
+            _user_id: &str,
             _conv_id: &str,
             _msg_id: &str,
             _msg_type: &str,
@@ -3111,6 +3228,7 @@ mod tests {
 
         async fn upsert_artifact(
             &self,
+            _user_id: &str,
             artifact: &ConversationArtifactRow,
         ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
             self.operations
