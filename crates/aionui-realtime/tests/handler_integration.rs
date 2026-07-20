@@ -37,6 +37,7 @@ fn default_state() -> (WsHandlerState, Arc<WebSocketManager>) {
         manager: manager.clone(),
         router: Arc::new(NoopMessageRouter),
         token_validator: Arc::new(|t| t == "valid-token"),
+        token_user_resolver: Arc::new(|t| (t == "valid-token").then(|| "test-user".to_owned())),
         token_extractor: Arc::new(|headers| {
             headers
                 .get("authorization")
@@ -396,6 +397,7 @@ async fn unknown_message_routed_to_message_router() {
         manager: manager.clone(),
         router: router.clone(),
         token_validator: Arc::new(|t| t == "valid-token"),
+        token_user_resolver: Arc::new(|t| (t == "valid-token").then(|| "test-user".to_owned())),
         token_extractor: Arc::new(|headers| {
             headers
                 .get("authorization")

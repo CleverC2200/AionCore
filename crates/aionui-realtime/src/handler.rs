@@ -20,12 +20,16 @@ use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocket
 /// so that `aionui-realtime` does not depend on `aionui-auth` directly.
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
+/// Resolves a verified JWT token to the internal user ID carried by it.
+pub type TokenUserResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
 pub struct WsHandlerState {
     pub manager: Arc<WebSocketManager>,
     pub router: Arc<dyn MessageRouter>,
     pub token_validator: TokenValidator,
+    pub token_user_resolver: TokenUserResolver,
     pub token_extractor: TokenExtractor,
 }
 
@@ -75,10 +79,15 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         return;
     }
 
-    let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client(token, tx);
+    let Some(user_id) = (state.token_user_resolver)(&token) else {
+        send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
+        return;
+    };
 
-    info!(%conn_id, "websocket connection established");
+    let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
+    let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
+
+    info!(%conn_id, user_id = %user_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
@@ -88,7 +97,7 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
     state.manager.remove_client(conn_id);
-    info!(%conn_id, "websocket connection closed");
+    info!(%conn_id, user_id = %user_id, "websocket connection closed");
 }
 
 /// Send a realtime boundary error event, then close with 1008.
@@ -260,6 +269,7 @@ mod tests {
             manager,
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Some("system_default_user".into())),
             token_extractor: Arc::new(|_| None),
         }
     }
@@ -505,6 +515,7 @@ mod tests {
             manager,
             router: router.clone(),
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Some("system_default_user".into())),
             token_extractor: Arc::new(|_| None),
         };
 

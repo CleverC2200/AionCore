@@ -859,12 +859,16 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
             manager: services.ws_manager.clone(),
             router: Arc::new(NoopMessageRouter),
             token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Some("system_default_user".to_owned())),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }
 
     let jwt_service = services.jwt_service.clone();
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let jwt_service = services.jwt_service.clone();
+    let token_user_resolver =
+        Arc::new(move |token: &str| jwt_service.verify(token).ok().map(|payload| payload.user_id));
 
     let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
 
@@ -872,6 +876,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
         manager: services.ws_manager.clone(),
         router: Arc::new(NoopMessageRouter),
         token_validator,
+        token_user_resolver,
         token_extractor,
     }
 }

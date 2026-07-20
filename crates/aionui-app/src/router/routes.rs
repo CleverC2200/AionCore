@@ -70,7 +70,16 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let ws_manager = services.ws_manager.clone();
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
-            ws_manager.broadcast_all(event);
+            if let Some(user_id) = event
+                .data
+                .get("user_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            {
+                ws_manager.broadcast_to_user(&user_id, event);
+            } else {
+                ws_manager.broadcast_all(event);
+            }
         }
     });
 

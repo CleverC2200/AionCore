@@ -35,8 +35,14 @@ impl WebSocketManager {
 
     /// Register a new client connection and return its assigned ID.
     pub fn add_client(&self, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        self.add_client_for_user("system_default_user".to_owned(), token, tx)
+    }
+
+    /// Register a new authenticated client connection for an internal user ID.
+    pub fn add_client_for_user(&self, user_id: String, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
+            user_id,
             token,
             last_ping: Instant::now(),
             tx,
@@ -65,6 +71,14 @@ impl WebSocketManager {
         self.connections.len()
     }
 
+    /// Returns the number of active connections authenticated as `user_id`.
+    pub fn client_count_for_user(&self, user_id: &str) -> usize {
+        self.connections
+            .iter()
+            .filter(|entry| entry.value().user_id == user_id)
+            .count()
+    }
+
     /// Send a message to all connected clients.
     ///
     /// Uses `try_send` for backpressure. A saturated channel cannot reliably
@@ -90,6 +104,45 @@ impl WebSocketManager {
                         %conn_id,
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, broadcast message dropped"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    disconnected.push(conn_id);
+                }
+            }
+        }
+
+        for conn_id in disconnected {
+            self.remove_client(conn_id);
+        }
+    }
+
+    /// Send a message to all connections authenticated as `user_id`.
+    pub fn broadcast_to_user(&self, user_id: &str, msg: WebSocketMessage<serde_json::Value>) {
+        let text = match serde_json::to_string(&msg) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(user_id = %user_id, error = %e, "failed to serialize user broadcast message");
+                return;
+            }
+        };
+
+        let mut disconnected = Vec::new();
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+
+            match client.tx.try_send(WsOutbound::Text(text.clone())) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id = %user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user broadcast message dropped"
                     );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -367,6 +420,28 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_to_user_delivers_only_matching_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = new_client_tx();
+        let (tx2, mut rx2) = new_client_tx();
+        let (tx3, mut rx3) = new_client_tx();
+
+        mgr.add_client_for_user("user-a".into(), "t1".into(), tx1);
+        mgr.add_client_for_user("user-b".into(), "t2".into(), tx2);
+        mgr.add_client_for_user("user-a".into(), "t3".into(), tx3);
+
+        assert_eq!(mgr.client_count_for_user("user-a"), 2);
+        assert_eq!(mgr.client_count_for_user("user-b"), 1);
+
+        let event = WebSocketMessage::new("scoped-event", json!({"user_id": "user-a"}));
+        mgr.broadcast_to_user("user-a", event);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_err());
+        assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
     fn broadcast_all_removes_closed_channels() {
         let mgr = WebSocketManager::new();
         let (tx1, rx1) = new_client_tx();
@@ -442,6 +517,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "valid".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -476,6 +552,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "valid".into(),
                 last_ping: old_ping,
                 tx,
@@ -507,6 +584,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -540,6 +618,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
@@ -563,6 +642,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "expired".into(),
                 last_ping: old_ping,
                 tx,
@@ -596,6 +676,7 @@ mod tests {
         connections.insert(
             ConnectionId(1),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "good".into(),
                 last_ping: Instant::now(),
                 tx: tx1,
@@ -607,6 +688,7 @@ mod tests {
         connections.insert(
             ConnectionId(2),
             ClientInfo {
+                user_id: "user-a".into(),
                 token: "good".into(),
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,

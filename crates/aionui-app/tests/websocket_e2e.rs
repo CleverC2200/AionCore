@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_app::{AppConfig, AppServices, create_router};
-use aionui_realtime::WebSocketManager;
+use aionui_realtime::{EventBroadcaster, WebSocketManager};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -347,6 +347,33 @@ async fn t4_1_broadcast_reaches_all_clients() {
 
     assert_eq!(msg1["name"], "test-broadcast");
     assert_eq!(msg2["name"], "test-broadcast");
+}
+
+#[tokio::test]
+async fn t4_1_scoped_event_reaches_only_matching_user() {
+    let app = start_app().await;
+    let token_a = sign_token(&app, "user-a");
+    let token_b = sign_token(&app, "user-b");
+
+    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(ws_manager(&app).client_count(), 2);
+    assert_eq!(ws_manager(&app).client_count_for_user("user-a"), 1);
+    assert_eq!(ws_manager(&app).client_count_for_user("user-b"), 1);
+
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "scoped-broadcast",
+        json!({"user_id": "user-a", "seq": 1}),
+    ));
+
+    let msg_a = read_text(&mut rx_a).await;
+    assert_eq!(msg_a["name"], "scoped-broadcast");
+    assert_eq!(msg_a["data"]["user_id"], "user-a");
+
+    let timeout_result = tokio::time::timeout(Duration::from_millis(200), rx_b.next()).await;
+    assert!(timeout_result.is_err(), "user-b should not receive user-a event");
 }
 
 #[tokio::test]
