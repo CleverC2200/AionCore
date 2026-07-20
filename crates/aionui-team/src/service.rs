@@ -291,12 +291,20 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        Ok(Team::from_row(&row)?)
+    }
+
+    async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
         let row = self
             .repo
-            .get_team(user_id, team_id)
+            .get_team_for_restore(team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        Ok(Team::from_row(&row)?)
+        if row.user_id != user_id {
+            return Err(TeamError::Forbidden("team belongs to another user".into()));
+        }
+        Ok(row)
     }
 
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
@@ -538,11 +546,7 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
 
-        let row = self
-            .repo
-            .get_team(user_id, team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        let row = self.load_owned_team_row(user_id, team_id).await?;
         let mut team = Team::from_row(&row)?;
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
@@ -815,10 +819,7 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        self.repo
-            .get_team(user_id, team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        self.load_owned_team_row(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await
     }
 
@@ -1232,11 +1233,7 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, TeamError> {
-        let row = self
-            .repo
-            .get_team(user_id, team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
         let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
