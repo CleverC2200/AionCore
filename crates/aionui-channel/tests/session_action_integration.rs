@@ -84,6 +84,7 @@ async fn create_user(repo: &Arc<dyn IChannelRepository>, platform_user_id: &str,
 
 fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
@@ -112,6 +113,7 @@ fn make_action_message(
     category: ActionCategory,
 ) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
+        owner_user_id: None,
         id: format!("msg_{}", now_ms()),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),

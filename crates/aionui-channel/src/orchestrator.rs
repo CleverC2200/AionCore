@@ -67,6 +67,8 @@ impl ChannelOrchestrator {
         let chat_id = msg.chat_id.clone();
         let plugin_id = platform.to_string();
         let text = msg.content.text.clone();
+        let fallback_owner_user_id = self.action_executor.owner_user_id().to_owned();
+        let message_owner_user_id = msg.owner_user_id.clone().unwrap_or(fallback_owner_user_id);
 
         let executor = Arc::clone(&self.action_executor);
         let msg_svc = Arc::clone(&self.message_service);
@@ -76,7 +78,7 @@ impl ChannelOrchestrator {
         tokio::spawn(async move {
             match executor.handle_incoming_message(&msg).await {
                 Ok(MessageResult::Action(response)) => {
-                    send_action_response(&sender, &plugin_id, &chat_id, &response).await;
+                    send_action_response(&sender, &message_owner_user_id, &plugin_id, &chat_id, &response).await;
                 }
                 Ok(MessageResult::Dispatched {
                     owner_user_id,
@@ -110,6 +112,7 @@ impl ChannelOrchestrator {
 
 async fn send_action_response(
     sender: &Arc<dyn ChannelSender>,
+    owner_user_id: &str,
     plugin_id: &str,
     chat_id: &str,
     response: &crate::types::ActionResponse,
@@ -132,11 +135,13 @@ async fn send_action_response(
         match response.behavior {
             ActionBehavior::Edit => {
                 if let Some(ref edit_id) = response.edit_message_id {
-                    let _ = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await;
+                    let _ = sender
+                        .edit_message(owner_user_id, plugin_id, chat_id, edit_id, outgoing)
+                        .await;
                 }
             }
             _ => {
-                let _ = sender.send_message(plugin_id, chat_id, outgoing).await;
+                let _ = sender.send_message(owner_user_id, plugin_id, chat_id, outgoing).await;
             }
         }
     }
@@ -184,7 +189,7 @@ async fn handle_dispatched(
                 reply_to_message_id: None,
                 silent: None,
             };
-            let _ = sender.send_message(plugin_id, chat_id, err_msg).await;
+            let _ = sender.send_message(owner_user_id, plugin_id, chat_id, err_msg).await;
             return;
         }
     };
@@ -201,6 +206,7 @@ async fn handle_dispatched(
     // Spawn stream relay if we got a subscription
     if let Some(rx) = send_result.stream_rx {
         let relay_config = RelayConfig {
+            owner_user_id: owner_user_id.to_owned(),
             platform,
             plugin_id: plugin_id.to_owned(),
             chat_id: chat_id.to_owned(),

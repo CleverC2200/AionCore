@@ -256,7 +256,7 @@ mod weixin_tests {
     #[tokio::test]
     async fn is_plugin_running_false_when_not_enabled() {
         let (manager, _repo, _bc) = setup().await;
-        assert!(!manager.is_plugin_running("weixin"));
+        assert!(!manager.is_plugin_running("system_default_user", "weixin"));
     }
 
     // -- Login event serialization ------------------------------------------

@@ -28,7 +28,7 @@ pub struct ChannelManager {
     repo: Arc<dyn IChannelRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     encryption_key: [u8; 32],
-    /// Active plugin instances keyed by plugin ID.
+    /// Active plugin instances keyed by owner user ID + plugin ID.
     plugins: DashMap<String, Box<dyn ChannelPlugin>>,
     /// Sender for incoming messages from all plugins.
     /// The `ActionExecutor` holds the receiving end.
@@ -82,7 +82,10 @@ impl ChannelManager {
         let statuses: Vec<PluginStatusResponse> = rows
             .into_iter()
             .map(|row| {
-                let live_status = self.plugins.get(&row.id).map(|p| p.status().to_string());
+                let live_status = self
+                    .plugins
+                    .get(&Self::runtime_key(owner_user_id, &row.id))
+                    .map(|p| p.status().to_string());
                 self.row_to_status_response(&row, live_status)
             })
             .collect();
@@ -119,10 +122,7 @@ impl ChannelManager {
             None => self.load_stored_config(owner_user_id, plugin_id).await?,
         };
 
-        // Stop existing plugin if running
-        if self.plugins.contains_key(plugin_id) {
-            self.stop_plugin(plugin_id).await;
-        }
+        self.stop_plugin(owner_user_id, plugin_id).await;
 
         // Encrypt config for storage
         let config_json = serde_json::to_string(&config)?;
@@ -149,10 +149,7 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = PluginCallbacks {
-            message_tx: self.message_tx.clone(),
-            confirm_tx: self.confirm_tx.clone(),
-        };
+        let callbacks = self.callbacks_for_owner(owner_user_id);
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
             self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
@@ -177,7 +174,7 @@ impl ChannelManager {
             .await?;
 
         // Store active instance
-        self.plugins.insert(plugin_id.to_owned(), plugin);
+        self.plugins.insert(Self::runtime_key(owner_user_id, plugin_id), plugin);
 
         info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin enabled and started");
         self.broadcast_status_change(owner_user_id, plugin_id).await;
@@ -196,9 +193,7 @@ impl ChannelManager {
         plugin_name: &str,
         config: &PluginConfig,
     ) -> Result<(), ChannelError> {
-        if self.plugins.contains_key(plugin_id) {
-            self.stop_plugin(plugin_id).await;
-        }
+        self.stop_plugin(owner_user_id, plugin_id).await;
 
         let config_json = serde_json::to_string(config)?;
         let encrypted_config = encrypt_string(&config_json, &self.encryption_key)
@@ -231,7 +226,7 @@ impl ChannelManager {
     /// Idempotent — disabling an already-disabled plugin is a no-op.
     pub async fn disable_plugin(&self, owner_user_id: &str, plugin_id: &str) -> Result<(), ChannelError> {
         // Stop running instance if any
-        self.stop_plugin(plugin_id).await;
+        self.stop_plugin(owner_user_id, plugin_id).await;
 
         // Update DB
         let params = UpdatePluginStatusParams {
@@ -330,7 +325,7 @@ impl ChannelManager {
         let keys: Vec<String> = self.plugins.iter().map(|entry| entry.key().clone()).collect();
 
         for key in keys {
-            self.stop_plugin(&key).await;
+            self.stop_plugin_by_key(&key).await;
         }
         info!("all plugins shut down");
     }
@@ -341,9 +336,9 @@ impl ChannelManager {
     }
 
     /// Checks whether a specific plugin is currently running.
-    pub fn is_plugin_running(&self, plugin_id: &str) -> bool {
+    pub fn is_plugin_running(&self, owner_user_id: &str, plugin_id: &str) -> bool {
         self.plugins
-            .get(plugin_id)
+            .get(&Self::runtime_key(owner_user_id, plugin_id))
             .map(|p| p.status() == PluginStatus::Running)
             .unwrap_or(false)
     }
@@ -354,13 +349,14 @@ impl ChannelManager {
     /// to the correct platform plugin.
     pub async fn send_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<String, ChannelError> {
         let plugin = self
             .plugins
-            .get(plugin_id)
+            .get(&Self::runtime_key(owner_user_id, plugin_id))
             .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
         plugin.send_message(chat_id, message).await
     }
@@ -368,6 +364,7 @@ impl ChannelManager {
     /// Edits an existing message through a specific plugin.
     pub async fn edit_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message_id: &str,
@@ -375,7 +372,7 @@ impl ChannelManager {
     ) -> Result<(), ChannelError> {
         let plugin = self
             .plugins
-            .get(plugin_id)
+            .get(&Self::runtime_key(owner_user_id, plugin_id))
             .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
         plugin.edit_message(chat_id, message_id, message).await
     }
@@ -431,8 +428,38 @@ impl ChannelManager {
     }
 
     /// Stops and removes an active plugin instance.
-    async fn stop_plugin(&self, plugin_id: &str) {
-        if let Some((_, mut plugin)) = self.plugins.remove(plugin_id) {
+    fn runtime_key(owner_user_id: &str, plugin_id: &str) -> String {
+        format!("{owner_user_id}:{plugin_id}")
+    }
+
+    fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
+        let (plugin_msg_tx, mut plugin_msg_rx) = mpsc::channel::<UnifiedIncomingMessage>(64);
+        let message_tx = self.message_tx.clone();
+        let owner_user_id = owner_user_id.to_owned();
+        tokio::spawn(async move {
+            while let Some(mut msg) = plugin_msg_rx.recv().await {
+                msg.owner_user_id = Some(owner_user_id.clone());
+                if message_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        PluginCallbacks {
+            message_tx: plugin_msg_tx,
+            confirm_tx: self.confirm_tx.clone(),
+        }
+    }
+
+    async fn stop_plugin(&self, owner_user_id: &str, plugin_id: &str) {
+        let key = Self::runtime_key(owner_user_id, plugin_id);
+        self.stop_plugin_by_key(&key).await;
+    }
+
+    /// Stops and removes an active plugin instance by runtime key.
+    async fn stop_plugin_by_key(&self, key: &str) {
+        if let Some((_, mut plugin)) = self.plugins.remove(key) {
+            let plugin_id = plugin.plugin_type().to_string();
             if let Err(e) = plugin.stop().await {
                 warn!(
                     plugin_id = %plugin_id,
@@ -462,10 +489,7 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = PluginCallbacks {
-            message_tx: self.message_tx.clone(),
-            confirm_tx: self.confirm_tx.clone(),
-        };
+        let callbacks = self.callbacks_for_owner(owner_user_id);
 
         plugin.initialize(config, callbacks).await?;
         plugin.start().await?;
@@ -478,7 +502,7 @@ impl ChannelManager {
         };
         self.repo.update_plugin_status(owner_user_id, &row.id, &params).await?;
 
-        self.plugins.insert(row.id.clone(), plugin);
+        self.plugins.insert(Self::runtime_key(owner_user_id, &row.id), plugin);
         info!(owner_user_id = %owner_user_id, plugin_id = %row.id, "plugin restored");
         self.broadcast_status_change(owner_user_id, &row.id).await;
         Ok(())
@@ -521,10 +545,14 @@ impl ChannelManager {
             }
         };
 
-        let live_status = self.plugins.get(plugin_id).map(|p| p.status().to_string());
+        let live_status = self
+            .plugins
+            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .map(|p| p.status().to_string());
         let status_response = self.row_to_status_response(&row, live_status);
 
         let payload = PluginStatusChangedPayload {
+            user_id: owner_user_id.to_owned(),
             plugin_id: plugin_id.to_owned(),
             status: status_response,
         };
@@ -541,7 +569,9 @@ impl ChannelManager {
 
     /// Converts a DB row + optional live status to a `PluginStatusResponse`.
     fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
-        let is_running = self.plugins.contains_key(&row.id);
+        let is_running = self
+            .plugins
+            .contains_key(&Self::runtime_key(&row.owner_user_id, &row.id));
         let has_token = !row.config.is_empty();
         PluginStatusResponse {
             plugin_id: row.id.clone(),
@@ -576,21 +606,24 @@ impl ChannelManager {
 impl crate::stream_relay::ChannelSender for ChannelManager {
     async fn send_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<String, crate::error::ChannelError> {
-        self.send_message(plugin_id, chat_id, message).await
+        self.send_message(owner_user_id, plugin_id, chat_id, message).await
     }
 
     async fn edit_message(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         chat_id: &str,
         message_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<(), crate::error::ChannelError> {
-        self.edit_message(plugin_id, chat_id, message_id, message).await
+        self.edit_message(owner_user_id, plugin_id, chat_id, message_id, message)
+            .await
     }
 }
 
@@ -1072,7 +1105,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(mgr.active_plugin_count(), 1);
-        assert!(mgr.is_plugin_running("telegram"));
+        assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
     }
 
     #[tokio::test]
@@ -1188,7 +1221,7 @@ mod tests {
         mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
-        assert!(mgr.is_plugin_running("telegram"));
+        assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
 
         mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
@@ -1336,7 +1369,7 @@ mod tests {
 
         mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 1);
-        assert!(mgr.is_plugin_running("telegram"));
+        assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
     }
 
     #[tokio::test]
@@ -1380,8 +1413,8 @@ mod tests {
 
         // Telegram should have started, Lark should have failed
         assert_eq!(mgr.active_plugin_count(), 1);
-        assert!(mgr.is_plugin_running("telegram"));
-        assert!(!mgr.is_plugin_running("lark"));
+        assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
+        assert!(!mgr.is_plugin_running(OWNER_ID, "lark"));
 
         // Lark should have error status in DB
         let plugins = repo.get_plugins();
@@ -1436,7 +1469,7 @@ mod tests {
             .unwrap();
 
         let msg_id = mgr
-            .send_message("telegram", "chat_1", make_test_outgoing())
+            .send_message(OWNER_ID, "telegram", "chat_1", make_test_outgoing())
             .await
             .unwrap();
         assert_eq!(msg_id, "mock_msg_id");
@@ -1446,7 +1479,7 @@ mod tests {
     async fn send_message_plugin_not_found() {
         let (mgr, _repo, _bc) = make_manager();
         let err = mgr
-            .send_message("telegram", "chat_1", make_test_outgoing())
+            .send_message(OWNER_ID, "telegram", "chat_1", make_test_outgoing())
             .await
             .unwrap_err();
         assert!(matches!(err, ChannelError::PluginNotFound(_)));
@@ -1461,7 +1494,7 @@ mod tests {
             .await
             .unwrap();
 
-        mgr.edit_message("telegram", "chat_1", "msg_1", make_test_outgoing())
+        mgr.edit_message(OWNER_ID, "telegram", "chat_1", "msg_1", make_test_outgoing())
             .await
             .unwrap();
     }
@@ -1470,7 +1503,7 @@ mod tests {
     async fn edit_message_plugin_not_found() {
         let (mgr, _repo, _bc) = make_manager();
         let err = mgr
-            .edit_message("telegram", "chat_1", "msg_1", make_test_outgoing())
+            .edit_message(OWNER_ID, "telegram", "chat_1", "msg_1", make_test_outgoing())
             .await
             .unwrap_err();
         assert!(matches!(err, ChannelError::PluginNotFound(_)));
@@ -1497,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn is_plugin_running_false_for_missing() {
         let (mgr, _repo, _bc) = make_manager();
-        assert!(!mgr.is_plugin_running("nonexistent"));
+        assert!(!mgr.is_plugin_running(OWNER_ID, "nonexistent"));
     }
 
     #[test]

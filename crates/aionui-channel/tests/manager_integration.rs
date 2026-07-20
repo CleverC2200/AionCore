@@ -16,7 +16,9 @@ use aionui_channel::types::{
     BotInfo, OutgoingMessageType, PluginConfig, PluginCredentials, PluginStatus, PluginType, UnifiedOutgoingMessage,
 };
 use aionui_common::decrypt_string;
-use aionui_db::{IChannelRepository, SqliteChannelRepository, init_database_memory};
+use aionui_db::{
+    IChannelRepository, IUserRepository, SqliteChannelRepository, SqliteUserRepository, init_database_memory,
+};
 use aionui_realtime::EventBroadcaster;
 use tokio::sync::mpsc;
 
@@ -146,7 +148,35 @@ fn test_key() -> [u8; 32] {
 }
 
 async fn setup() -> (ChannelManager, Arc<dyn IChannelRepository>, Arc<MockBroadcaster>) {
+    let (mgr, repo, bc, _) = setup_with_optional_second_owner(false).await;
+    (mgr, repo, bc)
+}
+
+async fn setup_with_second_owner() -> (
+    ChannelManager,
+    Arc<dyn IChannelRepository>,
+    Arc<MockBroadcaster>,
+    String,
+) {
+    let (mgr, repo, bc, owner_b_id) = setup_with_optional_second_owner(true).await;
+    (mgr, repo, bc, owner_b_id.expect("second owner should be created"))
+}
+
+async fn setup_with_optional_second_owner(
+    create_second_owner: bool,
+) -> (
+    ChannelManager,
+    Arc<dyn IChannelRepository>,
+    Arc<MockBroadcaster>,
+    Option<String>,
+) {
     let db = init_database_memory().await.unwrap();
+    let owner_b_id = if create_second_owner {
+        let user_repo = SqliteUserRepository::new(db.pool().clone());
+        Some(user_repo.create_user("channel_owner_b", "hash").await.unwrap().id)
+    } else {
+        None
+    };
     let repo: Arc<dyn IChannelRepository> = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
     let bc = Arc::new(MockBroadcaster::new());
     let (msg_tx, _msg_rx) = mpsc::channel(16);
@@ -154,7 +184,7 @@ async fn setup() -> (ChannelManager, Arc<dyn IChannelRepository>, Arc<MockBroadc
     let mgr = ChannelManager::new(repo.clone(), bc.clone(), test_key(), msg_tx, confirm_tx);
     // Keep db alive by leaking — test process exits anyway
     std::mem::forget(db);
-    (mgr, repo, bc)
+    (mgr, repo, bc, owner_b_id)
 }
 
 fn make_factory() -> PluginFactory {
@@ -278,7 +308,7 @@ async fn ep1_enable_telegram_plugin() {
     assert!(row.last_connected.is_some());
 
     // Plugin is running in memory
-    assert!(mgr.is_plugin_running("telegram"));
+    assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
     assert_eq!(mgr.active_plugin_count(), 1);
 }
 
@@ -331,7 +361,7 @@ async fn ep6_re_enable_empty_config_reuses_stored_credentials() {
         .await
         .unwrap();
 
-    assert!(mgr.is_plugin_running("telegram"));
+    assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
 
     let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert!(row.enabled);
@@ -383,7 +413,7 @@ async fn dp1_disable_enabled_plugin() {
     mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
     assert_eq!(mgr.active_plugin_count(), 0);
-    assert!(!mgr.is_plugin_running("telegram"));
+    assert!(!mgr.is_plugin_running(OWNER_ID, "telegram"));
 
     let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert!(!row.enabled);
@@ -588,7 +618,7 @@ async fn restore_starts_enabled_plugins() {
     // Restore should bring it back
     mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
     assert_eq!(mgr.active_plugin_count(), 1);
-    assert!(mgr.is_plugin_running("telegram"));
+    assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
 }
 
 // ── Restore: disabled plugins are skipped ─────────────────────────
@@ -622,11 +652,41 @@ async fn enable_multiple_plugins() {
         .unwrap();
 
     assert_eq!(mgr.active_plugin_count(), 2);
-    assert!(mgr.is_plugin_running("telegram"));
-    assert!(mgr.is_plugin_running("lark"));
+    assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
+    assert!(mgr.is_plugin_running(OWNER_ID, "lark"));
 
     let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
     assert_eq!(statuses.len(), 2);
+}
+
+#[tokio::test]
+async fn same_plugin_id_is_runtime_isolated_by_owner() {
+    let (mgr, repo, _bc, owner_b_id) = setup_with_second_owner().await;
+    let factory = make_factory();
+
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
+        .await
+        .unwrap();
+    mgr.enable_plugin(&owner_b_id, "telegram", &make_telegram_config(), &factory)
+        .await
+        .unwrap();
+
+    assert_eq!(mgr.active_plugin_count(), 2);
+    assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
+    assert!(mgr.is_plugin_running(&owner_b_id, "telegram"));
+
+    let owner_a_plugins = repo.get_all_plugins(OWNER_ID).await.unwrap();
+    let owner_b_plugins = repo.get_all_plugins(&owner_b_id).await.unwrap();
+    assert_eq!(owner_a_plugins.len(), 1);
+    assert_eq!(owner_b_plugins.len(), 1);
+    assert_eq!(owner_a_plugins[0].id, "telegram");
+    assert_eq!(owner_b_plugins[0].id, "telegram");
+
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
+
+    assert_eq!(mgr.active_plugin_count(), 1);
+    assert!(!mgr.is_plugin_running(OWNER_ID, "telegram"));
+    assert!(mgr.is_plugin_running(&owner_b_id, "telegram"));
 }
 
 // ── Shutdown stops all ────────────────────────────────────────────
@@ -659,7 +719,7 @@ async fn send_message_routes_to_plugin() {
         .unwrap();
 
     let msg_id = mgr
-        .send_message("telegram", "chat_1", make_test_outgoing())
+        .send_message(OWNER_ID, "telegram", "chat_1", make_test_outgoing())
         .await
         .unwrap();
     assert_eq!(msg_id, "mock_msg_id");
@@ -670,7 +730,7 @@ async fn send_message_not_running_fails() {
     let (mgr, _repo, _bc) = setup().await;
 
     let err = mgr
-        .send_message("telegram", "chat_1", make_test_outgoing())
+        .send_message(OWNER_ID, "telegram", "chat_1", make_test_outgoing())
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::PluginNotFound(_)));
@@ -685,7 +745,7 @@ async fn edit_message_routes_to_plugin() {
         .await
         .unwrap();
 
-    mgr.edit_message("telegram", "chat_1", "msg_1", make_test_outgoing())
+    mgr.edit_message(OWNER_ID, "telegram", "chat_1", "msg_1", make_test_outgoing())
         .await
         .unwrap();
 }

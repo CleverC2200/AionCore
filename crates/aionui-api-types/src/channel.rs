@@ -267,6 +267,7 @@ pub struct PairingRequestedPayload {
 /// Pushed when a plugin starts, stops, or encounters an error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginStatusChangedPayload {
+    pub user_id: String,
     pub plugin_id: String,
     pub status: PluginStatusResponse,
 }
@@ -714,6 +715,7 @@ mod tests {
     #[test]
     fn test_plugin_status_changed_payload_serde() {
         let payload = PluginStatusChangedPayload {
+            user_id: "user-1".into(),
             plugin_id: "telegram".into(),
             status: PluginStatusResponse {
                 plugin_id: "telegram".into(),

@@ -59,6 +59,10 @@ impl ActionExecutor {
         }
     }
 
+    pub fn owner_user_id(&self) -> &str {
+        &self.owner_user_id
+    }
+
     /// Main entry point: handle an incoming message from any platform.
     ///
     /// Flow:
@@ -772,6 +776,7 @@ mod tests {
 
     fn make_text_message(user_id: &str, chat_id: &str, text: &str, platform: PluginType) -> UnifiedIncomingMessage {
         UnifiedIncomingMessage {
+            owner_user_id: None,
             id: "msg_1".into(),
             platform,
             chat_id: chat_id.into(),
@@ -802,6 +807,7 @@ mod tests {
         params: Option<HashMap<String, String>>,
     ) -> UnifiedIncomingMessage {
         UnifiedIncomingMessage {
+            owner_user_id: None,
             id: "msg_1".into(),
             platform,
             chat_id: chat_id.into(),

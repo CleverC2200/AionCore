@@ -12,6 +12,7 @@ const OWNER_ID: &str = "system_default_user";
 
 fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
+        owner_user_id: None,
         id: "msg-1".into(),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),

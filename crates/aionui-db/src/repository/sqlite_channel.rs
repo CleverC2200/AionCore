@@ -16,6 +16,27 @@ impl SqliteChannelRepository {
     }
 }
 
+fn plugin_storage_id(owner_user_id: &str, plugin_id: &str) -> String {
+    if owner_user_id == "system_default_user" {
+        plugin_id.to_owned()
+    } else {
+        format!("{owner_user_id}:{plugin_id}")
+    }
+}
+
+fn plugin_logical_id(owner_user_id: &str, stored_id: &str) -> String {
+    let prefix = format!("{owner_user_id}:");
+    stored_id
+        .strip_prefix(&prefix)
+        .map(str::to_owned)
+        .unwrap_or_else(|| stored_id.to_owned())
+}
+
+fn plugin_row_with_logical_id(owner_user_id: &str, mut row: ChannelPluginRow) -> ChannelPluginRow {
+    row.id = plugin_logical_id(owner_user_id, &row.id);
+    row
+}
+
 #[async_trait::async_trait]
 impl IChannelRepository for SqliteChannelRepository {
     // ── Plugin CRUD ──────────────────────────────────────────────────
@@ -27,20 +48,28 @@ impl IChannelRepository for SqliteChannelRepository {
         .bind(owner_user_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|row| plugin_row_with_logical_id(owner_user_id, row))
+            .collect())
     }
 
     async fn get_plugin(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-        let row =
-            sqlx::query_as::<_, ChannelPluginRow>("SELECT * FROM assistant_plugins WHERE owner_user_id = ? AND id = ?")
-                .bind(owner_user_id)
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row)
+        let storage_id = plugin_storage_id(owner_user_id, id);
+        let row = sqlx::query_as::<_, ChannelPluginRow>(
+            "SELECT * FROM assistant_plugins WHERE owner_user_id = ? AND id IN (?, ?) ORDER BY id = ? DESC LIMIT 1",
+        )
+        .bind(owner_user_id)
+        .bind(&storage_id)
+        .bind(id)
+        .bind(&storage_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| plugin_row_with_logical_id(owner_user_id, row)))
     }
 
     async fn upsert_plugin(&self, owner_user_id: &str, row: &ChannelPluginRow) -> Result<(), DbError> {
+        let storage_id = plugin_storage_id(owner_user_id, &row.id);
         sqlx::query(
             "INSERT INTO assistant_plugins \
                 (id, owner_user_id, type, name, enabled, config, status, last_connected, created_at, updated_at) \
@@ -55,7 +84,7 @@ impl IChannelRepository for SqliteChannelRepository {
                 last_connected = excluded.last_connected, \
                 updated_at = excluded.updated_at",
         )
-        .bind(&row.id)
+        .bind(&storage_id)
         .bind(owner_user_id)
         .bind(&row.r#type)
         .bind(&row.name)
@@ -76,6 +105,7 @@ impl IChannelRepository for SqliteChannelRepository {
         id: &str,
         params: &UpdatePluginStatusParams,
     ) -> Result<(), DbError> {
+        let storage_id = plugin_storage_id(owner_user_id, id);
         let mut set_clauses = Vec::new();
         if params.status.is_some() {
             set_clauses.push("status = ?");
@@ -111,7 +141,7 @@ impl IChannelRepository for SqliteChannelRepository {
         }
         query = query.bind(now);
         query = query.bind(owner_user_id);
-        query = query.bind(id);
+        query = query.bind(&storage_id);
 
         let result = query.execute(&self.pool).await?;
         if result.rows_affected() == 0 {
@@ -121,9 +151,10 @@ impl IChannelRepository for SqliteChannelRepository {
     }
 
     async fn delete_plugin(&self, owner_user_id: &str, id: &str) -> Result<(), DbError> {
+        let storage_id = plugin_storage_id(owner_user_id, id);
         let result = sqlx::query("DELETE FROM assistant_plugins WHERE owner_user_id = ? AND id = ?")
             .bind(owner_user_id)
-            .bind(id)
+            .bind(&storage_id)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
@@ -682,6 +713,47 @@ mod tests {
 
         assert!(repo.get_plugin(OWNER_B, "tg-1").await.unwrap().is_none());
         assert!(repo.get_all_plugins(OWNER_B).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_plugin_id_can_exist_for_different_owners() {
+        let (repo, db) = setup().await;
+        create_owner(db.pool(), OWNER_B).await;
+
+        let owner_a_plugin = sample_plugin();
+        let owner_b_plugin = ChannelPluginRow {
+            owner_user_id: OWNER_B.into(),
+            name: "Owner B Telegram Bot".into(),
+            enabled: true,
+            ..sample_plugin()
+        };
+
+        repo.upsert_plugin(OWNER_A, &owner_a_plugin).await.unwrap();
+        repo.upsert_plugin(OWNER_B, &owner_b_plugin).await.unwrap();
+
+        let owner_a_found = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let owner_b_found = repo.get_plugin(OWNER_B, "tg-1").await.unwrap().unwrap();
+        assert_eq!(owner_a_found.id, "tg-1");
+        assert_eq!(owner_b_found.id, "tg-1");
+        assert_eq!(owner_a_found.name, "My Telegram Bot");
+        assert_eq!(owner_b_found.name, "Owner B Telegram Bot");
+
+        repo.update_plugin_status(
+            OWNER_B,
+            "tg-1",
+            &UpdatePluginStatusParams {
+                status: Some("running".into()),
+                last_connected: None,
+                enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let owner_a_after = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let owner_b_after = repo.get_plugin(OWNER_B, "tg-1").await.unwrap().unwrap();
+        assert_eq!(owner_a_after.status, None);
+        assert_eq!(owner_b_after.status, Some("running".into()));
     }
 
     #[tokio::test]
