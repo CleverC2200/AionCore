@@ -330,7 +330,10 @@ fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentit
 }
 
 fn is_global_websocket_event(event_name: &str) -> bool {
-    matches!(event_name, "runtime.statusChanged")
+    matches!(
+        event_name,
+        "runtime.statusChanged" | "extensions.state-changed" | "extensions.lifecycle" | "hub.state-changed"
+    )
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {

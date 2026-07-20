@@ -412,6 +412,16 @@ async fn t4_1_whitelisted_global_event_reaches_all_users() {
     let msg_b = read_text(&mut rx_b).await;
     assert_eq!(msg_a["name"], "runtime.statusChanged");
     assert_eq!(msg_b["name"], "runtime.statusChanged");
+
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "hub.state-changed",
+        json!({"name": "demo-extension", "status": "installed"}),
+    ));
+
+    let msg_a = read_text(&mut rx_a).await;
+    let msg_b = read_text(&mut rx_b).await;
+    assert_eq!(msg_a["name"], "hub.state-changed");
+    assert_eq!(msg_b["name"], "hub.state-changed");
 }
 
 #[tokio::test]
