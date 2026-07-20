@@ -74,6 +74,7 @@ impl TeamSessionService {
 
     pub(crate) async fn resolve_spawn_backend_and_model(
         &self,
+        user_id: &str,
         assistant_id: Option<&str>,
         requested_model: Option<&str>,
         fallback_backend: &str,
@@ -96,7 +97,7 @@ impl TeamSessionService {
                 .flatten()
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty());
-            let backend_default_model = self.default_model_for_backend(&backend).await;
+            let backend_default_model = self.default_model_for_backend(user_id, &backend).await;
             let model = requested_model
                 .or(fixed_model)
                 .or(backend_default_model)
@@ -109,7 +110,7 @@ impl TeamSessionService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
-        let backend_default_model = self.default_model_for_backend(&backend).await;
+        let backend_default_model = self.default_model_for_backend(user_id, &backend).await;
         let model = requested_model
             .or(backend_default_model)
             .unwrap_or_else(|| fallback_model.to_owned());
@@ -138,8 +139,8 @@ impl TeamSessionService {
 
     /// Collect all enabled provider model IDs grouped by provider name.
     /// Returns a flat list of model IDs for use by internal agents (aionrs).
-    async fn collect_provider_models(&self) -> Vec<String> {
-        let Ok(providers) = self.provider_repo.list().await else {
+    async fn collect_provider_models(&self, user_id: &str) -> Vec<String> {
+        let Ok(providers) = self.provider_repo.list(user_id).await else {
             return vec![];
         };
         providers
@@ -149,9 +150,9 @@ impl TeamSessionService {
             .collect()
     }
 
-    pub(crate) async fn default_model_for_backend(&self, backend: &str) -> Option<String> {
+    pub(crate) async fn default_model_for_backend(&self, user_id: &str, backend: &str) -> Option<String> {
         if backend == "aionrs" {
-            return self.collect_provider_models().await.into_iter().next();
+            return self.collect_provider_models(user_id).await.into_iter().next();
         }
         let row = self.agent_metadata_repo.find_builtin_by_backend(backend).await.ok()??;
         let json: serde_json::Value = serde_json::from_str(row.available_models.as_deref()?).ok()?;
@@ -731,7 +732,7 @@ mod tests {
         let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);
 
         let err = svc
-            .resolve_spawn_backend_and_model(Some("word-creator"), None, "gemini", "gemini-2.5-pro")
+            .resolve_spawn_backend_and_model("user1", Some("word-creator"), None, "gemini", "gemini-2.5-pro")
             .await
             .expect_err("spawn must reject assistants outside the team-selectable catalog");
 
@@ -845,7 +846,7 @@ mod tests {
         );
 
         let (backend, model) = svc
-            .resolve_spawn_backend_and_model(Some("word-creator"), None, "gemini", "gemini-2.5-pro")
+            .resolve_spawn_backend_and_model("user1", Some("word-creator"), None, "gemini", "gemini-2.5-pro")
             .await
             .unwrap();
 

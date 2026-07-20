@@ -558,7 +558,7 @@ impl TeamAgentProvisioner {
             session_mode,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(model)
+            self.resolve_provider_for_model(user_id, model)
                 .await
                 .unwrap_or_else(|| backend.to_owned())
         } else {
@@ -703,8 +703,8 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
-    async fn resolve_provider_for_model(&self, model: &str) -> Option<String> {
-        let providers = self.provider_repo.list().await.ok()?;
+    async fn resolve_provider_for_model(&self, user_id: &str, model: &str) -> Option<String> {
+        let providers = self.provider_repo.list(user_id).await.ok()?;
         for provider in providers {
             if !provider.enabled {
                 continue;

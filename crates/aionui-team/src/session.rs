@@ -1369,7 +1369,13 @@ impl TeamSession {
         // capability checks. Assistant spawns derive backend from the preset
         // identity rather than inheriting the caller backend.
         let (backend, model) = service
-            .resolve_spawn_backend_and_model(Some(assistant_id), None, caller.backend.as_str(), caller.model.as_str())
+            .resolve_spawn_backend_and_model(
+                &self.user_id,
+                Some(assistant_id),
+                None,
+                caller.backend.as_str(),
+                caller.model.as_str(),
+            )
             .await?;
 
         // Step 4: DB side-effects (new conversation + persisted agent slot).
