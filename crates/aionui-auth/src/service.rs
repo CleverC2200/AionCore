@@ -75,7 +75,9 @@ impl AuthProvisionService {
         }
 
         let username = user.username.clone().unwrap_or_else(|| "external_user".to_string());
-        let token = self.jwt_service.sign(&user.id, &username)?;
+        let token = self
+            .jwt_service
+            .sign_with_session_generation(&user.id, &username, user.session_generation)?;
         self.user_repo.update_last_login(&user.id).await?;
 
         Ok(EnsureExternalSessionResponse {

@@ -400,7 +400,11 @@ async fn login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, user.username.as_deref().unwrap_or("external_user"))
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
@@ -685,9 +689,27 @@ async fn refresh_handler(
         .verify(&req.token)
         .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
 
+    let user = state
+        .user_repo
+        .find_active_by_id(&payload.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "refresh token user lookup failed");
+            ApiError::Internal("Authentication service unavailable".into())
+        })?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+
+    if payload.session_generation != user.session_generation {
+        return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
     let new_token = state
         .jwt_service
-        .sign(&payload.user_id, &payload.username)
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     Ok(Json(RefreshResponse {
@@ -749,7 +771,11 @@ async fn qr_login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, user.username.as_deref().unwrap_or("external_user"))
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)

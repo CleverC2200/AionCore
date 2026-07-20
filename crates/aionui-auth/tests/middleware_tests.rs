@@ -240,6 +240,32 @@ async fn auth_middleware_missing_user_returns_unauthorized_code() {
 }
 
 #[tokio::test]
+async fn auth_middleware_session_generation_mismatch_returns_unauthorized_code() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    repo.increment_session_generation("system_default_user").await.unwrap();
+    let app = protected_auth_app(jwt_service, repo as Arc<dyn IUserRepository>);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
 async fn auth_middleware_database_error_returns_internal_error_code() {
     let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
     let token = jwt_service.sign("system_default_user", "system_default_user").unwrap();

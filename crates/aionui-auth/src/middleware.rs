@@ -81,6 +81,10 @@ pub async fn auth_middleware(
         })?
         .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
 
+    if payload.session_generation != user.session_generation {
+        return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
