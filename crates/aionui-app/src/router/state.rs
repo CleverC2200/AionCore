@@ -380,13 +380,17 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
 
+    let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
+    let client_pref_service = if services.identity_mode.is_local() {
+        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
+    } else {
+        ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
+    };
+
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
-        client_pref_service: ClientPrefService::with_keep_awake_controller(
-            Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
-            Arc::new(aionui_system::SystemKeepAwakeController::new()),
-            "system_default_user",
-        ),
+        client_pref_service,
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
@@ -1062,15 +1066,19 @@ mod tests {
 
         let pref_repo = SqliteClientPreferenceRepository::new(pool.clone());
         pref_repo
-            .upsert_batch(&[(
-                "assistant.weixin.agent",
-                r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
-            )])
+            .upsert_batch(
+                "system_default_user",
+                &[(
+                    "assistant.weixin.agent",
+                    r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
+                )],
+            )
             .await
             .unwrap();
 
         let settings = build_channel_settings_service(&services);
-        let message_service = build_channel_message_service(&services, settings).await;
+        let message_service =
+            build_channel_message_service(&services, settings, "system_default_user".to_owned()).await;
         let session = AssistantSessionRow {
             id: "session-channel-state".to_owned(),
             user_id: "channel-user-state".to_owned(),

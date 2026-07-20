@@ -617,22 +617,27 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
     let ext_root = write_legacy_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
     let now = now_ms();
-    repo.upsert_plugin(&aionui_db::models::ChannelPluginRow {
-        id: "legacy-channel".to_string(),
-        r#type: "legacy-channel".to_string(),
-        name: "Legacy Channel Persisted".to_string(),
-        enabled: true,
-        config: "{\"token\":\"secret\"}".to_string(),
-        status: Some("running".to_string()),
-        last_connected: Some(now),
-        created_at: now,
-        updated_at: now,
-    })
+    repo.upsert_plugin(
+        &owner_user_id,
+        &aionui_db::models::ChannelPluginRow {
+            id: "legacy-channel".to_string(),
+            owner_user_id: owner_user_id.clone(),
+            r#type: "legacy-channel".to_string(),
+            name: "Legacy Channel Persisted".to_string(),
+            enabled: true,
+            config: "{\"token\":\"secret\"}".to_string(),
+            status: Some("running".to_string()),
+            last_connected: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+    )
     .await
     .unwrap();
 
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
     let resp = app
         .oneshot(get_with_token("/api/channel/plugins", &token))
         .await
@@ -664,6 +669,7 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
     let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
 
     let enable_resp = app
         .clone()
@@ -686,7 +692,11 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let enable_json = body_json(enable_resp).await;
     assert_eq!(enable_json["data"]["success"], true);
 
-    let row = repo.get_plugin("legacy-channel").await.unwrap().unwrap();
+    let row = repo
+        .get_plugin(&owner_user_id, "legacy-channel")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.enabled);
     assert_eq!(row.r#type, "legacy-channel");
     assert_eq!(row.status.as_deref(), Some("stopped"));

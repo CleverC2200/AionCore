@@ -686,6 +686,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
     let fixed_mcp = mcp_repo
         .create(CreateMcpServerParams {
+            user_id: "system_default_user",
             name: "fixed-mcp",
             description: None,
             enabled: true,
@@ -699,6 +700,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("create fixed mcp");
     let extra_mcp = mcp_repo
         .create(CreateMcpServerParams {
+            user_id: "system_default_user",
             name: "extra-mcp",
             description: None,
             enabled: true,

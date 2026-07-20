@@ -31,12 +31,19 @@ impl ClientPrefService {
         keep_awake_controller: DynKeepAwakeController,
         keep_awake_restore_user_id: impl Into<String>,
     ) -> Self {
-        let service = Self {
-            repo,
-            keep_awake_controller,
-        };
+        let service = Self::with_keep_awake_controller_without_restore(repo, keep_awake_controller);
         service.restore_keep_awake_from_preferences(keep_awake_restore_user_id.into());
         service
+    }
+
+    pub fn with_keep_awake_controller_without_restore(
+        repo: Arc<dyn IClientPreferenceRepository>,
+        keep_awake_controller: DynKeepAwakeController,
+    ) -> Self {
+        Self {
+            repo,
+            keep_awake_controller,
+        }
     }
 
     /// Get all client preferences, or only the specified keys.
@@ -630,6 +637,23 @@ mod tests {
         }
 
         assert_eq!(*controller.calls.lock().unwrap(), vec![true]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    async fn keep_awake_without_restore_does_not_read_persisted_default_user_preference() {
+        let initial = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert(KEEP_AWAKE_KEY.into(), json!(true));
+        initial.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        let controller = Arc::new(RecordingKeepAwakeController::default());
+        let service =
+            ClientPrefService::with_keep_awake_controller_without_restore(initial.repo.clone(), controller.clone());
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(controller.calls.lock().unwrap().is_empty());
         drop(service);
     }
 }
