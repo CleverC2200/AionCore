@@ -78,6 +78,7 @@ async fn start_watch_and_detect_change() {
     let ev = events.iter().find(|e| e.name == "fileWatch.fileChanged").unwrap();
     assert!(ev.data["file_path"].as_str().is_some());
     assert!(ev.data["event_type"].as_str().is_some());
+    assert_eq!(ev.data["user_id"].as_str(), Some("system_default_user"));
 }
 
 #[tokio::test]
@@ -286,4 +287,5 @@ async fn office_watch_event_has_correct_fields() {
         data["workspace"].as_str().is_some(),
         "workspace should be present: {data:?}"
     );
+    assert_eq!(data["user_id"].as_str(), Some("system_default_user"));
 }

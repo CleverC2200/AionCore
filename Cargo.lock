@@ -667,6 +667,7 @@ name = "aionui-file"
 version = "0.1.50"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-realtime",
  "async-trait",

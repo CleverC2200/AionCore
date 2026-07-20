@@ -84,10 +84,10 @@ struct ProxyPortPath {
 
 async fn start_word_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Word).await
+    start_preview(state, &user.id, body, DocType::Word).await
 }
 
 async fn stop_word_preview(
@@ -100,10 +100,10 @@ async fn stop_word_preview(
 
 async fn start_excel_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Excel).await
+    start_preview(state, &user.id, body, DocType::Excel).await
 }
 
 async fn stop_excel_preview(
@@ -116,10 +116,10 @@ async fn stop_excel_preview(
 
 async fn start_ppt_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Ppt).await
+    start_preview(state, &user.id, body, DocType::Ppt).await
 }
 
 async fn stop_ppt_preview(
@@ -132,6 +132,7 @@ async fn stop_ppt_preview(
 
 async fn start_preview(
     state: OfficeRouterState,
+    user_id: &str,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
@@ -139,7 +140,10 @@ async fn start_preview(
     let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
     let validated_path = validated_path.to_string_lossy().into_owned();
 
-    let result = state.watch_manager.start(&validated_path, doc_type).await;
+    let result = state
+        .watch_manager
+        .start_for_user(user_id, &validated_path, doc_type)
+        .await;
 
     let resp = match result {
         Ok(port) => {

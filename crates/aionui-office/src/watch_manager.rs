@@ -78,6 +78,10 @@ impl OfficecliWatchManager {
     }
 
     pub async fn start(&self, file_path: &str, doc_type: DocType) -> Result<u16, OfficeError> {
+        self.start_for_user("system_default_user", file_path, doc_type).await
+    }
+
+    pub async fn start_for_user(&self, user_id: &str, file_path: &str, doc_type: DocType) -> Result<u16, OfficeError> {
         let resolved = resolve_path(file_path)?;
         let key = session_key(&resolved, doc_type);
 
@@ -89,20 +93,25 @@ impl OfficecliWatchManager {
             self.sessions.remove(&key);
         }
 
-        self.broadcast_status(doc_type, PreviewState::Starting, None);
+        self.broadcast_status_for_user(user_id, doc_type, PreviewState::Starting, None);
 
-        let result = self.try_start(&resolved, doc_type).await;
+        let result = self.try_start(user_id, &resolved, doc_type).await;
 
         match &result {
             Ok(port) => {
-                self.broadcast_status(doc_type, PreviewState::Ready, None);
+                self.broadcast_status_for_user(user_id, doc_type, PreviewState::Ready, None);
                 if doc_type == DocType::Ppt {
                     self.maybe_check_update(doc_type).await;
                 }
                 Ok(*port)
             }
             Err(e) => {
-                self.broadcast_status(doc_type, PreviewState::Error, Some(public_preview_error_message(e)));
+                self.broadcast_status_for_user(
+                    user_id,
+                    doc_type,
+                    PreviewState::Error,
+                    Some(public_preview_error_message(e)),
+                );
                 Err(match e {
                     OfficeError::OfficecliNotFound => OfficeError::OfficecliNotFound,
                     OfficeError::InstallFailed(m) => OfficeError::InstallFailed(m.clone()),
@@ -118,10 +127,13 @@ impl OfficecliWatchManager {
         }
     }
 
-    async fn try_start(&self, resolved: &str, doc_type: DocType) -> Result<u16, OfficeError> {
+    async fn try_start(&self, user_id: &str, resolved: &str, doc_type: DocType) -> Result<u16, OfficeError> {
         for attempt in 1..=START_PORT_MAX_ATTEMPTS {
             let port = allocate_port()?;
-            match self.spawn_officecli_with_install(resolved, port, doc_type).await {
+            match self
+                .spawn_officecli_with_install(user_id, resolved, port, doc_type)
+                .await
+            {
                 Ok(process) => {
                     self.poll_port_ready(port, resolved).await?;
 
@@ -158,6 +170,7 @@ impl OfficecliWatchManager {
 
     async fn spawn_officecli_with_install(
         &self,
+        user_id: &str,
         resolved: &str,
         port: u16,
         doc_type: DocType,
@@ -165,7 +178,7 @@ impl OfficecliWatchManager {
         match self.spawner.spawn_officecli(resolved, port, doc_type).await {
             Ok(process) => Ok(process),
             Err(OfficeError::OfficecliNotFound) => {
-                self.broadcast_status(doc_type, PreviewState::Installing, None);
+                self.broadcast_status_for_user(user_id, doc_type, PreviewState::Installing, None);
                 self.spawner.install_officecli().await?;
                 self.spawner.spawn_officecli(resolved, port, doc_type).await
             }
@@ -243,16 +256,23 @@ impl OfficecliWatchManager {
         }
     }
 
-    fn broadcast_status(&self, doc_type: DocType, state: PreviewState, message: Option<String>) {
+    fn broadcast_status_for_user(
+        &self,
+        user_id: &str,
+        doc_type: DocType,
+        state: PreviewState,
+        message: Option<String>,
+    ) {
         let event_name = format!("{}.status", doc_type.event_prefix());
         let payload = PreviewStatusEvent { state, message };
-        let data = match serde_json::to_value(payload) {
+        let mut data = match serde_json::to_value(payload) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("failed to serialize preview status: {e}");
                 return;
             }
         };
+        data["user_id"] = serde_json::Value::String(user_id.to_owned());
         self.broadcaster.broadcast(WebSocketMessage::new(event_name, data));
     }
 }

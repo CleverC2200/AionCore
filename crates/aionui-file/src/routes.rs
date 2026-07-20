@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,6 +16,7 @@ use aionui_api_types::{
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
@@ -256,6 +257,7 @@ async fn read_file_buffer(
 
 async fn write_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -267,7 +269,7 @@ async fn write_file(
     });
     let ok = state
         .file_service
-        .write_file(&req.path, req.data.as_bytes(), &workspace)
+        .write_file_for_user(&user.id, &req.path, req.data.as_bytes(), &workspace)
         .await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -286,6 +288,7 @@ async fn copy_files(
 
 async fn remove_entry(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RemoveEntryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -295,7 +298,10 @@ async fn remove_entry(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
-    state.file_service.remove_entry(&req.path, &workspace).await?;
+    state
+        .file_service
+        .remove_entry_for_user(&user.id, &req.path, &workspace)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -478,44 +484,63 @@ async fn cancel_zip(
 
 async fn start_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.watch_service.start_watch(&req.file_path).await?;
+    state
+        .watch_service
+        .start_watch_for_user(&user.id, &req.file_path)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn stop_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.watch_service.stop_watch(&req.file_path).await?;
+    state
+        .watch_service
+        .stop_watch_for_user(&user.id, &req.file_path)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
-async fn stop_all_watches(State(state): State<FileRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.watch_service.stop_all_watches().await?;
+async fn stop_all_watches(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.watch_service.stop_all_watches_for_user(&user.id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn start_office_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let allowed_roots: Vec<&Path> = state.allowed_roots.iter().map(std::path::PathBuf::as_path).collect();
     crate::path_safety::validate_path_with_extra_root(&req.workspace, &allowed_roots, Some(Path::new(&req.workspace)))?;
-    state.watch_service.start_office_watch(&req.workspace).await?;
+    state
+        .watch_service
+        .start_office_watch_for_user(&user.id, &req.workspace)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn stop_office_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.watch_service.stop_office_watch(&req.workspace).await?;
+    state
+        .watch_service
+        .stop_office_watch_for_user(&user.id, &req.workspace)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
