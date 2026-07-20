@@ -761,7 +761,9 @@ impl CronService {
             ..Default::default()
         };
         self.repo.update_for_user(user_id, job_id, &params).await?;
-        self.executor.mark_skill_suggest_artifacts_saved(job_id).await?;
+        self.executor
+            .mark_skill_suggest_artifacts_saved(user_id, job_id)
+            .await?;
 
         info!(job_id, "Skill content saved");
         Ok(())

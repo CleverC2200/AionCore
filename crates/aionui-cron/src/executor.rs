@@ -28,7 +28,6 @@ use crate::types::{CronJob, ExecutionMode};
 
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
-const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
@@ -612,6 +611,13 @@ impl JobExecutor {
     }
 
     async fn resolve_conversation_owner_user_id(&self, job: &CronJob) -> Result<String, CronError> {
+        if job.conversation_id.trim().is_empty() {
+            return Err(CronError::Scheduler(format!(
+                "cron job {} has no conversation owner",
+                job.id
+            )));
+        }
+
         if !job.conversation_id.trim().is_empty()
             && let Some(user_id) = self
                 .conversation_repo
@@ -623,7 +629,10 @@ impl JobExecutor {
             return Ok(user_id);
         }
 
-        Ok(SYSTEM_DEFAULT_USER_ID.to_owned())
+        Err(CronError::Scheduler(format!(
+            "cron job {} conversation {} has no resolvable owner",
+            job.id, job.conversation_id
+        )))
     }
 
     async fn execute_inner_with_busy_retry(
@@ -830,21 +839,23 @@ impl JobExecutor {
         };
 
         if row.user_id.trim().is_empty() {
-            return Ok(SYSTEM_DEFAULT_USER_ID.to_owned());
+            return Err(CronError::Scheduler(format!(
+                "conversation {conversation_id} has no owner"
+            )));
         }
 
         Ok(row.user_id)
     }
 
-    pub async fn mark_skill_suggest_artifacts_saved(&self, job_id: &str) -> Result<(), CronError> {
+    pub async fn mark_skill_suggest_artifacts_saved(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
         let rows = self
             .conversation_repo
-            .mark_skill_suggest_artifacts_saved(SYSTEM_DEFAULT_USER_ID, job_id, now_ms())
+            .mark_skill_suggest_artifacts_saved(user_id, job_id, now_ms())
             .await
             .map_err(CronError::Database)?;
 
         for row in rows {
-            broadcast_artifact(&self.broadcaster, SYSTEM_DEFAULT_USER_ID, &row)?;
+            broadcast_artifact(&self.broadcaster, user_id, &row)?;
         }
 
         Ok(())
