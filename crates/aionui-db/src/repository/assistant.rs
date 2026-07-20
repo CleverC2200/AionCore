@@ -201,6 +201,19 @@ pub trait IAssistantDefinitionRepository: Send + Sync {
         let _ = user_id;
         self.get_by_source_ref_including_deleted(source, source_ref).await
     }
+    async fn get_global_by_source_ref_including_deleted(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref_including_deleted(source, source_ref).await
+    }
+    async fn get_global_by_assistant_id_including_deleted(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id_including_deleted(assistant_id).await
+    }
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError>;
     async fn upsert_for_user(
         &self,

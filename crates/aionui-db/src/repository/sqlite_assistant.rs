@@ -715,6 +715,38 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         Ok(row)
     }
 
+    async fn get_global_by_source_ref_including_deleted(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT * FROM assistant_definitions
+             WHERE user_id IS NULL AND source = ? AND source_ref = ?
+             LIMIT 1",
+        )
+        .bind(source)
+        .bind(source_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_global_by_assistant_id_including_deleted(
+        &self,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT * FROM assistant_definitions
+             WHERE user_id IS NULL AND assistant_id = ?
+             LIMIT 1",
+        )
+        .bind(assistant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
         if params.source == "builtin" && params.owner_type == "system" {
             self.upsert_global(params).await
@@ -760,7 +792,17 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
     }
 
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError> {
-        self.soft_delete_for_user(DEFAULT_USER_ID, id, deleted_at).await
+        let result = sqlx::query(
+            "UPDATE assistant_definitions
+             SET deleted_at = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(deleted_at)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn soft_delete_for_user(&self, user_id: &str, id: &str, deleted_at: i64) -> Result<bool, DbError> {

@@ -35,6 +35,7 @@ use crate::error::AssistantError;
 /// contended by a concurrent startup (Sentry 135525166 Option B).
 const BOOTSTRAP_RETRY_MAX_ATTEMPTS: u32 = 5;
 const BOOTSTRAP_RETRY_BACKOFF_MS: [u64; 4] = [50, 100, 200, 400];
+const DEFAULT_USER_ID: &str = "system_default_user";
 
 /// Whether an assistant error is transient SQLite busy/locked contention. Repos
 /// convert `DbError` into `AssistantError::Internal(other.to_string())`, so the
@@ -228,7 +229,7 @@ impl AssistantService {
                 .map_err(|e| AssistantError::Internal(format!("encode builtin disabled skills: {e}")))?;
             let (avatar_type, avatar_value) = serialize_avatar("builtin", builtin.avatar.as_deref());
             let (definition_id, assistant_id) = self
-                .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
+                .resolve_global_definition_identity("builtin", Some(&builtin.id), &builtin.id)
                 .await?;
             let existing_definition = self
                 .definition_repo
@@ -265,7 +266,7 @@ impl AssistantService {
                 .and_then(|definition| definition.default_thought_level_value.as_deref());
 
             self.definition_repo
-                .upsert(&UpsertAssistantDefinitionParams {
+                .upsert_global(&UpsertAssistantDefinitionParams {
                     id: &definition_id,
                     assistant_id: &assistant_id,
                     source: "builtin",
@@ -457,12 +458,19 @@ impl AssistantService {
     }
 
     async fn reconcile_generated_assistants(&self) -> Result<Vec<AgentManagementRow>, AssistantError> {
+        self.reconcile_generated_assistants_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn reconcile_generated_assistants_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<AgentManagementRow>, AssistantError> {
         let Some(agent_catalog) = &self.agent_catalog else {
             return Ok(Vec::new());
         };
 
         let rows = agent_catalog.list_management_agents().await?;
-        let definitions = self.definition_repo.list().await.map_err(|e| {
+        let definitions = self.definition_repo.list_for_user(user_id).await.map_err(|e| {
             AssistantError::Internal(format!("list assistant definitions for generated reconcile: {e}"))
         })?;
         let generated_source_refs: HashSet<String> = definitions
@@ -473,7 +481,7 @@ impl AssistantService {
         let has_existing_generated = !generated_source_refs.is_empty();
         let existing_min_sort_order = self
             .state_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays for generated reconcile: {e}")))?
             .into_iter()
@@ -502,6 +510,7 @@ impl AssistantService {
         for row in generated_rows {
             if let Err(error) = self
                 .reconcile_generated_assistant(
+                    user_id,
                     row,
                     &definitions,
                     has_existing_generated,
@@ -524,6 +533,7 @@ impl AssistantService {
 
     async fn reconcile_generated_assistant(
         &self,
+        user_id: &str,
         row: &AgentManagementRow,
         definitions: &[AssistantDefinitionRow],
         has_existing_generated: bool,
@@ -540,7 +550,7 @@ impl AssistantService {
         let is_missing = existing_definition.is_none();
         let assistant_id = format!("bare:{}", row.id);
         let (definition_id, assistant_id) = self
-            .resolve_definition_identity("generated", Some(&row.id), &assistant_id)
+            .resolve_definition_identity_for_user(user_id, "generated", Some(&row.id), &assistant_id)
             .await?;
         let avatar_value = row.icon.as_deref().filter(|value| !value.trim().is_empty());
         let (definition, should_upsert) = if let Some(mut definition) = existing_definition {
@@ -612,7 +622,7 @@ impl AssistantService {
 
         if should_upsert {
             self.definition_repo
-                .upsert(&upsert_params_from_definition(&definition))
+                .upsert_for_user(user_id, &upsert_params_from_definition(&definition))
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
         }
@@ -623,7 +633,7 @@ impl AssistantService {
 
         if self
             .state_repo
-            .get(&definition_id)
+            .get_for_user(user_id, &definition_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
             .is_none()
@@ -636,13 +646,16 @@ impl AssistantService {
                 row.sort_order
             };
             self.state_repo
-                .upsert(&UpsertAssistantOverlayParams {
-                    assistant_definition_id: &definition_id,
-                    enabled: true,
-                    sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                    agent_id_override: None,
-                    last_used_at: None,
-                })
+                .upsert_for_user(
+                    user_id,
+                    &UpsertAssistantOverlayParams {
+                        assistant_definition_id: &definition_id,
+                        enabled: true,
+                        sort_order: initial_generated_sort_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        agent_id_override: None,
+                        last_used_at: None,
+                    },
+                )
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert generated assistant overlay: {e}")))?;
         }
@@ -652,6 +665,16 @@ impl AssistantService {
 
     async fn upsert_definition_from_legacy_user_row(
         &self,
+        row: &AssistantRow,
+        requested_agent_id: Option<&str>,
+    ) -> Result<(), AssistantError> {
+        self.upsert_definition_from_legacy_user_row_for_user(DEFAULT_USER_ID, row, requested_agent_id)
+            .await
+    }
+
+    async fn upsert_definition_from_legacy_user_row_for_user(
+        &self,
+        user_id: &str,
         row: &AssistantRow,
         requested_agent_id: Option<&str>,
     ) -> Result<(), AssistantError> {
@@ -666,58 +689,67 @@ impl AssistantService {
         let custom_skill_names = normalize_json_array_string(row.custom_skill_names.as_deref(), "custom_skill_names")?;
         let default_disabled_builtin_skill_ids =
             normalize_json_array_string(row.disabled_builtin_skills.as_deref(), "disabled_builtin_skills")?;
-        let (definition_id, assistant_id) = self.resolve_definition_identity("user", Some(&row.id), &row.id).await?;
+        let (definition_id, assistant_id) = self
+            .resolve_definition_identity_for_user(user_id, "user", Some(&row.id), &row.id)
+            .await?;
         let (avatar_type, avatar_value) =
             self.normalize_legacy_user_avatar_input(&assistant_id, row.avatar.as_deref())?;
-        let existing_definition = self.definition_repo.get_by_assistant_id(&assistant_id).await?;
+        let existing_definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, &assistant_id)
+            .await?;
         let agent_id = match requested_agent_id {
             Some(agent_id) => agent_id.to_string(),
             None => match existing_definition {
                 Some(definition) => definition.agent_id,
-                None => self.resolve_default_agent_id().await?,
+                None => self.resolve_default_agent_id_for_user(user_id).await?,
             },
         };
         self.resolve_runtime_backend_for_agent_id(&agent_id).await?;
 
         self.definition_repo
-            .upsert(&UpsertAssistantDefinitionParams {
-                id: &definition_id,
-                assistant_id: &assistant_id,
-                source: "user",
-                owner_type: "user",
-                source_ref: Some(&row.id),
-                name: &row.name,
-                name_i18n: &name_i18n,
-                description: row.description.as_deref(),
-                description_i18n: &description_i18n,
-                avatar_type: &avatar_type,
-                avatar_value: avatar_value.as_deref(),
-                agent_id: &agent_id,
-                rule_resource_type: "user_file",
-                rule_resource_ref: Some(&row.id),
-                recommended_prompts: &recommended_prompts,
-                recommended_prompts_i18n: &recommended_prompts_i18n,
-                default_model_mode: "auto",
-                default_model_value: None,
-                default_permission_mode: "auto",
-                default_permission_value: None,
-                default_thought_level_mode: "auto",
-                default_thought_level_value: None,
-                default_skills_mode: "fixed",
-                default_skill_ids: &default_skill_ids,
-                custom_skill_names: &custom_skill_names,
-                default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
-                default_mcps_mode: "auto",
-                default_mcp_ids: "[]",
-            })
+            .upsert_for_user(
+                user_id,
+                &UpsertAssistantDefinitionParams {
+                    id: &definition_id,
+                    assistant_id: &assistant_id,
+                    source: "user",
+                    owner_type: "user",
+                    source_ref: Some(&row.id),
+                    name: &row.name,
+                    name_i18n: &name_i18n,
+                    description: row.description.as_deref(),
+                    description_i18n: &description_i18n,
+                    avatar_type: &avatar_type,
+                    avatar_value: avatar_value.as_deref(),
+                    agent_id: &agent_id,
+                    rule_resource_type: "user_file",
+                    rule_resource_ref: Some(&row.id),
+                    recommended_prompts: &recommended_prompts,
+                    recommended_prompts_i18n: &recommended_prompts_i18n,
+                    default_model_mode: "auto",
+                    default_model_value: None,
+                    default_permission_mode: "auto",
+                    default_permission_value: None,
+                    default_thought_level_mode: "auto",
+                    default_thought_level_value: None,
+                    default_skills_mode: "fixed",
+                    default_skill_ids: &default_skill_ids,
+                    custom_skill_names: &custom_skill_names,
+                    default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
+                    default_mcps_mode: "auto",
+                    default_mcp_ids: "[]",
+                },
+            )
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert user definition: {e}")))?;
 
         Ok(())
     }
 
-    async fn apply_detail_overrides(
+    async fn apply_detail_overrides_for_user(
         &self,
+        user_id: &str,
         assistant_id: &str,
         overrides: SerializedDetailOverrides,
         reset_model_and_permission: bool,
@@ -728,7 +760,7 @@ impl AssistantService {
 
         let Some(existing) = self
             .definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant definition: {e}")))?
         else {
@@ -736,10 +768,14 @@ impl AssistantService {
         };
 
         let mut patched = existing.clone();
+        if patched.source == "builtin" && patched.owner_type == "system" {
+            patched.id = generate_prefixed_id("asstdef");
+            patched.owner_type = "user".to_string();
+        }
         apply_detail_patch_to_definition(&mut patched, &overrides, reset_model_and_permission);
 
         self.definition_repo
-            .upsert(&upsert_params_from_definition(&patched))
+            .upsert_for_user(user_id, &upsert_params_from_definition(&patched))
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert patched assistant definition: {e}")))?;
 
@@ -752,10 +788,15 @@ impl AssistantService {
 
     /// Classify an assistant id into its source.
     pub async fn classify_source(&self, id: &str) -> AssistantSource {
+        self.classify_source_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    /// Classify an assistant id into its source for the current user.
+    pub async fn classify_source_for_user(&self, user_id: &str, id: &str) -> AssistantSource {
         if self.builtin.has(id) {
             return AssistantSource::Builtin;
         }
-        if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id(id).await {
+        if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await {
             return match definition.source.as_str() {
                 "builtin" => AssistantSource::Builtin,
                 "generated" => AssistantSource::Generated,
@@ -773,15 +814,19 @@ impl AssistantService {
     /// application. Also performs opportunistic orphan cleanup on the
     /// overrides table.
     pub async fn list(&self) -> Result<Vec<AssistantResponse>, AssistantError> {
-        let projections = self.reconcile_generated_assistants().await?;
+        self.list_for_user(DEFAULT_USER_ID).await
+    }
+
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<AssistantResponse>, AssistantError> {
+        let projections = self.reconcile_generated_assistants_for_user(user_id).await?;
         let definitions = self
             .definition_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?;
         let states = self
             .state_repo
-            .list()
+            .list_for_user(user_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
         let state_map: HashMap<String, AssistantOverlayRow> = states
@@ -811,7 +856,7 @@ impl AssistantService {
         // Opportunistic orphan cleanup: any override row whose assistant_id no
         // longer appears in the merged list is stale.
         let valid_ids: Vec<&str> = result.iter().map(|a| a.id.as_str()).collect();
-        if let Err(e) = self.override_repo.delete_orphans(&valid_ids).await {
+        if let Err(e) = self.override_repo.delete_orphans_for_user(user_id, &valid_ids).await {
             warn!("override orphan cleanup failed: {e}");
         }
 
@@ -819,12 +864,16 @@ impl AssistantService {
     }
 
     pub async fn get(&self, id: &str) -> Result<AssistantResponse, AssistantError> {
-        let projections = self.reconcile_generated_assistants().await?;
-        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+        self.get_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<AssistantResponse, AssistantError> {
+        let projections = self.reconcile_generated_assistants_for_user(user_id).await?;
+        if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
-            let state = self.state_repo.get(&definition.id).await?;
+            let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
                 .await?;
@@ -835,13 +884,22 @@ impl AssistantService {
     }
 
     pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
-        let projections = self.reconcile_generated_assistants().await?;
-        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
+        self.get_detail_for_user(DEFAULT_USER_ID, id, locale).await
+    }
+
+    pub async fn get_detail_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+    ) -> Result<AssistantDetailResponse, AssistantError> {
+        let projections = self.reconcile_generated_assistants_for_user(user_id).await?;
+        if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
-            let state = self.state_repo.get(&definition.id).await?;
-            let preference = self.preference_repo.get(&definition.id).await?;
+            let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
+            let preference = self.preference_repo.get_for_user(user_id, &definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
@@ -879,9 +937,13 @@ impl AssistantService {
     ///    which on machines without the Gemini CLI 400'd within 1 ms
     ///    with `Agent 'Gemini CLI' CLI not found in PATH`.
     pub async fn resolve_default_agent_id(&self) -> Result<String, AssistantError> {
+        self.resolve_default_agent_id_for_user(DEFAULT_USER_ID).await
+    }
+
+    pub async fn resolve_default_agent_id_for_user(&self, user_id: &str) -> Result<String, AssistantError> {
         let providers = self
             .provider_repo
-            .list()
+            .list(user_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("failed to list providers: {e}")))?;
 
@@ -945,6 +1007,14 @@ impl AssistantService {
     // -----------------------------------------------------------------------
 
     pub async fn create(&self, req: CreateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
+        self.create_for_user(DEFAULT_USER_ID, req).await
+    }
+
+    pub async fn create_for_user(
+        &self,
+        user_id: &str,
+        req: CreateAssistantRequest,
+    ) -> Result<AssistantResponse, AssistantError> {
         let name = req.name.trim().to_string();
         if name.is_empty() {
             return Err(AssistantError::BadRequest("name is required".into()));
@@ -970,7 +1040,7 @@ impl AssistantService {
         // the Gemini CLI (ELECTRON-1J1, ELECTRON-1KV).
         let resolved_agent_id = match req.agent_id.as_deref() {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => self.resolve_default_agent_id().await?,
+            _ => self.resolve_default_agent_id_for_user(user_id).await?,
         };
         self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await?;
         let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
@@ -989,19 +1059,33 @@ impl AssistantService {
             prompts_i18n: serialized.prompts_i18n.as_deref(),
         };
 
-        let row = self.repo.create(&params).await?;
-        self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+        let row = self.repo.create_for_user(user_id, &params).await?;
+        self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, Some(&resolved_agent_id))
             .await?;
-        self.apply_detail_overrides(&row.id, detail_overrides, false).await?;
-        if let Some(definition) = self.definition_repo.get_by_assistant_id(&row.id).await? {
-            self.sync_preferences_from_defaults_request(&definition, None, req.defaults.as_ref())
+        self.apply_detail_overrides_for_user(user_id, &row.id, detail_overrides, false)
+            .await?;
+        if let Some(definition) = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, &row.id)
+            .await?
+        {
+            self.sync_preferences_from_defaults_request_for_user(user_id, &definition, None, req.defaults.as_ref())
                 .await?;
         }
-        self.get(&id).await
+        self.get_for_user(user_id, &id).await
     }
 
     pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
-        match self.classify_source(id).await {
+        self.update_for_user(DEFAULT_USER_ID, id, req).await
+    }
+
+    pub async fn update_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateAssistantRequest,
+    ) -> Result<AssistantResponse, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
                 let builtin_defaults_forbidden = req
@@ -1036,18 +1120,18 @@ impl AssistantService {
 
                 let definition = self
                     .definition_repo
-                    .get_by_assistant_id(id)
+                    .get_by_assistant_id_for_user(user_id, id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
 
-                let existing = self.override_repo.get(id).await?;
+                let existing = self.override_repo.get_for_user(user_id, id).await?;
                 let enabled = existing.as_ref().is_none_or(|o| o.enabled);
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
                 let requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
                 let current_agent_id = self
                     .state_repo
-                    .get(&definition.id)
+                    .get_for_user(user_id, &definition.id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
                     .and_then(|row| row.agent_id_override)
@@ -1057,27 +1141,37 @@ impl AssistantService {
                     .is_some_and(|agent_id| agent_id != current_agent_id);
                 if let Some(requested_agent_id) = requested_agent_id.as_deref() {
                     self.resolve_runtime_backend_for_agent_id(requested_agent_id).await?;
-                    self.state_repo
-                        .upsert(&UpsertAssistantOverlayParams {
-                            assistant_definition_id: &definition.id,
-                            enabled,
-                            sort_order,
-                            agent_id_override: Some(requested_agent_id),
-                            last_used_at,
-                        })
-                        .await
-                        .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
                 }
-                self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
+                self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
                     .await?;
                 let definition = self
                     .definition_repo
-                    .get_by_assistant_id(id)
+                    .get_by_assistant_id_for_user(user_id, id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-                self.sync_preferences_from_defaults_request(&definition, Some(&definition), req.defaults.as_ref())
-                    .await?;
-                return self.get(id).await;
+                if let Some(requested_agent_id) = requested_agent_id.as_deref() {
+                    self.state_repo
+                        .upsert_for_user(
+                            user_id,
+                            &UpsertAssistantOverlayParams {
+                                assistant_definition_id: &definition.id,
+                                enabled,
+                                sort_order,
+                                agent_id_override: Some(requested_agent_id),
+                                last_used_at,
+                            },
+                        )
+                        .await
+                        .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+                }
+                self.sync_preferences_from_defaults_request_for_user(
+                    user_id,
+                    &definition,
+                    Some(&definition),
+                    req.defaults.as_ref(),
+                )
+                .await?;
+                return self.get_for_user(user_id, id).await;
             }
             AssistantSource::Generated => {
                 if req.name.is_some()
@@ -1100,7 +1194,7 @@ impl AssistantService {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
                 let current_definition = self
                     .definition_repo
-                    .get_by_assistant_id(id)
+                    .get_by_assistant_id_for_user(user_id, id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
                 let mut patched = current_definition.clone();
@@ -1128,12 +1222,17 @@ impl AssistantService {
 
                 let patched = self
                     .definition_repo
-                    .upsert(&upsert_params_from_definition(&patched))
+                    .upsert_for_user(user_id, &upsert_params_from_definition(&patched))
                     .await
                     .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
-                self.sync_preferences_from_defaults_request(&patched, Some(&current_definition), req.defaults.as_ref())
-                    .await?;
-                return self.get(id).await;
+                self.sync_preferences_from_defaults_request_for_user(
+                    user_id,
+                    &patched,
+                    Some(&current_definition),
+                    req.defaults.as_ref(),
+                )
+                .await?;
+                return self.get_for_user(user_id, id).await;
             }
             AssistantSource::User => {}
         }
@@ -1142,7 +1241,7 @@ impl AssistantService {
         let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
         let current_definition = self
             .definition_repo
-            .get_by_assistant_id(id)
+            .get_by_assistant_id_for_user(user_id, id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
         let requested_agent_id = match req.agent_id.as_deref() {
@@ -1177,22 +1276,28 @@ impl AssistantService {
 
         let row = self
             .repo
-            .update(id, &params)
+            .update_for_user(user_id, id, &params)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        self.upsert_definition_from_legacy_user_row(&row, requested_agent_id.as_deref())
+        self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, requested_agent_id.as_deref())
             .await?;
-        self.apply_detail_overrides(id, detail_overrides, reset_model_and_permission)
+        self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
             .await?;
-        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
-            self.sync_preferences_from_defaults_request(&definition, Some(&current_definition), req.defaults.as_ref())
-                .await?;
+        if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
+            self.sync_preferences_from_defaults_request_for_user(
+                user_id,
+                &definition,
+                Some(&current_definition),
+                req.defaults.as_ref(),
+            )
+            .await?;
         }
-        self.get(id).await
+        self.get_for_user(user_id, id).await
     }
 
-    async fn sync_preferences_from_defaults_request(
+    async fn sync_preferences_from_defaults_request_for_user(
         &self,
+        user_id: &str,
         definition: &AssistantDefinitionRow,
         previous_definition: Option<&AssistantDefinitionRow>,
         defaults: Option<&AssistantDefaultsRequest>,
@@ -1203,7 +1308,7 @@ impl AssistantService {
 
         let existing = self
             .preference_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant preference: {e}")))?;
 
@@ -1327,7 +1432,7 @@ impl AssistantService {
         {
             if existing.is_some() {
                 self.preference_repo
-                    .delete(&definition.id)
+                    .delete_for_user(user_id, &definition.id)
                     .await
                     .map_err(|e| AssistantError::Internal(format!("delete assistant preference: {e}")))?;
             }
@@ -1342,15 +1447,18 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("encode assistant mcp preference: {e}")))?;
 
         self.preference_repo
-            .upsert(&UpsertAssistantPreferenceParams {
-                assistant_definition_id: &definition.id,
-                last_model_id: last_model_id.as_deref(),
-                last_permission_value: last_permission_value.as_deref(),
-                last_thought_level_value: last_thought_level_value.as_deref(),
-                last_skill_ids: &last_skill_ids_json,
-                last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids_json,
-                last_mcp_ids: &last_mcp_ids_json,
-            })
+            .upsert_for_user(
+                user_id,
+                &UpsertAssistantPreferenceParams {
+                    assistant_definition_id: &definition.id,
+                    last_model_id: last_model_id.as_deref(),
+                    last_permission_value: last_permission_value.as_deref(),
+                    last_thought_level_value: last_thought_level_value.as_deref(),
+                    last_skill_ids: &last_skill_ids_json,
+                    last_disabled_builtin_skill_ids: &last_disabled_builtin_skill_ids_json,
+                    last_mcp_ids: &last_mcp_ids_json,
+                },
+            )
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert assistant preference: {e}")))?;
 
@@ -1358,7 +1466,11 @@ impl AssistantService {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), AssistantError> {
-        match self.classify_source(id).await {
+        self.delete_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 return Err(AssistantError::Forbidden("Cannot delete built-in assistant".into()));
             }
@@ -1368,23 +1480,27 @@ impl AssistantService {
             AssistantSource::User => {}
         }
 
-        let removed = self.repo.delete(id).await?;
+        let removed = self.repo.delete_for_user(user_id, id).await?;
         if !removed {
             return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
         }
 
         // Drop the override row (best-effort).
-        if let Err(e) = self.override_repo.delete(id).await {
+        if let Err(e) = self.override_repo.delete_for_user(user_id, id).await {
             warn!("failed to remove override for deleted assistant '{id}': {e}");
         }
-        if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
-            if let Err(e) = self.state_repo.delete(&definition.id).await {
+        if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
+            if let Err(e) = self.state_repo.delete_for_user(user_id, &definition.id).await {
                 warn!("failed to remove assistant overlay for deleted assistant '{id}': {e}");
             }
-            if let Err(e) = self.preference_repo.delete(&definition.id).await {
+            if let Err(e) = self.preference_repo.delete_for_user(user_id, &definition.id).await {
                 warn!("failed to remove assistant preferences for deleted assistant '{id}': {e}");
             }
-            if let Err(e) = self.definition_repo.soft_delete(&definition.id, now_ms()).await {
+            if let Err(e) = self
+                .definition_repo
+                .soft_delete_for_user(user_id, &definition.id, now_ms())
+                .await
+            {
                 warn!("failed to soft-delete assistant definition for deleted assistant '{id}': {e}");
             }
         }
@@ -1400,11 +1516,20 @@ impl AssistantService {
         id: &str,
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
-        match self.classify_source(id).await {
+        self.set_state_for_user(DEFAULT_USER_ID, id, req).await
+    }
+
+    pub async fn set_state_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: SetAssistantStateRequest,
+    ) -> Result<AssistantResponse, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin | AssistantSource::Generated => {}
             AssistantSource::User => {
                 // Confirm the user row exists (otherwise 404).
-                if self.repo.get(id).await?.is_none() {
+                if self.repo.get_for_user(user_id, id).await?.is_none() {
                     return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
                 }
             }
@@ -1413,11 +1538,11 @@ impl AssistantService {
         // Merge with existing state/override to preserve fields not in this request.
         let definition = self
             .definition_repo
-            .get_by_assistant_id(id)
+            .get_by_assistant_id_for_user(user_id, id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let existing_state = self.state_repo.get(&definition.id).await?;
-        let existing = self.override_repo.get(id).await?;
+        let existing_state = self.state_repo.get_for_user(user_id, &definition.id).await?;
+        let existing = self.override_repo.get_for_user(user_id, id).await?;
         let enabled = req.enabled.unwrap_or_else(|| {
             existing_state
                 .as_ref()
@@ -1437,17 +1562,20 @@ impl AssistantService {
             .as_ref()
             .and_then(|state| state.agent_id_override.clone());
         self.state_repo
-            .upsert(&UpsertAssistantOverlayParams {
-                assistant_definition_id: &definition.id,
-                enabled,
-                sort_order,
-                agent_id_override: agent_id_override.as_deref(),
-                last_used_at,
-            })
+            .upsert_for_user(
+                user_id,
+                &UpsertAssistantOverlayParams {
+                    assistant_definition_id: &definition.id,
+                    enabled,
+                    sort_order,
+                    agent_id_override: agent_id_override.as_deref(),
+                    last_used_at,
+                },
+            )
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
 
-        self.get(id).await
+        self.get_for_user(user_id, id).await
     }
 
     // -----------------------------------------------------------------------
@@ -1458,6 +1586,14 @@ impl AssistantService {
     /// built-in id collision or already-imported user-id collision.
     /// Never overwrites an existing user row.
     pub async fn import(&self, req: ImportAssistantsRequest) -> Result<ImportAssistantsResult, AssistantError> {
+        self.import_for_user(DEFAULT_USER_ID, req).await
+    }
+
+    pub async fn import_for_user(
+        &self,
+        user_id: &str,
+        req: ImportAssistantsRequest,
+    ) -> Result<ImportAssistantsResult, AssistantError> {
         let mut result = ImportAssistantsResult::default();
 
         // Resolved-once cache for the inferred default agent id. We only
@@ -1476,7 +1612,7 @@ impl AssistantService {
                 result.skipped += 1;
                 continue;
             }
-            match self.repo.get(&id).await {
+            match self.repo.get_for_user(user_id, &id).await {
                 Ok(Some(_)) => {
                     result.skipped += 1;
                     continue;
@@ -1528,7 +1664,7 @@ impl AssistantService {
                 }
                 _ => match cached_default_agent_id.as_deref() {
                     Some(v) => v.to_string(),
-                    None => match self.resolve_default_agent_id().await {
+                    None => match self.resolve_default_agent_id_for_user(user_id).await {
                         Ok(v) => {
                             cached_default_agent_id = Some(v.clone());
                             v
@@ -1580,9 +1716,9 @@ impl AssistantService {
                 prompts_i18n: serialized.prompts_i18n.as_deref(),
             };
 
-            match self.repo.create(&params).await {
+            match self.repo.create_for_user(user_id, &params).await {
                 Ok(row) => {
-                    self.upsert_definition_from_legacy_user_row(&row, Some(&resolved_agent_id))
+                    self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, Some(&resolved_agent_id))
                         .await?;
                     result.imported += 1;
                 }
@@ -1746,10 +1882,14 @@ impl AssistantService {
     /// has no on-disk file) also return `None`; clients fall back to the
     /// text avatar for those.
     pub async fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
-        match self.classify_source(id).await {
+        self.avatar_asset_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn avatar_asset_for_user(&self, user_id: &str, id: &str) -> Option<AvatarAsset> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => self.builtin.avatar_asset(id),
             AssistantSource::Generated | AssistantSource::User => {
-                if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id(id).await {
+                if let Ok(Some(definition)) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await {
                     if definition.avatar_type != "user_asset" {
                         return None;
                     }
@@ -2024,8 +2164,9 @@ impl AssistantService {
         assistant_md_path(&self.user_skills_dir(), id, locale)
     }
 
-    async fn resolve_definition_identity(
+    async fn resolve_definition_identity_for_user(
         &self,
+        user_id: &str,
         source: &str,
         source_ref: Option<&str>,
         assistant_id: &str,
@@ -2033,7 +2174,7 @@ impl AssistantService {
         if let Some(source_ref) = source_ref
             && let Some(existing) = self
                 .definition_repo
-                .get_by_source_ref_including_deleted(source, source_ref)
+                .get_by_source_ref_including_deleted_for_user(user_id, source, source_ref)
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant definition by source_ref: {e}")))?
         {
@@ -2042,9 +2183,37 @@ impl AssistantService {
 
         if let Some(existing) = self
             .definition_repo
-            .get_by_assistant_id_including_deleted(assistant_id)
+            .get_by_assistant_id_including_deleted_for_user(user_id, assistant_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get assistant definition by key: {e}")))?
+        {
+            return Ok((existing.id, existing.assistant_id));
+        }
+
+        Ok((generate_prefixed_id("asstdef"), assistant_id.to_string()))
+    }
+
+    async fn resolve_global_definition_identity(
+        &self,
+        source: &str,
+        source_ref: Option<&str>,
+        assistant_id: &str,
+    ) -> Result<(String, String), AssistantError> {
+        if let Some(source_ref) = source_ref
+            && let Some(existing) = self
+                .definition_repo
+                .get_global_by_source_ref_including_deleted(source, source_ref)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("get global assistant definition by source_ref: {e}")))?
+        {
+            return Ok((existing.id, existing.assistant_id));
+        }
+
+        if let Some(existing) = self
+            .definition_repo
+            .get_global_by_assistant_id_including_deleted(assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("get global assistant definition by key: {e}")))?
         {
             return Ok((existing.id, existing.assistant_id));
         }
@@ -3053,7 +3222,7 @@ pub fn generate_user_id() -> String {
 mod tests {
     use super::*;
     use aionui_db::{
-        CreateProviderParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+        CreateProviderParams, IUserRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
         SqliteProviderRepository, UpsertOverrideParams, init_database_memory,
     };
@@ -3302,8 +3471,13 @@ mod tests {
     }
 
     async fn seed_provider(repo: &dyn IProviderRepository, platform: &str) {
+        seed_provider_for_user(repo, DEFAULT_USER_ID, platform).await;
+    }
+
+    async fn seed_provider_for_user(repo: &dyn IProviderRepository, user_id: &str, platform: &str) {
         repo.create(CreateProviderParams {
             id: None,
+            user_id,
             platform,
             name: "Test Provider",
             base_url: "https://example.invalid",
@@ -3321,6 +3495,13 @@ mod tests {
         })
         .await
         .expect("seed provider");
+    }
+
+    async fn create_test_user(db: &aionui_db::Database, username: &str) -> String {
+        let repo = aionui_db::SqliteUserRepository::new(db.pool().clone());
+        let user = repo.create_user(username, "hash").await.unwrap();
+        assert_eq!(user.username.as_deref(), Some(username));
+        user.id
     }
 
     fn mk_builtin(id: &str, name: &str) -> BuiltinAssistant {
@@ -3696,6 +3877,46 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|a| a.id == "builtin-office"));
         assert!(list.iter().any(|a| a.id == "u1"));
+    }
+
+    #[tokio::test]
+    async fn list_for_user_isolates_user_authored_assistants() {
+        let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
+        let user_b = create_test_user(&fx._db, "assistant_user_b").await;
+        seed_provider_for_user(&*fx.provider_repo, &user_b, "openai").await;
+
+        fx.service
+            .create_for_user(
+                DEFAULT_USER_ID,
+                CreateAssistantRequest {
+                    id: Some("u-default".into()),
+                    name: "Default User Assistant".into(),
+                    ..req_default()
+                },
+            )
+            .await
+            .unwrap();
+        fx.service
+            .create_for_user(
+                &user_b,
+                CreateAssistantRequest {
+                    id: Some("u-b".into()),
+                    name: "User B Assistant".into(),
+                    ..req_default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let default_list = fx.service.list_for_user(DEFAULT_USER_ID).await.unwrap();
+        let user_b_list = fx.service.list_for_user(&user_b).await.unwrap();
+
+        assert!(default_list.iter().any(|assistant| assistant.id == "builtin-office"));
+        assert!(user_b_list.iter().any(|assistant| assistant.id == "builtin-office"));
+        assert!(default_list.iter().any(|assistant| assistant.id == "u-default"));
+        assert!(!default_list.iter().any(|assistant| assistant.id == "u-b"));
+        assert!(user_b_list.iter().any(|assistant| assistant.id == "u-b"));
+        assert!(!user_b_list.iter().any(|assistant| assistant.id == "u-default"));
     }
 
     #[tokio::test]
@@ -6196,6 +6417,7 @@ mod tests {
         fx.provider_repo
             .create(CreateProviderParams {
                 id: None,
+                user_id: DEFAULT_USER_ID,
                 platform: "anthropic",
                 name: "Disabled",
                 base_url: "https://example.invalid",

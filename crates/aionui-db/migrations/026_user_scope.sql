@@ -309,14 +309,86 @@ ALTER TABLE assistant_overrides_new RENAME TO assistant_overrides;
 CREATE INDEX IF NOT EXISTS idx_assistant_overrides_user_sort
     ON assistant_overrides(user_id, sort_order);
 
-ALTER TABLE assistant_definitions
-    ADD COLUMN user_id TEXT REFERENCES users(id);
-UPDATE assistant_definitions
-SET user_id = 'system_default_user'
-WHERE user_id IS NULL
-  AND NOT (source = 'builtin' AND owner_type = 'system');
 DROP INDEX IF EXISTS idx_assistant_definitions_source_ref;
 DROP INDEX IF EXISTS idx_assistant_definitions_assistant_id;
+
+CREATE TABLE assistant_definitions_new (
+    id                                   TEXT PRIMARY KEY NOT NULL,
+    user_id                              TEXT REFERENCES users(id),
+    assistant_id                         TEXT NOT NULL,
+    source                               TEXT NOT NULL
+                                             CHECK (source IN ('builtin', 'user', 'generated')),
+    owner_type                           TEXT NOT NULL
+                                             CHECK (owner_type IN ('system', 'user')),
+    source_ref                           TEXT,
+    name                                 TEXT NOT NULL,
+    name_i18n                            TEXT NOT NULL DEFAULT '{}',
+    description                          TEXT,
+    description_i18n                     TEXT NOT NULL DEFAULT '{}',
+    avatar_type                          TEXT NOT NULL DEFAULT 'none'
+                                             CHECK (avatar_type IN ('none', 'emoji', 'builtin_asset', 'user_asset')),
+    avatar_value                         TEXT,
+    agent_id                             TEXT NOT NULL,
+    rule_resource_type                   TEXT NOT NULL
+                                             CHECK (rule_resource_type IN ('none', 'builtin_asset', 'user_file', 'extension')),
+    rule_resource_ref                    TEXT,
+    recommended_prompts                  TEXT NOT NULL DEFAULT '[]',
+    recommended_prompts_i18n             TEXT NOT NULL DEFAULT '{}',
+    default_model_mode                   TEXT NOT NULL
+                                             CHECK (default_model_mode IN ('auto', 'fixed')),
+    default_model_value                  TEXT,
+    default_permission_mode              TEXT NOT NULL
+                                             CHECK (default_permission_mode IN ('auto', 'fixed')),
+    default_permission_value             TEXT,
+    default_thought_level_mode           TEXT NOT NULL DEFAULT 'auto'
+                                             CHECK (default_thought_level_mode IN ('auto', 'fixed')),
+    default_thought_level_value          TEXT,
+    default_skills_mode                  TEXT NOT NULL
+                                             CHECK (default_skills_mode IN ('auto', 'fixed')),
+    default_skill_ids                    TEXT NOT NULL DEFAULT '[]',
+    custom_skill_names                   TEXT NOT NULL DEFAULT '[]',
+    default_disabled_builtin_skill_ids   TEXT NOT NULL DEFAULT '[]',
+    default_mcps_mode                    TEXT NOT NULL
+                                             CHECK (default_mcps_mode IN ('auto', 'fixed')),
+    default_mcp_ids                      TEXT NOT NULL DEFAULT '[]',
+    created_at                           INTEGER NOT NULL,
+    updated_at                           INTEGER NOT NULL,
+    deleted_at                           INTEGER
+);
+
+INSERT INTO assistant_definitions_new (
+    id, user_id, assistant_id, source, owner_type, source_ref,
+    name, name_i18n, description, description_i18n, avatar_type, avatar_value,
+    agent_id, rule_resource_type, rule_resource_ref,
+    recommended_prompts, recommended_prompts_i18n,
+    default_model_mode, default_model_value,
+    default_permission_mode, default_permission_value,
+    default_thought_level_mode, default_thought_level_value,
+    default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
+    default_mcps_mode, default_mcp_ids,
+    created_at, updated_at, deleted_at
+)
+SELECT
+    id,
+    CASE
+        WHEN source = 'builtin' AND owner_type = 'system' THEN NULL
+        ELSE 'system_default_user'
+    END,
+    assistant_id, source, owner_type, source_ref,
+    name, name_i18n, description, description_i18n, avatar_type, avatar_value,
+    agent_id, rule_resource_type, rule_resource_ref,
+    recommended_prompts, recommended_prompts_i18n,
+    default_model_mode, default_model_value,
+    default_permission_mode, default_permission_value,
+    default_thought_level_mode, default_thought_level_value,
+    default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
+    default_mcps_mode, default_mcp_ids,
+    created_at, updated_at, deleted_at
+FROM assistant_definitions;
+
+DROP TABLE assistant_definitions;
+ALTER TABLE assistant_definitions_new RENAME TO assistant_definitions;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_global_source_ref
     ON assistant_definitions(source, source_ref)
     WHERE user_id IS NULL AND source_ref IS NOT NULL;
@@ -329,6 +401,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_global_assistant_id
 CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_definitions_user_assistant_id
     ON assistant_definitions(user_id, assistant_id)
     WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_assistant_definitions_source
+    ON assistant_definitions(source);
+CREATE INDEX IF NOT EXISTS idx_assistant_definitions_agent_id
+    ON assistant_definitions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_assistant_definitions_user_updated_at
     ON assistant_definitions(user_id, updated_at DESC);
 
