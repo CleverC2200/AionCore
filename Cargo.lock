@@ -515,6 +515,7 @@ version = "0.1.50"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-conversation",
  "aionui-db",

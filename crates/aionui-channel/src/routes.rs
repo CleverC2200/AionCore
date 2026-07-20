@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, post, put};
 use tracing::warn;
 
@@ -14,6 +14,7 @@ use aionui_api_types::{
     EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::{DbError, IChannelRepository};
 use aionui_extension::{ExtensionRegistry, ResolvedChannelPlugin};
@@ -568,18 +569,20 @@ async fn get_active_sessions(
 /// `GET /api/channel/settings/:platform` — return backend-owned channel settings.
 async fn get_channel_settings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
 ) -> Result<Json<ApiResponse<ChannelPlatformSettingsResponse>>, ApiError> {
     let platform = PluginType::from_str_opt(&platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
 
-    let settings = state.settings_service.get_platform_settings(platform).await?;
+    let settings = state.settings_service.get_platform_settings(&user.id, platform).await?;
     Ok(Json(ApiResponse::ok(settings)))
 }
 
 /// `PUT /api/channel/settings/:platform/assistant` — persist assistant binding for a platform.
 async fn set_channel_assistant_setting(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
     body: Result<Json<ChannelAssistantSettingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
@@ -587,7 +590,10 @@ async fn set_channel_assistant_setting(
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.settings_service.set_assistant_setting(platform, &req).await?;
+    state
+        .settings_service
+        .set_assistant_setting(&user.id, platform, &req)
+        .await?;
     state.session_manager.clear_all_sessions().await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
@@ -600,6 +606,7 @@ async fn set_channel_assistant_setting(
 /// `PUT /api/channel/settings/:platform/default-model` — persist default model for a platform.
 async fn set_channel_default_model_setting(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(platform): Path<String>,
     body: Result<Json<ChannelDefaultModelSetting>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
@@ -607,7 +614,10 @@ async fn set_channel_default_model_setting(
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.settings_service.set_model_setting(platform, &req).await?;
+    state
+        .settings_service
+        .set_model_setting(&user.id, platform, &req)
+        .await?;
     state.session_manager.clear_all_sessions().await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {

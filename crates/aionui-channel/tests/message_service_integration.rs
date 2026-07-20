@@ -24,6 +24,8 @@ use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+const TEST_OWNER_USER_ID: &str = "system_default_user";
+
 struct TestBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
 }
@@ -306,10 +308,13 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .await
         .unwrap();
     pref_repo
-        .upsert_batch(&[(
-            "assistant.telegram.agent",
-            r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
-        )])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[(
+                "assistant.telegram.agent",
+                r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+            )],
+        )
         .await
         .unwrap();
 
@@ -338,7 +343,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .unwrap();
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(&result.conversation_id)
+        .get_assistant_snapshot(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap();
     assert!(
@@ -346,7 +351,11 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         "channel-created conversation should persist an assistant snapshot when the platform is bound to an assistant"
     );
     let snapshot = snapshot.unwrap();
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
     let session_row = acp_session_repo
         .get(&result.conversation_id)
@@ -380,10 +389,13 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
 
     let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     pref_repo
-        .upsert_batch(&[(
-            "assistant.telegram.agent",
-            r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
-        )])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[(
+                "assistant.telegram.agent",
+                r#"{"assistant_id":"missing-assistant","name":"Missing"}"#,
+            )],
+        )
         .await
         .unwrap();
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
@@ -478,11 +490,15 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
         .unwrap();
 
     let snapshot = conversation_repo
-        .get_assistant_snapshot(&result.conversation_id)
+        .get_assistant_snapshot(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap()
         .expect("channel-created conversation should default to a bare assistant snapshot");
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(snapshot.assistant_id, "bare-aionrs");
     assert_eq!(snapshot.agent_id, "632f31d2");
@@ -525,7 +541,10 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .await
         .unwrap();
     pref_repo
-        .upsert_batch(&[("assistant.telegram.agent", r#"{"assistant_id":"bare-codex"}"#)])
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[("assistant.telegram.agent", r#"{"assistant_id":"bare-codex"}"#)],
+        )
         .await
         .unwrap();
 
@@ -553,6 +572,10 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .await
         .unwrap();
 
-    let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &result.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(conversation.name, "tg-acp-codex-70880480");
 }

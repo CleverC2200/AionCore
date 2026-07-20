@@ -86,7 +86,7 @@ impl ActionExecutor {
         }
 
         // 3. Text message → session resolution → AI dispatch
-        let agent_config = self.settings.get_agent_config(msg.platform).await?;
+        let agent_config = self.settings.get_agent_config(&internal_user_id, msg.platform).await?;
         let session = self
             .session_mgr
             .get_or_create_session(&internal_user_id, chat_id, &agent_config.agent_type, None)
@@ -224,7 +224,10 @@ impl ActionExecutor {
             "session.new" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
-                let agent_config = self.settings.get_agent_config(action.context.platform).await?;
+                let agent_config = self
+                    .settings
+                    .get_agent_config(internal_user_id, action.context.platform)
+                    .await?;
                 let session = self
                     .session_mgr
                     .reset_session(user_id, chat_id, &agent_config.agent_type, None)
@@ -251,7 +254,10 @@ impl ActionExecutor {
             "session.status" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
-                let agent_config = self.settings.get_agent_config(action.context.platform).await?;
+                let agent_config = self
+                    .settings
+                    .get_agent_config(internal_user_id, action.context.platform)
+                    .await?;
                 let session = self
                     .session_mgr
                     .get_or_create_session(user_id, chat_id, &agent_config.agent_type, None)
@@ -673,16 +679,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IClientPreferenceRepository for MockPrefRepo {
-        async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
+        async fn get_all(&self, _user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
             Ok(vec![])
         }
-        async fn get_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+        async fn get_by_keys(&self, _user_id: &str, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
             Ok(vec![])
         }
-        async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+        async fn upsert_batch(&self, _user_id: &str, _entries: &[(&str, &str)]) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+        async fn delete_keys(&self, _user_id: &str, _keys: &[&str]) -> Result<(), DbError> {
             Ok(())
         }
     }

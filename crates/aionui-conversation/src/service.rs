@@ -1040,11 +1040,11 @@ impl ConversationService {
         if let Some(repo) = repo {
             let rows = match selected_mcp_server_ids.as_ref() {
                 Some(ids) => repo
-                    .list_by_ids_any(ids)
+                    .list_by_ids_any(user_id, ids)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
                 None => repo
-                    .list()
+                    .list(user_id)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
             };

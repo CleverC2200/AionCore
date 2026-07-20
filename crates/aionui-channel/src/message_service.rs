@@ -127,10 +127,13 @@ impl ChannelMessageService {
         let source = platform_to_source(platform);
         let agent_config = self
             .settings
-            .get_agent_config(platform)
+            .get_agent_config(&self.owner_user_id, platform)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
-        let assistant_setting = self.settings.get_assistant_setting(platform).await?;
+        let assistant_setting = self
+            .settings
+            .get_assistant_setting(&self.owner_user_id, platform)
+            .await?;
         let assistant_id = assistant_setting
             .as_ref()
             .and_then(|setting| setting.assistant_id.as_deref())
@@ -141,7 +144,7 @@ impl ChannelMessageService {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned);
-        let model_config = self.settings.get_model_config(platform).await?;
+        let model_config = self.settings.get_model_config(&self.owner_user_id, platform).await?;
         let agent_type = parse_agent_type(&agent_config.agent_type)?;
         let model = resolved_model_to_provider(model_config.as_ref());
         let mut extra = Self::build_channel_extra(if assistant_id.is_some() {
