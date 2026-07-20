@@ -384,6 +384,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         client_pref_service: ClientPrefService::with_keep_awake_controller(
             Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
             Arc::new(aionui_system::SystemKeepAwakeController::new()),
+            "system_default_user",
         ),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
