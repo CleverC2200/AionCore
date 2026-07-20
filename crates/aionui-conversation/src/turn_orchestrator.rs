@@ -129,6 +129,7 @@ impl ConversationTurnOrchestrator {
                 let failure_message = send_error_display_message(&send_error);
                 record_agent_session_failure(
                     &self.service,
+                    &input.user_id,
                     availability_agent_id.as_deref(),
                     "session_build_failed",
                     &failure_message,
@@ -268,6 +269,7 @@ impl ConversationTurnOrchestrator {
             let send_agent = agent.clone();
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();
+            let feedback_user_id = input.user_id.clone();
             let feedback_service = self.service.clone();
             let feedback_agent_id = availability_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
@@ -277,6 +279,7 @@ impl ConversationTurnOrchestrator {
                     let failure_message = send_error_display_message(&e);
                     record_agent_session_failure(
                         &feedback_service,
+                        &feedback_user_id,
                         feedback_agent_id.as_deref(),
                         "session_send_failed",
                         &failure_message,
@@ -511,6 +514,7 @@ impl ConversationTurnOrchestrator {
             // availability so the list stops showing it as plainly usable.
             record_agent_session_failure(
                 &self.service,
+                &input.user_id,
                 availability_agent_id(&input.build_options).as_deref(),
                 "auth_required",
                 final_error_message
@@ -519,7 +523,12 @@ impl ConversationTurnOrchestrator {
             )
             .await;
         } else if !final_failed {
-            record_agent_session_success(&self.service, availability_agent_id(&input.build_options).as_deref()).await;
+            record_agent_session_success(
+                &self.service,
+                &input.user_id,
+                availability_agent_id(&input.build_options).as_deref(),
+            )
+            .await;
         }
 
         let was_deleting = turn_claim.release_for_turn(&turn_id);
@@ -598,6 +607,7 @@ fn turn_attempt_error_message(summary: &TurnAttemptSummary) -> Option<String> {
 
 async fn record_agent_session_failure(
     service: &ConversationService,
+    user_id: &str,
     agent_id: Option<&str>,
     code: &str,
     message: &str,
@@ -608,8 +618,9 @@ async fn record_agent_session_failure(
     let Some(feedback) = service.agent_availability_feedback() else {
         return;
     };
-    if let Err(error) = feedback.record_session_failure(agent_id, code, message).await {
+    if let Err(error) = feedback.record_session_failure(user_id, agent_id, code, message).await {
         warn!(
+            user_id,
             agent_id,
             code,
             error = %ErrorChain(&error),
@@ -618,15 +629,16 @@ async fn record_agent_session_failure(
     }
 }
 
-async fn record_agent_session_success(service: &ConversationService, agent_id: Option<&str>) {
+async fn record_agent_session_success(service: &ConversationService, user_id: &str, agent_id: Option<&str>) {
     let Some(agent_id) = agent_id else {
         return;
     };
     let Some(feedback) = service.agent_availability_feedback() else {
         return;
     };
-    if let Err(error) = feedback.record_session_success(agent_id).await {
+    if let Err(error) = feedback.record_session_success(user_id, agent_id).await {
         warn!(
+            user_id,
             agent_id,
             error = %ErrorChain(&error),
             "Failed to record agent availability session success"

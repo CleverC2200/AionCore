@@ -18,12 +18,16 @@ use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
 use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
 
-const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
-
 #[async_trait::async_trait]
 pub trait AgentAvailabilityFeedbackPort: Send + Sync {
-    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError>;
-    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError>;
+    async fn record_session_success(&self, user_id: &str, agent_id: &str) -> Result<(), AgentError>;
+    async fn record_session_failure(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError>;
 }
 
 struct AvailabilitySnapshot {
@@ -83,7 +87,13 @@ impl AgentAvailabilityService {
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
     }
 
-    pub async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
+    pub async fn record_session_failure(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError> {
         let checked_at = now_ms();
         let snapshot = AvailabilitySnapshot {
             status: "offline",
@@ -93,10 +103,10 @@ impl AgentAvailabilityService {
             latency_ms: 0,
             checked_at,
         };
-        self.persist_snapshot(agent_id, &snapshot).await
+        self.persist_snapshot_for_user(user_id, agent_id, &snapshot).await
     }
 
-    pub async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
+    pub async fn record_session_success(&self, user_id: &str, agent_id: &str) -> Result<(), AgentError> {
         let checked_at = now_ms();
         let snapshot = AvailabilitySnapshot {
             status: "online",
@@ -106,7 +116,7 @@ impl AgentAvailabilityService {
             latency_ms: 0,
             checked_at,
         };
-        self.persist_snapshot(agent_id, &snapshot).await
+        self.persist_snapshot_for_user(user_id, agent_id, &snapshot).await
     }
 
     pub async fn management_row_by_id(
@@ -115,11 +125,6 @@ impl AgentAvailabilityService {
         id: &str,
     ) -> Result<Option<AgentManagementRow>, AgentError> {
         self.registry.management_row_by_id_for_user(user_id, id).await
-    }
-
-    async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
-        self.persist_snapshot_for_user(SYSTEM_DEFAULT_USER_ID, id, snapshot)
-            .await
     }
 
     async fn persist_snapshot_for_user(
@@ -163,9 +168,6 @@ impl AgentAvailabilityService {
             .update_availability_snapshot_for_user(user_id, id, &params)
             .await
             .map_err(|error| AgentError::internal(format!("repo.update_availability_snapshot_for_user: {error}")))?;
-        if user_id == SYSTEM_DEFAULT_USER_ID {
-            self.registry.reload_one(id).await?;
-        }
         Ok(())
     }
 }
@@ -386,12 +388,18 @@ async fn try_connect_builtin_managed_agent(
 
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
-    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
-        AgentAvailabilityService::record_session_success(self, agent_id).await
+    async fn record_session_success(&self, user_id: &str, agent_id: &str) -> Result<(), AgentError> {
+        AgentAvailabilityService::record_session_success(self, user_id, agent_id).await
     }
 
-    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
-        AgentAvailabilityService::record_session_failure(self, agent_id, code, message).await
+    async fn record_session_failure(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError> {
+        AgentAvailabilityService::record_session_failure(self, user_id, agent_id, code, message).await
     }
 }
 
@@ -399,10 +407,7 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{
-        AgentAvailabilityService, SYSTEM_DEFAULT_USER_ID, explicit_probe_args, probe_aionrs_provider_readiness,
-        run_probe,
-    };
+    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -414,10 +419,12 @@ mod tests {
         SqliteProviderRepository, UpsertAgentMetadataParams, init_database_memory,
     };
 
+    const TEST_USER_ID: &str = "system_default_user";
+
     fn enabled_provider_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
             id: None,
-            user_id: "system_default_user",
+            user_id: TEST_USER_ID,
             platform: "openai",
             name: "OpenAI",
             base_url: "https://api.openai.com",
@@ -440,7 +447,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, "system_default_user").await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, TEST_USER_ID).await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Offline);
         assert_eq!(code.as_deref(), Some("no_provider"));
@@ -452,7 +459,7 @@ mod tests {
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         provider_repo.create(enabled_provider_params()).await.unwrap();
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, "system_default_user").await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, TEST_USER_ID).await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Online);
         assert!(code.is_none());
@@ -499,6 +506,7 @@ mod tests {
         let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
         service
             .record_session_failure(
+                TEST_USER_ID,
                 "agent-session-failure",
                 "session_send_failed",
                 "provider returned 401 invalid api key",
@@ -507,7 +515,7 @@ mod tests {
             .unwrap();
 
         let row = service
-            .list_management_rows(SYSTEM_DEFAULT_USER_ID)
+            .list_management_rows(TEST_USER_ID)
             .await
             .unwrap()
             .into_iter()
@@ -572,6 +580,7 @@ mod tests {
         let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
         service
             .record_session_failure(
+                TEST_USER_ID,
                 "agent-session-success",
                 "session_send_failed",
                 "provider returned 401 invalid api key",
@@ -579,10 +588,13 @@ mod tests {
             .await
             .unwrap();
 
-        service.record_session_success("agent-session-success").await.unwrap();
+        service
+            .record_session_success(TEST_USER_ID, "agent-session-success")
+            .await
+            .unwrap();
 
         let row = service
-            .list_management_rows(SYSTEM_DEFAULT_USER_ID)
+            .list_management_rows(TEST_USER_ID)
             .await
             .unwrap()
             .into_iter()

@@ -174,6 +174,7 @@ impl EventBroadcaster for MockBroadcaster {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedAvailabilityFailure {
+    user_id: String,
     agent_id: String,
     code: String,
     message: String,
@@ -181,19 +182,29 @@ struct RecordedAvailabilityFailure {
 
 #[derive(Default)]
 struct RecordingAvailabilityFeedback {
-    successes: Mutex<Vec<String>>,
+    successes: Mutex<Vec<(String, String)>>,
     failures: Mutex<Vec<RecordedAvailabilityFailure>>,
 }
 
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
-    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
-        self.successes.lock().unwrap().push(agent_id.to_owned());
+    async fn record_session_success(&self, user_id: &str, agent_id: &str) -> Result<(), AgentError> {
+        self.successes
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), agent_id.to_owned()));
         Ok(())
     }
 
-    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
+    async fn record_session_failure(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError> {
         self.failures.lock().unwrap().push(RecordedAvailabilityFailure {
+            user_id: user_id.to_owned(),
             agent_id: agent_id.to_owned(),
             code: code.to_owned(),
             message: message.to_owned(),
@@ -5181,11 +5192,13 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
         failures,
         vec![
             RecordedAvailabilityFailure {
+                user_id: "user_1".into(),
                 agent_id: "agent-feedback-1".into(),
                 code: "session_send_failed".into(),
                 message: "provider returned 401 invalid api key".into(),
             },
             RecordedAvailabilityFailure {
+                user_id: "user_1".into(),
                 agent_id: "agent-feedback-1".into(),
                 code: "auth_required".into(),
                 message: "provider returned 401 invalid api key".into(),
@@ -5226,7 +5239,10 @@ async fn send_message_records_agent_availability_feedback_on_send_success() {
     wait_for_turn_released(&svc, &conv.id).await;
 
     let successes = feedback.successes.lock().unwrap().clone();
-    assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
+    assert_eq!(
+        successes,
+        vec![("user_1".to_owned(), "agent-feedback-success".to_owned())]
+    );
     assert!(feedback.failures.lock().unwrap().is_empty());
 }
 
