@@ -259,7 +259,7 @@ impl<'a> SessionContextBuilder<'a> {
         if let Some(session_row) = session_row.filter(|row| !row.agent_id.is_empty()) {
             let metadata = self
                 .agent_metadata_repo
-                .get(&session_row.agent_id)
+                .get_for_user(&row.user_id, &session_row.agent_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?;
             debug!(
@@ -292,7 +292,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         let Some(row_meta) = self
             .agent_metadata_repo
-            .find_builtin_by_backend(backend)
+            .find_builtin_by_backend_for_user(&row.user_id, backend)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
         else {

@@ -640,7 +640,7 @@ impl ConversationService {
             .get_assistant_snapshot(user_id, &response.id)
             .await?
         {
-            response.assistant = Some(self.assistant_identity_from_snapshot(&snapshot).await?);
+            response.assistant = Some(self.assistant_identity_from_snapshot(user_id, &snapshot).await?);
         }
 
         Ok(())
@@ -648,14 +648,17 @@ impl ConversationService {
 
     async fn assistant_identity_from_snapshot(
         &self,
+        user_id: &str,
         snapshot: &ConversationAssistantSnapshotRow,
     ) -> Result<aionui_api_types::ConversationAssistantIdentityResponse, ConversationError> {
         let runtime_backend = self
-            .resolve_assistant_agent_binding(&snapshot.agent_id)
+            .resolve_assistant_agent_binding(user_id, &snapshot.agent_id)
             .await?
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| snapshot.agent_id.clone());
-        let current_definition = self.current_assistant_definition(&snapshot.assistant_id).await?;
+        let current_definition = self
+            .current_assistant_definition(user_id, &snapshot.assistant_id)
+            .await?;
         let (source, name, avatar) = match current_definition {
             Some(definition) => (
                 definition.source,
@@ -686,13 +689,14 @@ impl ConversationService {
 
     async fn current_assistant_definition(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<Option<AssistantDefinitionRow>, ConversationError> {
         let Some(definition_repo) = self.assistant_definition_repo() else {
             return Ok(None);
         };
         definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))
     }
@@ -732,7 +736,7 @@ impl ConversationService {
             .unwrap_or_default();
         let assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
-                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+                self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
             }
             None => None,
@@ -968,6 +972,7 @@ impl ConversationService {
             && !initial_skills.is_empty()
             && let Some(rel_dirs) = native_skills_dirs(
                 &self.agent_metadata_repo,
+                user_id,
                 &effective_type,
                 effective_backend
                     .as_ref()
@@ -1026,7 +1031,9 @@ impl ConversationService {
             None => None,
         };
 
-        let mcp_support = self.resolve_mcp_support_policy(&effective_type, &extra).await?;
+        let mcp_support = self
+            .resolve_mcp_support_policy(user_id, &effective_type, &extra)
+            .await?;
         let mut selected_row_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
         let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
@@ -1175,7 +1182,7 @@ impl ConversationService {
         // conversation_id). Other agent types have no session-level
         // state so we only create it for ACP.
         if effective_type == AgentType::Acp {
-            self.create_acp_session_row(&id, &extra, assistant_snapshot.as_ref())
+            self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
         }
 
@@ -1209,6 +1216,7 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     async fn create_acp_session_row(
         &self,
+        user_id: &str,
         conversation_id: &str,
         extra: &serde_json::Value,
         assistant_snapshot: Option<&AssistantSnapshot>,
@@ -1251,7 +1259,7 @@ impl ConversationService {
             Some(id) => id.to_owned(),
             None if !backend.is_empty() && agent_source == "builtin" => self
                 .agent_metadata_repo
-                .find_builtin_by_backend(backend)
+                .find_builtin_by_backend_for_user(user_id, backend)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?
                 .map(|row| row.id)
@@ -1298,11 +1306,12 @@ impl ConversationService {
 
     async fn resolve_assistant_agent_binding(
         &self,
+        user_id: &str,
         value: &str,
     ) -> Result<Option<AgentBindingResolution>, ConversationError> {
         let rows = self
             .agent_metadata_repo
-            .list_all()
+            .list_all_for_user(user_id)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
         Ok(resolve_agent_binding_from_rows(&rows, value))
@@ -1310,6 +1319,7 @@ impl ConversationService {
 
     async fn resolve_assistant_snapshot(
         &self,
+        user_id: &str,
         assistant_id: &str,
         locale: Option<&str>,
         overrides: &AssistantConversationOverrides,
@@ -1324,7 +1334,7 @@ impl ConversationService {
         };
 
         let Some(definition) = definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
         else {
@@ -1332,11 +1342,11 @@ impl ConversationService {
         };
 
         let state = state_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant state lookup failed: {e}")))?;
         let preference = preference_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
@@ -1424,7 +1434,7 @@ impl ConversationService {
             .and_then(|row| row.agent_id_override.clone())
             .unwrap_or_else(|| definition.agent_id.clone());
         let agent_binding = self
-            .resolve_assistant_agent_binding(&effective_agent_id)
+            .resolve_assistant_agent_binding(user_id, &effective_agent_id)
             .await?
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
@@ -1658,7 +1668,7 @@ impl ConversationService {
                 return Ok(());
             };
             let Some(definition) = definition_repo
-                .get_by_assistant_id(&assistant_id)
+                .get_by_assistant_id_for_user(user_id, &assistant_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
             else {
@@ -3368,6 +3378,7 @@ impl ConversationService {
 
         let Some(rel_dirs) = native_skills_dirs(
             &self.agent_metadata_repo,
+            &context.conversation.user_id,
             &context.conversation.agent_type,
             backend.as_ref(),
         )
@@ -3760,6 +3771,7 @@ fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
 /// rely on prompt injection instead.
 async fn native_skills_dirs(
     repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> Option<Vec<String>> {
@@ -3767,7 +3779,11 @@ async fn native_skills_dirs(
         && let Some(serde_json::Value::String(vendor)) = backend
         && !vendor.is_empty()
     {
-        let row = repo.find_builtin_by_backend(vendor).await.ok().flatten()?;
+        let row = repo
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok()
+            .flatten()?;
         let raw = row.native_skills_dirs?;
         return serde_json::from_str::<Vec<String>>(&raw).ok();
     }
@@ -3779,11 +3795,12 @@ async fn native_skills_dirs(
 impl ConversationService {
     async fn resolve_mcp_support_policy(
         &self,
+        user_id: &str,
         agent_type: &AgentType,
         extra: &serde_json::Value,
     ) -> Result<McpSupportPolicy, ConversationError> {
         match agent_type {
-            AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, extra).await,
+            AgentType::Acp => resolve_acp_mcp_support_policy(&self.agent_metadata_repo, user_id, extra).await,
             AgentType::Aionrs => Ok(McpSupportPolicy::AIONRS),
             _ => Ok(McpSupportPolicy::AIONRS),
         }
@@ -3792,6 +3809,7 @@ impl ConversationService {
 
 async fn resolve_acp_mcp_support_policy(
     repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     extra: &serde_json::Value,
 ) -> Result<McpSupportPolicy, ConversationError> {
     let agent_id = extra
@@ -3809,12 +3827,12 @@ async fn resolve_acp_mcp_support_policy(
 
     let row = match agent_id {
         Some(id) => repo
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
         None if agent_source == "builtin" => match backend {
             Some(vendor) => repo
-                .find_builtin_by_backend(vendor)
+                .find_builtin_by_backend_for_user(user_id, vendor)
                 .await
                 .map_err(|e| ConversationError::internal(format!("agent_metadata lookup: {e}")))?,
             None => None,
