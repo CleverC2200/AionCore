@@ -688,7 +688,7 @@ impl JobExecutor {
                     let row = build_cron_trigger_artifact(&started.conversation_id, &job, created_at);
                     match conversation_repo.upsert_artifact(&user_id, &row).await {
                         Ok(row) => {
-                            if let Err(e) = broadcast_artifact(&broadcaster, &row) {
+                            if let Err(e) = broadcast_artifact(&broadcaster, &user_id, &row) {
                                 warn!(
                                     job_id = %job.id,
                                     conversation_id = %started.conversation_id,
@@ -844,7 +844,7 @@ impl JobExecutor {
             .map_err(CronError::Database)?;
 
         for row in rows {
-            broadcast_artifact(&self.broadcaster, &row)?;
+            broadcast_artifact(&self.broadcaster, SYSTEM_DEFAULT_USER_ID, &row)?;
         }
 
         Ok(())

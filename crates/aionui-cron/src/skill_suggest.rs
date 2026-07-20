@@ -155,7 +155,7 @@ impl SkillSuggestDetector {
             }
         };
 
-        if let Err(err) = broadcast_artifact(&self.broadcaster, &row) {
+        if let Err(err) = broadcast_artifact(&self.broadcaster, user_id, &row) {
             warn!(
                 conversation_id,
                 job_id,

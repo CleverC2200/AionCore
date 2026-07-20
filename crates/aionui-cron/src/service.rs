@@ -327,7 +327,7 @@ impl CronService {
         self.repo.insert(&row).await?;
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.schedule_job(&job);
-        self.emitter.emit_job_created(&cron_job_to_response(&job));
+        self.emitter.emit_job_created(user_id, &cron_job_to_response(&job));
 
         info!(job_id = %job.id, name = %job.name, "Cron job created");
         Ok(job)
@@ -445,7 +445,7 @@ impl CronService {
 
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.reschedule_job(&job);
-        self.emitter.emit_job_updated(&cron_job_to_response(&job));
+        self.emitter.emit_job_updated(user_id, &cron_job_to_response(&job));
 
         info!(job_id = %job.id, "Cron job updated");
         Ok(job)
@@ -457,7 +457,7 @@ impl CronService {
             warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");
         }
         self.repo.delete_for_user(user_id, job_id).await?;
-        self.emitter.emit_job_removed(job_id);
+        self.emitter.emit_job_removed(user_id, job_id);
         info!(job_id, "Cron job removed");
         Ok(())
     }
@@ -605,7 +605,9 @@ impl CronService {
             Ok(CronRunClaimResult::QueueBusy) => {
                 self.record_queue_busy_skip(&job).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                if let Some(user_id) = self.owner_user_id_for_job(&job).await {
+                    self.emitter.emit_job_executed(&user_id, job_id, "skipped", None);
+                }
                 return;
             }
             Err(error) => {
@@ -698,7 +700,9 @@ impl CronService {
                 self.record_missed_execution(&job).await;
                 self.insert_missed_job_tips(&job).await;
                 self.reschedule_after_missed(&job).await;
-                self.emitter.emit_job_executed(&job.id, "missed", None);
+                if let Some(user_id) = self.owner_user_id_for_job(&job).await {
+                    self.emitter.emit_job_executed(&user_id, &job.id, "missed", None);
+                }
                 continue;
             }
 
@@ -727,10 +731,11 @@ impl CronService {
         let conversation_id = prepared.conversation_id.clone();
         let service = self.clone();
         let job_id = job.id.clone();
+        let user_id = user_id.to_owned();
 
         tokio::spawn(async move {
             let result = service.executor.execute_prepared(&job, prepared).await;
-            service.handle_run_now_result(&job_id, result).await;
+            service.handle_run_now_result(&user_id, &job_id, result).await;
         });
 
         Ok(RunNowResponse { conversation_id })
@@ -831,6 +836,43 @@ impl CronService {
         };
 
         self.resolve_agent_type_for_assistant_id(assistant_id).await
+    }
+
+    async fn owner_user_id_for_job(&self, job: &CronJob) -> Option<String> {
+        let conversation_id = job.conversation_id.trim();
+        if conversation_id.is_empty() {
+            warn!(job_id = %job.id, "Cron event skipped because job has no conversation owner");
+            return None;
+        }
+
+        match self.executor.get_conversation_row(conversation_id).await {
+            Ok(Some(row)) if !row.user_id.trim().is_empty() => Some(row.user_id),
+            Ok(Some(_)) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    "Cron event skipped because conversation owner is empty"
+                );
+                None
+            }
+            Ok(None) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    "Cron event skipped because conversation owner could not be resolved"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    job_id = %job.id,
+                    conversation_id,
+                    error = %err,
+                    "Cron event skipped because conversation owner lookup failed"
+                );
+                None
+            }
+        }
     }
 
     async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {
@@ -967,6 +1009,7 @@ impl CronService {
 
     async fn handle_execution_result(&self, job: CronJob, scheduled_at: i64, result: ExecutionResult) {
         let job_id = &job.id;
+        let owner_user_id = self.owner_user_id_for_job(&job).await;
 
         match result {
             ExecutionResult::Success { conversation_id } => {
@@ -978,7 +1021,9 @@ impl CronService {
                 }
                 self.update_job_after_success(job_id, &conversation_id).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "ok", None);
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "ok", None);
+                }
             }
             ExecutionResult::Retrying { attempt } => {
                 if !self.schedule_retry(job_id, scheduled_at, attempt).await {
@@ -1008,7 +1053,9 @@ impl CronService {
                     error!(job_id, error = %e, "Failed to update skipped status");
                 }
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "skipped", None);
+                }
             }
             ExecutionResult::Error { message } => {
                 if !self
@@ -1019,20 +1066,22 @@ impl CronService {
                 }
                 self.update_job_after_error(job_id, &message).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
-                self.emitter.emit_job_executed(job_id, "error", Some(&message));
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
+                }
             }
         }
     }
 
-    async fn handle_run_now_result(&self, job_id: &str, result: ExecutionResult) {
+    async fn handle_run_now_result(&self, user_id: &str, job_id: &str, result: ExecutionResult) {
         match result {
             ExecutionResult::Success { conversation_id } => {
                 self.update_job_after_success(job_id, &conversation_id).await;
-                self.emitter.emit_job_executed(job_id, "ok", None);
+                self.emitter.emit_job_executed(user_id, job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
                 self.update_job_after_error(job_id, &message).await;
-                self.emitter.emit_job_executed(job_id, "error", Some(&message));
+                self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
             }
             ExecutionResult::Retrying { attempt } => {
                 let params = UpdateCronJobParams {
@@ -1060,7 +1109,7 @@ impl CronService {
                         "Failed to update run-now skipped status"
                     );
                 }
-                self.emitter.emit_job_executed(job_id, "skipped", None);
+                self.emitter.emit_job_executed(user_id, job_id, "skipped", None);
             }
         }
     }
@@ -1164,7 +1213,10 @@ impl CronService {
                 next_run_at: None,
                 ..job.clone()
             };
-            self.emitter.emit_job_updated(&cron_job_to_response(&disabled));
+            if let Some(user_id) = self.owner_user_id_for_job(job).await {
+                self.emitter
+                    .emit_job_updated(&user_id, &cron_job_to_response(&disabled));
+            }
 
             info!(job_id = %job.id, "At-type job executed, auto-disabled");
             return;
@@ -1216,9 +1268,12 @@ impl CronService {
             .insert_tips_message(&job.conversation_id, &content, "warning")
             .await
         {
-            Ok(()) => self
-                .emitter
-                .emit_conversation_tips(&job.conversation_id, &content, "warning"),
+            Ok(()) => {
+                if let Some(user_id) = self.owner_user_id_for_job(job).await {
+                    self.emitter
+                        .emit_conversation_tips(&user_id, &job.conversation_id, &content, "warning");
+                }
+            }
             Err(err) => {
                 warn!(
                     job_id = %job.id,
