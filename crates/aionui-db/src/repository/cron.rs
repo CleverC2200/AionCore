@@ -74,20 +74,39 @@ pub trait ICronRepository: Send + Sync {
     /// Returns `DbError::NotFound` if absent.
     async fn update(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
 
+    /// Updates a cron job whose conversation is owned by `user_id`.
+    async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
+
     /// Deletes a cron job by ID. Returns `DbError::NotFound` if absent.
     async fn delete(&self, id: &str) -> Result<(), DbError>;
+
+    /// Deletes a cron job whose conversation is owned by `user_id`.
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
     /// Returns a single cron job by ID, or `None` if not found.
     async fn get_by_id(&self, id: &str) -> Result<Option<CronJobRow>, DbError>;
 
+    /// Returns a single cron job whose conversation is owned by `user_id`.
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError>;
+
     /// Returns all cron jobs ordered by creation time ascending.
     async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError>;
+
+    /// Returns all cron jobs whose conversations are owned by `user_id`.
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError>;
 
     /// Returns all enabled cron jobs.
     async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError>;
 
     /// Returns all cron jobs for a given conversation.
     async fn list_by_conversation(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError>;
+
+    /// Returns all cron jobs for a given conversation owned by `user_id`.
+    async fn list_by_conversation_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJobRow>, DbError>;
 
     /// Deletes all cron jobs associated with a conversation.
     /// Returns the number of deleted rows.

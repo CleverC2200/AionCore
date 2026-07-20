@@ -293,14 +293,9 @@ impl TeamSessionService {
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
         Ok(Team::from_row(&row)?)
     }
 
@@ -351,7 +346,7 @@ impl TeamSessionService {
     /// Restore sessions for all existing teams. Called once at app startup
     /// so that MCP servers are available before any user sends a message.
     pub async fn restore_all_sessions(&self) {
-        let teams = match self.repo.list_teams().await {
+        let teams = match self.repo.list_teams_for_restore().await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list teams for session restore");
@@ -493,9 +488,9 @@ impl TeamSessionService {
                 .await;
         }
 
-        self.repo.delete_mailbox_by_team(team_id).await?;
-        self.repo.delete_tasks_by_team(team_id).await?;
-        self.repo.delete_team(team_id).await?;
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+        self.repo.delete_team(user_id, team_id).await?;
 
         self.add_agent_locks.remove(team_id);
 
@@ -509,6 +504,7 @@ impl TeamSessionService {
 
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     name: Some(name.to_owned()),
@@ -535,14 +531,9 @@ impl TeamSessionService {
 
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
         let mut team = Team::from_row(&row)?;
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
@@ -648,6 +639,7 @@ impl TeamSessionService {
             let agents_json = serde_json::to_string(&current.agents)?;
             self.repo
                 .update_team(
+                    user_id,
                     team_id,
                     &UpdateTeamParams {
                         agents: Some(agents_json),
@@ -781,6 +773,7 @@ impl TeamSessionService {
         let agents_json = serde_json::to_string(&team.agents)?;
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     agents: Some(agents_json),
@@ -811,15 +804,10 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        let row = match self.repo.get_team(team_id).await {
-            Ok(Some(row)) => row,
-            Ok(None) | Err(_) => return self.ensure_session_inner(team_id).await,
-        };
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
+        self.repo
+            .get_team(user_id, team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         self.ensure_session_inner(team_id).await
     }
 
@@ -831,7 +819,7 @@ impl TeamSessionService {
             .clone();
         let membership_guard = membership_lock.lock().await;
 
-        let row = match self.repo.get_team(team_id).await {
+        let row = match self.repo.get_team_for_restore(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
                 self.broadcast_session_status(
@@ -1131,7 +1119,7 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
-        let current_agents = match self.repo.get_team(team_id).await? {
+        let current_agents = match self.repo.get_team(user_id, team_id).await? {
             Some(row) => Team::from_row(&row)?.agents,
             None => return Err(TeamError::TeamNotFound(team_id.to_owned())),
         };
@@ -1220,14 +1208,9 @@ impl TeamSessionService {
     ) -> Result<GetConfigOptionsResponse, TeamError> {
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
 
         let team = Team::from_row(&row)?;
         let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
@@ -1613,7 +1596,7 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
-        let Ok(Some(row)) = self.repo.get_team(expected.team_id()).await else {
+        let Ok(Some(row)) = self.repo.get_team(expected.user_id(), expected.team_id()).await else {
             return;
         };
         let Ok(team) = Team::from_row(&row) else {
@@ -1722,16 +1705,10 @@ impl TeamSessionService {
 
         let team_row = self
             .repo
-            .get_team(&team_id)
+            .get_team(user_id, &team_id)
             .await
             .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
             .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "team not found"))?;
-        if team_row.user_id != user_id {
-            return Err(error_payload(
-                TeamToolErrorCode::PermissionDenied,
-                "team does not belong to user",
-            ));
-        }
 
         let binding = TeamSessionBinding {
             team_id: team_id.clone(),
@@ -2001,6 +1978,7 @@ impl TeamSessionService {
         let provisioner = self.provisioner();
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     session_mode: Some(mode.to_owned()),
@@ -2899,7 +2877,11 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let row = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         assert_eq!(row.session_mode.as_deref(), Some("full_auto"));
 
         let added = svc
@@ -2949,7 +2931,11 @@ mod tests {
             .create_team("user-test", single_agent_team_request("Partial Mode Seed"))
             .await
             .unwrap();
-        let mut row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let mut row = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         row.agents = serde_json::json!([
             {
                 "slot_id": "slot-accepts",
@@ -2972,6 +2958,7 @@ mod tests {
         ])
         .to_string();
         repo.update_team(
+            "user-test",
             &created.id,
             &aionui_db::UpdateTeamParams {
                 agents: Some(row.agents),
@@ -3029,7 +3016,11 @@ mod tests {
             .await
             .unwrap();
 
-        let team = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let team = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         assert_eq!(team.session_mode.as_deref(), Some("read-only"));
 
         let accepting_extra = conv_repo.get_extra(accepting_conversation_id).unwrap();
@@ -3179,6 +3170,6 @@ mod tests {
             .await
             .expect_err("team config options must reject cross-user access");
 
-        assert!(matches!(err, crate::error::TeamError::Forbidden(_)));
+        assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
     }
 }

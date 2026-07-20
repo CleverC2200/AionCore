@@ -90,8 +90,8 @@ impl Mailbox {
     }
 
     /// Marks the given message IDs as read. Called after successful prompt delivery.
-    pub async fn mark_read_batch(&self, ids: &[String]) -> Result<(), TeamError> {
-        self.repo.mark_read_batch(ids).await?;
+    pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
+        self.repo.mark_read_batch(team_id, ids).await?;
         Ok(())
     }
 
@@ -109,7 +109,7 @@ impl Mailbox {
         }
         let count = ids.len();
         if !ids.is_empty() {
-            self.mark_read_batch(&ids).await?;
+            self.mark_read_batch(team_id, &ids).await?;
         }
         Ok(count)
     }
@@ -131,7 +131,12 @@ impl Mailbox {
     }
 
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
-        self.repo.delete_mailbox_by_team(team_id).await?;
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        self.repo.delete_mailbox_by_team(&row.user_id, team_id).await?;
         debug!(team_id, "mailbox messages deleted for team");
         Ok(())
     }

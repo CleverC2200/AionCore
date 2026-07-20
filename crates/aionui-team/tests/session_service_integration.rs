@@ -99,19 +99,23 @@ impl MockConversationRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockConversationRepo {
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, DbError> {
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
         let convs = self.conversations.lock().unwrap();
-        Ok(convs.iter().find(|c| c.id == id).cloned())
+        Ok(convs.iter().find(|c| c.user_id == user_id && c.id == id).cloned())
+    }
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError> {
+        let convs = self.conversations.lock().unwrap();
+        Ok(convs.iter().find(|c| c.id == id).map(|c| c.user_id.clone()))
     }
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError> {
         self.conversations.lock().unwrap().push(row.clone());
         Ok(())
     }
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
+    async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
         let mut convs = self.conversations.lock().unwrap();
         let conv = convs
             .iter_mut()
-            .find(|c| c.id == id)
+            .find(|c| c.user_id == user_id && c.id == id)
             .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
         if let Some(ref extra) = updates.extra {
             conv.extra = extra.clone();
@@ -130,8 +134,11 @@ impl IConversationRepository for MockConversationRepo {
         }
         Ok(())
     }
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
-        self.conversations.lock().unwrap().retain(|c| c.id != id);
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.conversations
+            .lock()
+            .unwrap()
+            .retain(|c| c.user_id != user_id || c.id != id);
         Ok(())
     }
     async fn list_paginated(
@@ -162,6 +169,7 @@ impl IConversationRepository for MockConversationRepo {
     }
     async fn list_messages_page(
         &self,
+        _user_id: &str,
         _conv_id: &str,
         _params: &MessagePageParams,
     ) -> Result<MessagePageResult, DbError> {
@@ -171,18 +179,25 @@ impl IConversationRepository for MockConversationRepo {
             has_more_after: false,
         })
     }
-    async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+    async fn insert_message(&self, _user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
-    async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), DbError> {
+    async fn update_message(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _id: &str,
+        _updates: &MessageRowUpdate,
+    ) -> Result<(), DbError> {
         Ok(())
     }
-    async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), DbError> {
+    async fn delete_messages_by_conversation(&self, _user_id: &str, _conv_id: &str) -> Result<(), DbError> {
         Ok(())
     }
     async fn get_message_by_msg_id(
         &self,
+        _user_id: &str,
         conv_id: &str,
         msg_id: &str,
         msg_type: &str,
@@ -466,8 +481,14 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 target.insert(key.clone(), value.clone());
             }
         }
+        let user_id = self
+            .repo
+            .owner_user_id(conversation_id)
+            .await?
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
         self.repo
             .update(
+                &user_id,
                 conversation_id,
                 &ConversationRowUpdate {
                     name: None,
@@ -526,14 +547,9 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), aionui_team::TeamError> {
-        let row = self
-            .repo
-            .get(conversation_id)
-            .await?
-            .filter(|row| row.user_id == user_id)
-            .ok_or_else(|| {
-                aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
-            })?;
+        let row = self.repo.get(user_id, conversation_id).await?.ok_or_else(|| {
+            aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
+        })?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra)?;
         let team = aionui_api_types::TeamSessionBinding::from_extra_value(&extra)?;
         let config: AcpBuildExtra = serde_json::from_value(extra.clone()).unwrap_or_default();
@@ -594,7 +610,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         _user_id: &str,
         conversation_id: &str,
     ) -> Result<(), aionui_team::TeamError> {
-        self.repo.delete(conversation_id).await?;
+        self.repo.delete(_user_id, conversation_id).await?;
         Ok(())
     }
 }
@@ -611,14 +627,22 @@ impl TeamProjectionMessageStore for FakeConversationPorts {
         msg_id: &str,
         msg_type: &str,
     ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
         Ok(self
             .repo
-            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
+            .get_message_by_msg_id(&user_id, conversation_id, msg_id, msg_type)
             .await?)
     }
 
     async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
-        self.repo.insert_message(row).await?;
+        let user_id = self
+            .repo
+            .owner_user_id(&row.conversation_id)
+            .await?
+            .ok_or_else(|| aionui_team::TeamError::InvalidRequest("conversation not found".into()))?;
+        self.repo.insert_message(&user_id, row).await?;
         Ok(())
     }
 }
@@ -629,7 +653,10 @@ impl TeamConversationLookupPort for FakeConversationPorts {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
-        let Some(row) = self.repo.get(conversation_id).await? else {
+        let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.repo.get(&user_id, conversation_id).await? else {
             return Ok(None);
         };
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
@@ -722,7 +749,7 @@ impl ITeamRepository for FullMockTeamRepo {
         self.teams.lock().unwrap().push(row.clone());
         Ok(())
     }
-    async fn list_teams(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+    async fn list_teams_for_restore(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().clone())
     }
     async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
@@ -735,10 +762,19 @@ impl ITeamRepository for FullMockTeamRepo {
             .cloned()
             .collect())
     }
-    async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+    async fn get_team(&self, user_id: &str, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.user_id == user_id && t.id == id)
+            .cloned())
+    }
+    async fn get_team_for_restore(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
     }
-    async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
+    async fn update_team(&self, user_id: &str, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
             return Err(DbError::Init("forced workspace writeback failure".into()));
         }
@@ -748,7 +784,7 @@ impl ITeamRepository for FullMockTeamRepo {
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
-            .find(|t| t.id == id)
+            .find(|t| t.user_id == user_id && t.id == id)
             .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
         if let Some(ref name) = params.name {
             team.name = name.clone();
@@ -765,8 +801,11 @@ impl ITeamRepository for FullMockTeamRepo {
         team.updated_at = aionui_common::now_ms();
         Ok(())
     }
-    async fn delete_team(&self, id: &str) -> Result<(), DbError> {
-        self.teams.lock().unwrap().retain(|t| t.id != id);
+    async fn delete_team(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.teams
+            .lock()
+            .unwrap()
+            .retain(|t| t.user_id != user_id || t.id != id);
         Ok(())
     }
 
@@ -790,8 +829,8 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.peek_unread(team_id, to_agent_id).await
     }
-    async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
-        self.inner.mark_read_batch(ids).await
+    async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), DbError> {
+        self.inner.mark_read_batch(team_id, ids).await
     }
     async fn get_history(
         &self,
@@ -801,8 +840,8 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
         self.inner.get_history(team_id, to_agent_id, limit).await
     }
-    async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        self.inner.delete_mailbox_by_team(team_id).await
+    async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        self.inner.delete_mailbox_by_team(user_id, team_id).await
     }
 
     async fn create_task(&self, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
@@ -815,20 +854,32 @@ impl ITeamRepository for FullMockTeamRepo {
     ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
         self.inner.find_task_by_id(team_id, task_id).await
     }
-    async fn update_task(&self, task_id: &str, params: &aionui_db::UpdateTaskParams) -> Result<(), DbError> {
-        self.inner.update_task(task_id, params).await
+    async fn update_task(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        params: &aionui_db::UpdateTaskParams,
+    ) -> Result<(), DbError> {
+        self.inner.update_task(team_id, task_id, params).await
     }
     async fn list_tasks(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
         self.inner.list_tasks(team_id).await
     }
-    async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
-        self.inner.append_to_blocks(task_id, blocked_task_id).await
+    async fn append_to_blocks(&self, team_id: &str, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
+        self.inner.append_to_blocks(team_id, task_id, blocked_task_id).await
     }
-    async fn remove_from_blocked_by(&self, task_id: &str, unblocked_task_id: &str) -> Result<(), DbError> {
-        self.inner.remove_from_blocked_by(task_id, unblocked_task_id).await
+    async fn remove_from_blocked_by(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        unblocked_task_id: &str,
+    ) -> Result<(), DbError> {
+        self.inner
+            .remove_from_blocked_by(team_id, task_id, unblocked_task_id)
+            .await
     }
-    async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        self.inner.delete_tasks_by_team(team_id).await
+    async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        self.inner.delete_tasks_by_team(user_id, team_id).await
     }
 }
 
@@ -2206,7 +2257,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, TeamError::Forbidden(_)));
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
     for agent in &created.assistants {
         assert!(!active_leases.is_active(&agent.conversation_id));
     }
@@ -2214,6 +2265,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
 
 async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
     repo.update_team(
+        "user1",
         team_id,
         &aionui_db::UpdateTeamParams {
             workspace: Some(workspace.to_owned()),
@@ -2488,7 +2540,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .unwrap();
 
     let row = conv_repo
-        .get(&resp.assistants[0].conversation_id)
+        .get("user1", &resp.assistants[0].conversation_id)
         .await
         .unwrap()
         .expect("lead conversation row");
@@ -3356,7 +3408,7 @@ async fn tg3_get_team_rejects_cross_user_access() {
 
     let result = svc.get_team("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // -- Delete team --------------------------------------------------------------
@@ -3434,7 +3486,7 @@ async fn tr5_rename_team_rejects_cross_user_access() {
 
     let result = svc.rename_team("user2", &created.id, "Nope").await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // ===========================================================================
@@ -4030,7 +4082,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
 
     assert!(task_manager.get_task(&added.conversation_id).is_none());
     assert!(
-        conv_repo.get(&added.conversation_id).await.unwrap().is_none(),
+        conv_repo.get("user1", &added.conversation_id).await.unwrap().is_none(),
         "removed attaching member conversation must be deleted"
     );
     assert!(
@@ -4430,7 +4482,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
         .unwrap();
 
     let row = conv_repo
-        .get(&created.assistants[0].conversation_id)
+        .get("user1", &created.assistants[0].conversation_id)
         .await
         .unwrap()
         .expect("conversation row");
@@ -4522,7 +4574,7 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
 
     assert!(error.to_string().contains("forced agent update failure"));
     assert!(
-        conv_repo.get(&worker.conversation_id).await.unwrap().is_some(),
+        conv_repo.get("user1", &worker.conversation_id).await.unwrap().is_some(),
         "conversation deletion must happen only after membership persistence"
     );
     assert!(
@@ -4569,7 +4621,7 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
         .await
         .expect("post-persistence runtime cleanup must be idempotent");
 
-    assert!(conv_repo.get(&worker.conversation_id).await.unwrap().is_none());
+    assert!(conv_repo.get("user1", &worker.conversation_id).await.unwrap().is_none());
     assert!(
         svc.get_team("user1", &created.id)
             .await
@@ -5068,7 +5120,7 @@ async fn es4_ensure_session_rejects_cross_user_access() {
 
     let result = svc.ensure_session("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // -- W5-D31b-2: team.sessionStatusChanged service-layer broadcasts -----------
@@ -5082,19 +5134,10 @@ async fn d31b2_ensure_session_broadcasts_failed_loading_team_for_missing_team() 
     let err = svc.ensure_session("user1", "nonexistent-team-xyz").await.unwrap_err();
     assert!(matches!(err, aionui_team::TeamError::TeamNotFound(_)));
 
-    let failed = recorder
-        .events_by_name("team.sessionStatusChanged")
-        .into_iter()
-        .find(|e| {
-            e.data.get("status").and_then(|v| v.as_str()) == Some("failed")
-                && e.data.get("phase").and_then(|v| v.as_str()) == Some("loading_team")
-        })
-        .expect("failed/loading_team broadcast expected");
-    assert_eq!(
-        failed.data.get("team_id").and_then(|v| v.as_str()),
-        Some("nonexistent-team-xyz")
+    assert!(
+        recorder.events_by_name("team.sessionStatusChanged").is_empty(),
+        "missing teams should not emit session status events"
     );
-    assert!(failed.data.get("error").is_some());
 }
 
 #[tokio::test]
@@ -5225,7 +5268,7 @@ async fn ss4_stop_session_rejects_cross_user_access() {
 
     let result = svc.stop_session("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // ===========================================================================
@@ -5277,7 +5320,7 @@ async fn sm2_send_message_rejects_cross_user_access() {
 
     let result = svc.send_message("user2", &created.id, "Hello", None).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 #[tokio::test]
@@ -5322,7 +5365,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
         .send_message_to_agent("user2", &created.id, &worker_slot, "Do this", None)
         .await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 #[tokio::test]

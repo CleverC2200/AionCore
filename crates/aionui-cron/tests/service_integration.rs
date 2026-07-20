@@ -26,8 +26,8 @@ use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
     IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteCronRepository,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertConversationAssistantSnapshotParams, init_database_memory,
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
@@ -44,6 +44,37 @@ use aionui_cron::types::JobStatus;
 use tower::ServiceExt;
 
 // ── Test infrastructure ────────────────────────────────────────────
+
+async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &[&str]) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('u1', 'u1', 'hash', 0, 0)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let repo = SqliteConversationRepository::new(db.pool().clone());
+    for conversation_id in conversation_ids {
+        repo.create(&aionui_db::models::ConversationRow {
+            id: (*conversation_id).to_owned(),
+            user_id: "u1".to_owned(),
+            name: (*conversation_id).to_owned(),
+            r#type: "normal".to_owned(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: None,
+            channel_chat_id: None,
+            extra: "{}".to_owned(),
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .await
+        .unwrap();
+    }
+}
 
 fn ensure_named_workspace_path(name: &str) -> String {
     let workspace = std::env::temp_dir().join(name);
@@ -113,17 +144,31 @@ struct StubConvRepo {
     rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
     assistant_snapshots: Mutex<HashMap<String, ConversationAssistantSnapshotRow>>,
     update_failures: Mutex<Vec<String>>,
+    sqlite_pool: aionui_db::SqlitePool,
 }
 
 impl StubConvRepo {
-    fn new() -> Self {
+    fn new(sqlite_pool: aionui_db::SqlitePool) -> Self {
         Self {
             messages: Mutex::new(Vec::new()),
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
             assistant_snapshots: Mutex::new(HashMap::new()),
             update_failures: Mutex::new(Vec::new()),
+            sqlite_pool,
         }
+    }
+
+    async fn seed_sqlite_row(&self, row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
+        let repo = SqliteConversationRepository::new(self.sqlite_pool.clone());
+        if repo.get(&row.user_id, &row.id).await?.is_some() {
+            return Ok(());
+        }
+        let mut sqlite_row = row.clone();
+        if sqlite_row.status.as_deref() == Some("active") {
+            sqlite_row.status = Some("pending".to_owned());
+        }
+        repo.create(&sqlite_row).await
     }
 
     fn take_messages(&self) -> Vec<MessageRow> {
@@ -178,10 +223,9 @@ impl IConversationRepository for StubConvRepo {
         _user_id: &str,
         id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
-        let mut rows = self.rows.lock().unwrap();
-
-        if let Some(existing) = rows.get(id) {
-            return Ok(Some(existing.clone()));
+        if let Some(existing) = { self.rows.lock().unwrap().get(id).cloned() } {
+            self.seed_sqlite_row(&existing).await?;
+            return Ok(Some(existing));
         }
         if id.starts_with("missing") {
             return Ok(None);
@@ -481,7 +525,8 @@ impl IConversationRepository for StubConvRepo {
             }
         };
 
-        rows.insert(id.to_owned(), row.clone());
+        self.rows.lock().unwrap().insert(id.to_owned(), row.clone());
+        self.seed_sqlite_row(&row).await?;
         Ok(Some(row))
     }
 
@@ -792,6 +837,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    seed_sqlite_conversations(&db, &["conv_1"]).await;
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
@@ -801,7 +847,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let assistant_preference_repo: Arc<dyn IAssistantPreferenceRepository> =
         Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let bc = Arc::new(MockBroadcaster::new());
     let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -830,7 +876,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         }
     }
 
-    let stub_conv_repo = Arc::new(StubConvRepo::new());
+    let stub_conv_repo = Arc::new(StubConvRepo::new(pool.clone()));
     let stub_conv_repo_trait: Arc<dyn IConversationRepository> = stub_conv_repo.clone();
     let task_manager: Arc<dyn aionui_ai_agent::task_manager::IWorkerTaskManager> = Arc::new(StubTaskManager);
     let conv_service = Arc::new(ConversationService::new(
@@ -894,6 +940,7 @@ async fn setup_with_assistant_repos() -> (
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
+    seed_sqlite_conversations(&db, &["conv_1"]).await;
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
@@ -903,7 +950,7 @@ async fn setup_with_assistant_repos() -> (
         Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let assistant_preference_repo: Arc<dyn IAssistantPreferenceRepository> =
         Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
     let bc = Arc::new(MockBroadcaster::new());
     let data_dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", now_ms()));
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -932,7 +979,7 @@ async fn setup_with_assistant_repos() -> (
         }
     }
 
-    let stub_conv_repo = Arc::new(StubConvRepo::new());
+    let stub_conv_repo = Arc::new(StubConvRepo::new(pool.clone()));
     let stub_conv_repo_trait: Arc<dyn IConversationRepository> = stub_conv_repo.clone();
     let task_manager: Arc<dyn aionui_ai_agent::task_manager::IWorkerTaskManager> = Arc::new(StubTaskManager);
     let conv_service = Arc::new(ConversationService::new(
@@ -1124,7 +1171,7 @@ async fn cj1_create_cron_job() {
     let (svc, _, bc) = setup().await;
     let req = make_create_req("Daily Report", every_60s());
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     assert!(job.id.starts_with("cron_"));
     assert_eq!(job.name, "Daily Report");
@@ -1143,7 +1190,7 @@ async fn create_job_allows_missing_task_description() {
     let mut req = make_create_req("No Description", every_60s());
     req.description = None;
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     assert_eq!(job.description, None);
     let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
@@ -1166,7 +1213,7 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
         workspace: None,
     });
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     let config = job.agent_config.expect("agent config");
 
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
@@ -1179,7 +1226,7 @@ async fn create_job_uses_assistant_full_auto_mode_instead_of_requested_mode() {
     let (svc, _, _) = setup().await;
     let req = make_create_req("Full Auto Mode", every_60s());
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     let config = job.agent_config.expect("agent config");
 
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-default"));
@@ -1202,7 +1249,7 @@ async fn create_job_derives_assistant_runtime_without_backend_hint() {
         workspace: None,
     });
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     assert_eq!(job.agent_type, "acp");
 }
@@ -1213,7 +1260,7 @@ async fn create_job_requires_assistant_id_for_new_jobs() {
     let mut req = make_create_req("Missing Runtime Type", every_60s());
     req.agent_config = None;
 
-    let err = svc.add_job(req).await.unwrap_err();
+    let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)));
     assert!(err.to_string().contains("assistant_id is required for new cron jobs"));
 }
@@ -1239,7 +1286,7 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
         workspace: None,
     });
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     assert_eq!(job.agent_type, "aionrs");
 }
@@ -1272,7 +1319,7 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
         workspace: None,
     });
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     assert_eq!(job.agent_type, "aionrs");
 }
@@ -1294,7 +1341,7 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
         workspace: None,
     });
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     let config = job.agent_config.expect("agent config");
 
     assert_eq!(job.agent_type, "acp");
@@ -1318,7 +1365,7 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
     });
 
     let err = svc
-        .add_job(req)
+        .add_job("u1", req)
         .await
         .expect_err("missing assistant must not fall back to backend");
 
@@ -1334,17 +1381,20 @@ async fn cj2_create_three_schedule_types() {
     let now = now_ms();
 
     let at_job = svc
-        .add_job(make_create_req("At Job", at_future(3600000)))
+        .add_job("u1", make_create_req("At Job", at_future(3600000)))
         .await
         .unwrap();
     assert!(at_job.next_run_at.unwrap() > now);
 
-    let every_job = svc.add_job(make_create_req("Every Job", every_60s())).await.unwrap();
+    let every_job = svc
+        .add_job("u1", make_create_req("Every Job", every_60s()))
+        .await
+        .unwrap();
     let next = every_job.next_run_at.unwrap();
     assert!((next - now - 60000).abs() < 2000);
 
     let cron_job = svc
-        .add_job(make_create_req("Cron Job", cron_every_5min()))
+        .add_job("u1", make_create_req("Cron Job", cron_every_5min()))
         .await
         .unwrap();
     assert!(cron_job.next_run_at.unwrap() > now);
@@ -1355,9 +1405,12 @@ async fn cj2_create_three_schedule_types() {
 #[tokio::test]
 async fn cj4_get_single_job() {
     let (svc, _, _) = setup().await;
-    let created = svc.add_job(make_create_req("Get Test", every_60s())).await.unwrap();
+    let created = svc
+        .add_job("u1", make_create_req("Get Test", every_60s()))
+        .await
+        .unwrap();
 
-    let fetched = svc.get_job(&created.id).await.unwrap();
+    let fetched = svc.get_job("u1", &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
     assert_eq!(fetched.name, "Get Test");
 }
@@ -1367,7 +1420,7 @@ async fn cj4_get_single_job() {
 #[tokio::test]
 async fn cj5_get_nonexistent_job() {
     let (svc, _, _) = setup().await;
-    let err = svc.get_job("cron_nonexistent").await.unwrap_err();
+    let err = svc.get_job("u1", "cron_nonexistent").await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 }
 
@@ -1377,12 +1430,12 @@ async fn cj5_get_nonexistent_job() {
 async fn cj6_list_all_jobs() {
     let (svc, _, _) = setup().await;
     for i in 0..3 {
-        svc.add_job(make_create_req(&format!("Job {i}"), every_60s()))
+        svc.add_job("u1", make_create_req(&format!("Job {i}"), every_60s()))
             .await
             .unwrap();
     }
 
-    let jobs = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+    let jobs = svc.list_jobs("u1", &ListCronJobsQuery::default()).await.unwrap();
     assert!(jobs.len() >= 3);
 }
 
@@ -1408,7 +1461,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
                 })
                 .to_string(),
             ),
-            conversation_id: "conv_legacy".into(),
+            conversation_id: "conv_1".into(),
             conversation_title: None,
             created_by: "user".into(),
             skill_content: None,
@@ -1427,7 +1480,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
         .await
         .unwrap();
 
-    let jobs = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+    let jobs = svc.list_jobs("u1", &ListCronJobsQuery::default()).await.unwrap();
 
     let legacy = jobs
         .iter()
@@ -1444,20 +1497,20 @@ async fn cj7_list_by_conversation() {
 
     let mut req1 = make_create_req("Job A", every_60s());
     req1.conversation_id = "conv_target".into();
-    svc.add_job(req1).await.unwrap();
+    svc.add_job("u1", req1).await.unwrap();
 
     let mut req2 = make_create_req("Job B", every_60s());
     req2.conversation_id = "conv_target".into();
-    svc.add_job(req2).await.unwrap();
+    svc.add_job("u1", req2).await.unwrap();
 
     let mut req3 = make_create_req("Job C", every_60s());
     req3.conversation_id = "conv_other".into();
-    svc.add_job(req3).await.unwrap();
+    svc.add_job("u1", req3).await.unwrap();
 
     let query = ListCronJobsQuery {
         conversation_id: Some("conv_target".into()),
     };
-    let jobs = svc.list_jobs(&query).await.unwrap();
+    let jobs = svc.list_jobs("u1", &query).await.unwrap();
     assert_eq!(jobs.len(), 2);
 }
 
@@ -1468,7 +1521,7 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
     let mut req = make_create_req("Bound Existing Conversation", every_60s());
     req.conversation_id = "conv_existing_bind".into();
 
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
 
     let bound = conv_repo.get("u1", "conv_existing_bind").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
@@ -1485,7 +1538,10 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
 #[tokio::test]
 async fn cj8_update_job() {
     let (svc, _, bc) = setup().await;
-    let created = svc.add_job(make_create_req("Original", every_60s())).await.unwrap();
+    let created = svc
+        .add_job("u1", make_create_req("Original", every_60s()))
+        .await
+        .unwrap();
     bc.take_events();
 
     let req = UpdateCronJobRequest {
@@ -1501,7 +1557,7 @@ async fn cj8_update_job() {
         queue_enabled: None,
     };
 
-    let updated = svc.update_job(&created.id, req).await.unwrap();
+    let updated = svc.update_job("u1", &created.id, req).await.unwrap();
     assert_eq!(updated.name, "Updated Name");
     assert_eq!(updated.description.as_deref(), Some("Updated description"));
     assert!(!updated.enabled);
@@ -1516,7 +1572,10 @@ async fn cj8_update_job() {
 async fn update_existing_conversation_job_rejects_agent_config_changes() {
     let (svc, _, _) = setup().await;
     let created = svc
-        .add_job(make_create_req("Existing Conversation Assistant Lock", every_60s()))
+        .add_job(
+            "u1",
+            make_create_req("Existing Conversation Assistant Lock", every_60s()),
+        )
         .await
         .unwrap();
 
@@ -1542,7 +1601,7 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         queue_enabled: None,
     };
 
-    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
     assert!(
         matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("ongoing conversation"))
     );
@@ -1552,10 +1611,10 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
 async fn update_existing_conversation_job_rejects_agent_config_even_when_switching_to_new_conversation() {
     let (svc, _, _) = setup().await;
     let created = svc
-        .add_job(make_create_req(
-            "Existing Conversation Assistant Lock Mode Switch",
-            every_60s(),
-        ))
+        .add_job(
+            "u1",
+            make_create_req("Existing Conversation Assistant Lock Mode Switch", every_60s()),
+        )
         .await
         .unwrap();
 
@@ -1581,21 +1640,19 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         queue_enabled: None,
     };
 
-    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
     assert!(
         matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(message) if message.contains("ongoing conversation"))
     );
 }
 
 #[tokio::test]
-async fn update_existing_job_to_new_conversation_removes_previous_conversation_binding() {
-    use aionui_common::OnConversationDelete;
-
+async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
     let (svc, cron_repo, _, conv_repo) = setup_with_conv_repo().await;
     let mut create_req = make_create_req("Mode Switch Clears Binding", every_60s());
     create_req.conversation_id = "conv_mode_switch".into();
     create_req.execution_mode = Some("existing".into());
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     let bound_before = conv_repo.get("u1", "conv_mode_switch").await.unwrap().unwrap();
     let extra_before: serde_json::Value = serde_json::from_str(&bound_before.extra).unwrap();
@@ -1604,6 +1661,7 @@ async fn update_existing_job_to_new_conversation_removes_previous_conversation_b
 
     let updated = svc
         .update_job(
+            "u1",
             &created.id,
             UpdateCronJobRequest {
                 name: None,
@@ -1624,19 +1682,13 @@ async fn update_existing_job_to_new_conversation_removes_previous_conversation_b
 
     let row = cron_repo.get_by_id(&created.id).await.unwrap().unwrap();
     assert_eq!(row.execution_mode, "new_conversation");
-    assert_eq!(row.conversation_id, "");
+    assert_eq!(row.conversation_id, "conv_mode_switch");
     assert!(row.conversation_title.is_none());
 
     let bound_after = conv_repo.get("u1", "conv_mode_switch").await.unwrap().unwrap();
     let extra_after: serde_json::Value = serde_json::from_str(&bound_after.extra).unwrap();
     assert!(extra_after.get("cron_job_id").is_none());
     assert!(extra_after.get("cronJobId").is_none());
-
-    svc.on_conversation_deleted("conv_mode_switch").await;
-    assert!(
-        svc.get_job(&created.id).await.is_ok(),
-        "deleting the previous existing-mode conversation must not delete the switched new-conversation job"
-    );
 }
 
 #[tokio::test]
@@ -1659,7 +1711,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
     create_req.conversation_id = conversation_id.clone();
     create_req.execution_mode = Some("existing".into());
     create_req.agent_config.as_mut().unwrap().workspace = Some(auto_workspace);
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     let bound_conversation = conv_repo.get("u1", &conversation_id).await.unwrap().unwrap();
     assert!(
@@ -1670,6 +1722,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
     );
 
     svc.update_job(
+        "u1",
         &created.id,
         UpdateCronJobRequest {
             name: None,
@@ -1711,9 +1764,10 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
     create_req.conversation_id = conversation_id.clone();
     create_req.execution_mode = Some("existing".into());
     create_req.agent_config.as_mut().unwrap().workspace = Some(custom_workspace.clone());
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     svc.update_job(
+        "u1",
         &created.id,
         UpdateCronJobRequest {
             name: None,
@@ -1748,7 +1802,7 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
             "workspace": ensure_named_workspace_path("aionui-cron-service-team-workspace")
         }),
     );
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
         name: None,
@@ -1763,7 +1817,7 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
         queue_enabled: None,
     };
 
-    let err = svc.update_job(&created.id, req).await.unwrap_err();
+    let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidExecutionMode(message) if message.contains("Team")));
 }
 
@@ -1773,7 +1827,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
     seed_assistant_definition(&definition_repo, "asstdef_update_assistant_1", "assistant-1", "claude").await;
     let mut create_req = make_create_req("Assistant Only Update", every_60s());
     create_req.execution_mode = Some("new_conversation".into());
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
         name: None,
@@ -1797,7 +1851,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         queue_enabled: None,
     };
 
-    let updated = svc.update_job(&created.id, req).await.unwrap();
+    let updated = svc.update_job("u1", &created.id, req).await.unwrap();
     let config = updated.agent_config.expect("agent config");
 
     assert_eq!(config.assistant_id.as_deref(), Some("assistant-1"));
@@ -1810,7 +1864,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
     let (svc, _, _) = setup().await;
     let mut create_req = make_create_req("Assistant Missing Update", every_60s());
     create_req.execution_mode = Some("new_conversation".into());
-    let created = svc.add_job(create_req).await.unwrap();
+    let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
         name: None,
@@ -1835,7 +1889,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
     };
 
     let err = svc
-        .update_job(&created.id, req)
+        .update_job("u1", &created.id, req)
         .await
         .expect_err("missing assistant must not fall back to backend");
 
@@ -1852,7 +1906,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
 async fn cj9_update_schedule_type() {
     let (svc, _, _) = setup().await;
     let created = svc
-        .add_job(make_create_req("Schedule Change", every_60s()))
+        .add_job("u1", make_create_req("Schedule Change", every_60s()))
         .await
         .unwrap();
 
@@ -1869,7 +1923,7 @@ async fn cj9_update_schedule_type() {
         queue_enabled: None,
     };
 
-    let updated = svc.update_job(&created.id, req).await.unwrap();
+    let updated = svc.update_job("u1", &created.id, req).await.unwrap();
     assert!(matches!(
         updated.schedule,
         aionui_cron::types::CronSchedule::Cron { .. }
@@ -1894,7 +1948,7 @@ async fn cj10_update_nonexistent() {
         max_retries: None,
         queue_enabled: None,
     };
-    let err = svc.update_job("cron_nonexistent", req).await.unwrap_err();
+    let err = svc.update_job("u1", "cron_nonexistent", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 }
 
@@ -1903,12 +1957,15 @@ async fn cj10_update_nonexistent() {
 #[tokio::test]
 async fn cj11_delete_job() {
     let (svc, _, bc) = setup().await;
-    let created = svc.add_job(make_create_req("To Delete", every_60s())).await.unwrap();
+    let created = svc
+        .add_job("u1", make_create_req("To Delete", every_60s()))
+        .await
+        .unwrap();
     bc.take_events();
 
-    svc.remove_job(&created.id).await.unwrap();
+    svc.remove_job("u1", &created.id).await.unwrap();
 
-    let err = svc.get_job(&created.id).await.unwrap_err();
+    let err = svc.get_job("u1", &created.id).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 
     let events = bc.take_events();
@@ -1921,7 +1978,7 @@ async fn cj11_delete_job() {
 #[tokio::test]
 async fn cj12_delete_nonexistent() {
     let (svc, _, _) = setup().await;
-    let err = svc.remove_job("cron_nonexistent").await.unwrap_err();
+    let err = svc.remove_job("u1", "cron_nonexistent").await.unwrap_err();
     assert!(matches!(
         err,
         aionui_cron::error::CronError::Database(aionui_db::DbError::NotFound(_))
@@ -1933,19 +1990,22 @@ async fn cj12_delete_nonexistent() {
 #[tokio::test]
 async fn sk1_save_skill() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("Skill Job", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Skill Job", every_60s()))
+        .await
+        .unwrap();
 
     let req = SaveCronSkillRequest {
         content: "---\nname: test\ndescription: test skill\n---\nDo something".into(),
     };
-    svc.save_skill(&job.id, req).await.unwrap();
+    svc.save_skill("u1", &job.id, req).await.unwrap();
 }
 
 #[tokio::test]
 async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
     let (svc, _, bc, conv_repo) = setup_with_conv_repo().await;
     let job = svc
-        .add_job(make_create_req("Skill Artifact Job", every_60s()))
+        .add_job("u1", make_create_req("Skill Artifact Job", every_60s()))
         .await
         .unwrap();
 
@@ -1967,6 +2027,7 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
     });
 
     svc.save_skill(
+        "u1",
         &job.id,
         SaveCronSkillRequest {
             content: "---\nname: daily-report\ndescription: Daily report\n---\nUse it.".into(),
@@ -1996,9 +2057,13 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
 #[tokio::test]
 async fn sk2_has_skill_true() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("Skill Check", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Skill Check", every_60s()))
+        .await
+        .unwrap();
 
     svc.save_skill(
+        "u1",
         &job.id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nContent".into(),
@@ -2007,7 +2072,7 @@ async fn sk2_has_skill_true() {
     .await
     .unwrap();
 
-    let resp = svc.has_skill(&job.id).await.unwrap();
+    let resp = svc.has_skill("u1", &job.id).await.unwrap();
     assert!(resp.has_skill);
 }
 
@@ -2016,9 +2081,12 @@ async fn sk2_has_skill_true() {
 #[tokio::test]
 async fn sk3_has_skill_false() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("No Skill", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("No Skill", every_60s()))
+        .await
+        .unwrap();
 
-    let resp = svc.has_skill(&job.id).await.unwrap();
+    let resp = svc.has_skill("u1", &job.id).await.unwrap();
     assert!(!resp.has_skill);
 }
 
@@ -2027,10 +2095,13 @@ async fn sk3_has_skill_false() {
 #[tokio::test]
 async fn sk4_save_empty_skill() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("Empty Skill", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Empty Skill", every_60s()))
+        .await
+        .unwrap();
 
     let err = svc
-        .save_skill(&job.id, SaveCronSkillRequest { content: "".into() })
+        .save_skill("u1", &job.id, SaveCronSkillRequest { content: "".into() })
         .await
         .unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidSkillContent(_)));
@@ -2042,12 +2113,13 @@ async fn sk4_save_empty_skill() {
 async fn sk5_save_placeholder_skill() {
     let (svc, _, _) = setup().await;
     let job = svc
-        .add_job(make_create_req("Placeholder Skill", every_60s()))
+        .add_job("u1", make_create_req("Placeholder Skill", every_60s()))
         .await
         .unwrap();
 
     let err = svc
         .save_skill(
+            "u1",
             &job.id,
             SaveCronSkillRequest {
                 content: "TODO: fill in later".into(),
@@ -2065,6 +2137,7 @@ async fn sk6_save_skill_nonexistent() {
     let (svc, _, _) = setup().await;
     let err = svc
         .save_skill(
+            "u1",
             "cron_nonexistent",
             SaveCronSkillRequest {
                 content: "---\nname: x\n---\nOk".into(),
@@ -2081,10 +2154,11 @@ async fn sk6_save_skill_nonexistent() {
 async fn sk7_delete_cleans_skill() {
     let (svc, _, _) = setup().await;
     let job = svc
-        .add_job(make_create_req("Skill Cleanup", every_60s()))
+        .add_job("u1", make_create_req("Skill Cleanup", every_60s()))
         .await
         .unwrap();
     svc.save_skill(
+        "u1",
         &job.id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nContent".into(),
@@ -2093,9 +2167,9 @@ async fn sk7_delete_cleans_skill() {
     .await
     .unwrap();
 
-    svc.remove_job(&job.id).await.unwrap();
+    svc.remove_job("u1", &job.id).await.unwrap();
 
-    let err = svc.has_skill(&job.id).await.unwrap_err();
+    let err = svc.has_skill("u1", &job.id).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 }
 
@@ -2105,7 +2179,10 @@ async fn sk7_delete_cleans_skill() {
 async fn sc3_every_type_next_run() {
     let (svc, _, _) = setup().await;
     let now = now_ms();
-    let job = svc.add_job(make_create_req("Every 60s", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Every 60s", every_60s()))
+        .await
+        .unwrap();
 
     let next = job.next_run_at.unwrap();
     let diff = (next - now - 60000).abs();
@@ -2125,7 +2202,7 @@ async fn sc5_invalid_cron_expression() {
             description: None,
         },
     );
-    let err = svc.add_job(req).await.unwrap_err();
+    let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidCronExpression(_)));
 }
 
@@ -2143,7 +2220,7 @@ async fn sc6_cron_with_timezone() {
             description: None,
         },
     );
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     assert!(job.next_run_at.unwrap() > now);
 }
 
@@ -2159,7 +2236,7 @@ async fn sc7_every_zero_interval() {
             description: None,
         },
     );
-    let err = svc.add_job(req).await.unwrap_err();
+    let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidSchedule(_)));
 }
 
@@ -2175,111 +2252,59 @@ async fn sc8_every_negative_interval() {
             description: None,
         },
     );
-    let err = svc.add_job(req).await.unwrap_err();
+    let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::InvalidSchedule(_)));
 }
 
-// ── OC-1: Init preserves lazy-bind "existing" jobs with empty conversation_id ─────
+// ── OC-1: Creation rejects jobs without a scoped parent conversation ─────
 
 #[tokio::test]
-async fn oc1_init_preserves_lazy_existing_jobs() {
-    // "existing + empty conversation_id" is a legitimate lazy-binding job:
-    // the frontend creates a cron from the standalone cron page before any
-    // conversation exists, and the first execution materializes it. Those
-    // jobs must survive init, not be cleaned up as orphans.
+async fn oc1_rejects_lazy_existing_jobs() {
     let (svc, _repo, _) = setup().await;
 
     let mut req = make_create_req("Lazy Existing", every_60s());
     req.conversation_id = "".into();
     req.execution_mode = Some("existing".into());
-    let lazy = svc.add_job(req).await.unwrap();
-
-    let normal_req = make_create_req("Normal", every_60s());
-    let normal = svc.add_job(normal_req).await.unwrap();
-
-    svc.init().await;
-
-    let found_lazy = svc.get_job(&lazy.id).await;
-    assert!(found_lazy.is_ok(), "lazy-bind existing job should survive init");
-
-    let found = svc.get_job(&normal.id).await;
-    assert!(found.is_ok());
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
 }
 
-// NewConversation jobs don't depend on any existing conversation — they
-// create one on every run. They must never be cleaned up as orphans.
 #[tokio::test]
-async fn oc1b_init_preserves_new_conversation_jobs() {
+async fn oc1b_rejects_new_conversation_jobs_without_owner_anchor() {
     let (svc, _repo, _) = setup().await;
 
     let mut empty_req = make_create_req("New-conv empty", every_60s());
     empty_req.conversation_id = "".into();
     empty_req.execution_mode = Some("new_conversation".into());
-    let empty = svc.add_job(empty_req).await.unwrap();
+    let empty_err = svc.add_job("u1", empty_req).await.unwrap_err();
+    assert!(matches!(empty_err, aionui_cron::error::CronError::Conversation(_)));
 
     let mut stale_req = make_create_req("New-conv with stale id", every_60s());
-    stale_req.conversation_id = "conv-that-no-longer-exists".into();
+    stale_req.conversation_id = "missing-conv-that-no-longer-exists".into();
     stale_req.execution_mode = Some("new_conversation".into());
-    let stale = svc.add_job(stale_req).await.unwrap();
-
-    svc.init().await;
-
-    assert!(
-        svc.get_job(&empty.id).await.is_ok(),
-        "empty new_conversation job must survive"
-    );
-    assert!(
-        svc.get_job(&stale.id).await.is_ok(),
-        "new_conversation job with stale id must survive"
-    );
+    let stale_err = svc.add_job("u1", stale_req).await.unwrap_err();
+    assert!(matches!(stale_err, aionui_cron::error::CronError::Conversation(_)));
 }
 
 #[tokio::test]
-async fn oc2_init_preserves_existing_jobs_with_missing_conversation() {
+async fn oc2_rejects_existing_jobs_with_missing_conversation() {
     let (svc, _repo, _) = setup().await;
 
     let mut missing_req = make_create_req("Missing Conversation", every_60s());
     missing_req.conversation_id = "missing-conv-1".into();
-    let missing = svc.add_job(missing_req).await.unwrap();
-
-    let mut normal_req = make_create_req("Existing Conversation", every_60s());
-    normal_req.conversation_id = "conv-existing".into();
-    let normal = svc.add_job(normal_req).await.unwrap();
-
-    svc.init().await;
-
-    let missing_found = svc.get_job(&missing.id).await;
-    assert!(
-        missing_found.is_ok(),
-        "existing job with deleted conversation should survive init and recover on next execution"
-    );
-
-    let found = svc.get_job(&normal.id).await;
-    assert!(found.is_ok());
+    let err = svc.add_job("u1", missing_req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
 }
 
 #[tokio::test]
-async fn existing_job_with_missing_conversation_run_now_creates_replacement_conversation() {
-    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+async fn existing_job_with_missing_conversation_is_rejected() {
+    let (svc, _repo, _bc, _conv_repo) = setup_with_conv_repo().await;
 
     let mut req = make_create_req("Missing Existing RunNow", every_60s());
     req.conversation_id = "missing-conv-run-now".into();
     req.execution_mode = Some("existing".into());
-    let job = svc.add_job(req).await.unwrap();
-
-    let response = svc.run_now(&job.id).await.unwrap();
-
-    assert_ne!(response.conversation_id, "missing-conv-run-now");
-    assert!(
-        conv_repo.get("u1", &response.conversation_id).await.unwrap().is_some(),
-        "run-now should create a replacement conversation for an existing job whose previous conversation was deleted"
-    );
-
-    let rebound = svc.get_job(&job.id).await.unwrap();
-    assert_eq!(
-        rebound.conversation_id, response.conversation_id,
-        "existing-mode replacement conversations must bind before the async turn finishes"
-    );
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
 }
 
 #[tokio::test]
@@ -2289,7 +2314,7 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
     let mut req = make_create_req("Running Existing RunNow", every_60s());
     req.conversation_id = "conv-running-run-now".into();
     req.execution_mode = Some("existing".into());
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
     let claim = conv_service
@@ -2297,7 +2322,7 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
         .try_claim_turn(&job.conversation_id, "turn-active")
         .expect("runtime claim should succeed");
 
-    let response = svc.run_now(&job.id).await.unwrap();
+    let response = svc.run_now("u1", &job.id).await.unwrap();
 
     assert_eq!(response.conversation_id, job.conversation_id);
     for _ in 0..20 {
@@ -2320,9 +2345,13 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
 #[tokio::test]
 async fn delete_skill_clears_content() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("Del Skill", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Del Skill", every_60s()))
+        .await
+        .unwrap();
 
     svc.save_skill(
+        "u1",
         &job.id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nOk".into(),
@@ -2330,10 +2359,10 @@ async fn delete_skill_clears_content() {
     )
     .await
     .unwrap();
-    assert!(svc.has_skill(&job.id).await.unwrap().has_skill);
+    assert!(svc.has_skill("u1", &job.id).await.unwrap().has_skill);
 
-    svc.delete_skill(&job.id).await.unwrap();
-    assert!(!svc.has_skill(&job.id).await.unwrap().has_skill);
+    svc.delete_skill("u1", &job.id).await.unwrap();
+    assert!(!svc.has_skill("u1", &job.id).await.unwrap().has_skill);
 }
 
 fn conversation_cron_request(message: &str) -> CreateConversationCronRequest {
@@ -2868,7 +2897,10 @@ async fn update_for_conversation_helper_rejects_job_from_other_conversation() {
 #[tokio::test]
 async fn update_max_retries() {
     let (svc, _, _) = setup().await;
-    let job = svc.add_job(make_create_req("Retries", every_60s())).await.unwrap();
+    let job = svc
+        .add_job("u1", make_create_req("Retries", every_60s()))
+        .await
+        .unwrap();
     assert_eq!(job.max_retries, 3);
 
     let req = UpdateCronJobRequest {
@@ -2883,7 +2915,7 @@ async fn update_max_retries() {
         max_retries: Some(5),
         queue_enabled: None,
     };
-    let updated = svc.update_job(&job.id, req).await.unwrap();
+    let updated = svc.update_job("u1", &job.id, req).await.unwrap();
     assert_eq!(updated.max_retries, 5);
 }
 
@@ -2892,12 +2924,13 @@ async fn create_and_update_queue_enabled() {
     let (svc, _, _) = setup().await;
     let mut create = make_create_req("Queued", every_60s());
     create.queue_enabled = true;
-    let job = svc.add_job(create).await.unwrap();
+    let job = svc.add_job("u1", create).await.unwrap();
     assert!(job.queue_enabled);
     assert!(CronService::to_response(&job).state.queue_enabled);
 
     let updated = svc
         .update_job(
+            "u1",
             &job.id,
             UpdateCronJobRequest {
                 queue_enabled: Some(false),
@@ -2933,7 +2966,7 @@ async fn sc1_at_type_future_timestamp() {
             description: Some("once in 1h".into()),
         },
     );
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     assert_eq!(job.next_run_at, Some(target_ms));
 }
 
@@ -2950,7 +2983,7 @@ async fn sc2_at_type_past_timestamp() {
             description: Some("once in the past".into()),
         },
     );
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     assert_eq!(job.next_run_at, Some(target_ms));
 }
 
@@ -2961,7 +2994,7 @@ async fn sr1_system_resume_missed_job() {
     let (svc, repo, bc, conv_repo) = setup_with_conv_repo().await;
 
     let req = make_create_req("Resume Job", every_60s());
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
     let past_ms = now_ms() - 10_000;
@@ -2973,7 +3006,7 @@ async fn sr1_system_resume_missed_job() {
 
     svc.handle_system_resume().await;
 
-    let updated = svc.get_job(&job.id).await.unwrap();
+    let updated = svc.get_job("u1", &job.id).await.unwrap();
     assert!(
         updated.last_run_at.is_none(),
         "missed job should not be auto-executed on resume"
@@ -3017,24 +3050,24 @@ async fn cd1_delete_by_conversation_preserves_jobs() {
 
     let mut req_a = make_create_req("Cascade A", every_60s());
     req_a.conversation_id = "conv_cascade".into();
-    let job_a = svc.add_job(req_a).await.unwrap();
+    let job_a = svc.add_job("u1", req_a).await.unwrap();
 
     let mut req_b = make_create_req("Cascade B", every_60s());
     req_b.conversation_id = "conv_cascade".into();
-    let job_b = svc.add_job(req_b).await.unwrap();
+    let job_b = svc.add_job("u1", req_b).await.unwrap();
 
     let mut req_c = make_create_req("Unrelated", every_60s());
     req_c.conversation_id = "conv_other".into();
-    let _job_c = svc.add_job(req_c).await.unwrap();
+    let _job_c = svc.add_job("u1", req_c).await.unwrap();
 
     bc.take_events();
 
     svc.delete_jobs_by_conversation("conv_cascade").await;
 
-    assert!(svc.get_job(&job_a.id).await.is_ok());
-    assert!(svc.get_job(&job_b.id).await.is_ok());
+    assert!(svc.get_job("u1", &job_a.id).await.is_ok());
+    assert!(svc.get_job("u1", &job_b.id).await.is_ok());
 
-    let remaining = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+    let remaining = svc.list_jobs("u1", &ListCronJobsQuery::default()).await.unwrap();
     assert_eq!(remaining.len(), 3, "all cron jobs should remain");
 
     let events = bc.take_events();
@@ -3051,7 +3084,9 @@ async fn cd1_delete_by_conversation_preserves_jobs() {
 async fn cd2_delete_by_conversation_no_matching_jobs() {
     let (svc, _repo, bc) = setup().await;
 
-    svc.add_job(make_create_req("Existing", every_60s())).await.unwrap();
+    svc.add_job("u1", make_create_req("Existing", every_60s()))
+        .await
+        .unwrap();
     bc.take_events();
 
     svc.delete_jobs_by_conversation("conv_nonexistent").await;
@@ -3059,7 +3094,7 @@ async fn cd2_delete_by_conversation_no_matching_jobs() {
     let events = bc.take_events();
     assert!(events.is_empty(), "no events should be emitted when no jobs match");
 
-    let all = svc.list_jobs(&ListCronJobsQuery::default()).await.unwrap();
+    let all = svc.list_jobs("u1", &ListCronJobsQuery::default()).await.unwrap();
     assert_eq!(all.len(), 1, "existing job should remain untouched");
 }
 
@@ -3073,12 +3108,12 @@ async fn cd3_on_conversation_delete_trait_preserves_jobs() {
 
     let mut req = make_create_req("Trait Cascade", every_60s());
     req.conversation_id = "conv_trait_del".into();
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
     svc.on_conversation_deleted("conv_trait_del").await;
 
-    assert!(svc.get_job(&job.id).await.is_ok());
+    assert!(svc.get_job("u1", &job.id).await.is_ok());
 
     let events = bc.take_events();
     assert!(events.is_empty());
@@ -3105,7 +3140,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
     let mut req = make_create_req("Clears Deleted Workspace", every_60s());
     req.conversation_id = conversation_id.clone();
     req.agent_config.as_mut().unwrap().workspace = Some(deleted_workspace);
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
     let bound_conversation = conv_repo.get("u1", &conversation_id).await.unwrap().unwrap();
@@ -3124,7 +3159,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
 
     svc.on_conversation_deleted(&conversation_id).await;
 
-    assert!(svc.get_job(&job.id).await.is_ok());
+    assert!(svc.get_job("u1", &job.id).await.is_ok());
     let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert!(
@@ -3153,7 +3188,7 @@ async fn cd3c_on_conversation_delete_preserves_custom_workspace_on_jobs() {
     let mut req = make_create_req("Preserves Custom Workspace", every_60s());
     req.conversation_id = conversation_id.clone();
     req.agent_config.as_mut().unwrap().workspace = Some(custom_workspace.clone());
-    let job = svc.add_job(req).await.unwrap();
+    let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
     svc.on_conversation_deleted(&conversation_id).await;
@@ -3175,23 +3210,23 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let mut new_conversation_req = make_create_req("Generated Run History", every_60s());
     new_conversation_req.conversation_id = "conv_generated_run".into();
     new_conversation_req.execution_mode = Some("new_conversation".into());
-    let new_conversation_job = svc.add_job(new_conversation_req).await.unwrap();
+    let new_conversation_job = svc.add_job("u1", new_conversation_req).await.unwrap();
 
     let mut existing_req = make_create_req("Existing Bound Job", every_60s());
     existing_req.conversation_id = "conv_generated_run".into();
     existing_req.execution_mode = Some("existing".into());
-    let existing_job = svc.add_job(existing_req).await.unwrap();
+    let existing_job = svc.add_job("u1", existing_req).await.unwrap();
 
     bc.take_events();
 
     svc.on_conversation_deleted("conv_generated_run").await;
 
     assert!(
-        svc.get_job(&new_conversation_job.id).await.is_ok(),
+        svc.get_job("u1", &new_conversation_job.id).await.is_ok(),
         "deleting a generated run conversation must not delete its new-conversation cron job"
     );
     assert!(
-        svc.get_job(&existing_job.id).await.is_ok(),
+        svc.get_job("u1", &existing_job.id).await.is_ok(),
         "existing-mode jobs should also survive conversation deletion"
     );
 

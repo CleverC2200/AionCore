@@ -94,8 +94,14 @@ impl TeamWorkspaceResolver {
     }
 
     async fn write_team_workspace(&self, team_id: &str, workspace: &str) -> Result<(), TeamError> {
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         self.repo
             .update_team(
+                &row.user_id,
                 team_id,
                 &UpdateTeamParams {
                     workspace: Some(workspace.to_owned()),

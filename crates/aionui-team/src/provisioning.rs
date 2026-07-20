@@ -343,7 +343,7 @@ impl TeamAgentProvisioner {
     pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
         let row = self
             .repo
-            .get_team(&req.team_id)
+            .get_team(&req.user_id, &req.team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
@@ -685,8 +685,14 @@ impl TeamAgentProvisioner {
 
     async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
         let agents_json = serde_json::to_string(agents)?;
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
         self.repo
             .update_team(
+                &row.user_id,
                 team_id,
                 &UpdateTeamParams {
                     agents: Some(agents_json),

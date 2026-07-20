@@ -316,7 +316,9 @@ impl TeamSession {
             .work_coordinator
             .set_runtime_constraint(slot_id, runtime_constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
 
         let unread = self
@@ -604,7 +606,9 @@ impl TeamSession {
         };
         let update = self.work_coordinator.set_runtime_constraint(slot_id, constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
         Ok(())
     }
@@ -777,7 +781,7 @@ impl TeamSession {
                 self.work_coordinator.abort_enqueue(lease, "enqueue_commit_failed");
                 if let Err(mark_read_error) = self
                     .mailbox
-                    .mark_read_batch(std::slice::from_ref(&mailbox_message_id))
+                    .mark_read_batch(&self.team.id, std::slice::from_ref(&mailbox_message_id))
                     .await
                 {
                     warn!(
@@ -928,7 +932,9 @@ impl TeamSession {
         self.team_run_manager.begin_cancel(team_run_id, reason)?;
         let result = self.work_coordinator.cancel_run(team_run_id);
         if !result.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&result.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &result.terminal_message_ids)
+                .await?;
         }
         for target in result.cancel_targets {
             let Some(turn_id) = target.turn_id else {
@@ -1280,7 +1286,9 @@ impl TeamSession {
         }
         let work = self.work_coordinator.remove_slot(slot_id);
         if !work.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&work.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &work.terminal_message_ids)
+                .await?;
         }
         if let Some(target) = work.cancel_target
             && let Some(turn_id) = target.turn_id
@@ -1589,7 +1597,10 @@ pub(crate) async fn attach_member_runtime(
                 },
             );
             if !update.terminal_message_ids.is_empty() {
-                let _ = session.mailbox.mark_read_batch(&update.terminal_message_ids).await;
+                let _ = session
+                    .mailbox
+                    .mark_read_batch(&session.team.id, &update.terminal_message_ids)
+                    .await;
             }
             service.refresh_member_runtime_status(&session).await;
             if let Err(notify_error) = session

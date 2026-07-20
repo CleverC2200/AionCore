@@ -71,6 +71,28 @@ fn make_job(id: &str) -> CronJobRow {
     }
 }
 
+async fn insert_user_and_conversation(db: &aionui_db::Database, user_id: &str, conversation_id: &str) {
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES (?, ?, 'hash', 0, 0)",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, ?, ?, 'normal', 0, 0)",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .bind(conversation_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
 // ── A. CRUD ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -175,6 +197,62 @@ async fn cj7_list_by_conversation() {
 
     let conv2 = r.list_by_conversation("conv_2").await.unwrap();
     assert_eq!(conv2.len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_crud_filters_by_conversation_owner() {
+    let (r, db) = repo().await;
+    insert_user_and_conversation(&db, "user_2", "conv_2").await;
+
+    r.insert(&make_job("cron_user_1")).await.unwrap();
+    let mut other = make_job("cron_user_2");
+    other.conversation_id = "conv_2".into();
+    r.insert(&other).await.unwrap();
+
+    assert!(r.get_by_id_for_user("user_2", "cron_user_1").await.unwrap().is_none());
+    assert!(r.get_by_id_for_user("user_1", "cron_user_1").await.unwrap().is_some());
+
+    let user_1_jobs = r.list_all_for_user("user_1").await.unwrap();
+    assert_eq!(user_1_jobs.iter().filter(|job| job.id == "cron_user_1").count(), 1);
+    assert!(!user_1_jobs.iter().any(|job| job.id == "cron_user_2"));
+
+    let wrong_update = r
+        .update_for_user(
+            "user_2",
+            "cron_user_1",
+            &UpdateCronJobParams {
+                name: Some("leak".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(wrong_update, Err(DbError::NotFound(_))));
+
+    let wrong_delete = r.delete_for_user("user_2", "cron_user_1").await;
+    assert!(matches!(wrong_delete, Err(DbError::NotFound(_))));
+
+    assert_eq!(
+        r.get_by_id_for_user("user_1", "cron_user_1")
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "Test Job"
+    );
+}
+
+#[tokio::test]
+async fn scheduler_enabled_scan_requires_conversation_owner() {
+    let (r, _db) = repo().await;
+    r.insert(&make_job("cron_owned")).await.unwrap();
+    let mut orphan = make_job("cron_orphan");
+    orphan.conversation_id = "missing_conversation".into();
+    let orphan_insert = r.insert(&orphan).await;
+    assert!(orphan_insert.is_err());
+
+    let enabled = r.list_enabled().await.unwrap();
+
+    assert!(enabled.iter().any(|job| job.id == "cron_owned"));
 }
 
 #[tokio::test]

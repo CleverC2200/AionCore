@@ -64,93 +64,11 @@ impl ICronRepository for SqliteCronRepository {
     }
 
     async fn update(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
-        let mut set_parts: Vec<String> = Vec::new();
-        let mut binds: Vec<BindValue> = Vec::new();
+        self.update_inner(None, id, params).await
+    }
 
-        macro_rules! push_str {
-            ($field:ident) => {
-                if let Some(ref v) = params.$field {
-                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
-                    binds.push(BindValue::Str(v.clone()));
-                }
-            };
-        }
-
-        macro_rules! push_opt_str {
-            ($field:ident) => {
-                if let Some(ref v) = params.$field {
-                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
-                    binds.push(BindValue::OptStr(v.clone()));
-                }
-            };
-        }
-
-        macro_rules! push_opt_i64 {
-            ($field:ident) => {
-                if let Some(ref v) = params.$field {
-                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
-                    binds.push(BindValue::OptI64(*v));
-                }
-            };
-        }
-
-        macro_rules! push_i64 {
-            ($field:ident) => {
-                if let Some(v) = params.$field {
-                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
-                    binds.push(BindValue::I64(v));
-                }
-            };
-        }
-
-        if let Some(v) = params.enabled {
-            set_parts.push("enabled = ?".to_string());
-            binds.push(BindValue::Bool(v));
-        }
-        if let Some(v) = params.queue_enabled {
-            set_parts.push("queue_enabled = ?".to_string());
-            binds.push(BindValue::Bool(v));
-        }
-
-        push_str!(name);
-        push_str!(schedule_kind);
-        push_str!(schedule_value);
-        push_opt_str!(schedule_tz);
-        push_opt_str!(schedule_description);
-        push_str!(payload_message);
-        push_str!(execution_mode);
-        push_opt_str!(agent_config);
-        push_str!(conversation_id);
-        push_opt_str!(conversation_title);
-        push_opt_str!(skill_content);
-        push_opt_str!(description);
-        push_opt_i64!(next_run_at);
-        push_opt_i64!(last_run_at);
-        push_opt_str!(last_status);
-        push_opt_str!(last_error);
-        push_i64!(run_count);
-        push_i64!(retry_count);
-
-        if set_parts.is_empty() {
-            return Ok(());
-        }
-
-        set_parts.push("updated_at = ?".to_string());
-        binds.push(BindValue::I64(now_ms()));
-
-        let sql = format!("UPDATE cron_jobs SET {} WHERE id = ?", set_parts.join(", "));
-
-        let mut query = sqlx::query(&sql);
-        for bind in &binds {
-            query = bind_value(query, bind);
-        }
-        query = query.bind(id);
-
-        let result = query.execute(&self.pool).await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("cron job '{id}'")));
-        }
-        Ok(())
+    async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
+        self.update_inner(Some(user_id), id, params).await
     }
 
     async fn delete(&self, id: &str) -> Result<(), DbError> {
@@ -158,6 +76,25 @@ impl ICronRepository for SqliteCronRepository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("cron job '{id}'")));
+        }
+        Ok(())
+    }
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "DELETE FROM cron_jobs \
+             WHERE id = ? \
+               AND EXISTS (\
+                   SELECT 1 FROM conversations c \
+                   WHERE c.id = cron_jobs.conversation_id AND c.user_id = ?\
+               )",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("cron job '{id}'")));
         }
@@ -172,6 +109,19 @@ impl ICronRepository for SqliteCronRepository {
         Ok(row)
     }
 
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError> {
+        let row = sqlx::query_as::<_, CronJobRow>(
+            "SELECT j.* FROM cron_jobs j \
+             JOIN conversations c ON c.id = j.conversation_id \
+             WHERE c.user_id = ? AND j.id = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs ORDER BY created_at ASC")
             .fetch_all(&self.pool)
@@ -179,10 +129,28 @@ impl ICronRepository for SqliteCronRepository {
         Ok(rows)
     }
 
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError> {
+        let rows = sqlx::query_as::<_, CronJobRow>(
+            "SELECT j.* FROM cron_jobs j \
+             JOIN conversations c ON c.id = j.conversation_id \
+             WHERE c.user_id = ? \
+             ORDER BY j.created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError> {
-        let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE enabled = 1 ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, CronJobRow>(
+            "SELECT j.* FROM cron_jobs j \
+             JOIN conversations c ON c.id = j.conversation_id \
+             WHERE j.enabled = 1 \
+             ORDER BY j.created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -190,6 +158,24 @@ impl ICronRepository for SqliteCronRepository {
         let rows = sqlx::query_as::<_, CronJobRow>(
             "SELECT * FROM cron_jobs WHERE conversation_id = ? ORDER BY created_at ASC",
         )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_by_conversation_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJobRow>, DbError> {
+        let rows = sqlx::query_as::<_, CronJobRow>(
+            "SELECT j.* FROM cron_jobs j \
+             JOIN conversations c ON c.id = j.conversation_id \
+             WHERE c.user_id = ? AND j.conversation_id = ? \
+             ORDER BY j.created_at ASC",
+        )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -209,6 +195,20 @@ impl ICronRepository for SqliteCronRepository {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
 
         let result = async {
+            let job_has_owner: bool = sqlx::query_scalar(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM cron_jobs j \
+                    JOIN conversations c ON c.id = j.conversation_id \
+                    WHERE j.id = ?\
+                )",
+            )
+            .bind(params.job_id)
+            .fetch_one(&mut *connection)
+            .await?;
+            if !job_has_owner {
+                return Ok(CronRunClaimResult::Duplicate);
+            }
+
             let existing = sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
                 "SELECT status, owner_id, lease_until FROM cron_job_runs WHERE job_id = ? AND scheduled_at = ?",
             )
@@ -312,7 +312,12 @@ impl ICronRepository for SqliteCronRepository {
     ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE cron_job_runs SET lease_until = ?, updated_at = ? \
-             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
+               AND EXISTS (\
+                   SELECT 1 FROM cron_jobs j \
+                   JOIN conversations c ON c.id = j.conversation_id \
+                   WHERE j.id = cron_job_runs.job_id\
+               )",
         )
         .bind(lease_until)
         .bind(updated_at)
@@ -334,7 +339,12 @@ impl ICronRepository for SqliteCronRepository {
     ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE cron_job_runs SET status = 'retrying', owner_id = NULL, lease_until = ?, updated_at = ? \
-             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
+               AND EXISTS (\
+                   SELECT 1 FROM cron_jobs j \
+                   JOIN conversations c ON c.id = j.conversation_id \
+                   WHERE j.id = cron_job_runs.job_id\
+               )",
         )
         .bind(retry_at)
         .bind(updated_at)
@@ -350,7 +360,12 @@ impl ICronRepository for SqliteCronRepository {
         let result = sqlx::query(
             "UPDATE cron_job_runs SET status = ?, conversation_id = ?, error = ?, lease_until = NULL, \
              finished_at = ?, updated_at = ? \
-             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ?",
+             WHERE job_id = ? AND scheduled_at = ? AND status = 'running' AND owner_id = ? \
+               AND EXISTS (\
+                   SELECT 1 FROM cron_jobs j \
+                   JOIN conversations c ON c.id = j.conversation_id \
+                   WHERE j.id = cron_job_runs.job_id\
+               )",
         )
         .bind(params.status)
         .bind(params.conversation_id)
@@ -376,9 +391,11 @@ impl ICronRepository for SqliteCronRepository {
 
     async fn get_recoverable_run(&self, job_id: &str, now: TimestampMs) -> Result<Option<RecoverableCronRun>, DbError> {
         let row = sqlx::query_as::<_, (TimestampMs, TimestampMs)>(
-            "SELECT scheduled_at, MAX(lease_until, ?) AS wake_at FROM cron_job_runs \
-             WHERE job_id = ? AND status IN ('running', 'retrying') AND lease_until IS NOT NULL \
-             ORDER BY lease_until ASC LIMIT 1",
+            "SELECT r.scheduled_at, MAX(r.lease_until, ?) AS wake_at FROM cron_job_runs r \
+             JOIN cron_jobs j ON j.id = r.job_id \
+             JOIN conversations c ON c.id = j.conversation_id \
+             WHERE r.job_id = ? AND r.status IN ('running', 'retrying') AND r.lease_until IS NOT NULL \
+             ORDER BY r.lease_until ASC LIMIT 1",
         )
         .bind(now)
         .bind(job_id)
@@ -386,6 +403,124 @@ impl ICronRepository for SqliteCronRepository {
         .await?;
 
         Ok(row.map(|(scheduled_at, wake_at)| RecoverableCronRun { scheduled_at, wake_at }))
+    }
+}
+
+impl SqliteCronRepository {
+    async fn update_inner(&self, user_id: Option<&str>, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
+        let mut set_parts: Vec<String> = Vec::new();
+        let mut binds: Vec<BindValue> = Vec::new();
+
+        macro_rules! push_str {
+            ($field:ident) => {
+                if let Some(ref v) = params.$field {
+                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
+                    binds.push(BindValue::Str(v.clone()));
+                }
+            };
+        }
+
+        macro_rules! push_opt_str {
+            ($field:ident) => {
+                if let Some(ref v) = params.$field {
+                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
+                    binds.push(BindValue::OptStr(v.clone()));
+                }
+            };
+        }
+
+        macro_rules! push_opt_i64 {
+            ($field:ident) => {
+                if let Some(ref v) = params.$field {
+                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
+                    binds.push(BindValue::OptI64(*v));
+                }
+            };
+        }
+
+        macro_rules! push_i64 {
+            ($field:ident) => {
+                if let Some(v) = params.$field {
+                    set_parts.push(concat!(stringify!($field), " = ?").to_string());
+                    binds.push(BindValue::I64(v));
+                }
+            };
+        }
+
+        if let Some(v) = params.enabled {
+            set_parts.push("enabled = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
+        if let Some(v) = params.queue_enabled {
+            set_parts.push("queue_enabled = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
+
+        push_str!(name);
+        push_str!(schedule_kind);
+        push_str!(schedule_value);
+        push_opt_str!(schedule_tz);
+        push_opt_str!(schedule_description);
+        push_str!(payload_message);
+        push_str!(execution_mode);
+        push_opt_str!(agent_config);
+        push_str!(conversation_id);
+        push_opt_str!(conversation_title);
+        push_opt_str!(skill_content);
+        push_opt_str!(description);
+        push_opt_i64!(next_run_at);
+        push_opt_i64!(last_run_at);
+        push_opt_str!(last_status);
+        push_opt_str!(last_error);
+        push_i64!(run_count);
+        push_i64!(retry_count);
+
+        if set_parts.is_empty() {
+            return Ok(());
+        }
+
+        set_parts.push("updated_at = ?".to_string());
+        binds.push(BindValue::I64(now_ms()));
+
+        if let (Some(user_id), Some(conversation_id)) = (user_id, params.conversation_id.as_deref()) {
+            let owns_new_conversation: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                    .bind(user_id)
+                    .bind(conversation_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+            if !owns_new_conversation {
+                return Err(DbError::NotFound(format!("conversation '{conversation_id}'")));
+            }
+        }
+
+        let sql = if user_id.is_some() {
+            format!(
+                "UPDATE cron_jobs SET {} WHERE id = ? \
+                 AND EXISTS (\
+                     SELECT 1 FROM conversations c \
+                     WHERE c.id = cron_jobs.conversation_id AND c.user_id = ?\
+                 )",
+                set_parts.join(", ")
+            )
+        } else {
+            format!("UPDATE cron_jobs SET {} WHERE id = ?", set_parts.join(", "))
+        };
+
+        let mut query = sqlx::query(&sql);
+        for bind in &binds {
+            query = bind_value(query, bind);
+        }
+        query = query.bind(id);
+        if let Some(user_id) = user_id {
+            query = query.bind(user_id);
+        }
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("cron job '{id}'")));
+        }
+        Ok(())
     }
 }
 

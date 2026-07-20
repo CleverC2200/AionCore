@@ -1262,11 +1262,7 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
-    let user_id = repo
-        .owner_user_id(lead_conversation_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let user_id = repo.owner_user_id(lead_conversation_id).await.unwrap().unwrap();
     let messages = repo
         .list_messages_page(
             &user_id,

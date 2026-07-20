@@ -86,7 +86,11 @@ async fn create_and_get_team() {
     let team = make_team("t1", "Team Alpha");
     repo.create_team(&team).await.unwrap();
 
-    let fetched = repo.get_team("t1").await.unwrap().expect("team exists");
+    let fetched = repo
+        .get_team("system_default_user", "t1")
+        .await
+        .unwrap()
+        .expect("team exists");
     assert_eq!(fetched.id, "t1");
     assert_eq!(fetched.name, "Team Alpha");
     assert_eq!(fetched.lead_agent_id, Some("a1".into()));
@@ -95,14 +99,14 @@ async fn create_and_get_team() {
 #[tokio::test]
 async fn get_nonexistent_team_returns_none() {
     let (repo, _db) = repo().await;
-    let result = repo.get_team("nonexistent").await.unwrap();
+    let result = repo.get_team("system_default_user", "nonexistent").await.unwrap();
     assert!(result.is_none());
 }
 
 #[tokio::test]
 async fn list_teams_empty() {
     let (repo, _db) = repo().await;
-    let teams = repo.list_teams().await.unwrap();
+    let teams = repo.list_teams_for_restore().await.unwrap();
     assert!(teams.is_empty());
 }
 
@@ -112,7 +116,7 @@ async fn list_teams_multiple() {
     repo.create_team(&make_team("t1", "Alpha")).await.unwrap();
     repo.create_team(&make_team("t2", "Beta")).await.unwrap();
 
-    let teams = repo.list_teams().await.unwrap();
+    let teams = repo.list_teams_for_restore().await.unwrap();
     assert_eq!(teams.len(), 2);
     assert_eq!(teams[0].id, "t1");
     assert_eq!(teams[1].id, "t2");
@@ -140,11 +144,40 @@ async fn list_teams_by_user_filters_to_owner() {
 }
 
 #[tokio::test]
+async fn scoped_team_crud_rejects_wrong_user() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Alpha"))
+        .await
+        .unwrap();
+
+    assert!(repo.get_team("user-b", "t1").await.unwrap().is_none());
+
+    let update = repo
+        .update_team(
+            "user-b",
+            "t1",
+            &UpdateTeamParams {
+                name: Some("Leaked".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(update, Err(DbError::NotFound(_))));
+
+    let delete = repo.delete_team("user-b", "t1").await;
+    assert!(matches!(delete, Err(DbError::NotFound(_))));
+
+    let team = repo.get_team("user-a", "t1").await.unwrap().unwrap();
+    assert_eq!(team.name, "Alpha");
+}
+
+#[tokio::test]
 async fn update_team_name() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Old Name")).await.unwrap();
 
     repo.update_team(
+        "system_default_user",
         "t1",
         &UpdateTeamParams {
             name: Some("New Name".into()),
@@ -154,7 +187,7 @@ async fn update_team_name() {
     .await
     .unwrap();
 
-    let team = repo.get_team("t1").await.unwrap().unwrap();
+    let team = repo.get_team("system_default_user", "t1").await.unwrap().unwrap();
     assert_eq!(team.name, "New Name");
 }
 
@@ -165,6 +198,7 @@ async fn update_team_agents_json() {
 
     let new_agents = r#"[{"slotId":"a1"},{"slotId":"a2"}]"#;
     repo.update_team(
+        "system_default_user",
         "t1",
         &UpdateTeamParams {
             agents: Some(new_agents.into()),
@@ -174,7 +208,7 @@ async fn update_team_agents_json() {
     .await
     .unwrap();
 
-    let team = repo.get_team("t1").await.unwrap().unwrap();
+    let team = repo.get_team("system_default_user", "t1").await.unwrap().unwrap();
     assert_eq!(team.agents, new_agents);
 }
 
@@ -185,6 +219,7 @@ async fn update_team_can_patch_workspace() {
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
 
     repo.update_team(
+        "system_default_user",
         "t1",
         &UpdateTeamParams {
             workspace: Some("/tmp/aionui-team-shared-workspace".into()),
@@ -194,7 +229,7 @@ async fn update_team_can_patch_workspace() {
     .await
     .unwrap();
 
-    let updated = repo.get_team("t1").await.unwrap().unwrap();
+    let updated = repo.get_team("system_default_user", "t1").await.unwrap().unwrap();
     assert_eq!(updated.workspace, "/tmp/aionui-team-shared-workspace");
 }
 
@@ -204,6 +239,7 @@ async fn update_team_can_patch_session_mode() {
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
 
     repo.update_team(
+        "system_default_user",
         "t1",
         &UpdateTeamParams {
             session_mode: Some("full_auto".into()),
@@ -213,7 +249,7 @@ async fn update_team_can_patch_session_mode() {
     .await
     .unwrap();
 
-    let updated = repo.get_team("t1").await.unwrap().unwrap();
+    let updated = repo.get_team("system_default_user", "t1").await.unwrap().unwrap();
     assert_eq!(updated.session_mode.as_deref(), Some("full_auto"));
 }
 
@@ -222,6 +258,7 @@ async fn update_nonexistent_team_returns_not_found() {
     let (repo, _db) = repo().await;
     let result = repo
         .update_team(
+            "system_default_user",
             "nonexistent",
             &UpdateTeamParams {
                 name: Some("X".into()),
@@ -236,16 +273,16 @@ async fn update_nonexistent_team_returns_not_found() {
 async fn delete_team() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team("t1", "Team")).await.unwrap();
-    repo.delete_team("t1").await.unwrap();
+    repo.delete_team("system_default_user", "t1").await.unwrap();
 
-    let result = repo.get_team("t1").await.unwrap();
+    let result = repo.get_team("system_default_user", "t1").await.unwrap();
     assert!(result.is_none());
 }
 
 #[tokio::test]
 async fn delete_nonexistent_team_returns_not_found() {
     let (repo, _db) = repo().await;
-    let result = repo.delete_team("nonexistent").await;
+    let result = repo.delete_team("system_default_user", "nonexistent").await;
     assert!(matches!(result, Err(DbError::NotFound(_))));
 }
 
@@ -377,7 +414,7 @@ async fn delete_mailbox_by_team() {
     repo.write_message(&msg2).await.unwrap();
 
     // Delete team1 mailbox
-    repo.delete_mailbox_by_team("t1").await.unwrap();
+    repo.delete_mailbox_by_team("system_default_user", "t1").await.unwrap();
 
     // Team1 mailbox empty
     let h1 = repo.get_history("t1", "a1", None).await.unwrap();
@@ -386,6 +423,29 @@ async fn delete_mailbox_by_team() {
     // Team2 mailbox intact
     let h2 = repo.get_history("t2", "a1", None).await.unwrap();
     assert_eq!(h2.len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_mailbox_delete_and_mark_read_do_not_cross_team_owner() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Team A"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("t2", "user-b", "Team B"))
+        .await
+        .unwrap();
+    repo.write_message(&make_mailbox_msg("m1", "t1", "a1", "a2", "message"))
+        .await
+        .unwrap();
+    repo.write_message(&make_mailbox_msg("m2", "t2", "a1", "a2", "message"))
+        .await
+        .unwrap();
+
+    repo.mark_read_batch("t1", &["m2".to_owned()]).await.unwrap();
+    assert!(!repo.get_history("t2", "a1", None).await.unwrap()[0].read);
+
+    repo.delete_mailbox_by_team("user-b", "t1").await.unwrap();
+    assert_eq!(repo.get_history("t1", "a1", None).await.unwrap().len(), 1);
 }
 
 // ── Task Board Tests ─────────────────────────────────────────────────
@@ -444,6 +504,7 @@ async fn update_task_status() {
     repo.create_task(&task).await.unwrap();
 
     repo.update_task(
+        "t1",
         "tk1",
         &UpdateTaskParams {
             status: Some("in_progress".into()),
@@ -466,6 +527,7 @@ async fn update_task_description_and_owner() {
     repo.create_task(&task).await.unwrap();
 
     repo.update_task(
+        "t1",
         "tk1",
         &UpdateTaskParams {
             description: Some("New description".into()),
@@ -486,6 +548,7 @@ async fn update_nonexistent_task_returns_not_found() {
     let (repo, _db) = repo().await;
     let result = repo
         .update_task(
+            "t1",
             "nonexistent",
             &UpdateTaskParams {
                 status: Some("completed".into()),
@@ -509,14 +572,14 @@ async fn append_to_blocks_and_remove_from_blocked_by() {
     repo.create_task(&task_b).await.unwrap();
 
     // Append tkB to taskA's blocks
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
 
     let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
     let blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
     assert!(blocks.contains(&"tkB".to_string()));
 
     // Now complete taskA: remove tkA from taskB's blocked_by
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
+    repo.remove_from_blocked_by("t1", "tkB", "tkA").await.unwrap();
 
     let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
     let blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
@@ -531,8 +594,8 @@ async fn append_to_blocks_idempotent() {
     let task = make_task("tkA", "t1", "Task A");
     repo.create_task(&task).await.unwrap();
 
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
 
     let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
     let blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
@@ -555,12 +618,12 @@ async fn multi_dependency_unblock() {
     repo.create_task(&task_b).await.unwrap();
     repo.create_task(&task_c).await.unwrap();
 
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-    repo.append_to_blocks("tkA", "tkC").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkC").await.unwrap();
 
     // Complete A: unblock both B and C
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
-    repo.remove_from_blocked_by("tkC", "tkA").await.unwrap();
+    repo.remove_from_blocked_by("t1", "tkB", "tkA").await.unwrap();
+    repo.remove_from_blocked_by("t1", "tkC", "tkA").await.unwrap();
 
     let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
     let c = repo.find_task_by_id("t1", "tkC").await.unwrap().unwrap();
@@ -584,7 +647,7 @@ async fn partial_unblock_preserves_other_blockers() {
     repo.create_task(&task_b).await.unwrap();
 
     // Complete A only
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
+    repo.remove_from_blocked_by("t1", "tkB", "tkA").await.unwrap();
 
     let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
     let blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
@@ -601,6 +664,7 @@ async fn no_blocks_task_completes_cleanly() {
 
     // Complete without any blocks to unblock
     repo.update_task(
+        "t1",
         "tkA",
         &UpdateTaskParams {
             status: Some("completed".into()),
@@ -625,13 +689,42 @@ async fn delete_tasks_by_team() {
     repo.create_task(&make_task("tk1", "t1", "T1 Task")).await.unwrap();
     repo.create_task(&make_task("tk2", "t2", "T2 Task")).await.unwrap();
 
-    repo.delete_tasks_by_team("t1").await.unwrap();
+    repo.delete_tasks_by_team("system_default_user", "t1").await.unwrap();
 
     let t1_tasks = repo.list_tasks("t1").await.unwrap();
     assert!(t1_tasks.is_empty());
 
     let t2_tasks = repo.list_tasks("t2").await.unwrap();
     assert_eq!(t2_tasks.len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_task_updates_and_deletes_stay_within_team_owner() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Team A"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("t2", "user-b", "Team B"))
+        .await
+        .unwrap();
+    repo.create_task(&make_task("tk1", "t1", "A Task")).await.unwrap();
+    repo.create_task(&make_task("tk2", "t2", "B Task")).await.unwrap();
+
+    let update = repo
+        .update_task(
+            "t1",
+            "tk2",
+            &UpdateTaskParams {
+                status: Some("completed".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(update, Err(DbError::NotFound(_))));
+
+    repo.delete_tasks_by_team("user-b", "t1").await.unwrap();
+    assert_eq!(repo.list_tasks("t1").await.unwrap().len(), 1);
+    assert_eq!(repo.list_tasks("t2").await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -645,7 +738,7 @@ async fn tasks_contain_dependency_info() {
 
     repo.create_task(&task_a).await.unwrap();
     repo.create_task(&task_b).await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
 
     let tasks = repo.list_tasks("t1").await.unwrap();
     assert_eq!(tasks.len(), 2);
@@ -674,12 +767,12 @@ async fn delete_team_cascades_mailbox_and_tasks() {
     repo.create_task(&task).await.unwrap();
 
     // Delete team, then manually clean up related data (as service layer would)
-    repo.delete_mailbox_by_team("t1").await.unwrap();
-    repo.delete_tasks_by_team("t1").await.unwrap();
-    repo.delete_team("t1").await.unwrap();
+    repo.delete_mailbox_by_team("system_default_user", "t1").await.unwrap();
+    repo.delete_tasks_by_team("system_default_user", "t1").await.unwrap();
+    repo.delete_team("system_default_user", "t1").await.unwrap();
 
     // Verify all cleaned up
-    let team = repo.get_team("t1").await.unwrap();
+    let team = repo.get_team("system_default_user", "t1").await.unwrap();
     assert!(team.is_none());
     let mail = repo.get_history("t1", "a1", None).await.unwrap();
     assert!(mail.is_empty());
@@ -698,7 +791,7 @@ async fn task_blocked_by_blocks_bidirectional_consistency() {
 
     repo.create_task(&task_a).await.unwrap();
     repo.create_task(&task_b).await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
+    repo.append_to_blocks("t1", "tkA", "tkB").await.unwrap();
 
     // Verify bidirectional link
     let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();

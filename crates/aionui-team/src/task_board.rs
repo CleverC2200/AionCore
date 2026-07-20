@@ -64,7 +64,7 @@ impl TaskBoard {
         self.repo.create_task(&row).await?;
 
         for dep_id in blocked_by {
-            self.repo.append_to_blocks(dep_id, &task_id).await?;
+            self.repo.append_to_blocks(team_id, dep_id, &task_id).await?;
         }
 
         debug!(team_id, task_id = %task_id, subject, "task created");
@@ -87,10 +87,10 @@ impl TaskBoard {
             metadata: update.metadata.as_ref().map(serde_json::to_string).transpose()?,
         };
 
-        self.repo.update_task(task_id, &params).await?;
+        self.repo.update_task(team_id, task_id, &params).await?;
 
         if update.status == Some(TaskStatus::Completed) {
-            self.check_unblocks(task_id, &existing).await?;
+            self.check_unblocks(team_id, task_id, &existing).await?;
         }
 
         let updated = self
@@ -110,11 +110,16 @@ impl TaskBoard {
         Ok(tasks)
     }
 
-    async fn check_unblocks(&self, completed_task_id: &str, completed_row: &TeamTaskRow) -> Result<(), TeamError> {
+    async fn check_unblocks(
+        &self,
+        team_id: &str,
+        completed_task_id: &str,
+        completed_row: &TeamTaskRow,
+    ) -> Result<(), TeamError> {
         let blocks: Vec<String> = serde_json::from_str(&completed_row.blocks)?;
         for downstream_id in &blocks {
             self.repo
-                .remove_from_blocked_by(downstream_id, completed_task_id)
+                .remove_from_blocked_by(team_id, downstream_id, completed_task_id)
                 .await?;
             debug!(
                 completed = completed_task_id,

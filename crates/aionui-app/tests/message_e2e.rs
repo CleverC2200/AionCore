@@ -110,11 +110,7 @@ async fn insert_acp_tool_message(
 
 async fn upsert_artifact(services: &aionui_app::AppServices, artifact: aionui_db::ConversationArtifactRow) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
-    let user_id = repo
-        .owner_user_id(&artifact.conversation_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let user_id = repo.owner_user_id(&artifact.conversation_id).await.unwrap().unwrap();
     aionui_db::IConversationRepository::upsert_artifact(&repo, &user_id, &artifact)
         .await
         .unwrap();
