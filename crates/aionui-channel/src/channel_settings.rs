@@ -92,7 +92,7 @@ impl ChannelSettingsService {
 
         if let Some(setting) = parse_channel_assistant_setting(&pref.value) {
             if let Some(assistant_id) = setting.assistant_id.as_deref() {
-                if let Some(resolved) = self.resolve_assistant_agent_config(assistant_id).await? {
+                if let Some(resolved) = self.resolve_assistant_agent_config(user_id, assistant_id).await? {
                     debug!(
                         platform = %platform,
                         assistant_id,
@@ -186,7 +186,10 @@ impl ChannelSettingsService {
         for pref in prefs {
             if pref.key == key_agent {
                 if let Some(parsed) = parse_channel_assistant_setting(&pref.value) {
-                    assistant = Some(self.normalize_channel_assistant_setting_for_response(parsed).await?);
+                    assistant = Some(
+                        self.normalize_channel_assistant_setting_for_response(user_id, parsed)
+                            .await?,
+                    );
                 }
             } else if pref.key == key_model {
                 default_model = parse_channel_model_setting(&pref.value);
@@ -194,7 +197,7 @@ impl ChannelSettingsService {
         }
 
         if assistant.is_none() {
-            assistant = self.resolve_default_channel_assistant_setting().await?;
+            assistant = self.resolve_default_channel_assistant_setting(user_id).await?;
         }
 
         Ok(ChannelPlatformSettingsResponse {
@@ -213,11 +216,14 @@ impl ChannelSettingsService {
         let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
 
         let Some(pref) = prefs.into_iter().next() else {
-            return self.resolve_default_channel_assistant_setting().await;
+            return self.resolve_default_channel_assistant_setting(user_id).await;
         };
 
         let parsed = if let Some(assistant) = parse_channel_assistant_setting(&pref.value) {
-            Some(self.normalize_channel_assistant_setting_for_response(assistant).await?)
+            Some(
+                self.normalize_channel_assistant_setting_for_response(user_id, assistant)
+                    .await?,
+            )
         } else {
             None
         };
@@ -256,6 +262,7 @@ impl ChannelSettingsService {
 
     async fn resolve_assistant_agent_config(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<Option<ResolvedAgentConfig>, ChannelError> {
         let (Some(definition_repo), Some(overlay_repo)) =
@@ -264,16 +271,19 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let Some(definition) = definition_repo.get_by_assistant_id(assistant_id).await? else {
+        let Some(definition) = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+        else {
             return Ok(None);
         };
 
         let agent_id = overlay_repo
-            .get(&definition.id)
+            .get_for_user(user_id, &definition.id)
             .await?
             .and_then(|row| row.agent_id_override)
             .unwrap_or(definition.agent_id);
-        let agent_backend = self.runtime_backend_for_agent_id(&agent_id).await?;
+        let agent_backend = self.runtime_backend_for_agent_id(user_id, &agent_id).await?;
         let agent_type = backend_to_agent_type(&agent_backend);
         let backend = if agent_type == "acp" { Some(agent_backend) } else { None };
 
@@ -282,6 +292,7 @@ impl ChannelSettingsService {
 
     async fn resolve_assistant_identity_for_legacy_binding(
         &self,
+        user_id: &str,
         assistant: &ChannelAssistantSettingResponse,
     ) -> Result<Option<String>, ChannelError> {
         let (Some(definition_repo), Some(_overlay_repo)) =
@@ -300,13 +311,13 @@ impl ChannelSettingsService {
             return Ok(None);
         };
 
-        let definitions = definition_repo.list().await?;
+        let definitions = definition_repo.list_for_user(user_id).await?;
 
         for definition in definitions {
             if definition.source != "generated" {
                 continue;
             }
-            let runtime_backend = self.runtime_backend_for_agent_id(&definition.agent_id).await?;
+            let runtime_backend = self.runtime_backend_for_agent_id(user_id, &definition.agent_id).await?;
             if runtime_backend == legacy_backend {
                 return Ok(Some(definition.assistant_id));
             }
@@ -317,6 +328,7 @@ impl ChannelSettingsService {
 
     async fn normalize_channel_assistant_setting_for_response(
         &self,
+        user_id: &str,
         assistant: ChannelAssistantSettingResponse,
     ) -> Result<ChannelAssistantSettingResponse, ChannelError> {
         let assistant_id = assistant
@@ -335,7 +347,8 @@ impl ChannelSettingsService {
         let canonical_assistant_id = if assistant_id.is_some() {
             assistant_id
         } else {
-            self.resolve_assistant_identity_for_legacy_binding(&assistant).await?
+            self.resolve_assistant_identity_for_legacy_binding(user_id, &assistant)
+                .await?
         };
 
         if canonical_assistant_id.is_some() {
@@ -353,8 +366,9 @@ impl ChannelSettingsService {
 
     async fn resolve_default_channel_assistant_setting(
         &self,
+        user_id: &str,
     ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
-        let Some(assistant_id) = self.resolve_default_assistant_identity().await? else {
+        let Some(assistant_id) = self.resolve_default_assistant_identity(user_id).await? else {
             return Ok(None);
         };
 
@@ -367,25 +381,25 @@ impl ChannelSettingsService {
         }))
     }
 
-    async fn resolve_default_assistant_identity(&self) -> Result<Option<String>, ChannelError> {
+    async fn resolve_default_assistant_identity(&self, user_id: &str) -> Result<Option<String>, ChannelError> {
         let (Some(definition_repo), Some(overlay_repo)) =
             (&self.assistant_definition_repo, &self.assistant_overlay_repo)
         else {
             return Ok(None);
         };
 
-        let definitions = definition_repo.list().await?;
-        let overlays = overlay_repo.list().await?;
+        let definitions = definition_repo.list_for_user(user_id).await?;
+        let overlays = overlay_repo.list_for_user(user_id).await?;
 
         for definition in definitions.iter().filter(|definition| definition.source == "generated") {
-            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
                 return Ok(Some(definition.assistant_id.clone()));
             }
         }
 
         let mut any_aionrs = None;
         for definition in &definitions {
-            if self.effective_assistant_backend(definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
                 any_aionrs = Some(definition);
                 break;
             }
@@ -399,6 +413,7 @@ impl ChannelSettingsService {
 
     async fn effective_assistant_backend(
         &self,
+        user_id: &str,
         definition: &aionui_db::models::AssistantDefinitionRow,
         overlays: &[aionui_db::models::AssistantOverlayRow],
     ) -> Result<String, ChannelError> {
@@ -407,14 +422,14 @@ impl ChannelSettingsService {
             .find(|overlay| overlay.assistant_definition_id == definition.id)
             .and_then(|overlay| overlay.agent_id_override.as_deref())
             .unwrap_or(definition.agent_id.as_str());
-        self.runtime_backend_for_agent_id(agent_id).await
+        self.runtime_backend_for_agent_id(user_id, agent_id).await
     }
 
-    async fn runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, ChannelError> {
+    async fn runtime_backend_for_agent_id(&self, user_id: &str, agent_id: &str) -> Result<String, ChannelError> {
         let Some(agent_metadata_repo) = self.agent_metadata_repo.as_ref() else {
             return Ok(agent_id.to_owned());
         };
-        let rows = agent_metadata_repo.list_all().await?;
+        let rows = agent_metadata_repo.list_all_for_user(user_id).await?;
         Ok(resolve_agent_binding_from_rows(&rows, agent_id)
             .map(|binding| binding.runtime_backend)
             .unwrap_or_else(|| agent_id.to_owned()))
