@@ -85,6 +85,7 @@ impl PairingService {
 
         // Broadcast event
         let payload = PairingRequestedPayload {
+            user_id: owner_user_id.to_owned(),
             code: code.clone(),
             platform_user_id: platform_user_id.to_owned(),
             platform_type: platform_type.to_owned(),
@@ -136,6 +137,7 @@ impl PairingService {
 
         // Broadcast event
         let payload = UserAuthorizedPayload {
+            user_id: owner_user_id.to_owned(),
             id: user_id,
             platform_user_id: row.platform_user_id,
             platform_type: row.platform_type,
