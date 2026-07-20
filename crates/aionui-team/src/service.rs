@@ -322,9 +322,14 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let team = match self.load_owned_team(user_id, team_id).await {
+        let team = match self.repo.get_team(user_id, team_id).await {
+            Ok(Some(row)) => Team::from_row(&row).map_err(TeamError::from),
+            Ok(None) => Err(TeamError::TeamNotFound(team_id.to_owned())),
+            Err(error) => Err(TeamError::Database(error)),
+        };
+        let team = match team {
             Ok(team) => team,
-            Err(error @ (TeamError::TeamNotFound(_) | TeamError::Forbidden(_))) => {
+            Err(error @ TeamError::TeamNotFound(_)) => {
                 debug!(
                     kind = "team",
                     team_id,
