@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::User;
+use crate::models::{ExternalUserProjection, User, UserStatus, UserType};
 
 /// User data access abstraction.
 ///
@@ -32,11 +32,29 @@ pub trait IUserRepository: Send + Sync {
     /// Returns `DbError::Conflict` if the username already exists.
     async fn create_user(&self, username: &str, password_hash: &str) -> Result<User, DbError>;
 
-    /// Finds a user by username.
+    /// Finds an active local password user by username.
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError>;
+
+    /// Idempotently creates or returns an external identity projection.
+    async fn ensure_external_user(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+        projection: ExternalUserProjection,
+    ) -> Result<User, DbError>;
+
+    /// Finds a user by external identity mapping.
+    async fn find_by_external_user_id(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+    ) -> Result<Option<User>, DbError>;
 
     /// Finds a user by ID.
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
+
+    /// Finds an active user by ID.
+    async fn find_active_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
 
     /// Lists all users.
     async fn list_users(&self) -> Result<Vec<User>, DbError>;
@@ -57,4 +75,10 @@ pub trait IUserRepository: Send + Sync {
 
     /// Updates a user's JWT secret.
     async fn update_jwt_secret(&self, user_id: &str, jwt_secret: &str) -> Result<(), DbError>;
+
+    /// Updates a user's status.
+    async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError>;
+
+    /// Increments a user's session generation and returns the new value.
+    async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError>;
 }

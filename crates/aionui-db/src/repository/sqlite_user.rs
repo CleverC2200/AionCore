@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::User;
+use crate::models::{ExternalUserProjection, User, UserStatus, UserType};
 use crate::repository::IUserRepository;
 
 /// SQLite-backed implementation of [`IUserRepository`].
@@ -19,9 +19,12 @@ impl SqliteUserRepository {
 #[async_trait::async_trait]
 impl IUserRepository for SqliteUserRepository {
     async fn has_users(&self) -> Result<bool, DbError> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE password_hash != ''")
-            .fetch_one(&self.pool)
-            .await?;
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users \
+             WHERE user_type = 'local' AND password_hash IS NOT NULL AND password_hash != ''",
+        )
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(row.0 > 0)
     }
@@ -52,7 +55,7 @@ impl IUserRepository for SqliteUserRepository {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
             "UPDATE users SET username = ?, password_hash = ?, updated_at = ? \
-             WHERE id = 'system_default_user'",
+             WHERE id = 'system_default_user' AND user_type = 'local'",
         )
         .bind(username)
         .bind(password_hash)
@@ -78,8 +81,8 @@ impl IUserRepository for SqliteUserRepository {
         let now = aionui_common::now_ms();
 
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, ?, 'active', 0, ?, ?)",
         )
         .bind(&id)
         .bind(username)
@@ -97,11 +100,15 @@ impl IUserRepository for SqliteUserRepository {
 
         Ok(User {
             id,
-            username: username.to_string(),
+            user_type: UserType::Local,
+            external_user_id: None,
+            username: Some(username.to_string()),
             email: None,
-            password_hash: password_hash.to_string(),
+            password_hash: Some(password_hash.to_string()),
             avatar_path: None,
             jwt_secret: None,
+            status: UserStatus::Active,
+            session_generation: 0,
             created_at: now,
             updated_at: now,
             last_login: None,
@@ -109,8 +116,74 @@ impl IUserRepository for SqliteUserRepository {
     }
 
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
-            .bind(username)
+        let user = sqlx::query_as::<_, User>(
+            "SELECT * FROM users \
+             WHERE user_type = 'local' AND password_hash IS NOT NULL AND username = ?",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(user)
+    }
+
+    async fn ensure_external_user(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+        projection: ExternalUserProjection,
+    ) -> Result<User, DbError> {
+        if user_type == UserType::Local {
+            return Err(DbError::Conflict(
+                "External identity projection requires a non-local user type".to_string(),
+            ));
+        }
+        if external_user_id.trim().is_empty() {
+            return Err(DbError::Conflict("external_user_id must not be empty".to_string()));
+        }
+
+        if let Some(existing) = self.find_by_external_user_id(user_type, external_user_id).await? {
+            return Ok(existing);
+        }
+
+        let id = aionui_common::generate_prefixed_id("user");
+        let now = aionui_common::now_ms();
+
+        sqlx::query(
+            "INSERT INTO users \
+             (id, user_type, external_user_id, username, email, password_hash, avatar_path, status, session_generation, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, NULL, ?, 'active', 0, ?, ?)",
+        )
+        .bind(&id)
+        .bind(user_type.as_str())
+        .bind(external_user_id)
+        .bind(projection.username.as_deref())
+        .bind(projection.email.as_deref())
+        .bind(projection.avatar_path.as_deref())
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict("External user mapping already exists".to_string())
+            }
+            _ => DbError::Query(e),
+        })?;
+
+        self.find_by_id(&id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("User '{id}' not found after insert")))
+    }
+
+    async fn find_by_external_user_id(
+        &self,
+        user_type: UserType,
+        external_user_id: &str,
+    ) -> Result<Option<User>, DbError> {
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE user_type = ? AND external_user_id = ?")
+            .bind(user_type.as_str())
+            .bind(external_user_id)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -119,6 +192,15 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(user)
+    }
+
+    async fn find_active_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ? AND status = 'active'")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -144,12 +226,15 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_password(&self, user_id: &str, password_hash: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
-        let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(now)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE users SET password_hash = ?, updated_at = ? \
+             WHERE id = ? AND user_type = 'local'",
+        )
+        .bind(password_hash)
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("User '{user_id}' not found")));
@@ -160,18 +245,21 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_username(&self, user_id: &str, username: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
-        let result = sqlx::query("UPDATE users SET username = ?, updated_at = ? WHERE id = ?")
-            .bind(username)
-            .bind(now)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
-                    DbError::Conflict(format!("Username '{username}' already exists"))
-                }
-                _ => DbError::Query(e),
-            })?;
+        let result = sqlx::query(
+            "UPDATE users SET username = ?, updated_at = ? \
+             WHERE id = ? AND user_type = 'local'",
+        )
+        .bind(username)
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict(format!("Username '{username}' already exists"))
+            }
+            _ => DbError::Query(e),
+        })?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("User '{user_id}' not found")));
@@ -211,12 +299,52 @@ impl IUserRepository for SqliteUserRepository {
 
         Ok(())
     }
+
+    async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError> {
+        let now = aionui_common::now_ms();
+        let result = sqlx::query("UPDATE users SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+
+        Ok(())
+    }
+
+    async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError> {
+        let now = aionui_common::now_ms();
+        let result = sqlx::query(
+            "UPDATE users \
+             SET session_generation = session_generation + 1, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+
+        let generation: i64 = sqlx::query_scalar("SELECT session_generation FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(generation)
+    }
 }
 
 /// Checks if a SQLite database error is a UNIQUE constraint violation.
 fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
-    // SQLite error code 2067 = SQLITE_CONSTRAINT_UNIQUE
-    err.code().is_some_and(|c| c == "2067")
+    // SQLite error code 2067 = SQLITE_CONSTRAINT_UNIQUE, 1555 = SQLITE_CONSTRAINT_PRIMARYKEY.
+    err.code().is_some_and(|c| c == "2067" || c == "1555")
 }
 
 #[cfg(test)]
@@ -240,7 +368,7 @@ mod tests {
 
     #[test]
     fn non_unique_violation_code_rejected() {
-        assert!(!is_unique_violation(&FakeDbError("1555")));
+        assert!(!is_unique_violation(&FakeDbError("1299")));
     }
 
     /// Minimal fake for testing is_unique_violation.
@@ -289,8 +417,11 @@ mod tests {
         let user = repo.create_user("alice", "hash123").await.unwrap();
 
         assert!(user.id.starts_with("user_"));
-        assert_eq!(user.username, "alice");
-        assert_eq!(user.password_hash, "hash123");
+        assert_eq!(user.user_type, UserType::Local);
+        assert_eq!(user.status, UserStatus::Active);
+        assert_eq!(user.session_generation, 0);
+        assert_eq!(user.username.as_deref(), Some("alice"));
+        assert_eq!(user.password_hash.as_deref(), Some("hash123"));
         assert!(user.email.is_none());
         assert!(user.avatar_path.is_none());
         assert!(user.jwt_secret.is_none());
@@ -326,7 +457,9 @@ mod tests {
         let (repo, _db) = setup().await;
         let user = repo.get_system_user().await.unwrap().unwrap();
         assert_eq!(user.id, "system_default_user");
-        assert_eq!(user.username, "admin");
+        assert_eq!(user.user_type, UserType::Local);
+        assert_eq!(user.status, UserStatus::Active);
+        assert_eq!(user.username.as_deref(), Some("admin"));
     }
 
     #[tokio::test]
@@ -347,7 +480,7 @@ mod tests {
 
         let found = repo.find_by_username("charlie").await.unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().username, "charlie");
+        assert_eq!(found.unwrap().username.as_deref(), Some("charlie"));
     }
 
     #[tokio::test]
@@ -400,7 +533,7 @@ mod tests {
         repo.update_password(&user.id, "new_hash").await.unwrap();
 
         let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
-        assert_eq!(updated.password_hash, "new_hash");
+        assert_eq!(updated.password_hash.as_deref(), Some("new_hash"));
         assert!(updated.updated_at >= user.updated_at);
     }
 
@@ -419,7 +552,7 @@ mod tests {
         repo.update_username(&user.id, "ivan_new").await.unwrap();
 
         let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
-        assert_eq!(updated.username, "ivan_new");
+        assert_eq!(updated.username.as_deref(), Some("ivan_new"));
     }
 
     #[tokio::test]
@@ -473,7 +606,74 @@ mod tests {
         repo.set_system_user_credentials("admin", "secure_hash").await.unwrap();
 
         let user = repo.get_system_user().await.unwrap().unwrap();
-        assert_eq!(user.username, "admin");
-        assert_eq!(user.password_hash, "secure_hash");
+        assert_eq!(user.username.as_deref(), Some("admin"));
+        assert_eq!(user.password_hash.as_deref(), Some("secure_hash"));
+    }
+
+    #[tokio::test]
+    async fn ensure_external_user_is_idempotent_and_has_no_password() {
+        let (repo, _db) = setup().await;
+        let projection = ExternalUserProjection {
+            username: Some("AionPro User".to_string()),
+            email: Some("user@example.com".to_string()),
+            avatar_path: Some("/avatar.png".to_string()),
+        };
+
+        let first = repo
+            .ensure_external_user(UserType::Aionpro, "external-123", projection)
+            .await
+            .unwrap();
+        let second = repo
+            .ensure_external_user(
+                UserType::Aionpro,
+                "external-123",
+                ExternalUserProjection {
+                    username: Some("Different".to_string()),
+                    email: None,
+                    avatar_path: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.user_type, UserType::Aionpro);
+        assert_eq!(first.external_user_id.as_deref(), Some("external-123"));
+        assert_eq!(first.status, UserStatus::Active);
+        assert_eq!(first.session_generation, 0);
+        assert!(first.password_hash.is_none());
+        assert!(repo.find_by_username("AionPro User").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_user_is_excluded_from_active_lookup() {
+        let (repo, _db) = setup().await;
+        let user = repo
+            .ensure_external_user(
+                UserType::Aionpro,
+                "external-disabled",
+                ExternalUserProjection::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(repo.find_active_by_id(&user.id).await.unwrap().is_some());
+        repo.set_status(&user.id, UserStatus::Disabled).await.unwrap();
+
+        let disabled = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(disabled.status, UserStatus::Disabled);
+        assert!(repo.find_active_by_id(&user.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn increment_session_generation_returns_new_value() {
+        let (repo, _db) = setup().await;
+        let user = repo.create_user("session-user", "h").await.unwrap();
+
+        let generation = repo.increment_session_generation(&user.id).await.unwrap();
+
+        assert_eq!(generation, 1);
+        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(updated.session_generation, 1);
     }
 }
