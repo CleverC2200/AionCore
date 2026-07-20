@@ -77,8 +77,8 @@ impl ChannelManager {
     /// Returns the status of all registered plugins from the database.
     ///
     /// Merges DB state with live runtime status for active plugins.
-    pub async fn get_plugin_status(&self) -> Result<Vec<PluginStatusResponse>, ChannelError> {
-        let rows = self.repo.get_all_plugins().await?;
+    pub async fn get_plugin_status(&self, owner_user_id: &str) -> Result<Vec<PluginStatusResponse>, ChannelError> {
+        let rows = self.repo.get_all_plugins(owner_user_id).await?;
         let statuses: Vec<PluginStatusResponse> = rows
             .into_iter()
             .map(|row| {
@@ -102,6 +102,7 @@ impl ChannelManager {
     /// - `factory`: Function to create the platform-specific plugin instance
     pub async fn enable_plugin(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         config_value: &serde_json::Value,
         factory: &PluginFactory,
@@ -115,7 +116,7 @@ impl ChannelManager {
         // are supplied.
         let config: PluginConfig = match Self::config_with_credentials(config_value)? {
             Some(config) => config,
-            None => self.load_stored_config(plugin_id).await?,
+            None => self.load_stored_config(owner_user_id, plugin_id).await?,
         };
 
         // Stop existing plugin if running
@@ -132,6 +133,7 @@ impl ChannelManager {
         let now = now_ms();
         let row = ChannelPluginRow {
             id: plugin_id.to_owned(),
+            owner_user_id: owner_user_id.to_owned(),
             r#type: plugin_type.to_string(),
             name: self.default_plugin_name(plugin_type),
             enabled: true,
@@ -141,7 +143,7 @@ impl ChannelManager {
             created_at: now,
             updated_at: now,
         };
-        self.repo.upsert_plugin(&row).await?;
+        self.repo.upsert_plugin(owner_user_id, &row).await?;
 
         // Create and start plugin instance
         let mut plugin = factory(plugin_type)
@@ -153,14 +155,14 @@ impl ChannelManager {
         };
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
-            self.update_plugin_error(plugin_id, &e.to_string()).await;
-            self.broadcast_status_change(plugin_id).await;
+            self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
+            self.broadcast_status_change(owner_user_id, plugin_id).await;
             return Err(e);
         }
 
         if let Err(e) = plugin.start().await {
-            self.update_plugin_error(plugin_id, &e.to_string()).await;
-            self.broadcast_status_change(plugin_id).await;
+            self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
+            self.broadcast_status_change(owner_user_id, plugin_id).await;
             return Err(e);
         }
 
@@ -170,13 +172,15 @@ impl ChannelManager {
             last_connected: Some(now_ms()),
             enabled: None,
         };
-        self.repo.update_plugin_status(plugin_id, &params).await?;
+        self.repo
+            .update_plugin_status(owner_user_id, plugin_id, &params)
+            .await?;
 
         // Store active instance
         self.plugins.insert(plugin_id.to_owned(), plugin);
 
-        info!(plugin_id = %plugin_id, "plugin enabled and started");
-        self.broadcast_status_change(plugin_id).await;
+        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin enabled and started");
+        self.broadcast_status_change(owner_user_id, plugin_id).await;
         Ok(())
     }
 
@@ -187,6 +191,7 @@ impl ChannelManager {
     /// can behave consistently and survive restarts.
     pub async fn enable_extension_plugin(
         &self,
+        owner_user_id: &str,
         plugin_id: &str,
         plugin_name: &str,
         config: &PluginConfig,
@@ -200,9 +205,10 @@ impl ChannelManager {
             .map_err(|e| ChannelError::EncryptionFailed(e.to_string()))?;
 
         let now = now_ms();
-        let existing = self.repo.get_plugin(plugin_id).await?;
+        let existing = self.repo.get_plugin(owner_user_id, plugin_id).await?;
         let row = ChannelPluginRow {
             id: plugin_id.to_owned(),
+            owner_user_id: owner_user_id.to_owned(),
             r#type: plugin_id.to_owned(),
             name: plugin_name.to_owned(),
             enabled: true,
@@ -212,10 +218,10 @@ impl ChannelManager {
             created_at: existing.as_ref().map(|row| row.created_at).unwrap_or(now),
             updated_at: now,
         };
-        self.repo.upsert_plugin(&row).await?;
+        self.repo.upsert_plugin(owner_user_id, &row).await?;
 
-        info!(plugin_id = %plugin_id, "extension plugin enabled (metadata-only mode)");
-        self.broadcast_status_change(plugin_id).await;
+        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "extension plugin enabled (metadata-only mode)");
+        self.broadcast_status_change(owner_user_id, plugin_id).await;
         Ok(())
     }
 
@@ -223,7 +229,7 @@ impl ChannelManager {
     /// the active instance.
     ///
     /// Idempotent — disabling an already-disabled plugin is a no-op.
-    pub async fn disable_plugin(&self, plugin_id: &str) -> Result<(), ChannelError> {
+    pub async fn disable_plugin(&self, owner_user_id: &str, plugin_id: &str) -> Result<(), ChannelError> {
         // Stop running instance if any
         self.stop_plugin(plugin_id).await;
 
@@ -233,10 +239,12 @@ impl ChannelManager {
             last_connected: None,
             enabled: Some(false),
         };
-        self.repo.update_plugin_status(plugin_id, &params).await?;
+        self.repo
+            .update_plugin_status(owner_user_id, plugin_id, &params)
+            .await?;
 
-        info!(plugin_id = %plugin_id, "plugin disabled");
-        self.broadcast_status_change(plugin_id).await;
+        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin disabled");
+        self.broadcast_status_change(owner_user_id, plugin_id).await;
         Ok(())
     }
 
@@ -279,8 +287,8 @@ impl ChannelManager {
     /// Reads all enabled plugins from DB, decrypts their config, and
     /// starts them. Errors on individual plugins are logged but don't
     /// prevent other plugins from starting.
-    pub async fn restore_plugins(&self, factory: &PluginFactory) -> Result<(), ChannelError> {
-        let rows = self.repo.get_all_plugins().await?;
+    pub async fn restore_plugins(&self, owner_user_id: &str, factory: &PluginFactory) -> Result<(), ChannelError> {
+        let rows = self.repo.get_all_plugins(owner_user_id).await?;
         let enabled: Vec<ChannelPluginRow> = rows.into_iter().filter(|r| r.enabled).collect();
 
         if enabled.is_empty() {
@@ -288,7 +296,7 @@ impl ChannelManager {
             return Ok(());
         }
 
-        info!(count = enabled.len(), "restoring enabled plugins");
+        info!(owner_user_id = %owner_user_id, count = enabled.len(), "restoring enabled plugins");
 
         for row in enabled {
             if PluginType::from_str_opt(&row.r#type).is_none() {
@@ -297,17 +305,18 @@ impl ChannelManager {
                     plugin_type = %row.r#type,
                     "skipping extension plugin runtime restore; metadata-only mode"
                 );
-                self.broadcast_status_change(&row.id).await;
+                self.broadcast_status_change(owner_user_id, &row.id).await;
                 continue;
             }
-            if let Err(e) = self.restore_single_plugin(&row, factory).await {
+            if let Err(e) = self.restore_single_plugin(owner_user_id, &row, factory).await {
                 warn!(
+                    owner_user_id = %owner_user_id,
                     plugin_id = %row.id,
                     error = %e,
                     "failed to restore plugin, marking as error"
                 );
-                self.update_plugin_error(&row.id, &e.to_string()).await;
-                self.broadcast_status_change(&row.id).await;
+                self.update_plugin_error(owner_user_id, &row.id, &e.to_string()).await;
+                self.broadcast_status_change(owner_user_id, &row.id).await;
             }
         }
 
@@ -403,10 +412,10 @@ impl ChannelManager {
     /// Used when an enable request omits credentials and the stored
     /// configuration should be reused (Settings re-enable toggle). Returns
     /// `InvalidConfig` when there is no stored config to fall back to.
-    async fn load_stored_config(&self, plugin_id: &str) -> Result<PluginConfig, ChannelError> {
+    async fn load_stored_config(&self, owner_user_id: &str, plugin_id: &str) -> Result<PluginConfig, ChannelError> {
         let row = self
             .repo
-            .get_plugin(plugin_id)
+            .get_plugin(owner_user_id, plugin_id)
             .await?
             .filter(|row| !row.config.is_empty())
             .ok_or_else(|| {
@@ -436,7 +445,12 @@ impl ChannelManager {
     }
 
     /// Restores a single plugin from its DB row.
-    async fn restore_single_plugin(&self, row: &ChannelPluginRow, factory: &PluginFactory) -> Result<(), ChannelError> {
+    async fn restore_single_plugin(
+        &self,
+        owner_user_id: &str,
+        row: &ChannelPluginRow,
+        factory: &PluginFactory,
+    ) -> Result<(), ChannelError> {
         let plugin_type =
             PluginType::from_str_opt(&row.r#type).ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
 
@@ -462,23 +476,24 @@ impl ChannelManager {
             last_connected: Some(now_ms()),
             enabled: None,
         };
-        self.repo.update_plugin_status(&row.id, &params).await?;
+        self.repo.update_plugin_status(owner_user_id, &row.id, &params).await?;
 
         self.plugins.insert(row.id.clone(), plugin);
-        info!(plugin_id = %row.id, "plugin restored");
-        self.broadcast_status_change(&row.id).await;
+        info!(owner_user_id = %owner_user_id, plugin_id = %row.id, "plugin restored");
+        self.broadcast_status_change(owner_user_id, &row.id).await;
         Ok(())
     }
 
     /// Updates a plugin to error status in the DB.
-    async fn update_plugin_error(&self, plugin_id: &str, error_msg: &str) {
+    async fn update_plugin_error(&self, owner_user_id: &str, plugin_id: &str, error_msg: &str) {
         let params = UpdatePluginStatusParams {
             status: Some(PluginStatus::Error.to_string()),
             last_connected: None,
             enabled: None,
         };
-        if let Err(e) = self.repo.update_plugin_status(plugin_id, &params).await {
+        if let Err(e) = self.repo.update_plugin_status(owner_user_id, plugin_id, &params).await {
             error!(
+                owner_user_id = %owner_user_id,
                 plugin_id = %plugin_id,
                 db_error = %e,
                 original_error = %error_msg,
@@ -488,15 +503,16 @@ impl ChannelManager {
     }
 
     /// Broadcasts a `channel.plugin-status-changed` event.
-    async fn broadcast_status_change(&self, plugin_id: &str) {
-        let row = match self.repo.get_plugin(plugin_id).await {
+    async fn broadcast_status_change(&self, owner_user_id: &str, plugin_id: &str) {
+        let row = match self.repo.get_plugin(owner_user_id, plugin_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                warn!(plugin_id = %plugin_id, "plugin not found for status broadcast");
+                warn!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin not found for status broadcast");
                 return;
             }
             Err(e) => {
                 warn!(
+                    owner_user_id = %owner_user_id,
                     plugin_id = %plugin_id,
                     error = %e,
                     "failed to read plugin for status broadcast"
@@ -616,6 +632,7 @@ mod tests {
     }
 
     // ── Mock IChannelRepository ────────────────────────────────────────
+    const OWNER_ID: &str = "owner-test";
 
     struct MockRepo {
         plugins: Mutex<Vec<ChannelPluginRow>>,
@@ -635,16 +652,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IChannelRepository for MockRepo {
-        async fn get_all_plugins(&self) -> Result<Vec<ChannelPluginRow>, DbError> {
+        async fn get_all_plugins(&self, _owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
             Ok(self.plugins.lock().unwrap().clone())
         }
 
-        async fn get_plugin(&self, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
+        async fn get_plugin(&self, _owner_user_id: &str, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
             let plugins = self.plugins.lock().unwrap();
             Ok(plugins.iter().find(|p| p.id == id).cloned())
         }
 
-        async fn upsert_plugin(&self, row: &ChannelPluginRow) -> Result<(), DbError> {
+        async fn upsert_plugin(&self, _owner_user_id: &str, row: &ChannelPluginRow) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             if let Some(existing) = plugins.iter_mut().find(|p| p.id == row.id) {
                 *existing = row.clone();
@@ -654,7 +671,12 @@ mod tests {
             Ok(())
         }
 
-        async fn update_plugin_status(&self, id: &str, params: &UpdatePluginStatusParams) -> Result<(), DbError> {
+        async fn update_plugin_status(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+            params: &UpdatePluginStatusParams,
+        ) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
                 if let Some(ref s) = params.status {
@@ -673,7 +695,7 @@ mod tests {
             }
         }
 
-        async fn delete_plugin(&self, id: &str) -> Result<(), DbError> {
+        async fn delete_plugin(&self, _owner_user_id: &str, id: &str) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             let len_before = plugins.len();
             plugins.retain(|p| p.id != id);
@@ -685,67 +707,97 @@ mod tests {
         }
 
         // -- User CRUD (unused stubs) --
-        async fn get_all_users(&self) -> Result<Vec<AssistantUserRow>, DbError> {
+        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_user_by_platform(&self, _pid: &str, _pt: &str) -> Result<Option<AssistantUserRow>, DbError> {
+        async fn get_user_by_platform(
+            &self,
+            _owner_user_id: &str,
+            _pid: &str,
+            _pt: &str,
+        ) -> Result<Option<AssistantUserRow>, DbError> {
             Ok(None)
         }
-        async fn create_user(&self, _row: &AssistantUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, _owner_user_id: &str, _row: &AssistantUserRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_user_last_active(&self, _id: &str, _la: TimestampMs) -> Result<(), DbError> {
+        async fn update_user_last_active(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _la: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_user(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
         // -- Session CRUD (unused stubs) --
-        async fn get_all_sessions(&self) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_session(&self, _id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(&self, _owner_user_id: &str, _id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
             Ok(None)
         }
         async fn get_or_create_session(
             &self,
+            _owner_user_id: &str,
             _uid: &str,
             _cid: &str,
             new_row: &AssistantSessionRow,
         ) -> Result<AssistantSessionRow, DbError> {
             Ok(new_row.clone())
         }
-        async fn update_session_activity(&self, _id: &str, _la: TimestampMs) -> Result<(), DbError> {
+        async fn update_session_activity(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _la: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_conversation(&self, _id: &str, _cid: &str) -> Result<(), DbError> {
+        async fn update_session_conversation(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _cid: &str,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_agent_type(&self, _id: &str, _at: &str) -> Result<(), DbError> {
+        async fn update_session_agent_type(&self, _owner_user_id: &str, _id: &str, _at: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_sessions_by_user(&self, _uid: &str) -> Result<(), DbError> {
+        async fn delete_sessions_by_user(&self, _owner_user_id: &str, _uid: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_session_by_user_chat(&self, _uid: &str, _cid: &str) -> Result<(), DbError> {
+        async fn delete_session_by_user_chat(
+            &self,
+            _owner_user_id: &str,
+            _uid: &str,
+            _cid: &str,
+        ) -> Result<(), DbError> {
             Ok(())
         }
 
         // -- Pairing codes (unused stubs) --
-        async fn create_pairing(&self, _row: &PairingCodeRow) -> Result<(), DbError> {
+        async fn create_pairing(&self, _owner_user_id: &str, _row: &PairingCodeRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn get_pending_pairings(&self) -> Result<Vec<PairingCodeRow>, DbError> {
+        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_pairing_by_code(&self, _code: &str) -> Result<Option<PairingCodeRow>, DbError> {
+        async fn get_pairing_by_code(
+            &self,
+            _owner_user_id: &str,
+            _code: &str,
+        ) -> Result<Option<PairingCodeRow>, DbError> {
             Ok(None)
         }
-        async fn update_pairing_status(&self, _code: &str, _status: &str) -> Result<(), DbError> {
+        async fn update_pairing_status(&self, _owner_user_id: &str, _code: &str, _status: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn cleanup_expired_pairings(&self, _now: TimestampMs) -> Result<u64, DbError> {
+        async fn cleanup_expired_pairings(&self, _owner_user_id: &str, _now: TimestampMs) -> Result<u64, DbError> {
             Ok(0)
         }
     }
@@ -934,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn get_status_empty() {
         let (mgr, _repo, _bc) = make_manager();
-        let statuses = mgr.get_plugin_status().await.unwrap();
+        let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
         assert!(statuses.is_empty());
     }
 
@@ -944,6 +996,7 @@ mod tests {
         let now = now_ms();
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
             id: "telegram".into(),
+            owner_user_id: OWNER_ID.into(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
@@ -954,7 +1007,7 @@ mod tests {
             updated_at: now,
         });
 
-        let statuses = mgr.get_plugin_status().await.unwrap();
+        let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].plugin_id, "telegram");
         assert_eq!(statuses[0].plugin_type, "telegram");
@@ -968,7 +1021,7 @@ mod tests {
         let factory = make_factory();
 
         // Enable the plugin (will set live status to Running)
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -980,7 +1033,7 @@ mod tests {
             }
         }
 
-        let statuses = mgr.get_plugin_status().await.unwrap();
+        let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
         assert_eq!(statuses.len(), 1);
         // Live status (running) should override DB status (stopped)
         assert_eq!(statuses[0].status.as_deref(), Some("running"));
@@ -993,7 +1046,7 @@ mod tests {
         let (mgr, repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1014,7 +1067,7 @@ mod tests {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1027,7 +1080,7 @@ mod tests {
         let (mgr, _repo, bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1043,13 +1096,13 @@ mod tests {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
         assert_eq!(mgr.active_plugin_count(), 1);
 
         // Re-enable should replace (stop old, start new)
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
         assert_eq!(mgr.active_plugin_count(), 1);
@@ -1061,7 +1114,7 @@ mod tests {
         let factory = make_factory();
 
         let err = mgr
-            .enable_plugin("whatsapp", &make_test_config(), &factory)
+            .enable_plugin(OWNER_ID, "whatsapp", &make_test_config(), &factory)
             .await
             .unwrap_err();
         assert!(matches!(err, ChannelError::InvalidPluginType(_)));
@@ -1073,7 +1126,10 @@ mod tests {
         let factory = make_factory();
 
         let bad_config = serde_json::json!({ "wrong": "shape" });
-        let err = mgr.enable_plugin("telegram", &bad_config, &factory).await.unwrap_err();
+        let err = mgr
+            .enable_plugin(OWNER_ID, "telegram", &bad_config, &factory)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ChannelError::InvalidConfig(_)));
     }
 
@@ -1083,7 +1139,7 @@ mod tests {
         let factory = make_no_impl_factory();
 
         let err = mgr
-            .enable_plugin("telegram", &make_test_config(), &factory)
+            .enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap_err();
         assert!(matches!(err, ChannelError::InvalidPluginType(_)));
@@ -1094,7 +1150,9 @@ mod tests {
         let (mgr, repo, _bc) = make_manager();
         let factory = make_failing_init_factory();
 
-        let err = mgr.enable_plugin("telegram", &make_test_config(), &factory).await;
+        let err = mgr
+            .enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
+            .await;
         assert!(err.is_err());
 
         // Plugin should not be in active map
@@ -1110,7 +1168,9 @@ mod tests {
         let (mgr, repo, _bc) = make_manager();
         let factory = make_failing_start_factory();
 
-        let err = mgr.enable_plugin("telegram", &make_test_config(), &factory).await;
+        let err = mgr
+            .enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
+            .await;
         assert!(err.is_err());
 
         assert_eq!(mgr.active_plugin_count(), 0);
@@ -1125,12 +1185,12 @@ mod tests {
         let (mgr, repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
         assert!(mgr.is_plugin_running("telegram"));
 
-        mgr.disable_plugin("telegram").await.unwrap();
+        mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
         assert_eq!(mgr.active_plugin_count(), 0);
         let plugins = repo.get_plugins();
@@ -1143,12 +1203,12 @@ mod tests {
         let (mgr, _repo, bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
         bc.take_events(); // clear enable events
 
-        mgr.disable_plugin("telegram").await.unwrap();
+        mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
         let events = bc.take_events();
         assert!(!events.is_empty());
@@ -1161,6 +1221,7 @@ mod tests {
         // Manually insert a disabled plugin in DB
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
             id: "telegram".into(),
+            owner_user_id: OWNER_ID.into(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
@@ -1172,7 +1233,7 @@ mod tests {
         });
 
         // Should not error
-        mgr.disable_plugin("telegram").await.unwrap();
+        mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 0);
     }
 
@@ -1237,6 +1298,7 @@ mod tests {
 
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
             id: "telegram".into(),
+            owner_user_id: OWNER_ID.into(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
@@ -1247,7 +1309,7 @@ mod tests {
             updated_at: now_ms(),
         });
 
-        mgr.restore_plugins(&factory).await.unwrap();
+        mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 0);
     }
 
@@ -1261,6 +1323,7 @@ mod tests {
 
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
             id: "telegram".into(),
+            owner_user_id: OWNER_ID.into(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
@@ -1271,7 +1334,7 @@ mod tests {
             updated_at: now_ms(),
         });
 
-        mgr.restore_plugins(&factory).await.unwrap();
+        mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 1);
         assert!(mgr.is_plugin_running("telegram"));
     }
@@ -1288,6 +1351,7 @@ mod tests {
             let mut plugins = repo.plugins.lock().unwrap();
             plugins.push(ChannelPluginRow {
                 id: "telegram".into(),
+                owner_user_id: OWNER_ID.into(),
                 r#type: "telegram".into(),
                 name: "Telegram Bot".into(),
                 enabled: true,
@@ -1299,6 +1363,7 @@ mod tests {
             });
             plugins.push(ChannelPluginRow {
                 id: "lark".into(),
+                owner_user_id: OWNER_ID.into(),
                 r#type: "lark".into(),
                 name: "Lark Bot".into(),
                 enabled: true,
@@ -1311,7 +1376,7 @@ mod tests {
         }
 
         let factory = make_factory();
-        mgr.restore_plugins(&factory).await.unwrap();
+        mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
 
         // Telegram should have started, Lark should have failed
         assert_eq!(mgr.active_plugin_count(), 1);
@@ -1328,7 +1393,7 @@ mod tests {
     async fn restore_empty_is_noop() {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
-        mgr.restore_plugins(&factory).await.unwrap();
+        mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 0);
     }
 
@@ -1339,7 +1404,7 @@ mod tests {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1349,7 +1414,9 @@ mod tests {
                 "appSecret": "secret"
             }
         });
-        mgr.enable_plugin("lark", &lark_config, &factory).await.unwrap();
+        mgr.enable_plugin(OWNER_ID, "lark", &lark_config, &factory)
+            .await
+            .unwrap();
 
         assert_eq!(mgr.active_plugin_count(), 2);
 
@@ -1364,7 +1431,7 @@ mod tests {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1390,7 +1457,7 @@ mod tests {
         let (mgr, _repo, _bc) = make_manager();
         let factory = make_factory();
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
 
@@ -1418,12 +1485,12 @@ mod tests {
 
         assert_eq!(mgr.active_plugin_count(), 0);
 
-        mgr.enable_plugin("telegram", &make_test_config(), &factory)
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
             .await
             .unwrap();
         assert_eq!(mgr.active_plugin_count(), 1);
 
-        mgr.disable_plugin("telegram").await.unwrap();
+        mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
         assert_eq!(mgr.active_plugin_count(), 0);
     }
 

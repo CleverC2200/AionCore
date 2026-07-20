@@ -21,6 +21,7 @@ use aionui_realtime::EventBroadcaster;
 use tokio::sync::mpsc;
 
 // ── Test infrastructure ─────────────────────────────────────────────
+const OWNER_ID: &str = "system_default_user";
 
 struct MockBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -234,7 +235,7 @@ fn make_test_outgoing() -> UnifiedOutgoingMessage {
 #[tokio::test]
 async fn ps1_get_status_empty() {
     let (mgr, _repo, _bc) = setup().await;
-    let statuses = mgr.get_plugin_status().await.unwrap();
+    let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
     assert!(statuses.is_empty());
 }
 
@@ -245,11 +246,11 @@ async fn ps2_get_status_with_plugins() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
-    let statuses = mgr.get_plugin_status().await.unwrap();
+    let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].plugin_id, "telegram");
     assert_eq!(statuses[0].plugin_type, "telegram");
@@ -265,12 +266,12 @@ async fn ep1_enable_telegram_plugin() {
     let (mgr, repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
     // Plugin persisted in DB
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert!(row.enabled);
     assert_eq!(row.r#type, "telegram");
     assert_eq!(row.name, "Telegram Bot");
@@ -288,7 +289,7 @@ async fn ep2_re_enable_updates_config() {
     let (mgr, repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
@@ -297,13 +298,15 @@ async fn ep2_re_enable_updates_config() {
         "credentials": { "token": "bot:new_token_456" },
         "config": { "mode": "webhook", "webhook_url": "https://example.com" }
     });
-    mgr.enable_plugin("telegram", &new_config, &factory).await.unwrap();
+    mgr.enable_plugin(OWNER_ID, "telegram", &new_config, &factory)
+        .await
+        .unwrap();
 
     // Still only one plugin
     assert_eq!(mgr.active_plugin_count(), 1);
 
     // Config should be updated
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     let decrypted = decrypt_string(&row.config, &test_key()).unwrap();
     let config: PluginConfig = serde_json::from_str(&decrypted).unwrap();
     assert_eq!(config.credentials.token.as_deref(), Some("bot:new_token_456"));
@@ -317,20 +320,20 @@ async fn ep6_re_enable_empty_config_reuses_stored_credentials() {
     let factory = make_factory();
 
     // First enable persists the token, then the user disables the channel.
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
     // The Settings re-enable toggle sends an empty config and relies on the
     // previously stored credentials being reused instead of erroring out.
-    mgr.enable_plugin("telegram", &serde_json::json!({}), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &serde_json::json!({}), &factory)
         .await
         .unwrap();
 
     assert!(mgr.is_plugin_running("telegram"));
 
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert!(row.enabled);
     let decrypted = decrypt_string(&row.config, &test_key()).unwrap();
     let config: PluginConfig = serde_json::from_str(&decrypted).unwrap();
@@ -345,7 +348,7 @@ async fn ep5_invalid_plugin_id() {
     let factory = make_factory();
 
     let err = mgr
-        .enable_plugin("nonexistent", &make_telegram_config(), &factory)
+        .enable_plugin(OWNER_ID, "nonexistent", &make_telegram_config(), &factory)
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::InvalidPluginType(_)));
@@ -360,7 +363,10 @@ async fn ep3_ep4_invalid_config_structure() {
 
     // Missing credentials entirely
     let bad = serde_json::json!({ "wrong_key": "value" });
-    let err = mgr.enable_plugin("telegram", &bad, &factory).await.unwrap_err();
+    let err = mgr
+        .enable_plugin(OWNER_ID, "telegram", &bad, &factory)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ChannelError::InvalidConfig(_)));
 }
 
@@ -371,15 +377,15 @@ async fn dp1_disable_enabled_plugin() {
     let (mgr, repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
     assert_eq!(mgr.active_plugin_count(), 0);
     assert!(!mgr.is_plugin_running("telegram"));
 
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert!(!row.enabled);
     assert_eq!(row.status.as_deref(), Some("stopped"));
 }
@@ -391,13 +397,13 @@ async fn dp2_disable_already_disabled() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
     // Second disable should not error
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
     assert_eq!(mgr.active_plugin_count(), 0);
 }
 
@@ -469,7 +475,7 @@ async fn tp_test_does_not_persist() {
         .await
         .unwrap();
 
-    let plugins = repo.get_all_plugins().await.unwrap();
+    let plugins = repo.get_all_plugins(OWNER_ID).await.unwrap();
     assert!(plugins.is_empty());
     assert_eq!(mgr.active_plugin_count(), 0);
 }
@@ -481,11 +487,11 @@ async fn cs1_credentials_stored_encrypted() {
     let (mgr, repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
 
     // Config should not contain plaintext token
     assert!(!row.config.contains("bot:valid123"));
@@ -507,11 +513,11 @@ async fn cs2_status_does_not_leak_credentials() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
-    let statuses = mgr.get_plugin_status().await.unwrap();
+    let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
     let json = serde_json::to_string(&statuses).unwrap();
 
     // No sensitive fields should appear
@@ -530,7 +536,7 @@ async fn ws2_enable_broadcasts_status_change() {
     let (mgr, _repo, bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
@@ -548,12 +554,12 @@ async fn ws2_disable_broadcasts_status_change() {
     let (mgr, _repo, bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
     bc.take_events(); // clear enable events
 
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
     let events = bc.take_events();
     let status_events: Vec<_> = events
@@ -571,7 +577,7 @@ async fn restore_starts_enabled_plugins() {
     let factory = make_factory();
 
     // First enable and persist a plugin
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
@@ -580,7 +586,7 @@ async fn restore_starts_enabled_plugins() {
     assert_eq!(mgr.active_plugin_count(), 0);
 
     // Restore should bring it back
-    mgr.restore_plugins(&factory).await.unwrap();
+    mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
     assert_eq!(mgr.active_plugin_count(), 1);
     assert!(mgr.is_plugin_running("telegram"));
 }
@@ -592,12 +598,12 @@ async fn restore_skips_disabled_plugins() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.disable_plugin("telegram").await.unwrap();
+    mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
-    mgr.restore_plugins(&factory).await.unwrap();
+    mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
     assert_eq!(mgr.active_plugin_count(), 0);
 }
 
@@ -608,16 +614,18 @@ async fn enable_multiple_plugins() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.enable_plugin("lark", &make_lark_config(), &factory).await.unwrap();
+    mgr.enable_plugin(OWNER_ID, "lark", &make_lark_config(), &factory)
+        .await
+        .unwrap();
 
     assert_eq!(mgr.active_plugin_count(), 2);
     assert!(mgr.is_plugin_running("telegram"));
     assert!(mgr.is_plugin_running("lark"));
 
-    let statuses = mgr.get_plugin_status().await.unwrap();
+    let statuses = mgr.get_plugin_status(OWNER_ID).await.unwrap();
     assert_eq!(statuses.len(), 2);
 }
 
@@ -628,10 +636,12 @@ async fn shutdown_stops_all() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
-    mgr.enable_plugin("lark", &make_lark_config(), &factory).await.unwrap();
+    mgr.enable_plugin(OWNER_ID, "lark", &make_lark_config(), &factory)
+        .await
+        .unwrap();
 
     mgr.shutdown().await;
     assert_eq!(mgr.active_plugin_count(), 0);
@@ -644,7 +654,7 @@ async fn send_message_routes_to_plugin() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
@@ -671,7 +681,7 @@ async fn edit_message_routes_to_plugin() {
     let (mgr, _repo, _bc) = setup().await;
     let factory = make_factory();
 
-    mgr.enable_plugin("telegram", &make_telegram_config(), &factory)
+    mgr.enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap();
 
@@ -687,11 +697,13 @@ async fn enable_failure_sets_error_in_db() {
     let (mgr, repo, _bc) = setup().await;
     let factory = make_failing_factory();
 
-    let err = mgr.enable_plugin("telegram", &make_telegram_config(), &factory).await;
+    let err = mgr
+        .enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
+        .await;
     assert!(err.is_err());
 
     // Plugin should exist in DB with error status
-    let row = repo.get_plugin("telegram").await.unwrap().unwrap();
+    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
     assert_eq!(row.status.as_deref(), Some("error"));
     assert_eq!(mgr.active_plugin_count(), 0);
 }
@@ -704,7 +716,7 @@ async fn enable_no_implementation_fails() {
     let factory = make_no_impl_factory();
 
     let err = mgr
-        .enable_plugin("telegram", &make_telegram_config(), &factory)
+        .enable_plugin(OWNER_ID, "telegram", &make_telegram_config(), &factory)
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::InvalidPluginType(_)));

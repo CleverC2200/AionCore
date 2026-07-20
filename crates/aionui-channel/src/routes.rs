@@ -133,8 +133,9 @@ pub fn weixin_login_route(state: ChannelRouterState) -> Router {
 /// `GET /api/channel/plugins` — get status of all registered plugins.
 async fn get_plugin_status(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelPluginStatusView>>>, ApiError> {
-    let statuses = state.manager.get_plugin_status().await?;
+    let statuses = state.manager.get_plugin_status(&user.id).await?;
     let extension_plugins = state.extension_registry.get_channel_plugins().await;
 
     let extension_map: HashMap<String, ResolvedChannelPlugin> = extension_plugins
@@ -308,6 +309,7 @@ impl From<&ResolvedChannelPlugin> for ChannelExtensionMetaView {
 /// `POST /api/channel/plugins/enable` — enable a plugin with config.
 async fn enable_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -316,7 +318,7 @@ async fn enable_plugin(
         let config = build_extension_config(&extension_plugin, &req.config)?;
         match state
             .manager
-            .enable_extension_plugin(&req.plugin_id, &extension_plugin.name, &config)
+            .enable_extension_plugin(&user.id, &req.plugin_id, &extension_plugin.name, &config)
             .await
         {
             Ok(()) => {
@@ -339,7 +341,7 @@ async fn enable_plugin(
 
     match state
         .manager
-        .enable_plugin(&req.plugin_id, &req.config, state.plugin_factory.as_ref())
+        .enable_plugin(&user.id, &req.plugin_id, &req.config, state.plugin_factory.as_ref())
         .await
     {
         Ok(()) => Ok(Json(ApiResponse::ok(BridgeResponse {
@@ -361,6 +363,7 @@ async fn enable_plugin(
 /// `POST /api/channel/plugins/disable` — disable a plugin.
 async fn disable_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DisablePluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -368,7 +371,7 @@ async fn disable_plugin(
     if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
         && state
             .repo
-            .get_plugin(&req.plugin_id)
+            .get_plugin(&user.id, &req.plugin_id)
             .await
             .map_err(db_error_to_api_error)?
             .is_none()
@@ -380,7 +383,7 @@ async fn disable_plugin(
         })));
     }
 
-    match state.manager.disable_plugin(&req.plugin_id).await {
+    match state.manager.disable_plugin(&user.id, &req.plugin_id).await {
         Ok(()) => Ok(Json(ApiResponse::ok(BridgeResponse {
             success: true,
             message: Some("Plugin disabled".into()),
@@ -440,8 +443,9 @@ async fn test_plugin(
 /// `GET /api/channel/pairings` — get all pending pairing requests.
 async fn get_pending_pairings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<PairingRequestResponse>>>, ApiError> {
-    let rows = state.pairing_service.get_pending_pairings().await?;
+    let rows = state.pairing_service.get_pending_pairings(&user.id).await?;
     let responses: Vec<PairingRequestResponse> = rows
         .into_iter()
         .map(|r| PairingRequestResponse {
@@ -459,11 +463,12 @@ async fn get_pending_pairings(
 /// `POST /api/channel/pairings/approve` — approve a pairing request.
 async fn approve_pairing(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ApprovePairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.approve_pairing(&req.code).await?;
+    state.pairing_service.approve_pairing(&user.id, &req.code).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -475,11 +480,12 @@ async fn approve_pairing(
 /// `POST /api/channel/pairings/reject` — reject a pairing request.
 async fn reject_pairing(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RejectPairingRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.reject_pairing(&req.code).await?;
+    state.pairing_service.reject_pairing(&user.id, &req.code).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -495,8 +501,13 @@ async fn reject_pairing(
 /// `GET /api/channel/users` — get all authorized users.
 async fn get_authorized_users(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelUserResponse>>>, ApiError> {
-    let rows = state.repo.get_all_users().await.map_err(db_error_to_api_error)?;
+    let rows = state
+        .repo
+        .get_all_users(&user.id)
+        .await
+        .map_err(db_error_to_api_error)?;
     let responses: Vec<ChannelUserResponse> = rows
         .into_iter()
         .map(|r| ChannelUserResponse {
@@ -516,17 +527,21 @@ async fn get_authorized_users(
 /// Also cleans up the user's sessions.
 async fn revoke_user(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RevokeUserRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Clean up sessions first
-    state.session_manager.cleanup_user_sessions(&req.user_id).await?;
+    state
+        .session_manager
+        .cleanup_user_sessions(&user.id, &req.user_id)
+        .await?;
 
     // Delete user record
     state
         .repo
-        .delete_user(&req.user_id)
+        .delete_user(&user.id, &req.user_id)
         .await
         .map_err(db_error_to_api_error)?;
 
@@ -544,8 +559,9 @@ async fn revoke_user(
 /// `GET /api/channel/sessions` — get all active sessions.
 async fn get_active_sessions(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelSessionResponse>>>, ApiError> {
-    let rows = state.session_manager.get_active_sessions().await?;
+    let rows = state.session_manager.get_active_sessions(&user.id).await?;
     let responses: Vec<ChannelSessionResponse> = rows
         .into_iter()
         .map(|r| ChannelSessionResponse {
@@ -594,7 +610,7 @@ async fn set_channel_assistant_setting(
         .settings_service
         .set_assistant_setting(&user.id, platform, &req)
         .await?;
-    state.session_manager.clear_all_sessions().await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -618,7 +634,7 @@ async fn set_channel_default_model_setting(
         .settings_service
         .set_model_setting(&user.id, platform, &req)
         .await?;
-    state.session_manager.clear_all_sessions().await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -638,6 +654,7 @@ async fn set_channel_default_model_setting(
 /// Agent/model config is persisted separately via `PUT /api/settings/client`.
 async fn sync_channel_settings(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -645,7 +662,7 @@ async fn sync_channel_settings(
     let _platform = PluginType::from_str_opt(&req.platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
-    state.session_manager.clear_all_sessions().await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,

@@ -185,6 +185,7 @@ pub struct ChannelOrchestratorComponents {
     pub confirm_rx: tokio::sync::mpsc::Receiver<(String, String)>,
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
+    pub owner_user_id: String,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -507,7 +508,17 @@ fn build_channel_settings_service(
 async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
+    owner_user_id: String,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
+    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
+        Arc::new(services.conversation_service.clone()),
+        services.worker_task_manager.clone(),
+        channel_settings,
+        owner_user_id,
+    ))
+}
+
+async fn primary_channel_owner_user_id(services: &AppServices) -> String {
     let owner_user_id = services
         .user_repo
         .get_primary_webui_user()
@@ -516,13 +527,7 @@ async fn build_channel_message_service(
         .flatten()
         .map(|u| u.id)
         .unwrap_or_else(|| "system_default_user".to_string());
-
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        Arc::new(services.conversation_service.clone()),
-        services.worker_task_manager.clone(),
-        channel_settings,
-        owner_user_id,
-    ))
+    owner_user_id
 }
 
 /// Build the default `ChannelRouterState` and orchestrator components.
@@ -557,15 +562,18 @@ pub async fn build_channel_state(
 
     // Build channel settings service for per-plugin agent/model configuration.
     let channel_settings = build_channel_settings_service(services);
+    let runtime_owner_user_id = primary_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
     let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
         Arc::clone(&pairing_service),
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
+        runtime_owner_user_id.clone(),
     ));
 
-    let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
+    let message_service =
+        build_channel_message_service(services, Arc::clone(&channel_settings), runtime_owner_user_id.clone()).await;
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
@@ -590,6 +598,7 @@ pub async fn build_channel_state(
         confirm_rx,
         manager,
         plugin_factory,
+        owner_user_id: runtime_owner_user_id,
     };
 
     (state, components)

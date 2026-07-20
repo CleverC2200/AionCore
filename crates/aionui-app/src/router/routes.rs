@@ -92,11 +92,13 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // Restore enabled channel plugins (starts receiving IM messages)
     let chan_mgr = channel_components.manager;
     let chan_factory = channel_components.plugin_factory;
+    let chan_owner_user_id = channel_components.owner_user_id;
     tokio::spawn(async move {
-        if let Err(e) = chan_mgr.restore_plugins(&chan_factory).await {
+        if let Err(e) = chan_mgr.restore_plugins(&chan_owner_user_id, &chan_factory).await {
             tracing::warn!(
                 code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
                 stage = "channel.restore",
+                owner_user_id = %chan_owner_user_id,
                 error = %e,
                 "failed to restore channel plugins"
             );

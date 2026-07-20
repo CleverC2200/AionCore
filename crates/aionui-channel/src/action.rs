@@ -21,6 +21,7 @@ pub enum MessageResult {
     /// Message was dispatched to the AI Agent. The caller should send
     /// a "thinking" placeholder and then relay stream events.
     Dispatched {
+        owner_user_id: String,
         session_id: String,
         conversation_id: Option<String>,
     },
@@ -40,6 +41,7 @@ pub struct ActionExecutor {
     pairing: Arc<PairingService>,
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
+    owner_user_id: String,
 }
 
 impl ActionExecutor {
@@ -47,11 +49,13 @@ impl ActionExecutor {
         pairing: Arc<PairingService>,
         session_mgr: Arc<SessionManager>,
         settings: Arc<ChannelSettingsService>,
+        owner_user_id: String,
     ) -> Self {
         Self {
             pairing,
             session_mgr,
             settings,
+            owner_user_id,
         }
     }
 
@@ -67,7 +71,10 @@ impl ActionExecutor {
         let chat_id = &msg.chat_id;
 
         // 1. Authorization check — resolve platform user → internal user ID
-        let internal_user_id = self.pairing.get_internal_user_id(user_id, &platform_type).await?;
+        let internal_user_id = self
+            .pairing
+            .get_internal_user_id(&self.owner_user_id, user_id, &platform_type)
+            .await?;
 
         let internal_user_id = match internal_user_id {
             Some(id) => id,
@@ -86,10 +93,19 @@ impl ActionExecutor {
         }
 
         // 3. Text message → session resolution → AI dispatch
-        let agent_config = self.settings.get_agent_config(&internal_user_id, msg.platform).await?;
+        let agent_config = self
+            .settings
+            .get_agent_config(&self.owner_user_id, msg.platform)
+            .await?;
         let session = self
             .session_mgr
-            .get_or_create_session(&internal_user_id, chat_id, &agent_config.agent_type, None)
+            .get_or_create_session(
+                &self.owner_user_id,
+                &internal_user_id,
+                chat_id,
+                &agent_config.agent_type,
+                None,
+            )
             .await?;
 
         info!(
@@ -101,6 +117,7 @@ impl ActionExecutor {
         );
 
         Ok(MessageResult::Dispatched {
+            owner_user_id: self.owner_user_id.clone(),
             session_id: session.id,
             conversation_id: session.conversation_id,
         })
@@ -116,7 +133,7 @@ impl ActionExecutor {
     ) -> Result<ActionResponse, ChannelError> {
         let code = self
             .pairing
-            .request_pairing(platform_user_id, platform_type, Some(display_name))
+            .request_pairing(&self.owner_user_id, platform_user_id, platform_type, Some(display_name))
             .await?;
 
         debug!(
@@ -148,14 +165,23 @@ impl ActionExecutor {
             "pairing.show" | "pairing.refresh" => {
                 let code = self
                     .pairing
-                    .request_pairing(&action.context.user_id, &action.context.platform.to_string(), None)
+                    .request_pairing(
+                        &self.owner_user_id,
+                        &action.context.user_id,
+                        &action.context.platform.to_string(),
+                        None,
+                    )
                     .await?;
                 Ok(build_pairing_response(&code))
             }
             "pairing.check" => {
                 let authorized = self
                     .pairing
-                    .is_user_authorized(&action.context.user_id, &action.context.platform.to_string())
+                    .is_user_authorized(
+                        &self.owner_user_id,
+                        &action.context.user_id,
+                        &action.context.platform.to_string(),
+                    )
                     .await?;
                 if authorized {
                     Ok(ActionResponse {
@@ -230,7 +256,7 @@ impl ActionExecutor {
                     .await?;
                 let session = self
                     .session_mgr
-                    .reset_session(user_id, chat_id, &agent_config.agent_type, None)
+                    .reset_session(&self.owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -256,11 +282,11 @@ impl ActionExecutor {
                 let chat_id = &action.context.chat_id;
                 let agent_config = self
                     .settings
-                    .get_agent_config(internal_user_id, action.context.platform)
+                    .get_agent_config(&self.owner_user_id, action.context.platform)
                     .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(user_id, chat_id, &agent_config.agent_type, None)
+                    .get_or_create_session(&self.owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -519,6 +545,7 @@ mod tests {
     }
 
     // ── Mock IChannelRepository ────────────────────────────────────────
+    const OWNER_ID: &str = "owner-test";
 
     struct MockRepo {
         users: Mutex<Vec<AssistantUserRow>>,
@@ -538,6 +565,7 @@ mod tests {
         fn add_authorized_user(&self, platform_user_id: &str, platform_type: &str) {
             let user = AssistantUserRow {
                 id: format!("user_{platform_user_id}"),
+                owner_user_id: OWNER_ID.to_owned(),
                 platform_user_id: platform_user_id.to_owned(),
                 platform_type: platform_type.to_owned(),
                 display_name: Some("Test User".into()),
@@ -551,27 +579,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IChannelRepository for MockRepo {
-        async fn get_all_plugins(&self) -> Result<Vec<ChannelPluginRow>, DbError> {
+        async fn get_all_plugins(&self, _owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_plugin(&self, _id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
+        async fn get_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
             Ok(None)
         }
-        async fn upsert_plugin(&self, _row: &ChannelPluginRow) -> Result<(), DbError> {
+        async fn upsert_plugin(&self, _owner_user_id: &str, _row: &ChannelPluginRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_plugin_status(&self, _id: &str, _params: &UpdatePluginStatusParams) -> Result<(), DbError> {
+        async fn update_plugin_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _params: &UpdatePluginStatusParams,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_plugin(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
-        async fn get_all_users(&self) -> Result<Vec<AssistantUserRow>, DbError> {
+        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
             Ok(self.users.lock().unwrap().clone())
         }
         async fn get_user_by_platform(
             &self,
+            _owner_user_id: &str,
             platform_user_id: &str,
             platform_type: &str,
         ) -> Result<Option<AssistantUserRow>, DbError> {
@@ -581,26 +615,32 @@ mod tests {
                 .find(|u| u.platform_user_id == platform_user_id && u.platform_type == platform_type)
                 .cloned())
         }
-        async fn create_user(&self, row: &AssistantUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, _owner_user_id: &str, row: &AssistantUserRow) -> Result<(), DbError> {
             self.users.lock().unwrap().push(row.clone());
             Ok(())
         }
-        async fn update_user_last_active(&self, _id: &str, _last_active: TimestampMs) -> Result<(), DbError> {
+        async fn update_user_last_active(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _last_active: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_user(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
-        async fn get_all_sessions(&self) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
             Ok(self.sessions.lock().unwrap().clone())
         }
-        async fn get_session(&self, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(&self, _owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
             let sessions = self.sessions.lock().unwrap();
             Ok(sessions.iter().find(|s| s.id == id).cloned())
         }
         async fn get_or_create_session(
             &self,
+            _owner_user_id: &str,
             user_id: &str,
             chat_id: &str,
             new_row: &AssistantSessionRow,
@@ -616,10 +656,20 @@ mod tests {
             sessions.push(new_row.clone());
             Ok(new_row.clone())
         }
-        async fn update_session_activity(&self, _id: &str, _last_activity: TimestampMs) -> Result<(), DbError> {
+        async fn update_session_activity(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _last_activity: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_conversation(&self, id: &str, conversation_id: &str) -> Result<(), DbError> {
+        async fn update_session_conversation(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+            conversation_id: &str,
+        ) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.conversation_id = Some(conversation_id.to_owned());
@@ -628,7 +678,12 @@ mod tests {
                 Err(DbError::NotFound(id.into()))
             }
         }
-        async fn update_session_agent_type(&self, id: &str, agent_type: &str) -> Result<(), DbError> {
+        async fn update_session_agent_type(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+            agent_type: &str,
+        ) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.agent_type = agent_type.to_owned();
@@ -637,29 +692,38 @@ mod tests {
                 Err(DbError::NotFound(id.into()))
             }
         }
-        async fn delete_sessions_by_user(&self, user_id: &str) -> Result<(), DbError> {
+        async fn delete_sessions_by_user(&self, _owner_user_id: &str, user_id: &str) -> Result<(), DbError> {
             self.sessions.lock().unwrap().retain(|s| s.user_id != user_id);
             Ok(())
         }
-        async fn delete_session_by_user_chat(&self, user_id: &str, chat_id: &str) -> Result<(), DbError> {
+        async fn delete_session_by_user_chat(
+            &self,
+            _owner_user_id: &str,
+            user_id: &str,
+            chat_id: &str,
+        ) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.retain(|s| !(s.user_id == user_id && s.chat_id.as_deref() == Some(chat_id)));
             Ok(())
         }
 
-        async fn create_pairing(&self, row: &PairingCodeRow) -> Result<(), DbError> {
+        async fn create_pairing(&self, _owner_user_id: &str, row: &PairingCodeRow) -> Result<(), DbError> {
             self.pairings.lock().unwrap().push(row.clone());
             Ok(())
         }
-        async fn get_pending_pairings(&self) -> Result<Vec<PairingCodeRow>, DbError> {
+        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
             let pairings = self.pairings.lock().unwrap();
             Ok(pairings.iter().filter(|p| p.status == "pending").cloned().collect())
         }
-        async fn get_pairing_by_code(&self, code: &str) -> Result<Option<PairingCodeRow>, DbError> {
+        async fn get_pairing_by_code(
+            &self,
+            _owner_user_id: &str,
+            code: &str,
+        ) -> Result<Option<PairingCodeRow>, DbError> {
             let pairings = self.pairings.lock().unwrap();
             Ok(pairings.iter().find(|p| p.code == code).cloned())
         }
-        async fn update_pairing_status(&self, code: &str, status: &str) -> Result<(), DbError> {
+        async fn update_pairing_status(&self, _owner_user_id: &str, code: &str, status: &str) -> Result<(), DbError> {
             let mut pairings = self.pairings.lock().unwrap();
             if let Some(p) = pairings.iter_mut().find(|p| p.code == code) {
                 p.status = status.to_owned();
@@ -668,7 +732,7 @@ mod tests {
                 Err(DbError::NotFound(code.into()))
             }
         }
-        async fn cleanup_expired_pairings(&self, _now: TimestampMs) -> Result<u64, DbError> {
+        async fn cleanup_expired_pairings(&self, _owner_user_id: &str, _now: TimestampMs) -> Result<u64, DbError> {
             Ok(0)
         }
     }
@@ -702,7 +766,7 @@ mod tests {
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-        let executor = ActionExecutor::new(pairing, session_mgr, settings);
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, OWNER_ID.to_owned());
         (executor, repo)
     }
 

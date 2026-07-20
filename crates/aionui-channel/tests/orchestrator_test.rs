@@ -8,6 +8,8 @@ use aionui_channel::types::{
     MessageContentType, PluginType, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedUser,
 };
 
+const OWNER_ID: &str = "system_default_user";
+
 fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomingMessage {
     UnifiedIncomingMessage {
         id: "msg-1".into(),
@@ -45,7 +47,12 @@ async fn unauthorized_user_gets_pairing_response() {
 
     let pairing = Arc::new(PairingService::new(repo.clone(), bus));
     let session_mgr = Arc::new(SessionManager::new(repo));
-    let executor = Arc::new(ActionExecutor::new(pairing, Arc::clone(&session_mgr), settings));
+    let executor = Arc::new(ActionExecutor::new(
+        pairing,
+        Arc::clone(&session_mgr),
+        settings,
+        OWNER_ID.to_owned(),
+    ));
 
     let msg = make_text_message("unknown_user", "chat_1", "hello");
     let result = executor.handle_incoming_message(&msg).await.unwrap();

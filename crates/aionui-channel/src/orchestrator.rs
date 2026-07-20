@@ -79,6 +79,7 @@ impl ChannelOrchestrator {
                     send_action_response(&sender, &plugin_id, &chat_id, &response).await;
                 }
                 Ok(MessageResult::Dispatched {
+                    owner_user_id,
                     session_id,
                     conversation_id,
                 }) => {
@@ -86,6 +87,7 @@ impl ChannelOrchestrator {
                         &msg_svc,
                         &session_mgr,
                         &sender,
+                        &owner_user_id,
                         &session_id,
                         conversation_id.as_deref(),
                         &text,
@@ -145,6 +147,7 @@ async fn handle_dispatched(
     msg_svc: &Arc<ChannelMessageService>,
     session_mgr: &Arc<SessionManager>,
     sender: &Arc<dyn ChannelSender>,
+    owner_user_id: &str,
     session_id: &str,
     conversation_id: Option<&str>,
     text: &str,
@@ -152,7 +155,7 @@ async fn handle_dispatched(
     plugin_id: &str,
     chat_id: &str,
 ) {
-    let session = match session_mgr.get_session_by_id(session_id).await {
+    let session = match session_mgr.get_session_by_id(owner_user_id, session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             warn!(session_id = %session_id, "session not found after dispatch");
@@ -189,7 +192,7 @@ async fn handle_dispatched(
     // Bind conversation to session if newly created
     if conversation_id.is_none()
         && let Err(e) = session_mgr
-            .bind_conversation(session_id, &send_result.conversation_id)
+            .bind_conversation(owner_user_id, session_id, &send_result.conversation_id)
             .await
     {
         warn!(error = %e, "failed to bind conversation to session");
