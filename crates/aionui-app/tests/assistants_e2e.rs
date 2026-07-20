@@ -65,7 +65,10 @@ struct TestAgentCatalog {
 
 #[async_trait::async_trait]
 impl AssistantAgentCatalogPort for TestAgentCatalog {
-    async fn list_management_agents(&self) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
+    async fn list_management_agents(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<AgentManagementRow>, aionui_assistant::AssistantError> {
         Ok(self.rows.clone())
     }
 }

@@ -329,8 +329,14 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
     #[async_trait::async_trait]
     impl AssistantAgentCatalogPort for RegistryAssistantAgentCatalog {
-        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
-            Ok(self.registry.list_management_rows().await)
+        async fn list_management_agents(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+            self.registry
+                .list_management_rows_for_user(user_id)
+                .await
+                .map_err(|error| AssistantError::Internal(format!("agent catalog unavailable: {error}")))
         }
     }
 

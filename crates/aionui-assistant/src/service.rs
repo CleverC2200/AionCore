@@ -469,7 +469,7 @@ impl AssistantService {
             return Ok(Vec::new());
         };
 
-        let rows = agent_catalog.list_management_agents().await?;
+        let rows = agent_catalog.list_management_agents(user_id).await?;
         let definitions = self.definition_repo.list_for_user(user_id).await.map_err(|e| {
             AssistantError::Internal(format!("list assistant definitions for generated reconcile: {e}"))
         })?;
@@ -3346,7 +3346,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AssistantAgentCatalogPort for StubAgentCatalog {
-        async fn list_management_agents(&self) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
+        async fn list_management_agents(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<aionui_api_types::AgentManagementRow>, AssistantError> {
             Ok(self.rows.lock().expect("agent rows lock poisoned").clone())
         }
     }
