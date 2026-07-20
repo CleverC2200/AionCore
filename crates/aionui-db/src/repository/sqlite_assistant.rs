@@ -35,14 +35,25 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 #[async_trait::async_trait]
 impl IAssistantRepository for SqliteAssistantRepository {
     async fn list(&self) -> Result<Vec<AssistantRow>, DbError> {
-        let rows = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants ORDER BY updated_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
+        self.list_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<AssistantRow>, DbError> {
+        let rows =
+            sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE user_id = ? ORDER BY updated_at DESC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
     async fn get(&self, id: &str) -> Result<Option<AssistantRow>, DbError> {
-        let row = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE id = ?")
+        self.get_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AssistantRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantRow>("SELECT * FROM assistants WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -50,16 +61,25 @@ impl IAssistantRepository for SqliteAssistantRepository {
     }
 
     async fn create(&self, params: &CreateAssistantParams<'_>) -> Result<AssistantRow, DbError> {
+        self.create_for_user(DEFAULT_USER_ID, params).await
+    }
+
+    async fn create_for_user(
+        &self,
+        user_id: &str,
+        params: &CreateAssistantParams<'_>,
+    ) -> Result<AssistantRow, DbError> {
         let now = now_ms();
 
         sqlx::query(
             "INSERT INTO assistants \
-                (id, name, description, avatar, enabled_skills, \
+                (id, user_id, name, description, avatar, enabled_skills, \
                  custom_skill_names, disabled_builtin_skills, prompts, models, \
                  name_i18n, description_i18n, prompts_i18n, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(params.id)
+        .bind(user_id)
         .bind(params.name)
         .bind(params.description)
         .bind(params.avatar)
@@ -101,7 +121,16 @@ impl IAssistantRepository for SqliteAssistantRepository {
     }
 
     async fn update(&self, id: &str, params: &UpdateAssistantParams<'_>) -> Result<Option<AssistantRow>, DbError> {
-        let Some(existing) = self.get(id).await? else {
+        self.update_for_user(DEFAULT_USER_ID, id, params).await
+    }
+
+    async fn update_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: &UpdateAssistantParams<'_>,
+    ) -> Result<Option<AssistantRow>, DbError> {
+        let Some(existing) = self.get_for_user(user_id, id).await? else {
             return Ok(None);
         };
 
@@ -113,7 +142,7 @@ impl IAssistantRepository for SqliteAssistantRepository {
                 enabled_skills = ?, custom_skill_names = ?, disabled_builtin_skills = ?, \
                 prompts = ?, models = ?, name_i18n = ?, description_i18n = ?, \
                 prompts_i18n = ?, updated_at = ? \
-             WHERE id = ?",
+             WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.name)
         .bind(&merged.description)
@@ -127,6 +156,7 @@ impl IAssistantRepository for SqliteAssistantRepository {
         .bind(&merged.description_i18n)
         .bind(&merged.prompts_i18n)
         .bind(merged.updated_at)
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -135,7 +165,12 @@ impl IAssistantRepository for SqliteAssistantRepository {
     }
 
     async fn delete(&self, id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM assistants WHERE id = ?")
+        self.delete_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM assistants WHERE user_id = ? AND id = ?")
+            .bind(user_id)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -143,15 +178,24 @@ impl IAssistantRepository for SqliteAssistantRepository {
     }
 
     async fn upsert(&self, params: &CreateAssistantParams<'_>) -> Result<AssistantRow, DbError> {
+        self.upsert_for_user(DEFAULT_USER_ID, params).await
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &CreateAssistantParams<'_>,
+    ) -> Result<AssistantRow, DbError> {
         let now = now_ms();
 
         sqlx::query(
             "INSERT INTO assistants \
-                (id, name, description, avatar, enabled_skills, \
+                (id, user_id, name, description, avatar, enabled_skills, \
                  custom_skill_names, disabled_builtin_skills, prompts, models, \
                  name_i18n, description_i18n, prompts_i18n, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
+                user_id = excluded.user_id, \
                 name = excluded.name, \
                 description = excluded.description, \
                 avatar = excluded.avatar, \
@@ -166,6 +210,7 @@ impl IAssistantRepository for SqliteAssistantRepository {
                 updated_at = excluded.updated_at",
         )
         .bind(params.id)
+        .bind(user_id)
         .bind(params.name)
         .bind(params.description)
         .bind(params.avatar)
@@ -183,7 +228,7 @@ impl IAssistantRepository for SqliteAssistantRepository {
         .await?;
 
         let row = self
-            .get(params.id)
+            .get_for_user(user_id, params.id)
             .await?
             .ok_or_else(|| DbError::Init(format!("upsert did not produce row for id '{}'", params.id)))?;
         Ok(row)
@@ -236,6 +281,105 @@ impl SqliteAssistantDefinitionRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    async fn upsert_with_user_id(
+        &self,
+        user_id: Option<&str>,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        let now = now_ms();
+
+        sqlx::query(
+            "INSERT INTO assistant_definitions (
+                id, user_id, assistant_id, source, owner_type, source_ref,
+                name, name_i18n, description, description_i18n, avatar_type, avatar_value,
+                agent_id, rule_resource_type, rule_resource_ref,
+                recommended_prompts, recommended_prompts_i18n,
+                default_model_mode, default_model_value,
+                default_permission_mode, default_permission_value,
+                default_thought_level_mode, default_thought_level_value,
+                default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
+                default_mcps_mode, default_mcp_ids,
+                created_at, updated_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
+                assistant_id = excluded.assistant_id,
+                source = excluded.source,
+                owner_type = excluded.owner_type,
+                source_ref = excluded.source_ref,
+                name = excluded.name,
+                name_i18n = excluded.name_i18n,
+                description = excluded.description,
+                description_i18n = excluded.description_i18n,
+                avatar_type = excluded.avatar_type,
+                avatar_value = excluded.avatar_value,
+                agent_id = excluded.agent_id,
+                rule_resource_type = excluded.rule_resource_type,
+                rule_resource_ref = excluded.rule_resource_ref,
+                recommended_prompts = excluded.recommended_prompts,
+                recommended_prompts_i18n = excluded.recommended_prompts_i18n,
+                default_model_mode = excluded.default_model_mode,
+                default_model_value = excluded.default_model_value,
+                default_permission_mode = excluded.default_permission_mode,
+                default_permission_value = excluded.default_permission_value,
+                default_thought_level_mode = excluded.default_thought_level_mode,
+                default_thought_level_value = excluded.default_thought_level_value,
+                default_skills_mode = excluded.default_skills_mode,
+                default_skill_ids = excluded.default_skill_ids,
+                custom_skill_names = excluded.custom_skill_names,
+                default_disabled_builtin_skill_ids = excluded.default_disabled_builtin_skill_ids,
+                default_mcps_mode = excluded.default_mcps_mode,
+                default_mcp_ids = excluded.default_mcp_ids,
+                updated_at = excluded.updated_at,
+                deleted_at = NULL",
+        )
+        .bind(params.id)
+        .bind(user_id)
+        .bind(params.assistant_id)
+        .bind(params.source)
+        .bind(params.owner_type)
+        .bind(params.source_ref)
+        .bind(params.name)
+        .bind(params.name_i18n)
+        .bind(params.description)
+        .bind(params.description_i18n)
+        .bind(params.avatar_type)
+        .bind(params.avatar_value)
+        .bind(params.agent_id)
+        .bind(params.rule_resource_type)
+        .bind(params.rule_resource_ref)
+        .bind(params.recommended_prompts)
+        .bind(params.recommended_prompts_i18n)
+        .bind(params.default_model_mode)
+        .bind(params.default_model_value)
+        .bind(params.default_permission_mode)
+        .bind(params.default_permission_value)
+        .bind(params.default_thought_level_mode)
+        .bind(params.default_thought_level_value)
+        .bind(params.default_skills_mode)
+        .bind(params.default_skill_ids)
+        .bind(params.custom_skill_names)
+        .bind(params.default_disabled_builtin_skill_ids)
+        .bind(params.default_mcps_mode)
+        .bind(params.default_mcp_ids)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        let row = match user_id {
+            Some(user_id) => self.get_by_id_for_user(user_id, params.id).await?,
+            None => self.get_by_id(params.id).await?,
+        }
+        .ok_or_else(|| {
+            DbError::Init(format!(
+                "upsert did not produce assistant definition row for id '{}'",
+                params.id
+            ))
+        })?;
+        Ok(row)
+    }
 }
 
 /// SQLite-backed implementation of [`IAssistantOverlayRepository`].
@@ -271,10 +415,14 @@ impl SqliteAssistantOverrideRepository {
 #[async_trait::async_trait]
 impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     async fn get(&self, assistant_id: &str) -> Result<Option<AssistantOverrideRow>, DbError> {
+        self.get_for_user(DEFAULT_USER_ID, assistant_id).await
+    }
+
+    async fn get_for_user(&self, user_id: &str, assistant_id: &str) -> Result<Option<AssistantOverrideRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantOverrideRow>(
             "SELECT * FROM assistant_overrides WHERE user_id = ? AND assistant_id = ?",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(assistant_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -282,14 +430,26 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     }
 
     async fn get_all(&self) -> Result<Vec<AssistantOverrideRow>, DbError> {
+        self.get_all_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn get_all_for_user(&self, user_id: &str) -> Result<Vec<AssistantOverrideRow>, DbError> {
         let rows = sqlx::query_as::<_, AssistantOverrideRow>("SELECT * FROM assistant_overrides WHERE user_id = ?")
-            .bind(DEFAULT_USER_ID)
+            .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
     }
 
     async fn upsert(&self, params: &UpsertOverrideParams<'_>) -> Result<AssistantOverrideRow, DbError> {
+        self.upsert_for_user(DEFAULT_USER_ID, params).await
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &UpsertOverrideParams<'_>,
+    ) -> Result<AssistantOverrideRow, DbError> {
         let now = now_ms();
         let last_used_at: Option<TimestampMs> = params.last_used_at;
 
@@ -303,7 +463,7 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
                 last_used_at = COALESCE(excluded.last_used_at, assistant_overrides.last_used_at), \
                 updated_at = excluded.updated_at",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(params.assistant_id)
         .bind(params.enabled)
         .bind(params.sort_order)
@@ -312,7 +472,7 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
         .execute(&self.pool)
         .await?;
 
-        let row = self.get(params.assistant_id).await?.ok_or_else(|| {
+        let row = self.get_for_user(user_id, params.assistant_id).await?.ok_or_else(|| {
             DbError::Init(format!(
                 "upsert did not produce override row for id '{}'",
                 params.assistant_id
@@ -322,8 +482,12 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     }
 
     async fn delete(&self, assistant_id: &str) -> Result<bool, DbError> {
+        self.delete_for_user(DEFAULT_USER_ID, assistant_id).await
+    }
+
+    async fn delete_for_user(&self, user_id: &str, assistant_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM assistant_overrides WHERE user_id = ? AND assistant_id = ?")
-            .bind(DEFAULT_USER_ID)
+            .bind(user_id)
             .bind(assistant_id)
             .execute(&self.pool)
             .await?;
@@ -331,9 +495,13 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
     }
 
     async fn delete_orphans(&self, valid_ids: &[&str]) -> Result<u64, DbError> {
+        self.delete_orphans_for_user(DEFAULT_USER_ID, valid_ids).await
+    }
+
+    async fn delete_orphans_for_user(&self, user_id: &str, valid_ids: &[&str]) -> Result<u64, DbError> {
         if valid_ids.is_empty() {
             let result = sqlx::query("DELETE FROM assistant_overrides WHERE user_id = ?")
-                .bind(DEFAULT_USER_ID)
+                .bind(user_id)
                 .execute(&self.pool)
                 .await?;
             return Ok(result.rows_affected());
@@ -341,7 +509,7 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
 
         let placeholders = std::iter::repeat_n("?", valid_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM assistant_overrides WHERE user_id = ? AND assistant_id NOT IN ({placeholders})");
-        let mut q = sqlx::query(&sql).bind(DEFAULT_USER_ID);
+        let mut q = sqlx::query(&sql).bind(user_id);
         for id in valid_ids {
             q = q.bind(*id);
         }
@@ -353,26 +521,94 @@ impl IAssistantOverrideRepository for SqliteAssistantOverrideRepository {
 #[async_trait::async_trait]
 impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
     async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
         let rows = sqlx::query_as::<_, AssistantDefinitionRow>(
-            "SELECT * FROM assistant_definitions WHERE deleted_at IS NULL ORDER BY updated_at DESC",
+            "SELECT *
+             FROM assistant_definitions d
+             WHERE d.user_id = ? AND d.deleted_at IS NULL
+             UNION ALL
+             SELECT *
+             FROM assistant_definitions d
+             WHERE d.user_id IS NULL
+               AND d.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM assistant_definitions u
+                   WHERE u.user_id = ?
+                     AND (
+                         u.assistant_id = d.assistant_id
+                         OR (
+                             u.source = d.source
+                             AND u.source_ref IS NOT NULL
+                             AND d.source_ref IS NOT NULL
+                             AND u.source_ref = d.source_ref
+                         )
+                     )
+               )
+             ORDER BY updated_at DESC",
         )
+        .bind(user_id)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
     async fn list_including_deleted(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
-        let rows =
-            sqlx::query_as::<_, AssistantDefinitionRow>("SELECT * FROM assistant_definitions ORDER BY updated_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        self.list_including_deleted_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn list_including_deleted_for_user(&self, user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        let rows = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT *
+             FROM assistant_definitions d
+             WHERE d.user_id = ?
+             UNION ALL
+             SELECT *
+             FROM assistant_definitions d
+             WHERE d.user_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM assistant_definitions u
+                   WHERE u.user_id = ?
+                     AND (
+                         u.assistant_id = d.assistant_id
+                         OR (
+                             u.source = d.source
+                             AND u.source_ref IS NOT NULL
+                             AND d.source_ref IS NOT NULL
+                             AND u.source_ref = d.source_ref
+                         )
+                     )
+               )
+             ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id_for_user(DEFAULT_USER_ID, assistant_id).await
+    }
+
+    async fn get_by_assistant_id_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
-            "SELECT * FROM assistant_definitions WHERE assistant_id = ? AND deleted_at IS NULL",
+            "SELECT * FROM assistant_definitions
+             WHERE (user_id IS NULL OR user_id = ?) AND assistant_id = ? AND deleted_at IS NULL
+             ORDER BY user_id IS NULL ASC
+             LIMIT 1",
         )
+        .bind(user_id)
         .bind(assistant_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -383,18 +619,38 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         &self,
         assistant_id: &str,
     ) -> Result<Option<AssistantDefinitionRow>, DbError> {
-        let row =
-            sqlx::query_as::<_, AssistantDefinitionRow>("SELECT * FROM assistant_definitions WHERE assistant_id = ?")
-                .bind(assistant_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        self.get_by_assistant_id_including_deleted_for_user(DEFAULT_USER_ID, assistant_id)
+            .await
+    }
+
+    async fn get_by_assistant_id_including_deleted_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            "SELECT * FROM assistant_definitions
+             WHERE (user_id IS NULL OR user_id = ?) AND assistant_id = ?
+             ORDER BY user_id IS NULL ASC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(assistant_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_id_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
-            "SELECT * FROM assistant_definitions WHERE id = ? AND deleted_at IS NULL",
+            "SELECT * FROM assistant_definitions
+             WHERE (user_id IS NULL OR user_id = ?) AND id = ? AND deleted_at IS NULL",
         )
+        .bind(user_id)
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -406,9 +662,23 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         source: &str,
         source_ref: &str,
     ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref_for_user(DEFAULT_USER_ID, source, source_ref)
+            .await
+    }
+
+    async fn get_by_source_ref_for_user(
+        &self,
+        user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
-            "SELECT * FROM assistant_definitions WHERE source = ? AND source_ref = ? AND deleted_at IS NULL",
+            "SELECT * FROM assistant_definitions
+             WHERE (user_id IS NULL OR user_id = ?) AND source = ? AND source_ref = ? AND deleted_at IS NULL
+             ORDER BY user_id IS NULL ASC
+             LIMIT 1",
         )
+        .bind(user_id)
         .bind(source)
         .bind(source_ref)
         .fetch_optional(&self.pool)
@@ -421,9 +691,23 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         source: &str,
         source_ref: &str,
     ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref_including_deleted_for_user(DEFAULT_USER_ID, source, source_ref)
+            .await
+    }
+
+    async fn get_by_source_ref_including_deleted_for_user(
+        &self,
+        user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantDefinitionRow>(
-            "SELECT * FROM assistant_definitions WHERE source = ? AND source_ref = ?",
+            "SELECT * FROM assistant_definitions
+             WHERE (user_id IS NULL OR user_id = ?) AND source = ? AND source_ref = ?
+             ORDER BY user_id IS NULL ASC
+             LIMIT 1",
         )
+        .bind(user_id)
         .bind(source)
         .bind(source_ref)
         .fetch_optional(&self.pool)
@@ -432,91 +716,26 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
     }
 
     async fn upsert(&self, params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
-        let now = now_ms();
+        if params.source == "builtin" && params.owner_type == "system" {
+            self.upsert_global(params).await
+        } else {
+            self.upsert_for_user(DEFAULT_USER_ID, params).await
+        }
+    }
 
-        sqlx::query(
-            "INSERT INTO assistant_definitions (
-                id, assistant_id, source, owner_type, source_ref,
-                name, name_i18n, description, description_i18n, avatar_type, avatar_value,
-                agent_id, rule_resource_type, rule_resource_ref,
-                recommended_prompts, recommended_prompts_i18n,
-                default_model_mode, default_model_value,
-                default_permission_mode, default_permission_value,
-                default_thought_level_mode, default_thought_level_value,
-                default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
-                default_mcps_mode, default_mcp_ids,
-                created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(id) DO UPDATE SET
-                assistant_id = excluded.assistant_id,
-                source = excluded.source,
-                owner_type = excluded.owner_type,
-                source_ref = excluded.source_ref,
-                name = excluded.name,
-                name_i18n = excluded.name_i18n,
-                description = excluded.description,
-                description_i18n = excluded.description_i18n,
-                avatar_type = excluded.avatar_type,
-                avatar_value = excluded.avatar_value,
-                agent_id = excluded.agent_id,
-                rule_resource_type = excluded.rule_resource_type,
-                rule_resource_ref = excluded.rule_resource_ref,
-                recommended_prompts = excluded.recommended_prompts,
-                recommended_prompts_i18n = excluded.recommended_prompts_i18n,
-                default_model_mode = excluded.default_model_mode,
-                default_model_value = excluded.default_model_value,
-                default_permission_mode = excluded.default_permission_mode,
-                default_permission_value = excluded.default_permission_value,
-                default_thought_level_mode = excluded.default_thought_level_mode,
-                default_thought_level_value = excluded.default_thought_level_value,
-                default_skills_mode = excluded.default_skills_mode,
-                default_skill_ids = excluded.default_skill_ids,
-                custom_skill_names = excluded.custom_skill_names,
-                default_disabled_builtin_skill_ids = excluded.default_disabled_builtin_skill_ids,
-                default_mcps_mode = excluded.default_mcps_mode,
-                default_mcp_ids = excluded.default_mcp_ids,
-                updated_at = excluded.updated_at,
-                deleted_at = NULL",
-        )
-        .bind(params.id)
-        .bind(params.assistant_id)
-        .bind(params.source)
-        .bind(params.owner_type)
-        .bind(params.source_ref)
-        .bind(params.name)
-        .bind(params.name_i18n)
-        .bind(params.description)
-        .bind(params.description_i18n)
-        .bind(params.avatar_type)
-        .bind(params.avatar_value)
-        .bind(params.agent_id)
-        .bind(params.rule_resource_type)
-        .bind(params.rule_resource_ref)
-        .bind(params.recommended_prompts)
-        .bind(params.recommended_prompts_i18n)
-        .bind(params.default_model_mode)
-        .bind(params.default_model_value)
-        .bind(params.default_permission_mode)
-        .bind(params.default_permission_value)
-        .bind(params.default_thought_level_mode)
-        .bind(params.default_thought_level_value)
-        .bind(params.default_skills_mode)
-        .bind(params.default_skill_ids)
-        .bind(params.custom_skill_names)
-        .bind(params.default_disabled_builtin_skill_ids)
-        .bind(params.default_mcps_mode)
-        .bind(params.default_mcp_ids)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert_with_user_id(Some(user_id), params).await
+    }
 
-        self.get_by_id(params.id).await?.ok_or_else(|| {
-            DbError::Init(format!(
-                "upsert did not produce assistant definition row for id '{}'",
-                params.id
-            ))
-        })
+    async fn upsert_global(
+        &self,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert_with_user_id(None, params).await
     }
 
     async fn update_avatar_fields_preserving_deleted(
@@ -541,13 +760,18 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
     }
 
     async fn soft_delete(&self, id: &str, deleted_at: i64) -> Result<bool, DbError> {
+        self.soft_delete_for_user(DEFAULT_USER_ID, id, deleted_at).await
+    }
+
+    async fn soft_delete_for_user(&self, user_id: &str, id: &str, deleted_at: i64) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE assistant_definitions
              SET deleted_at = ?, updated_at = ?
-             WHERE id = ? AND deleted_at IS NULL",
+             WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
         )
         .bind(deleted_at)
         .bind(now_ms())
+        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -558,10 +782,18 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
 #[async_trait::async_trait]
 impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
     async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        self.get_for_user(DEFAULT_USER_ID, assistant_definition_id).await
+    }
+
+    async fn get_for_user(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+    ) -> Result<Option<AssistantOverlayRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantOverlayRow>(
             "SELECT * FROM assistant_overlays WHERE user_id = ? AND assistant_definition_id = ?",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(assistant_definition_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -569,16 +801,28 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
     }
 
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        self.list_for_user(DEFAULT_USER_ID).await
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<AssistantOverlayRow>, DbError> {
         let rows = sqlx::query_as::<_, AssistantOverlayRow>(
             "SELECT * FROM assistant_overlays WHERE user_id = ? ORDER BY sort_order, updated_at",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
     async fn upsert(&self, params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+        self.upsert_for_user(DEFAULT_USER_ID, params).await
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &UpsertAssistantOverlayParams<'_>,
+    ) -> Result<AssistantOverlayRow, DbError> {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_overlays (
@@ -592,7 +836,7 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
                 last_used_at = excluded.last_used_at,
                 updated_at = excluded.updated_at",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(params.assistant_definition_id)
         .bind(params.enabled)
         .bind(params.sort_order)
@@ -603,17 +847,23 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
         .execute(&self.pool)
         .await?;
 
-        self.get(params.assistant_definition_id).await?.ok_or_else(|| {
-            DbError::Init(format!(
-                "upsert did not produce overlay row for assistant_definition_id '{}'",
-                params.assistant_definition_id
-            ))
-        })
+        self.get_for_user(user_id, params.assistant_definition_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Init(format!(
+                    "upsert did not produce overlay row for assistant_definition_id '{}'",
+                    params.assistant_definition_id
+                ))
+            })
     }
 
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
+        self.delete_for_user(DEFAULT_USER_ID, assistant_definition_id).await
+    }
+
+    async fn delete_for_user(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM assistant_overlays WHERE user_id = ? AND assistant_definition_id = ?")
-            .bind(DEFAULT_USER_ID)
+            .bind(user_id)
             .bind(assistant_definition_id)
             .execute(&self.pool)
             .await?;
@@ -624,10 +874,18 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
 #[async_trait::async_trait]
 impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
     async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantPreferenceRow>, DbError> {
+        self.get_for_user(DEFAULT_USER_ID, assistant_definition_id).await
+    }
+
+    async fn get_for_user(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+    ) -> Result<Option<AssistantPreferenceRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantPreferenceRow>(
             "SELECT * FROM assistant_preferences WHERE user_id = ? AND assistant_definition_id = ?",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(assistant_definition_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -635,6 +893,14 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
     }
 
     async fn upsert(&self, params: &UpsertAssistantPreferenceParams<'_>) -> Result<AssistantPreferenceRow, DbError> {
+        self.upsert_for_user(DEFAULT_USER_ID, params).await
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: &UpsertAssistantPreferenceParams<'_>,
+    ) -> Result<AssistantPreferenceRow, DbError> {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO assistant_preferences (
@@ -650,7 +916,7 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
                 last_mcp_ids = excluded.last_mcp_ids,
                 updated_at = excluded.updated_at",
         )
-        .bind(DEFAULT_USER_ID)
+        .bind(user_id)
         .bind(params.assistant_definition_id)
         .bind(params.last_model_id)
         .bind(params.last_permission_value)
@@ -663,17 +929,23 @@ impl IAssistantPreferenceRepository for SqliteAssistantPreferenceRepository {
         .execute(&self.pool)
         .await?;
 
-        self.get(params.assistant_definition_id).await?.ok_or_else(|| {
-            DbError::Init(format!(
-                "upsert did not produce preference row for assistant_definition_id '{}'",
-                params.assistant_definition_id
-            ))
-        })
+        self.get_for_user(user_id, params.assistant_definition_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Init(format!(
+                    "upsert did not produce preference row for assistant_definition_id '{}'",
+                    params.assistant_definition_id
+                ))
+            })
     }
 
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
+        self.delete_for_user(DEFAULT_USER_ID, assistant_definition_id).await
+    }
+
+    async fn delete_for_user(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM assistant_preferences WHERE user_id = ? AND assistant_definition_id = ?")
-            .bind(DEFAULT_USER_ID)
+            .bind(user_id)
             .bind(assistant_definition_id)
             .execute(&self.pool)
             .await?;
@@ -690,6 +962,9 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
+    const USER_A: &str = "system_default_user";
+    const USER_B: &str = "user_b";
+
     async fn setup() -> (
         SqliteAssistantRepository,
         SqliteAssistantOverrideRepository,
@@ -698,6 +973,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let a = SqliteAssistantRepository::new(db.pool().clone());
         let o = SqliteAssistantOverrideRepository::new(db.pool().clone());
+        ensure_user(&db, USER_B).await;
         (a, o, db)
     }
 
@@ -711,7 +987,20 @@ mod tests {
         let d = SqliteAssistantDefinitionRepository::new(db.pool().clone());
         let s = SqliteAssistantOverlayRepository::new(db.pool().clone());
         let p = SqliteAssistantPreferenceRepository::new(db.pool().clone());
+        ensure_user(&db, USER_B).await;
         (d, s, p, db)
+    }
+
+    async fn ensure_user(db: &crate::Database, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     }
 
     fn params<'a>(id: &'a str, name: &'a str) -> CreateAssistantParams<'a> {
@@ -732,12 +1021,21 @@ mod tests {
     }
 
     fn definition_params<'a>(id: &'a str, name: &'a str) -> UpsertAssistantDefinitionParams<'a> {
+        definition_params_with_id("asstdef_u1", id, Some(id), name)
+    }
+
+    fn definition_params_with_id<'a>(
+        definition_id: &'a str,
+        assistant_id: &'a str,
+        source_ref: Option<&'a str>,
+        name: &'a str,
+    ) -> UpsertAssistantDefinitionParams<'a> {
         UpsertAssistantDefinitionParams {
-            id: "asstdef_u1",
-            assistant_id: id,
+            id: definition_id,
+            assistant_id,
             source: "user",
             owner_type: "user",
-            source_ref: Some(id),
+            source_ref,
             name,
             name_i18n: r#"{"zh-CN":"助手"}"#,
             description: Some("desc"),
@@ -761,6 +1059,19 @@ mod tests {
             default_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
+        }
+    }
+
+    fn builtin_definition_params<'a>(
+        definition_id: &'a str,
+        assistant_id: &'a str,
+        source_ref: Option<&'a str>,
+        name: &'a str,
+    ) -> UpsertAssistantDefinitionParams<'a> {
+        UpsertAssistantDefinitionParams {
+            source: "builtin",
+            owner_type: "system",
+            ..definition_params_with_id(definition_id, assistant_id, source_ref, name)
         }
     }
 
@@ -884,6 +1195,39 @@ mod tests {
 
         let list = a.list().await.unwrap();
         assert_eq!(list.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn assistants_are_scoped_by_user() {
+        let (a, _o, _db) = setup().await;
+        a.create_for_user(USER_A, &params("a1", "User A Assistant"))
+            .await
+            .unwrap();
+        a.create_for_user(USER_B, &params("b1", "User B Assistant"))
+            .await
+            .unwrap();
+
+        assert!(a.get_for_user(USER_A, "a1").await.unwrap().is_some());
+        assert!(a.get_for_user(USER_A, "b1").await.unwrap().is_none());
+        assert!(a.get_for_user(USER_B, "a1").await.unwrap().is_none());
+        assert!(a.get_for_user(USER_B, "b1").await.unwrap().is_some());
+
+        let user_a_ids: Vec<String> = a
+            .list_for_user(USER_A)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let user_b_ids: Vec<String> = a
+            .list_for_user(USER_B)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(user_a_ids, vec!["a1"]);
+        assert_eq!(user_b_ids, vec!["b1"]);
     }
 
     #[tokio::test]
@@ -1015,6 +1359,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overrides_are_scoped_by_user() {
+        let (_a, o, _db) = setup().await;
+        o.upsert_for_user(
+            USER_A,
+            &UpsertOverrideParams {
+                assistant_id: "shared",
+                enabled: true,
+                sort_order: 1,
+                last_used_at: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        o.upsert_for_user(
+            USER_B,
+            &UpsertOverrideParams {
+                assistant_id: "shared",
+                enabled: false,
+                sort_order: 9,
+                last_used_at: Some(900),
+            },
+        )
+        .await
+        .unwrap();
+
+        let user_a = o.get_for_user(USER_A, "shared").await.unwrap().unwrap();
+        let user_b = o.get_for_user(USER_B, "shared").await.unwrap().unwrap();
+        assert!(user_a.enabled);
+        assert_eq!(user_a.sort_order, 1);
+        assert!(!user_b.enabled);
+        assert_eq!(user_b.sort_order, 9);
+        assert_eq!(o.get_all_for_user(USER_A).await.unwrap().len(), 1);
+        assert_eq!(o.get_all_for_user(USER_B).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn definition_upsert_then_get() {
         let (d, _s, _p, _db) = setup_v2().await;
         let row = d.upsert(&definition_params("u1", "User One")).await.unwrap();
@@ -1028,6 +1408,104 @@ mod tests {
         assert_eq!(fetched.rule_resource_type, "user_file");
         assert_eq!(fetched.avatar_type, "emoji");
         assert_eq!(fetched.avatar_value.as_deref(), Some("🤖"));
+    }
+
+    #[tokio::test]
+    async fn definitions_with_same_refs_are_isolated_by_user() {
+        let (d, _s, _p, _db) = setup_v2().await;
+        d.upsert_for_user(
+            USER_A,
+            &definition_params_with_id("def_a", "shared-assistant", Some("shared-ref"), "User A Definition"),
+        )
+        .await
+        .unwrap();
+        d.upsert_for_user(
+            USER_B,
+            &definition_params_with_id("def_b", "shared-assistant", Some("shared-ref"), "User B Definition"),
+        )
+        .await
+        .unwrap();
+
+        let user_a = d
+            .get_by_source_ref_for_user(USER_A, "user", "shared-ref")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b = d
+            .get_by_source_ref_for_user(USER_B, "user", "shared-ref")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_a.id, "def_a");
+        assert_eq!(user_a.name, "User A Definition");
+        assert_eq!(user_b.id, "def_b");
+        assert_eq!(user_b.name, "User B Definition");
+    }
+
+    #[tokio::test]
+    async fn global_builtin_definition_is_visible_to_all_users() {
+        let (d, _s, _p, _db) = setup_v2().await;
+        d.upsert_global(&builtin_definition_params(
+            "builtin_def",
+            "builtin-assistant",
+            Some("builtin-ref"),
+            "Builtin Definition",
+        ))
+        .await
+        .unwrap();
+
+        let user_a = d
+            .get_by_assistant_id_for_user(USER_A, "builtin-assistant")
+            .await
+            .unwrap();
+        let user_b = d
+            .get_by_assistant_id_for_user(USER_B, "builtin-assistant")
+            .await
+            .unwrap();
+        assert_eq!(user_a.unwrap().id, "builtin_def");
+        assert_eq!(user_b.unwrap().id, "builtin_def");
+    }
+
+    #[tokio::test]
+    async fn user_definition_overrides_global_definition() {
+        let (d, _s, _p, _db) = setup_v2().await;
+        d.upsert_global(&builtin_definition_params(
+            "global_def",
+            "shared-assistant",
+            Some("shared-ref"),
+            "Global Definition",
+        ))
+        .await
+        .unwrap();
+        d.upsert_for_user(
+            USER_B,
+            &definition_params_with_id("user_def", "shared-assistant", Some("shared-ref"), "User Definition"),
+        )
+        .await
+        .unwrap();
+
+        let user_a = d
+            .get_by_assistant_id_for_user(USER_A, "shared-assistant")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_by_assistant = d
+            .get_by_assistant_id_for_user(USER_B, "shared-assistant")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_by_ref = d
+            .get_by_source_ref_for_user(USER_B, "user", "shared-ref")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_list = d.list_for_user(USER_B).await.unwrap();
+
+        assert_eq!(user_a.id, "global_def");
+        assert_eq!(user_b_by_assistant.id, "user_def");
+        assert_eq!(user_b_by_ref.id, "user_def");
+        assert_eq!(user_b_list.len(), 1);
+        assert_eq!(user_b_list[0].id, "user_def");
     }
 
     #[tokio::test]
@@ -1053,6 +1531,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlays_are_scoped_by_user() {
+        let (d, s, _p, _db) = setup_v2().await;
+        let definition = d.upsert(&definition_params("u1", "User One")).await.unwrap();
+        s.upsert_for_user(
+            USER_A,
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: &definition.id,
+                enabled: true,
+                sort_order: 1,
+                agent_id_override: Some("agent-a"),
+                last_used_at: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+        s.upsert_for_user(
+            USER_B,
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: &definition.id,
+                enabled: false,
+                sort_order: 7,
+                agent_id_override: Some("agent-b"),
+                last_used_at: Some(70),
+            },
+        )
+        .await
+        .unwrap();
+
+        let user_a = s.get_for_user(USER_A, &definition.id).await.unwrap().unwrap();
+        let user_b = s.get_for_user(USER_B, &definition.id).await.unwrap().unwrap();
+        assert!(user_a.enabled);
+        assert_eq!(user_a.agent_id_override.as_deref(), Some("agent-a"));
+        assert!(!user_b.enabled);
+        assert_eq!(user_b.agent_id_override.as_deref(), Some("agent-b"));
+        assert_eq!(s.list_for_user(USER_A).await.unwrap().len(), 1);
+        assert_eq!(s.list_for_user(USER_B).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn preference_upsert_then_get() {
         let (d, _s, p, _db) = setup_v2().await;
         let definition = d.upsert(&definition_params("u1", "User One")).await.unwrap();
@@ -1074,5 +1591,46 @@ mod tests {
         let fetched = p.get(&definition.id).await.unwrap().unwrap();
         assert_eq!(fetched.last_skill_ids, r#"["pdf"]"#);
         assert_eq!(fetched.last_thought_level_value.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn preferences_are_scoped_by_user() {
+        let (d, _s, p, _db) = setup_v2().await;
+        let definition = d.upsert(&definition_params("u1", "User One")).await.unwrap();
+        p.upsert_for_user(
+            USER_A,
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: &definition.id,
+                last_model_id: Some("model-a"),
+                last_permission_value: Some("read-only"),
+                last_thought_level_value: Some("low"),
+                last_skill_ids: r#"["a"]"#,
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
+        .await
+        .unwrap();
+        p.upsert_for_user(
+            USER_B,
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: &definition.id,
+                last_model_id: Some("model-b"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("high"),
+                last_skill_ids: r#"["b"]"#,
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
+        .await
+        .unwrap();
+
+        let user_a = p.get_for_user(USER_A, &definition.id).await.unwrap().unwrap();
+        let user_b = p.get_for_user(USER_B, &definition.id).await.unwrap().unwrap();
+        assert_eq!(user_a.last_model_id.as_deref(), Some("model-a"));
+        assert_eq!(user_a.last_skill_ids, r#"["a"]"#);
+        assert_eq!(user_b.last_model_id.as_deref(), Some("model-b"));
+        assert_eq!(user_b.last_skill_ids, r#"["b"]"#);
     }
 }
