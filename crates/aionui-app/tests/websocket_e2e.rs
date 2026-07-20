@@ -377,6 +377,44 @@ async fn t4_1_scoped_event_reaches_only_matching_user() {
 }
 
 #[tokio::test]
+async fn t4_1_unscoped_business_event_is_dropped_by_bridge() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user-a");
+
+    let (_, mut rx) = connect_bearer(app.addr, &token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "conversation.listChanged",
+        json!({"conversation_id": "c1"}),
+    ));
+
+    let timeout_result = tokio::time::timeout(Duration::from_millis(200), rx.next()).await;
+    assert!(timeout_result.is_err(), "unscoped business event should be dropped");
+}
+
+#[tokio::test]
+async fn t4_1_whitelisted_global_event_reaches_all_users() {
+    let app = start_app().await;
+    let token_a = sign_token(&app, "user-a");
+    let token_b = sign_token(&app, "user-b");
+
+    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "runtime.statusChanged",
+        json!({"phase": "ready"}),
+    ));
+
+    let msg_a = read_text(&mut rx_a).await;
+    let msg_b = read_text(&mut rx_b).await;
+    assert_eq!(msg_a["name"], "runtime.statusChanged");
+    assert_eq!(msg_b["name"], "runtime.statusChanged");
+}
+
+#[tokio::test]
 async fn t4_2_unicast_reaches_only_target() {
     use aionui_realtime::ConnectionId;
 

@@ -77,8 +77,13 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
                 .map(str::to_owned)
             {
                 ws_manager.broadcast_to_user(&user_id, event);
-            } else {
+            } else if is_global_websocket_event(&event.name) {
                 ws_manager.broadcast_all(event);
+            } else {
+                tracing::warn!(
+                    event_name = %event.name,
+                    "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
+                );
             }
         }
     });
@@ -322,6 +327,10 @@ fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentit
     } else {
         AuthIdentityMode::UserSession
     }
+}
+
+fn is_global_websocket_event(event_name: &str) -> bool {
+    matches!(event_name, "runtime.statusChanged")
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {
