@@ -240,7 +240,7 @@ async fn run_probe(
             },
         }
     } else if let Some(backend) = meta.backend.as_deref() {
-        let result = cli_detect::health_check(registry, backend).await;
+        let result = cli_detect::health_check(registry, user_id, backend).await;
         if result.available {
             (AgentSnapshotCheckStatus::Online, None, None)
         } else {

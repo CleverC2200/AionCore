@@ -34,7 +34,9 @@ pub(super) async fn build(
     let meta = if let Some(ref agent_id) = config.agent_id {
         deps.agent_registry.get(agent_id).await
     } else if let Some(ref vendor) = config.backend {
-        deps.agent_registry.find_builtin_by_backend(vendor).await
+        deps.agent_registry
+            .find_builtin_by_backend_for_user(&ctx.user_id, vendor)
+            .await
     } else {
         None
     }

@@ -13,10 +13,10 @@ pub(crate) struct CliHealthCheckResult {
 /// Perform a health check for an ACP backend.
 ///
 /// Checks CLI availability and returns an availability/error pair.
-pub(crate) async fn health_check(registry: &Arc<AgentRegistry>, backend: &str) -> CliHealthCheckResult {
+pub(crate) async fn health_check(registry: &Arc<AgentRegistry>, user_id: &str, backend: &str) -> CliHealthCheckResult {
     let start = Instant::now();
 
-    let Some(meta) = registry.find_builtin_by_backend(backend).await else {
+    let Some(meta) = registry.find_builtin_by_backend_for_user(user_id, backend).await else {
         return CliHealthCheckResult {
             available: false,
             error: Some(format!("No agent_metadata row for backend '{backend}'")),
