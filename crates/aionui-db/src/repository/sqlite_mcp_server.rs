@@ -24,7 +24,7 @@ impl SqliteMcpServerRepository {
 impl IMcpServerRepository for SqliteMcpServerRepository {
     async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT * FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at ASC",
+            "SELECT * FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, rowid ASC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -89,7 +89,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         for id in ids {
             separated.push_bind(id);
         }
-        separated.push_unseparated(") ORDER BY created_at ASC");
+        separated.push_unseparated(") ORDER BY created_at ASC, rowid ASC");
 
         let rows = query.build_query_as::<McpServerRow>().fetch_all(&self.pool).await?;
         let rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
