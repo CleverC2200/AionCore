@@ -268,7 +268,8 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
-    let row = repo.get(conversation_id).await.unwrap().unwrap();
+    let user_id = repo.owner_user_id(conversation_id).await.unwrap().unwrap();
+    let row = repo.get(&user_id, conversation_id).await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
 
     assert_eq!(extra["teamId"], data["id"]);
@@ -1087,9 +1088,15 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
     assert_eq!(ensure_resp.status(), StatusCode::OK);
 
+    let lead_user_id = services
+        .conversation_repo
+        .owner_user_id(lead_conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     let lead_conversation = services
         .conversation_repo
-        .get(lead_conversation_id)
+        .get(&lead_user_id, lead_conversation_id)
         .await
         .unwrap()
         .unwrap();
@@ -1255,8 +1262,14 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo
+        .owner_user_id(lead_conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
     let messages = repo
         .list_messages_page(
+            &user_id,
             lead_conversation_id,
             &MessagePageParams {
                 limit: 50,
