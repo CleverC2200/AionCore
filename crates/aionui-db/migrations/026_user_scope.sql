@@ -274,8 +274,85 @@ FROM client_preferences;
 DROP TABLE client_preferences;
 ALTER TABLE client_preferences_new RENAME TO client_preferences;
 
-ALTER TABLE agent_metadata
-    ADD COLUMN user_id TEXT REFERENCES users(id);
+CREATE TABLE agent_metadata_new (
+    id                       TEXT NOT NULL,
+    user_id                  TEXT REFERENCES users(id),
+    icon                     TEXT,
+    name                     TEXT NOT NULL,
+    name_i18n                TEXT,
+    description              TEXT,
+    description_i18n         TEXT,
+    backend                  TEXT,
+    agent_type               TEXT NOT NULL,
+    agent_source             TEXT NOT NULL,
+    agent_source_info        TEXT,
+    enabled                  INTEGER NOT NULL DEFAULT 1,
+    command                  TEXT,
+    args                     TEXT,
+    env                      TEXT,
+    native_skills_dirs       TEXT,
+    behavior_policy          TEXT,
+    yolo_id                  TEXT,
+    agent_capabilities       TEXT,
+    auth_methods             TEXT,
+    config_options           TEXT,
+    available_modes          TEXT,
+    available_models         TEXT,
+    available_commands       TEXT,
+    sort_order               INTEGER NOT NULL DEFAULT 1000,
+    last_check_status        TEXT,
+    last_check_kind          TEXT,
+    last_check_error_code    TEXT,
+    last_check_error_message TEXT,
+    last_check_guidance      TEXT,
+    last_check_latency_ms    INTEGER,
+    last_check_at            INTEGER,
+    last_success_at          INTEGER,
+    last_failure_at          INTEGER,
+    command_override         TEXT,
+    env_override             TEXT,
+    created_at               INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL
+);
+
+INSERT INTO agent_metadata_new (
+    id, user_id, icon, name, name_i18n, description, description_i18n,
+    backend, agent_type, agent_source, agent_source_info,
+    enabled, command, args, env, native_skills_dirs,
+    behavior_policy, yolo_id,
+    agent_capabilities, auth_methods, config_options,
+    available_modes, available_models, available_commands,
+    sort_order,
+    last_check_status, last_check_kind, last_check_error_code, last_check_error_message,
+    last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at,
+    command_override, env_override, created_at, updated_at
+)
+SELECT
+    id,
+    CASE WHEN agent_source IN ('builtin', 'internal') THEN NULL ELSE 'system_default_user' END,
+    icon, name, name_i18n, description, description_i18n,
+    backend, agent_type, agent_source, agent_source_info,
+    enabled, command, args, env, native_skills_dirs,
+    behavior_policy, yolo_id,
+    agent_capabilities, auth_methods, config_options,
+    available_modes, available_models, available_commands,
+    sort_order,
+    last_check_status, last_check_kind, last_check_error_code, last_check_error_message,
+    last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at,
+    command_override, env_override, created_at, updated_at
+FROM agent_metadata;
+
+DROP TABLE agent_metadata;
+ALTER TABLE agent_metadata_new RENAME TO agent_metadata;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_global_id
+    ON agent_metadata(id)
+    WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_user_id
+    ON agent_metadata(user_id, id)
+    WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_metadata_backend ON agent_metadata(backend);
+CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent_type ON agent_metadata(agent_type);
+CREATE INDEX IF NOT EXISTS idx_agent_metadata_sort_order ON agent_metadata(sort_order);
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_user_sort
     ON agent_metadata(user_id, sort_order, name);
 
