@@ -374,10 +374,14 @@ impl AgentRegistry {
         let mut rows: Vec<AgentManagementRow> = rows
             .into_iter()
             .filter_map(|row| decode_row(row, AvailabilityProjection::Cached))
-            .map(|(meta, reason)| {
+            .map(|(mut meta, mut reason)| {
                 let cached_meta = cached_rows.get(&meta.id);
                 let cached_reason = cached_reasons.get(&meta.id);
-                let (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta, cached_reason);
+                if cached_meta.is_some() {
+                    (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta, cached_reason);
+                } else if !has_availability_snapshot(&meta) {
+                    reason = apply_probe_availability(&mut meta);
+                }
                 agent_management_row(meta, reason.as_ref())
             })
             .collect();
@@ -414,12 +418,16 @@ impl AgentRegistry {
             .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
-        let Some((meta, reason)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Cached)) else {
+        let Some((mut meta, mut reason)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Cached)) else {
             return Ok(None);
         };
         let cached_meta = self.by_id.read().await.get(&meta.id).cloned();
         let cached_reason = self.unavailable_reasons.read().await.get(&meta.id).cloned();
-        let (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta.as_ref(), cached_reason.as_ref());
+        if cached_meta.is_some() {
+            (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta.as_ref(), cached_reason.as_ref());
+        } else if !has_availability_snapshot(&meta) {
+            reason = apply_probe_availability(&mut meta);
+        }
         Ok(Some(agent_management_row(meta, reason.as_ref())))
     }
 
