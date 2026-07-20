@@ -891,7 +891,10 @@ pub(crate) mod workspace_harness {
 
     #[async_trait]
     impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
-        async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        async fn list_team_selectable_assistants(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
             Ok(Vec::new())
         }
     }

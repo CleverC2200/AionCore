@@ -30,9 +30,10 @@ fn find_acp_backend_metadata(rows: &[AgentMetadataRow], backend: &str) -> Option
 
 pub(crate) async fn acp_backend_metadata(
     agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     backend: &str,
 ) -> Result<Option<AgentMetadataRow>, TeamError> {
-    let rows = agent_metadata_repo.list_all().await?;
+    let rows = agent_metadata_repo.list_all_for_user(user_id).await?;
     Ok(find_acp_backend_metadata(&rows, backend))
 }
 
@@ -51,9 +52,10 @@ pub(crate) fn session_mode_for_backend(
 
 pub(crate) async fn resolve_runtime_backend(
     agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
+    user_id: &str,
     agent_id: &str,
 ) -> Result<String, TeamError> {
-    let rows = agent_metadata_repo.list_all().await?;
+    let rows = agent_metadata_repo.list_all_for_user(user_id).await?;
     Ok(resolve_agent_binding_from_rows(&rows, agent_id)
         .map(|binding| binding.runtime_backend)
         .unwrap_or_else(|| agent_id.to_owned()))
@@ -62,10 +64,11 @@ pub(crate) async fn resolve_runtime_backend(
 impl TeamSessionService {
     pub(crate) async fn resolve_team_selectable_assistant(
         &self,
+        user_id: &str,
         assistant_id: &str,
     ) -> Result<TeamAssistantCatalogEntry, TeamError> {
         self.assistant_catalog
-            .resolve_team_selectable_assistant(assistant_id)
+            .resolve_team_selectable_assistant(user_id, assistant_id)
             .await?
             .ok_or_else(|| {
                 TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
@@ -81,10 +84,10 @@ impl TeamSessionService {
         fallback_model: &str,
     ) -> Result<(String, String), TeamError> {
         if let Some(assistant_id) = assistant_id.map(str::trim).filter(|value| !value.is_empty()) {
-            let selectable = self.resolve_team_selectable_assistant(assistant_id).await?;
+            let selectable = self.resolve_team_selectable_assistant(user_id, assistant_id).await?;
             let definition = self
                 .assistant_definition_repo
-                .get_by_assistant_id(assistant_id)
+                .get_by_assistant_id_for_user(user_id, assistant_id)
                 .await?
                 .ok_or_else(|| TeamError::InvalidRequest(format!("Preset assistant not found: {assistant_id}")))?;
             let backend = selectable.backend;
@@ -120,8 +123,8 @@ impl TeamSessionService {
     /// Return all enabled assistants that can currently participate in team mode.
     /// This consumes the same assistant projection as the Team creation UI, so
     /// `team_selectable` has a single source of truth.
-    pub(crate) async fn list_team_selectable_assistants(&self) -> Vec<AvailableAssistant> {
-        let Ok(assistants) = self.assistant_catalog.list_team_selectable_assistants().await else {
+    pub(crate) async fn list_team_selectable_assistants(&self, user_id: &str) -> Vec<AvailableAssistant> {
+        let Ok(assistants) = self.assistant_catalog.list_team_selectable_assistants(user_id).await else {
             return Vec::new();
         };
 
@@ -154,7 +157,11 @@ impl TeamSessionService {
         if backend == "aionrs" {
             return self.collect_provider_models(user_id).await.into_iter().next();
         }
-        let row = self.agent_metadata_repo.find_builtin_by_backend(backend).await.ok()??;
+        let row = self
+            .agent_metadata_repo
+            .find_builtin_by_backend_for_user(user_id, backend)
+            .await
+            .ok()??;
         let json: serde_json::Value = serde_json::from_str(row.available_models.as_deref()?).ok()?;
         if let Some(id) = json.get("current_model_id").and_then(|v| v.as_str())
             && !id.is_empty()
@@ -533,6 +540,7 @@ mod tests {
     impl crate::ports::TeamAssistantCatalogPort for RowsTeamAssistantCatalog {
         async fn list_team_selectable_assistants(
             &self,
+            _user_id: &str,
         ) -> Result<Vec<crate::ports::TeamAssistantCatalogEntry>, TeamError> {
             Ok(self.rows.clone())
         }
@@ -676,7 +684,7 @@ mod tests {
             base.backend_binary_path.clone(),
         );
 
-        let assistants = svc.list_team_selectable_assistants().await;
+        let assistants = svc.list_team_selectable_assistants("user1").await;
         let ids: Vec<&str> = assistants
             .iter()
             .map(|assistant| assistant.assistant_id.as_str())

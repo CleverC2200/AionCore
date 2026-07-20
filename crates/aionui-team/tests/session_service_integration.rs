@@ -1302,7 +1302,10 @@ struct EmptyTeamAssistantCatalog;
 
 #[async_trait::async_trait]
 impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
-    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+    async fn list_team_selectable_assistants(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
         Ok(Vec::new())
     }
 }
@@ -1315,13 +1318,19 @@ struct TestTeamAssistantCatalog {
 
 #[async_trait::async_trait]
 impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
-    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
-        let agent_rows = self.agent_metadata_repo.list_all().await?;
-        let definitions = self.assistant_definition_repo.list().await?;
+    async fn list_team_selectable_assistants(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        let agent_rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
+        let definitions = self.assistant_definition_repo.list_for_user(user_id).await?;
         let mut result = Vec::new();
 
         for definition in definitions {
-            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+            let overlay = self
+                .assistant_overlay_repo
+                .get_for_user(user_id, &definition.id)
+                .await?;
             if overlay.as_ref().is_some_and(|row| !row.enabled) {
                 continue;
             }

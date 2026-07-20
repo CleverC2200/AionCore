@@ -304,7 +304,7 @@ impl TeamSession {
         let Some(service) = self.service.upgrade() else {
             return Ok(TeamToolTransport::Mcp);
         };
-        service.provisioner().team_tool_transport(agent).await
+        service.provisioner().team_tool_transport(&self.user_id, agent).await
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {

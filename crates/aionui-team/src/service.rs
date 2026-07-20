@@ -299,6 +299,15 @@ impl TeamSessionService {
         Ok(Team::from_row(&row)?)
     }
 
+    pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+        Ok(row.user_id)
+    }
+
     pub async fn renew_active_lease(
         &self,
         user_id: &str,
@@ -434,7 +443,7 @@ impl TeamSessionService {
 
         self.broadcast_team_created(user_id, &team.id, &team.name);
 
-        self.build_team_response(&team).await
+        self.build_team_response(user_id, &team).await
     }
 
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
@@ -442,7 +451,7 @@ impl TeamSessionService {
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
             match Team::from_row(row) {
-                Ok(team) => match self.build_team_response(&team).await {
+                Ok(team) => match self.build_team_response(user_id, &team).await {
                     Ok(resp) => teams.push(resp),
                     Err(e) => {
                         tracing::warn!(team_id = %row.id, error = %e, "skipping team with build error");
@@ -458,7 +467,7 @@ impl TeamSessionService {
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
-        self.build_team_response(&team).await
+        self.build_team_response(user_id, &team).await
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -576,7 +585,7 @@ impl TeamSessionService {
             );
         }
 
-        self.build_agent_response(&agent).await
+        self.build_agent_response(user_id, &agent).await
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {

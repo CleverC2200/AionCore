@@ -629,8 +629,9 @@ pub fn build_team_state(
     impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
         async fn list_team_selectable_assistants(
             &self,
+            user_id: &str,
         ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
-            let assistants = self.assistant_service.list().await.map_err(|error| {
+            let assistants = self.assistant_service.list_for_user(user_id).await.map_err(|error| {
                 aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
             })?;
 
