@@ -10,9 +10,9 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload, api_rate_limit_middleware,
-    auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware, csrf_middleware,
-    security_headers_middleware,
+    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, JwtService, RateLimiter, TokenPayload,
+    api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    csrf_middleware, security_headers_middleware,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
@@ -134,7 +134,7 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
     let state = AuthState {
         jwt_service,
         user_repo,
-        local: false,
+        identity_mode: AuthIdentityMode::UserSession,
     };
 
     Router::new()

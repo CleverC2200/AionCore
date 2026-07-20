@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tracing::info;
 
-use aionui_app::AppConfig;
+use aionui_app::{AppConfig, IdentityMode};
 use aionui_db::Database;
 
 use crate::cli::Cli;
@@ -42,20 +42,35 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         std::env::set_var("AIONUI_WORK_DIR", &work_dir);
     }
 
+    let mut identity_mode: IdentityMode = cli.identity_mode.into();
+    if cli.local {
+        identity_mode = IdentityMode::Local;
+    }
+    let bootstrap_secret = std::env::var("AIONCORE_BOOTSTRAP_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty());
+
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
         data_dir: cli.data_dir.clone(),
         work_dir,
         app_version: cli.app_version.clone(),
-        local: cli.local,
+        local: cli.local || identity_mode.is_local(),
+        identity_mode,
+        bootstrap_secret,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
     info!(
-        "Running in {} mode — authentication is {}",
-        if config.local { "local" } else { "remote" },
-        if config.local { "disabled" } else { "enabled" }
+        identity_mode = config.identity_mode.auth_label(),
+        auth = if config.identity_mode.is_local() {
+            "disabled"
+        } else {
+            "enabled"
+        },
+        bootstrap_secret_configured = config.bootstrap_secret.is_some(),
+        "startup: identity mode resolved"
     );
 
     Ok(ServerEnvironment {

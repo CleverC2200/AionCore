@@ -18,7 +18,8 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware,
+    security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -140,13 +141,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         user_repo: services.user_repo.clone(),
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
+        identity_mode: auth_identity_mode(services.identity_mode),
+        bootstrap_secret: services.bootstrap_secret.clone(),
         local: services.local,
     };
 
     let auth_mw_state = AuthState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
-        local: services.local,
+        identity_mode: auth_identity_mode(services.identity_mode),
     };
 
     // System routes protected by auth middleware
@@ -258,7 +261,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     #[cfg(feature = "weixin")]
     let router = router.merge(weixin_login_authenticated);
 
-    let router = if services.local {
+    let router = if services.identity_mode.is_local() {
         router
     } else {
         router.layer(middleware::from_fn_with_state(
@@ -284,7 +287,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         "startup: route tree build with states completed"
     );
 
-    if services.local {
+    if services.identity_mode.is_local() {
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods([
@@ -299,6 +302,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         router.layer(cors)
     } else {
         router
+    }
+}
+
+fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentityMode {
+    if identity_mode.is_local() {
+        AuthIdentityMode::Local
+    } else {
+        AuthIdentityMode::UserSession
     }
 }
 

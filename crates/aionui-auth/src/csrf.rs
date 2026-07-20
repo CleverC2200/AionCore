@@ -18,7 +18,7 @@ use crate::extract::extract_cookie_value;
 ///
 /// Behavior:
 /// - Safe methods (GET, HEAD, OPTIONS) bypass validation.
-/// - Exempt paths (`/login`, `/api/auth/qr-login`) bypass validation.
+/// - Exempt paths (`/login`, `/api/auth/qr-login`, Bootstrap-secret internal auth) bypass validation.
 /// - All other requests must include an `x-csrf-token` header whose value
 ///   matches the `aionui-csrf-token` cookie.
 /// - Sets the CSRF cookie on responses if the client does not have one.
@@ -35,7 +35,10 @@ pub async fn csrf_middleware(
 
     // Validate CSRF for state-changing requests
     let needs_validation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
-    let is_exempt = path == "/login" || path == "/api/auth/qr-login";
+    let is_exempt = path == "/login"
+        || path == "/api/auth/qr-login"
+        || path.starts_with("/api/auth/internal/external-users/")
+        || path == "/api/auth/internal/external-sessions";
 
     if needs_validation && !is_exempt {
         let header_token = request

@@ -12,6 +12,12 @@ use aionui_db::IUserRepository;
 use crate::JwtService;
 use crate::extract::extract_token_from_headers;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthIdentityMode {
+    Local,
+    UserSession,
+}
+
 /// Authenticated user injected into request extensions by the auth middleware.
 ///
 /// Route handlers extract this from `request.extensions()` to identify
@@ -29,8 +35,7 @@ pub struct CurrentUser {
 pub struct AuthState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
-    /// When `true`, skip JWT verification and inject a fixed default user.
-    pub local: bool,
+    pub identity_mode: AuthIdentityMode,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -50,7 +55,7 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Result<Response, ApiError> {
     // In local mode, skip JWT verification and inject a fixed default user.
-    if state.local {
+    if state.identity_mode == AuthIdentityMode::Local {
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
@@ -68,7 +73,7 @@ pub async fn auth_middleware(
 
     let user = state
         .user_repo
-        .find_by_id(&payload.user_id)
+        .find_active_by_id(&payload.user_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "auth middleware user lookup failed");
@@ -78,7 +83,7 @@ pub async fn auth_middleware(
 
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
-        username: user.username,
+        username: user.username.unwrap_or_else(|| "external_user".to_string()),
     });
 
     Ok(next.run(request).await)
