@@ -257,8 +257,13 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
             .any(|skill| skill == "override-skill")
     );
 
+    let user_id = conversation_repo
+        .owner_user_id(data["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
     let snapshot = conversation_repo
-        .get_assistant_snapshot(data["id"].as_str().unwrap())
+        .get_assistant_snapshot(&user_id, data["id"].as_str().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -884,7 +889,8 @@ async fn t7_1_reset_conversation() {
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
@@ -975,7 +981,8 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
         hidden: false,
         created_at: 1000,
     };
-    aionui_db::IConversationRepository::insert_message(&repo, &msg)
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    aionui_db::IConversationRepository::insert_message(&repo, &user_id, &msg)
         .await
         .unwrap();
 
