@@ -53,7 +53,7 @@ impl AgentAvailabilityService {
         self.registry.list_management_rows().await
     }
 
-    pub async fn run_manual_health_check(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
+    pub async fn run_manual_health_check(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
         let meta = self
             .registry
             .reload_one(id)
@@ -71,6 +71,7 @@ impl AgentAvailabilityService {
             &self.registry,
             &self.provider_repo,
             &meta,
+            user_id,
             AgentSnapshotCheckKind::Manual,
         )
         .await;
@@ -155,6 +156,7 @@ async fn run_probe(
     registry: &Arc<AgentRegistry>,
     provider_repo: &Arc<dyn IProviderRepository>,
     meta: &AgentMetadata,
+    user_id: &str,
     kind: AgentSnapshotCheckKind,
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
@@ -233,7 +235,7 @@ async fn run_probe(
         // so its usability hinges entirely on having a configured model. It is
         // online only when at least one model provider is enabled — otherwise
         // it cannot run a single turn.
-        probe_aionrs_provider_readiness(provider_repo).await
+        probe_aionrs_provider_readiness(provider_repo, user_id).await
     } else {
         (AgentSnapshotCheckStatus::Online, None, None)
     };
@@ -279,8 +281,9 @@ fn explicit_probe_args(meta: &AgentMetadata) -> Result<Vec<String>, String> {
 /// `no_provider` code the UI maps to "configure a model" guidance.
 async fn probe_aionrs_provider_readiness(
     provider_repo: &Arc<dyn IProviderRepository>,
+    user_id: &str,
 ) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
-    match provider_repo.list().await {
+    match provider_repo.list(user_id).await {
         Ok(providers) if providers.iter().any(|p| p.enabled) => (AgentSnapshotCheckStatus::Online, None, None),
         Ok(_) => (
             AgentSnapshotCheckStatus::Offline,
@@ -393,6 +396,7 @@ mod tests {
     fn enabled_provider_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
             id: None,
+            user_id: "system_default_user",
             platform: "openai",
             name: "OpenAI",
             base_url: "https://api.openai.com",
@@ -415,7 +419,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, "system_default_user").await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Offline);
         assert_eq!(code.as_deref(), Some("no_provider"));
@@ -427,7 +431,7 @@ mod tests {
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         provider_repo.create(enabled_provider_params()).await.unwrap();
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, "system_default_user").await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Online);
         assert!(code.is_none());
@@ -622,7 +626,14 @@ mod tests {
             env_override_key_count: 0,
         };
 
-        let snapshot = run_probe(&registry, &provider_repo, &meta, AgentSnapshotCheckKind::Manual).await;
+        let snapshot = run_probe(
+            &registry,
+            &provider_repo,
+            &meta,
+            "system_default_user",
+            AgentSnapshotCheckKind::Manual,
+        )
+        .await;
 
         assert_eq!(snapshot.status, "offline");
         assert_eq!(snapshot.error_code.as_deref(), Some("command_not_found"));

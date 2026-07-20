@@ -68,13 +68,13 @@ async fn list_management_agents(
 
 async fn health_check_by_id(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .health_check_agent_by_id(&id)
+            .health_check_agent_by_id(&user.id, &id)
             .await
             .map_err(agent_error_to_api_error)?,
     )))
@@ -82,14 +82,14 @@ async fn health_check_by_id(
 
 async fn provider_health_check(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .provider_health_check(req)
+            .provider_health_check(&user.id, req)
             .await
             .map_err(agent_error_to_api_error)?,
     )))
@@ -186,7 +186,7 @@ async fn get_agent_overrides(
 
 async fn set_agent_overrides(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetAgentOverridesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
@@ -194,7 +194,7 @@ async fn set_agent_overrides(
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .set_agent_overrides(&id, req)
+            .set_agent_overrides(&user.id, &id, req)
             .await
             .map_err(agent_error_to_api_error)?,
     )))

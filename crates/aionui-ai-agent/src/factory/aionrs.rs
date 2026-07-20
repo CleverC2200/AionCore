@@ -53,6 +53,7 @@ pub(super) async fn build(
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
+            &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
@@ -81,7 +82,7 @@ pub(super) async fn build(
     let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
-        .find_by_id(provider_id)
+        .find_by_id(&ctx.user_id, provider_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
@@ -442,12 +443,13 @@ pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -761,6 +763,8 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    const TEST_USER_ID: &str = "user-1";
+
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -860,6 +864,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -882,16 +887,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockMcpRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.clone())
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
         }
 
-        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
         }
 
-        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.name == name).cloned())
+        async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
         }
 
         async fn create(
@@ -903,18 +916,20 @@ mod tests {
 
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
@@ -922,6 +937,7 @@ mod tests {
 
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
@@ -929,7 +945,12 @@ mod tests {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
     }
@@ -951,8 +972,14 @@ mod tests {
         let repo = MockMcpRepo { rows: vec![row] };
         let selected = vec!["mcp-docs".to_owned()];
 
-        let extra_mcp_servers =
-            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+        let extra_mcp_servers = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-frozen-mcp",
+            test_broadcaster(),
+        )
+        .await;
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);

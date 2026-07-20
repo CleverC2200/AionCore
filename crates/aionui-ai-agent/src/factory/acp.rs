@@ -79,6 +79,7 @@ pub(super) async fn build(
             load_user_mcp_servers(
                 repo.as_ref(),
                 config.mcp_server_ids.as_deref(),
+                &ctx.user_id,
                 &ctx.conversation_id,
                 &mcp_capabilities,
             )
@@ -294,12 +295,13 @@ async fn resolve_builtin_managed_acp_command_spec(
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
+    user_id: &str,
     conversation_id: &str,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -522,6 +524,8 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    const TEST_USER_ID: &str = "user-1";
+
     fn make_row(
         name: &str,
         transport_type: &str,
@@ -531,6 +535,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -849,26 +854,35 @@ mod tests {
 
     #[async_trait]
     impl IMcpServerRepository for MockRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             if self.fail {
                 Err(aionui_db::DbError::Init("simulated".into()))
             } else {
-                Ok(self.rows.clone())
+                Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
             }
         }
-        async fn find_by_id(&self, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn find_by_name(&self, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_name(&self, _user_id: &str, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+        async fn list_by_ids_any(
+            &self,
+            user_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             if self.fail {
                 return Err(aionui_db::DbError::Init("simulated".into()));
             }
             Ok(ids
                 .iter()
-                .filter_map(|id| self.rows.iter().find(|row| row.id == *id).cloned())
+                .filter_map(|id| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.user_id == user_id && row.id == *id)
+                        .cloned()
+                })
                 .collect())
         }
         async fn create(
@@ -879,29 +893,37 @@ mod tests {
         }
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
         ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
     }
@@ -928,7 +950,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
@@ -947,7 +969,7 @@ mod tests {
             rows: vec![],
             fail: true,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 
@@ -966,7 +988,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "good"),
@@ -991,7 +1013,7 @@ mod tests {
         });
 
         let selected = vec!["mcp_disabled-picked".to_owned()];
-        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), TEST_USER_ID, "conv-1", &caps).await;
 
         assert_eq!(servers.len(), 1);
         match &servers[0] {
@@ -1018,7 +1040,7 @@ mod tests {
             fail: false,
         });
 
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 }

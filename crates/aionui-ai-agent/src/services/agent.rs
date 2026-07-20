@@ -102,19 +102,21 @@ impl AgentService {
         Ok(entries)
     }
 
-    pub async fn health_check_agent_by_id(&self, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.availability.run_manual_health_check(id).await
+    pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
     pub async fn provider_health_check(
         &self,
+        user_id: &str,
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
-        self.provider_health.health_check(req).await
+        self.provider_health.health_check(user_id, req).await
     }
 
     pub async fn set_agent_overrides(
         &self,
+        user_id: &str,
         id: &str,
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
@@ -163,7 +165,7 @@ impl AgentService {
             .await
             .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides: {e}")))?;
 
-        self.availability.run_manual_health_check(id).await
+        self.availability.run_manual_health_check(user_id, id).await
     }
 
     pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {

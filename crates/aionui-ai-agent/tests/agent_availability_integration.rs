@@ -8,6 +8,8 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 
+const TEST_USER_ID: &str = "user-1";
+
 struct NoopBroadcaster;
 
 impl EventBroadcaster for NoopBroadcaster {
@@ -321,7 +323,10 @@ async fn manual_health_check_does_not_refresh_unrelated_agents() {
     std::fs::remove_file(&unrelated_path).unwrap();
 
     let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
-    service.health_check_agent_by_id("agent-target-missing").await.unwrap();
+    service
+        .health_check_agent_by_id(TEST_USER_ID, "agent-target-missing")
+        .await
+        .unwrap();
 
     let rows = registry.list_management_rows().await;
     let unrelated = rows.iter().find(|row| row.id == "agent-unrelated").unwrap();
