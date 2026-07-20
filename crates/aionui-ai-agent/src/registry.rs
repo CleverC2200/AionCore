@@ -301,6 +301,17 @@ impl AgentRegistry {
             .cloned()
     }
 
+    /// User-scoped builtin lookup for runtime paths that must honor per-user
+    /// agent overrides while still seeing global builtin rows.
+    pub async fn find_builtin_by_backend_for_user(&self, user_id: &str, vendor: &str) -> Option<AgentMetadata> {
+        let row = self
+            .repo
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok()??;
+        decode_row(row, AvailabilityProjection::Cached).map(|(meta, _)| meta)
+    }
+
     /// Every enabled, installed row whose `agent_type` matches,
     /// sorted by `sort_order`. See [`Self::list_all`] for the filter
     /// semantics.

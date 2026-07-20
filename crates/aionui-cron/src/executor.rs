@@ -559,7 +559,7 @@ impl JobExecutor {
         saved_skill: Option<&SavedSkillContext>,
         purpose: ConversationPurpose,
     ) -> Result<String, CronError> {
-        let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await?;
+        let agent_type = parse_agent_type(&self.agent_registry, &job.user_id, &job.agent_type).await?;
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
@@ -987,7 +987,11 @@ impl JobExecutor {
 /// 2. ACP vendor lookup via the registry — any builtin ACP row's
 ///    `backend` aliases to [`AgentType::Acp`].
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
-async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
+async fn parse_agent_type(
+    registry: &AgentRegistry,
+    user_id: &str,
+    agent_type_str: &str,
+) -> Result<AgentType, CronError> {
     if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
         if agent_type.is_deprecated_runtime() {
             return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
@@ -995,7 +999,11 @@ async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Res
         return Ok(agent_type);
     }
 
-    if registry.find_builtin_by_backend(agent_type_str).await.is_some() {
+    if registry
+        .find_builtin_by_backend_for_user(user_id, agent_type_str)
+        .await
+        .is_some()
+    {
         return Ok(AgentType::Acp);
     }
 
@@ -1030,7 +1038,10 @@ async fn inject_agent_identity(
         return;
     }
 
-    if let Some(meta) = registry.find_builtin_by_backend(lookup_label).await {
+    if let Some(meta) = registry
+        .find_builtin_by_backend_for_user(&job.user_id, lookup_label)
+        .await
+    {
         extra.insert("agent_id".to_owned(), serde_json::Value::String(meta.id.clone()));
         if let Some(backend) = meta.backend {
             extra.insert("backend".to_owned(), serde_json::Value::String(backend));
@@ -1555,15 +1566,21 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_known_types() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "acp").await.unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "aionrs").await.unwrap(), AgentType::Aionrs);
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "acp").await.unwrap(),
+            AgentType::Acp
+        );
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "aionrs").await.unwrap(),
+            AgentType::Aionrs
+        );
     }
 
     #[tokio::test]
     async fn parse_agent_type_rejects_deprecated_runtime_types() {
         let registry = hydrated_registry().await;
         for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
-            let err = parse_agent_type(&registry, agent_type).await.unwrap_err();
+            let err = parse_agent_type(&registry, "user1", agent_type).await.unwrap_err();
             assert!(matches!(err, CronError::InvalidAgentConfig(_)));
             assert!(
                 err.to_string()
@@ -1576,15 +1593,21 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_acp_backend_aliases_to_acp() {
         let registry = hydrated_registry().await;
-        assert_eq!(parse_agent_type(&registry, "claude").await.unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type(&registry, "qwen").await.unwrap(), AgentType::Acp);
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "claude").await.unwrap(),
+            AgentType::Acp
+        );
+        assert_eq!(
+            parse_agent_type(&registry, "user1", "qwen").await.unwrap(),
+            AgentType::Acp
+        );
     }
 
     #[tokio::test]
     async fn parse_agent_type_unknown_defaults_to_acp() {
         let registry = hydrated_registry().await;
         assert_eq!(
-            parse_agent_type(&registry, "unknown_type").await.unwrap(),
+            parse_agent_type(&registry, "user1", "unknown_type").await.unwrap(),
             AgentType::Acp
         );
     }
