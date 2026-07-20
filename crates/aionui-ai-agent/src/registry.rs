@@ -355,100 +355,72 @@ impl AgentRegistry {
             .values()
             .cloned()
             .map(|meta| {
-                let reason = reasons.get(&meta.id);
-                let status = derive_management_status(&meta, reason);
-                let diagnostics = derive_management_diagnostics(&meta, status, reason);
-                let handshake = meta.handshake;
-                AgentManagementRow {
-                    id: meta.id,
-                    icon: meta.icon,
-                    name: meta.name,
-                    name_i18n: meta.name_i18n,
-                    description: meta.description,
-                    description_i18n: meta.description_i18n,
-                    backend: meta.backend,
-                    agent_type: meta.agent_type,
-                    agent_source: meta.agent_source,
-                    agent_source_info: meta.agent_source_info,
-                    enabled: meta.enabled,
-                    installed: meta.available,
-                    command: meta.command,
-                    args: meta.args,
-                    env: Vec::new(),
-                    native_skills_dirs: meta.native_skills_dirs,
-                    behavior_policy: meta.behavior_policy,
-                    yolo_id: meta.yolo_id,
-                    config_options: handshake.config_options.clone(),
-                    available_modes: handshake.available_modes.clone(),
-                    available_models: handshake.available_models.clone(),
-                    available_commands: handshake.available_commands.clone(),
-                    sort_order: meta.sort_order,
-                    team_capable: meta.team_capable,
-                    status,
-                    last_check_status: meta.last_check_status,
-                    last_check_kind: meta.last_check_kind,
-                    last_check_error_code: diagnostics.error_code,
-                    last_check_error_message: diagnostics.error_message,
-                    last_check_error_details: diagnostics.details,
-                    last_check_guidance: diagnostics.guidance,
-                    last_check_latency_ms: meta.last_check_latency_ms,
-                    last_check_at: meta.last_check_at,
-                    last_success_at: meta.last_success_at,
-                    last_failure_at: meta.last_failure_at,
-                    has_command_override: meta.has_command_override,
-                    env_override_key_count: meta.env_override_key_count,
-                }
+                let reason = reasons.get(&meta.id).cloned();
+                agent_management_row(meta, reason.as_ref())
             })
             .collect();
         rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
         rows
     }
 
+    pub async fn list_management_rows_for_user(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        let rows = self
+            .repo
+            .list_all_for_user(user_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata for user: {e}")))?;
+        let cached_rows = self.by_id.read().await.clone();
+        let cached_reasons = self.unavailable_reasons.read().await.clone();
+        let mut rows: Vec<AgentManagementRow> = rows
+            .into_iter()
+            .filter_map(|row| decode_row(row, AvailabilityProjection::Cached))
+            .map(|(meta, reason)| {
+                let cached_meta = cached_rows.get(&meta.id);
+                let cached_reason = cached_reasons.get(&meta.id);
+                let (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta, cached_reason);
+                agent_management_row(meta, reason.as_ref())
+            })
+            .collect();
+        rows.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        Ok(rows)
+    }
+
     pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
         let reason = self.unavailable_reasons.read().await.get(id).cloned();
         let meta = self.by_id.read().await.get(id).cloned()?;
-        let status = derive_management_status(&meta, reason.as_ref());
-        let diagnostics = derive_management_diagnostics(&meta, status, reason.as_ref());
-        let handshake = meta.handshake.clone();
-        Some(AgentManagementRow {
-            id: meta.id,
-            icon: meta.icon,
-            name: meta.name,
-            name_i18n: meta.name_i18n,
-            description: meta.description,
-            description_i18n: meta.description_i18n,
-            backend: meta.backend,
-            agent_type: meta.agent_type,
-            agent_source: meta.agent_source,
-            agent_source_info: meta.agent_source_info,
-            enabled: meta.enabled,
-            installed: meta.available,
-            command: meta.command,
-            args: meta.args,
-            env: Vec::new(),
-            native_skills_dirs: meta.native_skills_dirs,
-            behavior_policy: meta.behavior_policy,
-            yolo_id: meta.yolo_id,
-            config_options: handshake.config_options.clone(),
-            available_modes: handshake.available_modes.clone(),
-            available_models: handshake.available_models.clone(),
-            available_commands: handshake.available_commands.clone(),
-            sort_order: meta.sort_order,
-            team_capable: meta.team_capable,
-            status,
-            last_check_status: meta.last_check_status,
-            last_check_kind: meta.last_check_kind,
-            last_check_error_code: diagnostics.error_code,
-            last_check_error_message: diagnostics.error_message,
-            last_check_error_details: diagnostics.details,
-            last_check_guidance: diagnostics.guidance,
-            last_check_latency_ms: meta.last_check_latency_ms,
-            last_check_at: meta.last_check_at,
-            last_success_at: meta.last_success_at,
-            last_failure_at: meta.last_failure_at,
-            has_command_override: meta.has_command_override,
-            env_override_key_count: meta.env_override_key_count,
-        })
+        Some(agent_management_row(meta, reason.as_ref()))
+    }
+
+    pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadata>, AgentError> {
+        let row = self
+            .repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
+        let Some((meta, _)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Probe)) else {
+            return Ok(None);
+        };
+        let (meta, _) = validate_cli_availability(meta, None).await;
+        Ok(Some(meta))
+    }
+
+    pub async fn management_row_by_id_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<AgentManagementRow>, AgentError> {
+        let row = self
+            .repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
+        let Some((meta, reason)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Cached)) else {
+            return Ok(None);
+        };
+        let cached_meta = self.by_id.read().await.get(&meta.id).cloned();
+        let cached_reason = self.unavailable_reasons.read().await.get(&meta.id).cloned();
+        let (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta.as_ref(), cached_reason.as_ref());
+        Ok(Some(agent_management_row(meta, reason.as_ref())))
     }
 
     /// Like [`Self::list_all_including_hidden`] but pairs every row
@@ -494,6 +466,91 @@ impl AgentRegistry {
 /// ACP/session admission out of visible legacy catalog reads.
 fn is_visible(meta: &AgentMetadata) -> bool {
     meta.enabled && matches!(derive_management_status(meta, None), AgentManagementStatus::Online)
+}
+
+fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementRow {
+    let status = derive_management_status(&meta, reason);
+    let diagnostics = derive_management_diagnostics(&meta, status, reason);
+    let handshake = meta.handshake;
+    AgentManagementRow {
+        id: meta.id,
+        icon: meta.icon,
+        name: meta.name,
+        name_i18n: meta.name_i18n,
+        description: meta.description,
+        description_i18n: meta.description_i18n,
+        backend: meta.backend,
+        agent_type: meta.agent_type,
+        agent_source: meta.agent_source,
+        agent_source_info: meta.agent_source_info,
+        enabled: meta.enabled,
+        installed: meta.available,
+        command: meta.command,
+        args: meta.args,
+        env: Vec::new(),
+        native_skills_dirs: meta.native_skills_dirs,
+        behavior_policy: meta.behavior_policy,
+        yolo_id: meta.yolo_id,
+        config_options: handshake.config_options.clone(),
+        available_modes: handshake.available_modes.clone(),
+        available_models: handshake.available_models.clone(),
+        available_commands: handshake.available_commands.clone(),
+        sort_order: meta.sort_order,
+        team_capable: meta.team_capable,
+        status,
+        last_check_status: meta.last_check_status,
+        last_check_kind: meta.last_check_kind,
+        last_check_error_code: diagnostics.error_code,
+        last_check_error_message: diagnostics.error_message,
+        last_check_error_details: diagnostics.details,
+        last_check_guidance: diagnostics.guidance,
+        last_check_latency_ms: meta.last_check_latency_ms,
+        last_check_at: meta.last_check_at,
+        last_success_at: meta.last_success_at,
+        last_failure_at: meta.last_failure_at,
+        has_command_override: meta.has_command_override,
+        env_override_key_count: meta.env_override_key_count,
+    }
+}
+
+fn overlay_hydrated_availability(
+    mut meta: AgentMetadata,
+    reason: Option<UnavailableReason>,
+    cached_meta: Option<&AgentMetadata>,
+    cached_reason: Option<&UnavailableReason>,
+) -> (AgentMetadata, Option<UnavailableReason>) {
+    let Some(cached_meta) = cached_meta else {
+        return (meta, reason);
+    };
+    if has_availability_snapshot(&meta) || !same_runtime_availability_inputs(&meta, cached_meta) {
+        return (meta, reason);
+    }
+
+    meta.available = cached_meta.available;
+    meta.resolved_command = cached_meta.resolved_command.clone();
+    let reason = if meta.available {
+        None
+    } else {
+        cached_reason.cloned().or(reason)
+    };
+    (meta, reason)
+}
+
+fn same_runtime_availability_inputs(a: &AgentMetadata, b: &AgentMetadata) -> bool {
+    a.enabled == b.enabled
+        && a.agent_source == b.agent_source
+        && a.agent_type == b.agent_type
+        && a.backend == b.backend
+        && a.command == b.command
+        && a.args == b.args
+        && json_values_equal(&a.env, &b.env)
+        && a.native_skills_dirs == b.native_skills_dirs
+        && json_values_equal(&a.behavior_policy, &b.behavior_policy)
+        && a.yolo_id == b.yolo_id
+}
+
+fn json_values_equal<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
 
 /// Extract and trim a command override, filtering out empty strings.

@@ -18,6 +18,8 @@ use crate::error::AgentError;
 use crate::protocol::{cli_detect, custom_agent_probe};
 use crate::registry::{AgentRegistry, guidance_for_snapshot_error_code};
 
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
+
 #[async_trait::async_trait]
 pub trait AgentAvailabilityFeedbackPort: Send + Sync {
     async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError>;
@@ -49,21 +51,21 @@ impl AgentAvailabilityService {
         }
     }
 
-    pub async fn list_management_rows(&self) -> Vec<AgentManagementRow> {
-        self.registry.list_management_rows().await
+    pub async fn list_management_rows(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        self.registry.list_management_rows_for_user(user_id).await
     }
 
     pub async fn run_manual_health_check(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
         let meta = self
             .registry
-            .reload_one(id)
-            .await
-            .and_then(|row| row.ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found"))))?;
+            .get_for_user(user_id, id)
+            .await?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         if !meta.available {
             return self
-                .management_row_by_id(id)
-                .await
+                .management_row_by_id(user_id, id)
+                .await?
                 .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")));
         }
 
@@ -75,9 +77,9 @@ impl AgentAvailabilityService {
             AgentSnapshotCheckKind::Manual,
         )
         .await;
-        self.persist_snapshot(id, &snapshot).await?;
-        self.management_row_by_id(id)
-            .await
+        self.persist_snapshot_for_user(user_id, id, &snapshot).await?;
+        self.management_row_by_id(user_id, id)
+            .await?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
     }
 
@@ -107,17 +109,31 @@ impl AgentAvailabilityService {
         self.persist_snapshot(agent_id, &snapshot).await
     }
 
-    pub async fn management_row_by_id(&self, id: &str) -> Option<AgentManagementRow> {
-        self.registry.management_row_by_id(id).await
+    pub async fn management_row_by_id(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<AgentManagementRow>, AgentError> {
+        self.registry.management_row_by_id_for_user(user_id, id).await
     }
 
     async fn persist_snapshot(&self, id: &str, snapshot: &AvailabilitySnapshot) -> Result<(), AgentError> {
+        self.persist_snapshot_for_user(SYSTEM_DEFAULT_USER_ID, id, snapshot)
+            .await
+    }
+
+    async fn persist_snapshot_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        snapshot: &AvailabilitySnapshot,
+    ) -> Result<(), AgentError> {
         let existing = self
             .registry
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|error| AgentError::internal(format!("repo.get: {error}")))?
+            .map_err(|error| AgentError::internal(format!("repo.get_for_user: {error}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
         let params = UpdateAgentAvailabilitySnapshotParams {
@@ -144,10 +160,12 @@ impl AgentAvailabilityService {
         };
         self.registry
             .repo_handle()
-            .update_availability_snapshot(id, &params)
+            .update_availability_snapshot_for_user(user_id, id, &params)
             .await
-            .map_err(|error| AgentError::internal(format!("repo.update_availability_snapshot: {error}")))?;
-        self.registry.reload_one(id).await?;
+            .map_err(|error| AgentError::internal(format!("repo.update_availability_snapshot_for_user: {error}")))?;
+        if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.registry.reload_one(id).await?;
+        }
         Ok(())
     }
 }
@@ -381,7 +399,10 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
+    use super::{
+        AgentAvailabilityService, SYSTEM_DEFAULT_USER_ID, explicit_probe_args, probe_aionrs_provider_readiness,
+        run_probe,
+    };
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -486,8 +507,9 @@ mod tests {
             .unwrap();
 
         let row = service
-            .list_management_rows()
+            .list_management_rows(SYSTEM_DEFAULT_USER_ID)
             .await
+            .unwrap()
             .into_iter()
             .find(|item| item.id == "agent-session-failure")
             .unwrap();
@@ -560,8 +582,9 @@ mod tests {
         service.record_session_success("agent-session-success").await.unwrap();
 
         let row = service
-            .list_management_rows()
+            .list_management_rows(SYSTEM_DEFAULT_USER_ID)
             .await
+            .unwrap()
             .into_iter()
             .find(|item| item.id == "agent-session-success")
             .unwrap();

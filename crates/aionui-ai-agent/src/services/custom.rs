@@ -26,6 +26,7 @@ use crate::protocol::custom_agent_probe::try_connect_custom_agent as probe;
 use crate::runtime_status::custom_agent_runtime_reporter;
 
 const CUSTOM_SORT_ORDER_DEFAULT: i64 = 1500;
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 impl AgentService {
     /// Public accessor for the probe — powers both
@@ -45,16 +46,22 @@ impl AgentService {
         Ok(probe(&req.command, &req.acp_args, &req.env, reporter.as_deref()).await)
     }
 
-    pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
+    pub async fn create_custom_agent(
+        &self,
+        user_id: &str,
+        req: CustomAgentUpsertRequest,
+    ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
         probe_or_reject(&req).await?;
 
         let id = generate_short_id();
-        self.upsert_custom_row(&id, &req, /* keep_enabled = */ true).await
+        self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
+            .await
     }
 
     pub async fn update_custom_agent(
         &self,
+        user_id: &str,
         id: &str,
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
@@ -62,9 +69,9 @@ impl AgentService {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AgentError::forbidden(
@@ -74,16 +81,16 @@ impl AgentService {
         probe_or_reject(&req).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(id, &req, keep_enabled).await
+        self.upsert_custom_row(user_id, id, &req, keep_enabled).await
     }
 
-    pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AgentError> {
+    pub async fn delete_custom_agent(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AgentError::forbidden(
@@ -93,39 +100,44 @@ impl AgentService {
         let removed = self
             .registry()
             .repo_handle()
-            .delete(id)
+            .delete_for_user(user_id, id)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.delete: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.delete_for_user: {e}")))?;
         if !removed {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if let Err(err) = self.registry().reload_one(id).await {
+        if user_id == SYSTEM_DEFAULT_USER_ID
+            && let Err(err) = self.registry().reload_one(id).await
+        {
             warn!(agent_id = %id, error = %err, "registry reload failed after delete_custom_agent");
         }
         Ok(())
     }
 
-    pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
+    pub async fn set_agent_enabled(&self, user_id: &str, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
         let updated = self
             .registry()
             .repo_handle()
-            .set_enabled(id, enabled)
+            .set_enabled_for_user(user_id, id, enabled)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.set_enabled: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.set_enabled_for_user: {e}")))?;
         if !updated {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if let Err(err) = self.registry().reload_one(id).await {
+        if user_id == SYSTEM_DEFAULT_USER_ID
+            && let Err(err) = self.registry().reload_one(id).await
+        {
             warn!(agent_id = %id, error = %err, "registry reload failed after set_agent_enabled");
         }
         self.registry()
-            .get(id)
-            .await
+            .get_for_user(user_id, id)
+            .await?
             .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after enable toggle")))
     }
 
     async fn upsert_custom_row(
         &self,
+        user_id: &str,
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
@@ -182,18 +194,20 @@ impl AgentService {
 
         self.registry()
             .repo_handle()
-            .upsert(&params)
+            .upsert_for_user(user_id, &params)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.upsert: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.upsert_for_user: {e}")))?;
+
+        if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.registry()
+                .reload_one(id)
+                .await
+                .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
+        }
 
         self.registry()
-            .reload_one(id)
-            .await
-            .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
-
-        self.registry()
-            .get(id)
-            .await
+            .get_for_user(user_id, id)
+            .await?
             .ok_or_else(|| AgentError::internal(format!("Agent '{id}' not visible after upsert")))
     }
 }
