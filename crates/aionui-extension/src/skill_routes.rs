@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path as AxumPath, State};
+use axum::extract::{Extension, Json, Path as AxumPath, State};
 use axum::routing::{delete, get, post};
 use tracing::warn;
 
@@ -17,6 +17,7 @@ use aionui_api_types::{
     ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
     SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
 
@@ -111,8 +112,14 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
 /// `GET /api/skills` — list all available skills.
 async fn list_skills(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, ApiError> {
-    let items = skill_service::list_available_skills_with_repo(&state.skill_paths, state.skill_repo.as_ref()).await?;
+    let items = skill_service::list_available_skills_with_repo_for_user(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &current_user.id,
+    )
+    .await?;
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
@@ -164,12 +171,14 @@ async fn get_import_limits() -> Result<Json<ApiResponse<SkillImportLimitsRespons
 /// `POST /api/skills/import` — import skill directories or zip packages by copying.
 async fn import_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportSkillResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let outcome = match skill_service::import_skills_with_repo(
+    let outcome = match skill_service::import_skills_with_repo_for_user(
         &state.skill_paths,
         state.skill_repo.as_ref(),
+        &current_user.id,
         Path::new(&req.skill_path),
     )
     .await
@@ -227,19 +236,27 @@ async fn export_skill_symlink(
 /// `DELETE /api/skills/:name` — delete a user-custom skill.
 async fn delete_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    skill_service::delete_skill_with_repo(&state.skill_paths, state.skill_repo.as_ref(), &name).await?;
+    skill_service::delete_skill_with_repo_for_user(
+        &state.skill_paths,
+        state.skill_repo.as_ref(),
+        &current_user.id,
+        &name,
+    )
+    .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 /// `GET /api/skills/import-history` — list recent skill import records.
 async fn list_import_history(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<SkillImportRecordResponse>>>, ApiError> {
     let records = state
         .skill_repo
-        .list_import_records(100)
+        .list_import_records_for_user(&current_user.id, 100)
         .await
         .map_err(ExtensionError::from)?;
     let resp = records
@@ -358,15 +375,17 @@ async fn read_builtin_skill(
 /// backend no longer copies any files per-conversation.
 async fn materialize_for_agent(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<MaterializeSkillsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<MaterializeSkillsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if req.conversation_id.trim().is_empty() {
         return Err(ApiError::BadRequest("conversationId must not be empty".into()));
     }
-    let resolved = skill_service::materialize_skills_for_agent_with_repo(
+    let resolved = skill_service::materialize_skills_for_agent_with_repo_for_user(
         &state.skill_paths,
         state.skill_repo.as_ref(),
+        &current_user.id,
         &req.conversation_id,
         &req.skills,
     )

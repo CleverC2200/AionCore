@@ -40,6 +40,11 @@ pub trait ISkillRepository: Send + Sync {
         self.upsert(params).await
     }
 
+    /// Creates or updates a global skill row (`user_id IS NULL`).
+    async fn upsert_global(&self, params: UpsertSkillParams<'_>) -> Result<SkillRow, DbError> {
+        self.upsert(params).await
+    }
+
     /// Soft-deletes an active skill by name.
     async fn delete_by_name(&self, name: &str) -> Result<SkillRow, DbError>;
 

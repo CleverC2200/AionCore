@@ -78,7 +78,11 @@ impl ISkillRepository for SqliteSkillRepository {
 
     async fn upsert_for_user(&self, user_id: &str, params: UpsertSkillParams<'_>) -> Result<SkillRow, DbError> {
         let now = aionui_common::now_ms();
-        let existing = self.find_by_name_any_for_user(user_id, params.name).await?;
+        let existing = sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE user_id = ? AND name = ?")
+            .bind(user_id)
+            .bind(params.name)
+            .fetch_optional(&self.pool)
+            .await?;
         let id = existing
             .as_ref()
             .map(|row| row.id.clone())
@@ -112,6 +116,48 @@ impl ISkillRepository for SqliteSkillRepository {
         self.find_by_name_any_for_user(user_id, params.name)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("skill '{}' was not found after upsert", params.name)))
+    }
+
+    async fn upsert_global(&self, params: UpsertSkillParams<'_>) -> Result<SkillRow, DbError> {
+        let now = aionui_common::now_ms();
+        let existing = sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE user_id IS NULL AND name = ?")
+            .bind(params.name)
+            .fetch_optional(&self.pool)
+            .await?;
+        let id = existing
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(|| aionui_common::generate_prefixed_id("skill"));
+        let created_at = existing.as_ref().map(|row| row.created_at).unwrap_or(now);
+
+        sqlx::query(
+            "INSERT INTO skills \
+                (id, user_id, name, description, path, source, enabled, deleted_at, created_at, updated_at) \
+             VALUES (?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?) \
+             ON CONFLICT(name) WHERE user_id IS NULL DO UPDATE SET \
+                description = excluded.description, \
+                path = excluded.path, \
+                source = excluded.source, \
+                enabled = excluded.enabled, \
+                deleted_at = NULL, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(&id)
+        .bind(params.name)
+        .bind(params.description)
+        .bind(params.path)
+        .bind(params.source)
+        .bind(params.enabled)
+        .bind(created_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query_as::<_, SkillRow>("SELECT * FROM skills WHERE user_id IS NULL AND name = ?")
+            .bind(params.name)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("global skill '{}' was not found after upsert", params.name)))
     }
 
     async fn delete_by_name(&self, name: &str) -> Result<SkillRow, DbError> {
@@ -381,6 +427,60 @@ mod tests {
 
         assert!(repo.find_by_name_for_user(USER_A, "shared").await.unwrap().is_none());
         assert!(repo.find_by_name_for_user(USER_B, "shared").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn global_builtin_skill_is_visible_to_all_users_and_user_skill_overrides_it() {
+        let (repo, _db) = setup().await;
+
+        repo.upsert_global(UpsertSkillParams {
+            name: "shared",
+            description: Some("Global"),
+            path: "/tmp/global",
+            source: "builtin",
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.find_by_name_for_user(USER_B, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+            "/tmp/global"
+        );
+
+        repo.upsert_for_user(
+            USER_B,
+            UpsertSkillParams {
+                name: "shared",
+                description: Some("B"),
+                path: "/tmp/b",
+                source: "user",
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.find_by_name_for_user(USER_B, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+            "/tmp/b"
+        );
+        assert_eq!(
+            repo.find_by_name_for_user(USER_A, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+            "/tmp/global"
+        );
     }
 
     #[tokio::test]
