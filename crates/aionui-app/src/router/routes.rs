@@ -108,13 +108,20 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let chan_factory = channel_components.plugin_factory;
     let chan_owner_user_id = channel_components.owner_user_id;
     tokio::spawn(async move {
-        if let Err(e) = chan_mgr.restore_plugins(&chan_owner_user_id, &chan_factory).await {
-            tracing::warn!(
-                code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+        if let Some(chan_owner_user_id) = chan_owner_user_id {
+            if let Err(e) = chan_mgr.restore_plugins(&chan_owner_user_id, &chan_factory).await {
+                tracing::warn!(
+                    code = "BOOTSTRAP_DEGRADED_CHANNEL_RESTORE",
+                    stage = "channel.restore",
+                    owner_user_id = %chan_owner_user_id,
+                    error = %e,
+                    "failed to restore channel plugins"
+                );
+            }
+        } else {
+            tracing::info!(
                 stage = "channel.restore",
-                owner_user_id = %chan_owner_user_id,
-                error = %e,
-                "failed to restore channel plugins"
+                "skipping channel plugin restore until an owner user is available"
             );
         }
     });

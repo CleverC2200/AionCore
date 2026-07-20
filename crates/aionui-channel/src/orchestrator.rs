@@ -67,8 +67,10 @@ impl ChannelOrchestrator {
         let chat_id = msg.chat_id.clone();
         let plugin_id = platform.to_string();
         let text = msg.content.text.clone();
-        let fallback_owner_user_id = self.action_executor.owner_user_id().to_owned();
-        let message_owner_user_id = msg.owner_user_id.clone().unwrap_or(fallback_owner_user_id);
+        let message_owner_user_id = msg
+            .owner_user_id
+            .clone()
+            .or_else(|| self.action_executor.owner_user_id().map(ToOwned::to_owned));
 
         let executor = Arc::clone(&self.action_executor);
         let msg_svc = Arc::clone(&self.message_service);
@@ -78,7 +80,11 @@ impl ChannelOrchestrator {
         tokio::spawn(async move {
             match executor.handle_incoming_message(&msg).await {
                 Ok(MessageResult::Action(response)) => {
-                    send_action_response(&sender, &message_owner_user_id, &plugin_id, &chat_id, &response).await;
+                    if let Some(owner_user_id) = message_owner_user_id.as_deref() {
+                        send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await;
+                    } else {
+                        warn!("dropping channel action response without owner user");
+                    }
                 }
                 Ok(MessageResult::Dispatched {
                     owner_user_id,
@@ -172,7 +178,7 @@ async fn handle_dispatched(
         }
     };
 
-    let send_result = match msg_svc.send_to_agent(&session, text, platform).await {
+    let send_result = match msg_svc.send_to_agent(owner_user_id, &session, text, platform).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to send to agent");

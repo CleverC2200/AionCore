@@ -41,7 +41,7 @@ pub struct ActionExecutor {
     pairing: Arc<PairingService>,
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
-    owner_user_id: String,
+    owner_user_id: Option<String>,
 }
 
 impl ActionExecutor {
@@ -49,7 +49,7 @@ impl ActionExecutor {
         pairing: Arc<PairingService>,
         session_mgr: Arc<SessionManager>,
         settings: Arc<ChannelSettingsService>,
-        owner_user_id: String,
+        owner_user_id: Option<String>,
     ) -> Self {
         Self {
             pairing,
@@ -59,8 +59,8 @@ impl ActionExecutor {
         }
     }
 
-    pub fn owner_user_id(&self) -> &str {
-        &self.owner_user_id
+    pub fn owner_user_id(&self) -> Option<&str> {
+        self.owner_user_id.as_deref()
     }
 
     /// Main entry point: handle an incoming message from any platform.
@@ -73,18 +73,23 @@ impl ActionExecutor {
         let platform_type = msg.platform.to_string();
         let user_id = &msg.user.id;
         let chat_id = &msg.chat_id;
+        let owner_user_id = msg
+            .owner_user_id
+            .as_deref()
+            .or(self.owner_user_id.as_deref())
+            .ok_or_else(|| ChannelError::InvalidConfig("channel owner user is required".to_owned()))?;
 
         // 1. Authorization check — resolve platform user → internal user ID
         let internal_user_id = self
             .pairing
-            .get_internal_user_id(&self.owner_user_id, user_id, &platform_type)
+            .get_internal_user_id(owner_user_id, user_id, &platform_type)
             .await?;
 
         let internal_user_id = match internal_user_id {
             Some(id) => id,
             None => {
                 let response = self
-                    .handle_unauthorized(user_id, &platform_type, &msg.user.display_name)
+                    .handle_unauthorized(owner_user_id, user_id, &platform_type, &msg.user.display_name)
                     .await?;
                 return Ok(MessageResult::Action(response));
             }
@@ -92,19 +97,16 @@ impl ActionExecutor {
 
         // 2. Button callback → action routing
         if let Some(action) = &msg.action {
-            let response = self.route_action(action, &internal_user_id).await?;
+            let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
             return Ok(MessageResult::Action(response));
         }
 
         // 3. Text message → session resolution → AI dispatch
-        let agent_config = self
-            .settings
-            .get_agent_config(&self.owner_user_id, msg.platform)
-            .await?;
+        let agent_config = self.settings.get_agent_config(owner_user_id, msg.platform).await?;
         let session = self
             .session_mgr
             .get_or_create_session(
-                &self.owner_user_id,
+                owner_user_id,
                 &internal_user_id,
                 chat_id,
                 &agent_config.agent_type,
@@ -121,7 +123,7 @@ impl ActionExecutor {
         );
 
         Ok(MessageResult::Dispatched {
-            owner_user_id: self.owner_user_id.clone(),
+            owner_user_id: owner_user_id.to_owned(),
             session_id: session.id,
             conversation_id: session.conversation_id,
         })
@@ -131,13 +133,14 @@ impl ActionExecutor {
     /// a response with instructions and action buttons.
     async fn handle_unauthorized(
         &self,
+        owner_user_id: &str,
         platform_user_id: &str,
         platform_type: &str,
         display_name: &str,
     ) -> Result<ActionResponse, ChannelError> {
         let code = self
             .pairing
-            .request_pairing(&self.owner_user_id, platform_user_id, platform_type, Some(display_name))
+            .request_pairing(owner_user_id, platform_user_id, platform_type, Some(display_name))
             .await?;
 
         debug!(
@@ -152,25 +155,30 @@ impl ActionExecutor {
     /// Routes an action to the appropriate handler by category.
     async fn route_action(
         &self,
+        owner_user_id: &str,
         action: &UnifiedAction,
         internal_user_id: &str,
     ) -> Result<ActionResponse, ChannelError> {
         match action.category {
-            ActionCategory::Platform => self.handle_platform_action(action).await,
-            ActionCategory::System => self.handle_system_action(action, internal_user_id).await,
+            ActionCategory::Platform => self.handle_platform_action(owner_user_id, action).await,
+            ActionCategory::System => self.handle_system_action(owner_user_id, action, internal_user_id).await,
             ActionCategory::Chat => self.handle_chat_action(action).await,
         }
     }
 
     // ── Platform actions ────────────────────────────────────────────
 
-    async fn handle_platform_action(&self, action: &UnifiedAction) -> Result<ActionResponse, ChannelError> {
+    async fn handle_platform_action(
+        &self,
+        owner_user_id: &str,
+        action: &UnifiedAction,
+    ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
             "pairing.show" | "pairing.refresh" => {
                 let code = self
                     .pairing
                     .request_pairing(
-                        &self.owner_user_id,
+                        owner_user_id,
                         &action.context.user_id,
                         &action.context.platform.to_string(),
                         None,
@@ -182,7 +190,7 @@ impl ActionExecutor {
                 let authorized = self
                     .pairing
                     .is_user_authorized(
-                        &self.owner_user_id,
+                        owner_user_id,
                         &action.context.user_id,
                         &action.context.platform.to_string(),
                     )
@@ -247,6 +255,7 @@ impl ActionExecutor {
 
     async fn handle_system_action(
         &self,
+        owner_user_id: &str,
         action: &UnifiedAction,
         internal_user_id: &str,
     ) -> Result<ActionResponse, ChannelError> {
@@ -256,11 +265,11 @@ impl ActionExecutor {
                 let chat_id = &action.context.chat_id;
                 let agent_config = self
                     .settings
-                    .get_agent_config(internal_user_id, action.context.platform)
+                    .get_agent_config(owner_user_id, action.context.platform)
                     .await?;
                 let session = self
                     .session_mgr
-                    .reset_session(&self.owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .reset_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -286,11 +295,11 @@ impl ActionExecutor {
                 let chat_id = &action.context.chat_id;
                 let agent_config = self
                     .settings
-                    .get_agent_config(&self.owner_user_id, action.context.platform)
+                    .get_agent_config(owner_user_id, action.context.platform)
                     .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(&self.owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .get_or_create_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
 
                 Ok(ActionResponse {
@@ -770,7 +779,18 @@ mod tests {
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-        let executor = ActionExecutor::new(pairing, session_mgr, settings, OWNER_ID.to_owned());
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, Some(OWNER_ID.to_owned()));
+        (executor, repo)
+    }
+
+    fn setup_without_owner() -> (ActionExecutor, Arc<MockRepo>) {
+        let repo = Arc::new(MockRepo::new());
+        let broadcaster = Arc::new(MockBroadcaster);
+        let pairing = Arc::new(PairingService::new(repo.clone(), broadcaster));
+        let session_mgr = Arc::new(SessionManager::new(repo.clone()));
+        let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
+        let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, None);
         (executor, repo)
     }
 
@@ -857,6 +877,16 @@ mod tests {
             }
             _ => panic!("Expected Action result for unauthorized user"),
         }
+    }
+
+    #[tokio::test]
+    async fn missing_owner_user_id_is_rejected() {
+        let (executor, _repo) = setup_without_owner();
+        let msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
+
+        let err = executor.handle_incoming_message(&msg).await.unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidConfig(_)));
+        assert!(err.to_string().contains("owner user"));
     }
 
     #[tokio::test]

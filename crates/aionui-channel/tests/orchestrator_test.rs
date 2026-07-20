@@ -52,7 +52,7 @@ async fn unauthorized_user_gets_pairing_response() {
         pairing,
         Arc::clone(&session_mgr),
         settings,
-        OWNER_ID.to_owned(),
+        Some(OWNER_ID.to_owned()),
     ));
 
     let msg = make_text_message("unknown_user", "chat_1", "hello");
