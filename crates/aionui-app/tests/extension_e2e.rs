@@ -1356,7 +1356,7 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review skill");
     write_skill(&paths.user_skills_dir, "my-skill", "A user-imported skill");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1395,7 +1395,7 @@ async fn sl2_list_skills_user_custom_overrides_builtin() {
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review");
     write_skill(&paths.user_skills_dir, "review", "Custom review override");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1437,7 +1437,7 @@ async fn ba1_unified_skill_list_includes_auto_inject_builtin_entries() {
     write_skill(&auto_dir, "skill-creator", "Scaffold a new skill");
     // A top-level builtin that must NOT appear in the auto list.
     write_skill(&builtin_dir, "review", "Top-level");
-    sync_skill_catalog_for_test(&services, &paths).await;
+    sync_skill_catalog_for_test(&services, &paths, "user1").await;
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

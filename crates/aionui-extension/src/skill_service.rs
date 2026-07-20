@@ -1622,11 +1622,27 @@ async fn list_skills_from_repo(
     user_id: &str,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
     let mut items = Vec::new();
-    for row in repo.list_for_user(user_id).await? {
+    for row in dedupe_user_visible_skill_rows(repo.list_for_user(user_id).await?) {
         let description = row.description.clone().unwrap_or_default();
         items.push(skill_row_to_list_item(paths, row, description));
     }
     Ok(items)
+}
+
+fn dedupe_user_visible_skill_rows(rows: Vec<SkillRow>) -> Vec<SkillRow> {
+    let mut merged: Vec<SkillRow> = Vec::new();
+
+    for row in rows {
+        if let Some(index) = merged.iter().position(|existing| existing.name == row.name) {
+            if merged[index].user_id.is_none() && row.user_id.is_some() {
+                merged[index] = row;
+            }
+        } else {
+            merged.push(row);
+        }
+    }
+
+    merged
 }
 
 /// Synchronize filesystem-backed skill catalogs into the database.
@@ -1638,7 +1654,19 @@ pub async fn sync_skill_catalog_into_repo(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
 ) -> Result<(), ExtensionError> {
-    sync_disk_user_skills_into_repo_for_user(paths, repo, DEFAULT_USER_ID).await?;
+    sync_skill_catalog_into_repo_for_user(paths, repo, DEFAULT_USER_ID).await
+}
+
+/// Synchronize filesystem-backed skill catalogs for a specific user.
+///
+/// Built-in skills are global. Disk-backed custom skills are attributed to
+/// `user_id`, matching the user-scoped catalog exposed by `/api/skills`.
+pub async fn sync_skill_catalog_into_repo_for_user(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+    user_id: &str,
+) -> Result<(), ExtensionError> {
+    sync_disk_user_skills_into_repo_for_user(paths, repo, user_id).await?;
     sync_builtin_skills_into_repo(paths, repo).await?;
     Ok(())
 }
