@@ -76,7 +76,8 @@ pub trait IUserRepository: Send + Sync {
     /// Updates a user's JWT secret.
     async fn update_jwt_secret(&self, user_id: &str, jwt_secret: &str) -> Result<(), DbError>;
 
-    /// Updates a user's status.
+    /// Updates a user's status. Transitioning into `disabled` also revokes
+    /// existing sessions by incrementing `session_generation`.
     async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError>;
 
     /// Increments a user's session generation and returns the new value.

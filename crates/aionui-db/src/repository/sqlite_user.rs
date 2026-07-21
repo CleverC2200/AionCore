@@ -302,12 +302,22 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
-        let result = sqlx::query("UPDATE users SET status = ?, updated_at = ? WHERE id = ?")
-            .bind(status.as_str())
-            .bind(now)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE users \
+             SET status = ?, \
+                 session_generation = CASE \
+                     WHEN ? = 'disabled' AND status != 'disabled' THEN session_generation + 1 \
+                     ELSE session_generation \
+                 END, \
+                 updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("User '{user_id}' not found")));
@@ -662,7 +672,12 @@ mod tests {
 
         let disabled = repo.find_by_id(&user.id).await.unwrap().unwrap();
         assert_eq!(disabled.status, UserStatus::Disabled);
+        assert_eq!(disabled.session_generation, 1);
         assert!(repo.find_active_by_id(&user.id).await.unwrap().is_none());
+
+        repo.set_status(&user.id, UserStatus::Disabled).await.unwrap();
+        let disabled_again = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(disabled_again.session_generation, 1);
     }
 
     #[tokio::test]

@@ -280,8 +280,13 @@ async fn t2_15_disabled_user_is_not_active() {
     assert!(r.find_active_by_id(&user.id).await.unwrap().is_some());
     r.set_status(&user.id, UserStatus::Disabled).await.unwrap();
 
-    assert!(r.find_by_id(&user.id).await.unwrap().is_some());
+    let disabled = r.find_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(disabled.session_generation, 1);
     assert!(r.find_active_by_id(&user.id).await.unwrap().is_none());
+
+    r.set_status(&user.id, UserStatus::Disabled).await.unwrap();
+    let disabled_again = r.find_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(disabled_again.session_generation, 1);
 }
 
 #[tokio::test]
