@@ -680,7 +680,35 @@ mod tests {
         let _clone = svc.clone();
     }
 
+    #[tokio::test]
+    async fn clear_pending_for_user_keeps_other_user_same_oauth_state() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+        insert_pending_login(&svc, "user-a", "shared-state").await;
+        insert_pending_login(&svc, "user-b", "shared-state").await;
+
+        svc.clear_pending_for_user("user-a").await;
+
+        let pending = svc.pending.lock().await;
+        assert!(!pending.contains_key(&("user-a".to_string(), "shared-state".to_string())));
+        assert!(pending.contains_key(&("user-b".to_string(), "shared-state".to_string())));
+    }
+
     // -- Mock repositories ---------------------------------------------------
+
+    async fn insert_pending_login(svc: &McpOAuthService, user_id: &str, state: &str) {
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut pending = svc.pending.lock().await;
+        pending.insert(
+            (user_id.to_string(), state.to_string()),
+            PendingLogin {
+                csrf_token: CsrfToken::new(state.to_string()),
+                pkce_verifier,
+                auth_url: "https://auth.example.com/authorize".to_string(),
+                token_url: "https://auth.example.com/token".to_string(),
+                redirect_url: "http://127.0.0.1/callback".to_string(),
+            },
+        );
+    }
 
     struct MockTokenRepo;
 
