@@ -61,7 +61,7 @@ async fn migration_allows_known_skill_sources_and_rejects_unknown_sources() {
     let pool = db.pool();
 
     for source in ["user", "builtin", "extension", "cron"] {
-        let user_id = if source == "builtin" {
+        let user_id = if source == "builtin" || source == "cron" {
             None
         } else {
             Some("system_default_user")

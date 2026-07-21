@@ -1702,7 +1702,7 @@ async fn sync_managed_skill_into_repo(
     skill: &ScannedSkill,
     source: &str,
 ) -> Result<(), ExtensionError> {
-    if let Some(existing) = repo.find_by_name_any(&skill.name).await?
+    if let Some(existing) = repo.find_by_name_any_for_user(DEFAULT_USER_ID, &skill.name).await?
         && existing.source == "user"
         && existing.deleted_at.is_none()
         && existing.enabled
@@ -1710,7 +1710,7 @@ async fn sync_managed_skill_into_repo(
         return Ok(());
     }
 
-    repo.upsert(UpsertSkillParams {
+    repo.upsert_global(UpsertSkillParams {
         name: &skill.name,
         description: Some(&skill.description),
         path: &skill.path,
@@ -3011,6 +3011,7 @@ mod tests {
         assert_eq!(scheduled.relative_location, None);
         let scheduled_row = repo.find_by_name("scheduled-task").await.unwrap().unwrap();
         assert_eq!(scheduled_row.source, "cron");
+        assert_eq!(scheduled_row.user_id, None);
     }
 
     #[tokio::test]
