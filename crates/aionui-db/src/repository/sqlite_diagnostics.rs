@@ -85,13 +85,13 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "created_at": conversation.try_get::<i64, _>("created_at")?,
                 "updated_at": conversation.try_get::<i64, _>("updated_at")?,
             },
-            "messages": self.collect_message_diagnostics(conversation_id).await?,
+            "messages": self.collect_message_diagnostics(&request.user_id, conversation_id).await?,
             "recent_conversations": self.collect_recent_conversations(
                 &request.user_id,
                 conversation_id,
                 conversation.try_get::<i64, _>("updated_at")?,
             ).await?,
-            "acp_session": self.collect_acp_session(conversation_id).await?,
+            "acp_session": self.collect_acp_session(&request.user_id, conversation_id).await?,
             "agent_metadata": self.collect_agent_metadata(&request.user_id, agent_id.as_deref()).await?,
             "assistant_snapshot": self.collect_assistant_snapshot(&request.user_id, conversation_id).await?,
         });
@@ -218,13 +218,15 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_message_diagnostics(&self, conversation_id: &str) -> Result<Value, DbError> {
+    async fn collect_message_diagnostics(&self, user_id: &str, conversation_id: &str) -> Result<Value, DbError> {
         let aggregate_rows = sqlx::query(
-            "SELECT type, status, hidden, COUNT(*) AS count, SUM(length(content)) AS content_bytes \
-             FROM messages \
-             WHERE conversation_id = ? \
-             GROUP BY type, status, hidden",
+            "SELECT m.type, m.status, m.hidden, COUNT(*) AS count, SUM(length(m.content)) AS content_bytes \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+             GROUP BY m.type, m.status, m.hidden",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -253,16 +255,18 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_messages = sqlx::query(
             "SELECT \
-                id, msg_id, type, position, status, hidden, created_at, length(content) AS content_bytes, \
-                CASE WHEN json_valid(content) THEN length(json_extract(content, '$.text')) END AS text_length, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.attachments') END AS attachment_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.images') END AS image_count, \
-                CASE WHEN json_valid(content) THEN json_array_length(content, '$.toolCalls') END AS tool_call_count \
-             FROM messages \
-             WHERE conversation_id = ? \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.position, m.status, m.hidden, m.created_at, length(m.content) AS content_bytes, \
+                CASE WHEN json_valid(m.content) THEN length(json_extract(m.content, '$.text')) END AS text_length, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.attachments') END AS attachment_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.images') END AS image_count, \
+                CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.toolCalls') END AS tool_call_count \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 20",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -289,19 +293,21 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_errors = sqlx::query(
             "SELECT \
-                id, type, status, position, created_at, length(content) AS content_bytes, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.kind') END AS resolution_kind, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.resolution.targetId') END AS resolution_target_id, \
-                CASE WHEN json_valid(content) THEN json_extract(content, '$.feedbackRecommended') END AS feedback_recommended \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.type, m.status, m.position, m.created_at, length(m.content) AS content_bytes, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END AS code, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.ownership'), json_extract(m.content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.kind') END AS resolution_kind, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.resolution.targetId') END AS resolution_target_id, \
+                CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.feedbackRecommended') END AS feedback_recommended \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -328,16 +334,18 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let recent_error_detail_rows = sqlx::query(
             "SELECT \
-                id, msg_id, type, status, position, hidden, created_at, length(content) AS content_bytes, content, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.code'), json_extract(content, '$.code')) END AS code, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.ownership'), json_extract(content, '$.ownership')) END AS ownership, \
-                CASE WHEN json_valid(content) THEN COALESCE(json_extract(content, '$.error.retryable'), json_extract(content, '$.retryable')) END AS retryable \
-             FROM messages \
-             WHERE conversation_id = ? \
-               AND (status = 'error' OR type = 'tips' OR (json_valid(content) AND json_extract(content, '$.error.code') IS NOT NULL)) \
-             ORDER BY created_at DESC, id DESC \
+                m.id, m.msg_id, m.type, m.status, m.position, m.hidden, m.created_at, length(m.content) AS content_bytes, m.content, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.code'), json_extract(m.content, '$.code')) END AS code, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.ownership'), json_extract(m.content, '$.ownership')) END AS ownership, \
+                CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? \
+               AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -388,17 +396,19 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_acp_session(&self, conversation_id: &str) -> Result<Value, DbError> {
+    async fn collect_acp_session(&self, user_id: &str, conversation_id: &str) -> Result<Value, DbError> {
         let row = sqlx::query(
             "SELECT \
-                conversation_id, agent_source, agent_id, session_id, session_status, \
-                session_config, length(session_config) AS session_config_bytes, \
-                last_active_at, suspended_at, \
-                CASE WHEN json_valid(session_config) THEN json_extract(session_config, '$.runtime.current_mode_id') END AS current_mode_id, \
-                CASE WHEN json_valid(session_config) THEN json_extract(session_config, '$.runtime.current_model_id') END AS current_model_id \
-             FROM acp_session \
-             WHERE conversation_id = ?",
+                s.conversation_id, s.agent_source, s.agent_id, s.session_id, s.session_status, \
+                s.session_config, length(s.session_config) AS session_config_bytes, \
+                s.last_active_at, s.suspended_at, \
+                CASE WHEN json_valid(s.session_config) THEN json_extract(s.session_config, '$.runtime.current_mode_id') END AS current_mode_id, \
+                CASE WHEN json_valid(s.session_config) THEN json_extract(s.session_config, '$.runtime.current_model_id') END AS current_model_id \
+             FROM acp_session s \
+             JOIN conversations c ON c.id = s.conversation_id \
+             WHERE c.user_id = ? AND s.conversation_id = ?",
         )
+        .bind(user_id)
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
