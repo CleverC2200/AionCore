@@ -169,16 +169,32 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         session_revoked_hook: {
             let ws_manager = services.ws_manager.clone();
             let conversation_service = states.conversation.service.clone();
+            let file_watch_service = states.file.watch_service.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
                 let user_id = user_id.to_owned();
                 let conversation_service = conversation_service.clone();
+                let file_watch_service = file_watch_service.clone();
                 tokio::spawn(async move {
                     if let Err(err) = conversation_service.terminate_runtime_for_user(&user_id).await {
                         tracing::warn!(
                             user_id = %user_id,
                             error = %err,
                             "failed to terminate runtimes after session revocation"
+                        );
+                    }
+                    if let Err(err) = file_watch_service.stop_all_watches_for_user(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to stop file watches after session revocation"
+                        );
+                    }
+                    if let Err(err) = file_watch_service.stop_all_office_watches_for_user(&user_id).await {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %err,
+                            "failed to stop office file watches after session revocation"
                         );
                     }
                 });
