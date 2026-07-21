@@ -288,8 +288,9 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
-            .get_config_options(conversation_id)
+            .get_config_options(&user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
     }
