@@ -296,8 +296,7 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
-        self
-            .repo
+        self.repo
             .get_team(user_id, team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
