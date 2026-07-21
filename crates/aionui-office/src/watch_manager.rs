@@ -83,7 +83,7 @@ impl OfficecliWatchManager {
 
     pub async fn start_for_user(&self, user_id: &str, file_path: &str, doc_type: DocType) -> Result<u16, OfficeError> {
         let resolved = resolve_path(file_path)?;
-        let key = session_key(&resolved, doc_type);
+        let key = session_key(user_id, &resolved, doc_type);
 
         if let Some(entry) = self.sessions.get(&key) {
             if !entry.aborted && entry.process.is_alive() {
@@ -137,7 +137,7 @@ impl OfficecliWatchManager {
                 Ok(process) => {
                     self.poll_port_ready(port, resolved).await?;
 
-                    let key = session_key(resolved, doc_type);
+                    let key = session_key(user_id, resolved, doc_type);
                     self.sessions.insert(
                         key,
                         WatchSession {
@@ -197,11 +197,15 @@ impl OfficecliWatchManager {
     }
 
     pub async fn stop(&self, file_path: &str, doc_type: DocType) {
+        self.stop_for_user("system_default_user", file_path, doc_type).await;
+    }
+
+    pub async fn stop_for_user(&self, user_id: &str, file_path: &str, doc_type: DocType) {
         let resolved = match resolve_path(file_path) {
             Ok(p) => p,
             Err(_) => return,
         };
-        let key = session_key(&resolved, doc_type);
+        let key = session_key(user_id, &resolved, doc_type);
 
         tokio::time::sleep(Duration::from_millis(STOP_DELAY_MS)).await;
 
@@ -444,8 +448,8 @@ fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
     Ok(resolved.to_string_lossy().into_owned())
 }
 
-fn session_key(resolved_path: &str, doc_type: DocType) -> String {
-    format!("{doc_type}:{resolved_path}")
+fn session_key(user_id: &str, resolved_path: &str, doc_type: DocType) -> String {
+    format!("{user_id}:{doc_type}:{resolved_path}")
 }
 
 fn is_port_in_use_start_failure(error: &OfficeError) -> bool {
@@ -625,14 +629,21 @@ mod tests {
 
     #[test]
     fn session_key_format() {
-        let key = session_key("/path/to/doc.docx", DocType::Word);
-        assert_eq!(key, "word:/path/to/doc.docx");
+        let key = session_key("user-1", "/path/to/doc.docx", DocType::Word);
+        assert_eq!(key, "user-1:word:/path/to/doc.docx");
     }
 
     #[test]
     fn session_key_different_doc_types() {
-        let k1 = session_key("/a.docx", DocType::Word);
-        let k2 = session_key("/a.docx", DocType::Excel);
+        let k1 = session_key("user-1", "/a.docx", DocType::Word);
+        let k2 = session_key("user-1", "/a.docx", DocType::Excel);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_different_users() {
+        let k1 = session_key("user-1", "/a.docx", DocType::Word);
+        let k2 = session_key("user-2", "/a.docx", DocType::Word);
         assert_ne!(k1, k2);
     }
 
@@ -710,6 +721,33 @@ mod tests {
 
         assert_eq!(p1, p2);
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn start_same_file_for_different_users_creates_independent_sessions() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.docx");
+        std::fs::write(&file, b"test").unwrap();
+        let path = file.to_str().unwrap();
+
+        let user_a_port = mgr.start_for_user("user-a", path, DocType::Word).await.unwrap();
+        let user_b_port = mgr.start_for_user("user-b", path, DocType::Word).await.unwrap();
+
+        assert_ne!(user_a_port, user_b_port);
+        assert_eq!(mgr.active_session_count(), 2);
+        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+
+        mgr.stop_for_user("user-a", path, DocType::Word).await;
+        assert_eq!(mgr.active_session_count(), 1);
+        assert!(!mgr.is_active_port(user_a_port, DocType::Word));
+        assert!(mgr.is_active_port(user_b_port, DocType::Word));
+
+        mgr.stop_for_user("user-b", path, DocType::Word).await;
+        assert_eq!(mgr.active_session_count(), 0);
     }
 
     #[tokio::test]

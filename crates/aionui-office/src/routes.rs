@@ -92,10 +92,10 @@ async fn start_word_preview(
 
 async fn stop_word_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Word).await
+    stop_preview(state, &user.id, body, DocType::Word).await
 }
 
 async fn start_excel_preview(
@@ -108,10 +108,10 @@ async fn start_excel_preview(
 
 async fn stop_excel_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Excel).await
+    stop_preview(state, &user.id, body, DocType::Excel).await
 }
 
 async fn start_ppt_preview(
@@ -124,10 +124,10 @@ async fn start_ppt_preview(
 
 async fn stop_ppt_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Ppt).await
+    stop_preview(state, &user.id, body, DocType::Ppt).await
 }
 
 async fn start_preview(
@@ -161,11 +161,15 @@ async fn start_preview(
 
 async fn stop_preview(
     state: OfficeRouterState,
+    user_id: &str,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.watch_manager.stop(&req.file_path, doc_type).await;
+    state
+        .watch_manager
+        .stop_for_user(user_id, &req.file_path, doc_type)
+        .await;
     Ok(Json(ApiResponse::success()))
 }
 
