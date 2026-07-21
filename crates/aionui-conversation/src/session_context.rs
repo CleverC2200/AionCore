@@ -205,7 +205,7 @@ impl<'a> SessionContextBuilder<'a> {
             serde_json::from_value(extra.clone()).map_err(|e| ConversationError::BadRequest {
                 reason: format!("Invalid ACP build options: {e}"),
             })?;
-        config.user_id.get_or_insert_with(|| row.user_id.clone());
+        config.user_id = Some(row.user_id.clone());
         apply_team_seed_to_acp_config(&team, &mut config);
         normalize_cron_alias(row, &extra, &mut config.cron_job_id);
 
@@ -384,7 +384,7 @@ fn build_aionrs_context(
             AionrsBuildExtra::default()
         }
     };
-    config.user_id.get_or_insert_with(|| row.user_id.clone());
+    config.user_id = Some(row.user_id.clone());
     apply_team_seed_to_aionrs_config(&team, &mut config);
     let belongs_to_team = team.is_some();
     // Team-bound sessions keep the team seed / create-time value; runtime
@@ -745,6 +745,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_extra_user_id_is_overridden_by_conversation_owner() {
+        let repos = setup().await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "user_id": "other-user"
+            }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let acp = acp_context(context);
+        assert_eq!(acp.config.user_id.as_deref(), Some("user-1"));
+    }
+
+    #[tokio::test]
     async fn acp_builtin_backend_fallback_resolves_agent_id() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
@@ -1007,6 +1024,16 @@ mod tests {
         let aionrs = aionrs_context(context);
         assert!(aionrs.belongs_to_team);
         assert_eq!(aionrs.config.team_mcp_stdio_config.unwrap().port, 5252);
+    }
+
+    #[tokio::test]
+    async fn aionrs_extra_user_id_is_overridden_by_conversation_owner() {
+        let repos = setup().await;
+        let row = row("aionrs", serde_json::json!({ "user_id": "other-user" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        let aionrs = aionrs_context(context);
+        assert_eq!(aionrs.config.user_id.as_deref(), Some("user-1"));
     }
 
     #[tokio::test]
