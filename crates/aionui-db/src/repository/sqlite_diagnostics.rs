@@ -92,7 +92,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 conversation.try_get::<i64, _>("updated_at")?,
             ).await?,
             "acp_session": self.collect_acp_session(conversation_id).await?,
-            "agent_metadata": self.collect_agent_metadata(agent_id.as_deref()).await?,
+            "agent_metadata": self.collect_agent_metadata(&request.user_id, agent_id.as_deref()).await?,
             "assistant_snapshot": self.collect_assistant_snapshot(&request.user_id, conversation_id).await?,
         });
 
@@ -428,7 +428,7 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_agent_metadata(&self, agent_id: Option<&str>) -> Result<Value, DbError> {
+    async fn collect_agent_metadata(&self, user_id: &str, agent_id: Option<&str>) -> Result<Value, DbError> {
         let Some(agent_id) = agent_id else {
             return Ok(Value::Null);
         };
@@ -441,9 +441,10 @@ impl SqliteFeedbackDiagnosticsRepository {
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at \
              FROM agent_metadata \
-             WHERE id = ?",
+             WHERE id = ? AND (user_id IS NULL OR user_id = ?)",
         )
         .bind(agent_id)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -978,9 +979,11 @@ impl SqliteFeedbackDiagnosticsRepository {
             .bind(&request.user_id)
             .fetch_one(&self.pool)
             .await?;
-        let agent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata")
-            .fetch_one(&self.pool)
-            .await?;
+        let agent_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE user_id IS NULL OR user_id = ?")
+                .bind(&request.user_id)
+                .fetch_one(&self.pool)
+                .await?;
         let active_mcp_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL")
                 .bind(&request.user_id)
@@ -999,7 +1002,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "conversation_status_counts": self.collect_global_conversation_status_counts(&request.user_id).await?,
                 "recent_conversations": self.collect_global_recent_conversations(&request.user_id).await?,
                 "recent_errors": self.collect_global_recent_errors(&request.user_id).await?,
-                "agent_health": self.collect_global_agent_health().await?,
+                "agent_health": self.collect_global_agent_health(&request.user_id).await?,
                 "provider_health": self.collect_global_provider_health(&request.user_id).await?,
             }),
         ))
@@ -1419,7 +1422,7 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_agent_health(&self) -> Result<Value, DbError> {
+    async fn collect_global_agent_health(&self, user_id: &str) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT \
                 id, name, backend, agent_type, agent_source, enabled, sort_order, \
@@ -1427,9 +1430,11 @@ impl SqliteFeedbackDiagnosticsRepository {
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at, updated_at \
              FROM agent_metadata \
+             WHERE user_id IS NULL OR user_id = ? \
              ORDER BY updated_at DESC, id DESC \
              LIMIT ?",
         )
+        .bind(user_id)
         .bind(GLOBAL_HEALTH_LIMIT)
         .fetch_all(&self.pool)
         .await?;
