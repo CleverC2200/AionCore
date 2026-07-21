@@ -42,10 +42,12 @@ use crate::manager::acp::config_option_catalog::{
 /// before producers start to back off.
 const CATALOG_SYNC_CHANNEL_CAPACITY: usize = 256;
 const CLI_PROBE_CONCURRENCY: usize = 8;
+const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 /// One unit of work submitted to the catalog sync consumer task.
 #[derive(Debug)]
 struct CatalogSyncMessage {
+    user_id: String,
     agent_metadata_id: String,
     handshake: AgentHandshake,
 }
@@ -89,8 +91,12 @@ impl AgentRegistry {
     fn spawn_catalog_consumer(self: Arc<Self>, mut rx: mpsc::Receiver<CatalogSyncMessage>) {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let Err(err) = self.apply_handshake_inner(&msg.agent_metadata_id, &msg.handshake).await {
+                if let Err(err) = self
+                    .apply_handshake_inner(&msg.user_id, &msg.agent_metadata_id, &msg.handshake)
+                    .await
+                {
                     warn!(
+                        user_id = %msg.user_id,
                         agent_metadata_id = %msg.agent_metadata_id,
                         error = %err,
                         "Catalog sync: apply_handshake failed"
@@ -108,13 +114,15 @@ impl AgentRegistry {
     /// tests and the consumer itself.
     ///
     /// `None` fields are left untouched (partial update).
-    async fn apply_handshake_inner(&self, id: &str, snapshot: &AgentHandshake) -> Result<(), AgentError> {
+    async fn apply_handshake_inner(
+        &self,
+        user_id: &str,
+        id: &str,
+        snapshot: &AgentHandshake,
+    ) -> Result<(), AgentError> {
         let mut snapshot = snapshot.clone();
         if let Some(incoming_config_options) = snapshot.config_options.as_ref() {
-            let existing_config_options = {
-                let guard = self.by_id.read().await;
-                guard.get(id).and_then(|meta| meta.handshake.config_options.clone())
-            };
+            let existing_config_options = self.existing_config_options_for_user(user_id, id).await?;
             if let Some(merged_config_options) =
                 merge_config_option_values(existing_config_options.as_ref(), incoming_config_options)
             {
@@ -139,12 +147,12 @@ impl AgentRegistry {
             available_commands: available_commands.as_deref().map(Some),
         };
 
-        let Some(row) = self
-            .repo
-            .apply_handshake(id, &params)
-            .await
-            .map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))?
-        else {
+        let row = if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.repo.apply_handshake(id, &params).await
+        } else {
+            self.repo.apply_handshake_for_user(user_id, id, &params).await
+        };
+        let Some(row) = row.map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))? else {
             return Ok(());
         };
 
@@ -170,6 +178,18 @@ impl AgentRegistry {
             self.by_id.write().await.insert(meta.id.clone(), meta);
         }
         Ok(())
+    }
+
+    async fn existing_config_options_for_user(&self, user_id: &str, id: &str) -> Result<Option<Value>, AgentError> {
+        let row = if user_id == SYSTEM_DEFAULT_USER_ID {
+            self.repo.get(id).await
+        } else {
+            self.repo.get_for_user(user_id, id).await
+        }
+        .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for handshake merge: {e}")))?;
+        Ok(row
+            .and_then(|row| decode_row(row, AvailabilityProjection::Cached))
+            .and_then(|(meta, _)| meta.handshake.config_options))
     }
 
     async fn update_cached_unavailable_reason(&self, id: &str, reason: Option<UnavailableReason>) {
@@ -1225,8 +1245,9 @@ impl CatalogSender {
     /// Submit a partial handshake update. Returns without error when the
     /// channel is closed (only happens at shutdown) or full — callers do
     /// not need to care because the consumer is best-effort.
-    pub fn send_partial(&self, agent_metadata_id: String, handshake: AgentHandshake) {
+    pub fn send_partial(&self, user_id: String, agent_metadata_id: String, handshake: AgentHandshake) {
         let msg = CatalogSyncMessage {
+            user_id,
             agent_metadata_id,
             handshake,
         };
@@ -1385,7 +1406,9 @@ fn probe_command_candidate(command: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::{SqliteAgentMetadataRepository, init_database_memory};
+    use aionui_db::{
+        IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
+    };
 
     async fn registry() -> Arc<AgentRegistry> {
         let db = init_database_memory().await.unwrap();
@@ -1393,6 +1416,35 @@ mod tests {
         let reg = AgentRegistry::new(repo);
         reg.hydrate().await.unwrap();
         reg
+    }
+
+    fn custom_params<'a>(id: &'a str, name: &'a str) -> UpsertAgentMetadataParams<'a> {
+        UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name,
+            name_i18n: None,
+            description: Some("test custom agent"),
+            description_i18n: None,
+            backend: None,
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"sh"}"#),
+            enabled: true,
+            command: Some("sh"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1500,
+        }
     }
 
     #[tokio::test]
@@ -1544,11 +1596,116 @@ mod tests {
             ])),
             ..Default::default()
         };
-        reg.apply_handshake_inner(&claude.id, &snapshot).await.unwrap();
+        reg.apply_handshake_inner(SYSTEM_DEFAULT_USER_ID, &claude.id, &snapshot)
+            .await
+            .unwrap();
 
         let refreshed = reg.get(&claude.id).await.unwrap();
         let methods = refreshed.handshake.auth_methods.unwrap();
         assert_eq!(methods.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_handshake_scopes_custom_agent_by_user() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user-b', 'local', 'user-b', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        repo.upsert_for_user(
+            SYSTEM_DEFAULT_USER_ID,
+            &custom_params("custom-shared", "Default Custom"),
+        )
+        .await
+        .unwrap();
+        repo.upsert_for_user("user-b", &custom_params("custom-shared", "User B Custom"))
+            .await
+            .unwrap();
+
+        let reg = AgentRegistry::new(repo.clone());
+        reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
+            "custom-shared",
+            &AgentHandshake {
+                config_options: Some(serde_json::json!({
+                    "config_options": [
+                        {
+                            "id": "mode",
+                            "name": "Mode",
+                            "type": "select",
+                            "category": "mode",
+                            "current_value": "default-mode",
+                            "options": [{"value": "default-mode", "name": "Default Mode"}]
+                        }
+                    ]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        reg.apply_handshake_inner(
+            "user-b",
+            "custom-shared",
+            &AgentHandshake {
+                auth_methods: Some(serde_json::json!([{"type":"agent","id":"oauth"}])),
+                config_options: Some(serde_json::json!({
+                    "config_options": [
+                        {
+                            "id": "model",
+                            "name": "Model",
+                            "type": "select",
+                            "category": "model",
+                            "current_value": "user-b-model",
+                            "options": [{"value": "user-b-model", "name": "User B Model"}]
+                        }
+                    ]
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let default_row = repo
+            .get_for_user(SYSTEM_DEFAULT_USER_ID, "custom-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_row = repo.get_for_user("user-b", "custom-shared").await.unwrap().unwrap();
+        assert!(default_row.auth_methods.is_none());
+        assert!(
+            default_row
+                .config_options
+                .as_deref()
+                .is_some_and(|value| value.contains(r#""id":"mode""#))
+        );
+        assert!(
+            default_row
+                .config_options
+                .as_deref()
+                .is_none_or(|value| !value.contains(r#""id":"model""#))
+        );
+        assert_eq!(
+            user_b_row.auth_methods.as_deref(),
+            Some(r#"[{"id":"oauth","type":"agent"}]"#)
+        );
+        assert!(
+            user_b_row
+                .config_options
+                .as_deref()
+                .is_some_and(|value| value.contains(r#""id":"model""#))
+        );
+        assert!(
+            user_b_row
+                .config_options
+                .as_deref()
+                .is_none_or(|value| !value.contains(r#""id":"mode""#))
+        );
     }
 
     /// Partial updates must leave unrelated columns untouched.
@@ -1567,6 +1724,7 @@ mod tests {
 
         // Write #1: agent_capabilities only.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"load_session": true})),
@@ -1578,6 +1736,7 @@ mod tests {
 
         // Write #2: auth_methods only. Capabilities must survive.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 auth_methods: Some(serde_json::json!([{"type": "agent", "id": "oauth"}])),
@@ -1589,6 +1748,7 @@ mod tests {
 
         // Write #3: available_modes only. Capabilities + auth_methods must survive.
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 available_modes: Some(serde_json::json!([{"id": "code", "name": "Code"}])),
@@ -1656,6 +1816,7 @@ mod tests {
         let claude = reg.find_builtin_by_backend("claude").await.unwrap();
 
         reg.apply_handshake_inner(
+            SYSTEM_DEFAULT_USER_ID,
             &claude.id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"x": 1})),
@@ -1665,7 +1826,7 @@ mod tests {
         .await
         .unwrap();
 
-        reg.apply_handshake_inner(&claude.id, &AgentHandshake::default())
+        reg.apply_handshake_inner(SYSTEM_DEFAULT_USER_ID, &claude.id, &AgentHandshake::default())
             .await
             .unwrap();
 

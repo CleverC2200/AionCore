@@ -140,6 +140,7 @@ pub(super) async fn build(
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
+        ctx.user_id.clone(),
         arc.agent_id().to_owned(),
         crate::IAgentTask::subscribe(arc.as_ref()),
         catalog_tx,
