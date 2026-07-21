@@ -4,7 +4,7 @@
 //! T7 (current user), T8 (change password), T9 (refresh token),
 //! T10 (ws token), T11 (QR login).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -13,7 +13,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, auth_routes, hash_password,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionRevokedHook, auth_routes,
+    hash_password,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, init_database_memory};
 
@@ -31,6 +32,14 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
 }
 
 async fn test_app_with_options(local: bool, bootstrap_secret: Option<&str>) -> (Router, TestContext) {
+    test_app_with_options_and_hook(local, bootstrap_secret, None).await
+}
+
+async fn test_app_with_options_and_hook(
+    local: bool,
+    bootstrap_secret: Option<&str>,
+    session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
@@ -51,6 +60,7 @@ async fn test_app_with_options(local: bool, bootstrap_secret: Option<&str>) -> (
             AuthIdentityMode::UserSession
         },
         bootstrap_secret: bootstrap_secret.map(Arc::<str>::from),
+        session_revoked_hook,
         local,
     };
 
@@ -882,7 +892,16 @@ async fn external_session_exchange_rejects_unprovisioned_user() {
 
 #[tokio::test]
 async fn external_session_revoke_invalidates_existing_token() {
-    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let revoked_users = Arc::new(Mutex::new(Vec::new()));
+    let hook_users = revoked_users.clone();
+    let (app, _ctx) = test_app_with_options_and_hook(
+        false,
+        Some("bootstrap-secret"),
+        Some(Arc::new(move |user_id: &str| {
+            hook_users.lock().unwrap().push(user_id.to_owned());
+        })),
+    )
+    .await;
 
     let provision = app
         .clone()
@@ -921,6 +940,10 @@ async fn external_session_revoke_invalidates_existing_token() {
     assert_eq!(revoke.status(), StatusCode::OK);
     let revoke_json = body_json(revoke).await;
     assert_eq!(revoke_json["data"]["session_generation"], 1);
+    assert_eq!(
+        revoked_users.lock().unwrap().as_slice(),
+        &[revoke_json["data"]["user_id"].as_str().unwrap().to_owned()]
+    );
 
     let user_resp = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
     assert_eq!(user_resp.status(), StatusCode::UNAUTHORIZED);

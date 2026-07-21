@@ -37,6 +37,8 @@ use crate::{CookieConfig, JwtService};
 
 const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
 
+pub type SessionRevokedHook = dyn Fn(&str) + Send + Sync;
+
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
         match err {
@@ -71,6 +73,7 @@ pub struct AuthRouterState {
     pub qr_token_store: Arc<QrTokenStore>,
     pub identity_mode: AuthIdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
+    pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
 }
 
@@ -370,6 +373,9 @@ async fn revoke_external_session_handler(
         session_generation = response.session_generation,
         "external core session revoked"
     );
+    if let Some(hook) = &state.session_revoked_hook {
+        hook(&response.user_id);
+    }
     Ok(Json(ApiResponse::ok(response)))
 }
 

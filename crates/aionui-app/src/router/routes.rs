@@ -166,6 +166,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         qr_token_store: services.qr_token_store.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
         bootstrap_secret: services.bootstrap_secret.clone(),
+        session_revoked_hook: {
+            let ws_manager = services.ws_manager.clone();
+            Some(Arc::new(move |user_id: &str| {
+                ws_manager.disconnect_user(user_id, "session revoked");
+            }))
+        },
         local: services.local,
     };
 
