@@ -134,6 +134,14 @@ pub struct AssistantServiceDeps {
     pub agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
 }
 
+struct GeneratedAssistantReconcileContext<'a> {
+    definitions: &'a [AssistantDefinitionRow],
+    has_existing_generated: bool,
+    existing_min_sort_order: i32,
+    missing_generated_count: usize,
+    missing_index: &'a mut usize,
+}
+
 impl AssistantService {
     /// Construct an `AssistantService` pinned to the runtime data directory.
     ///
@@ -512,11 +520,13 @@ impl AssistantService {
                 .reconcile_generated_assistant(
                     user_id,
                     row,
-                    &definitions,
-                    has_existing_generated,
-                    existing_min_sort_order,
-                    missing_generated_count,
-                    &mut missing_index,
+                    GeneratedAssistantReconcileContext {
+                        definitions: &definitions,
+                        has_existing_generated,
+                        existing_min_sort_order,
+                        missing_generated_count,
+                        missing_index: &mut missing_index,
+                    },
                 )
                 .await
             {
@@ -535,13 +545,10 @@ impl AssistantService {
         &self,
         user_id: &str,
         row: &AgentManagementRow,
-        definitions: &[AssistantDefinitionRow],
-        has_existing_generated: bool,
-        existing_min_sort_order: i32,
-        missing_generated_count: usize,
-        missing_index: &mut usize,
+        context: GeneratedAssistantReconcileContext<'_>,
     ) -> Result<(), AssistantError> {
-        let existing_definition = definitions
+        let existing_definition = context
+            .definitions
             .iter()
             .find(|definition| {
                 definition.source == "generated" && definition.source_ref.as_deref() == Some(row.id.as_str())
@@ -638,10 +645,12 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("get generated assistant overlay: {e}")))?
             .is_none()
         {
-            let current_missing_index = *missing_index;
-            *missing_index += 1;
-            let initial_generated_sort_order = if !has_existing_generated && missing_generated_count > 0 {
-                existing_min_sort_order as i64 - missing_generated_count as i64 + current_missing_index as i64
+            let current_missing_index = *context.missing_index;
+            *context.missing_index += 1;
+            let initial_generated_sort_order = if !context.has_existing_generated && context.missing_generated_count > 0
+            {
+                context.existing_min_sort_order as i64 - context.missing_generated_count as i64
+                    + current_missing_index as i64
             } else {
                 row.sort_order
             };
