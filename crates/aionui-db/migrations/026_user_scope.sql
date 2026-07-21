@@ -133,6 +133,10 @@ ALTER TABLE remote_agents
     ADD COLUMN user_id TEXT NOT NULL DEFAULT 'system_default_user';
 CREATE INDEX IF NOT EXISTS idx_remote_agents_user_status ON remote_agents(user_id, status);
 
+CREATE TEMP TABLE user_scope_rebuild_checks (
+    ok INTEGER NOT NULL CHECK (ok = 1)
+);
+
 CREATE TABLE mcp_servers_new (
     id               TEXT PRIMARY KEY NOT NULL,
     user_id          TEXT    NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
@@ -163,6 +167,13 @@ SELECT
     builtin, deleted_at, created_at, updated_at
 FROM mcp_servers;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM mcp_servers_new) = (SELECT COUNT(*) FROM mcp_servers)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE mcp_servers;
 ALTER TABLE mcp_servers_new RENAME TO mcp_servers;
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_name ON mcp_servers(user_id, name);
@@ -190,6 +201,13 @@ SELECT
     expires_at, created_at, updated_at
 FROM oauth_tokens;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM oauth_tokens_new) = (SELECT COUNT(*) FROM oauth_tokens)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE oauth_tokens;
 ALTER TABLE oauth_tokens_new RENAME TO oauth_tokens;
 
@@ -214,6 +232,13 @@ SELECT
 FROM system_settings
 WHERE id = 1;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM system_settings_new) = (SELECT COUNT(*) FROM system_settings WHERE id = 1)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE system_settings;
 ALTER TABLE system_settings_new RENAME TO system_settings;
 
@@ -228,6 +253,13 @@ CREATE TABLE client_preferences_new (
 INSERT INTO client_preferences_new (user_id, key, value, updated_at)
 SELECT 'system_default_user', key, value, updated_at
 FROM client_preferences;
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM client_preferences_new) = (SELECT COUNT(*) FROM client_preferences)
+    THEN 1
+    ELSE 0
+END;
 
 DROP TABLE client_preferences;
 ALTER TABLE client_preferences_new RENAME TO client_preferences;
@@ -300,6 +332,13 @@ SELECT
     command_override, env_override, created_at, updated_at
 FROM agent_metadata;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM agent_metadata_new) = (SELECT COUNT(*) FROM agent_metadata)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE agent_metadata;
 ALTER TABLE agent_metadata_new RENAME TO agent_metadata;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_global_id
@@ -338,6 +377,13 @@ INSERT INTO assistant_overrides_new (
 SELECT
     'system_default_user', assistant_id, enabled, sort_order, last_used_at, updated_at
 FROM assistant_overrides;
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_overrides_new) = (SELECT COUNT(*) FROM assistant_overrides)
+    THEN 1
+    ELSE 0
+END;
 
 DROP TABLE assistant_overrides;
 ALTER TABLE assistant_overrides_new RENAME TO assistant_overrides;
@@ -421,6 +467,13 @@ SELECT
     created_at, updated_at, deleted_at
 FROM assistant_definitions;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_definitions_new) = (SELECT COUNT(*) FROM assistant_definitions)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_definitions;
 ALTER TABLE assistant_definitions_new RENAME TO assistant_definitions;
 
@@ -465,6 +518,13 @@ SELECT
     agent_id_override, last_used_at, created_at, updated_at
 FROM assistant_overlays;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_overlays_new) = (SELECT COUNT(*) FROM assistant_overlays)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_overlays;
 ALTER TABLE assistant_overlays_new RENAME TO assistant_overlays;
 CREATE INDEX IF NOT EXISTS idx_assistant_overlays_user_enabled
@@ -501,6 +561,13 @@ SELECT
     created_at, updated_at, last_thought_level_value
 FROM assistant_preferences;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_preferences_new) = (SELECT COUNT(*) FROM assistant_preferences)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_preferences;
 ALTER TABLE assistant_preferences_new RENAME TO assistant_preferences;
 
@@ -526,6 +593,13 @@ SELECT
     CASE WHEN source IN ('builtin', 'cron') THEN NULL ELSE 'system_default_user' END,
     name, description, path, source, enabled, deleted_at, created_at, updated_at
 FROM skills;
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM skills_new) = (SELECT COUNT(*) FROM skills)
+    THEN 1
+    ELSE 0
+END;
 
 DROP TABLE skills;
 ALTER TABLE skills_new RENAME TO skills;
@@ -567,6 +641,13 @@ SELECT
     last_connected, created_at, updated_at
 FROM assistant_plugins;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_plugins_new) = (SELECT COUNT(*) FROM assistant_plugins)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_plugins;
 ALTER TABLE assistant_plugins_new RENAME TO assistant_plugins;
 CREATE INDEX IF NOT EXISTS idx_assistant_plugins_owner_created_at
@@ -593,10 +674,56 @@ SELECT
     authorized_at, last_active, session_id
 FROM assistant_users;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_users_new) = (SELECT COUNT(*) FROM assistant_users)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_users;
 ALTER TABLE assistant_users_new RENAME TO assistant_users;
 CREATE INDEX IF NOT EXISTS idx_assistant_users_owner_authorized_at
     ON assistant_users(owner_user_id, authorized_at DESC);
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM assistant_sessions s
+        LEFT JOIN assistant_users u ON u.id = s.user_id
+        WHERE u.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM assistant_sessions s
+        LEFT JOIN conversations c ON c.id = s.conversation_id
+        WHERE s.conversation_id IS NOT NULL
+          AND c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM assistant_sessions s
+        JOIN assistant_users u ON u.id = s.user_id
+        JOIN conversations c ON c.id = s.conversation_id
+        WHERE s.conversation_id IS NOT NULL
+          AND c.user_id != u.owner_user_id
+    )
+    THEN 1
+    ELSE 0
+END;
 
 CREATE TABLE assistant_pairing_codes_new (
     code             TEXT NOT NULL,
@@ -620,9 +747,18 @@ SELECT
     requested_at, expires_at, status
 FROM assistant_pairing_codes;
 
+INSERT INTO user_scope_rebuild_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM assistant_pairing_codes_new) = (SELECT COUNT(*) FROM assistant_pairing_codes)
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE assistant_pairing_codes;
 ALTER TABLE assistant_pairing_codes_new RENAME TO assistant_pairing_codes;
 CREATE INDEX IF NOT EXISTS idx_pairing_codes_owner_status
     ON assistant_pairing_codes(owner_user_id, status);
+
+DROP TABLE user_scope_rebuild_checks;
 
 PRAGMA foreign_keys = ON;
