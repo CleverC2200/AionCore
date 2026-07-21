@@ -236,9 +236,8 @@ impl CronService {
         }
 
         self.executor
-            .get_conversation_row(conversation_id)
+            .get_conversation_row_for_user(user_id, conversation_id)
             .await?
-            .filter(|row| row.user_id == user_id)
             .ok_or_else(|| {
                 CronError::Conversation(aionui_conversation::ConversationError::NotFound {
                     id: conversation_id.to_owned(),
@@ -272,9 +271,8 @@ impl CronService {
             && (conversation_id.is_empty()
                 || self
                     .executor
-                    .get_conversation_row(conversation_id)
+                    .get_conversation_row_for_user(user_id, conversation_id)
                     .await?
-                    .filter(|row| row.user_id == user_id)
                     .is_none())
         {
             return Err(CronError::Conversation(

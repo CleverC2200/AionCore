@@ -231,10 +231,13 @@ impl StubConvRepo {
 impl IConversationRepository for StubConvRepo {
     async fn get(
         &self,
-        _user_id: &str,
+        user_id: &str,
         id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
         if let Some(existing) = { self.rows.lock().unwrap().get(id).cloned() } {
+            if existing.user_id != user_id {
+                return Ok(None);
+            }
             self.seed_sqlite_row(&existing).await?;
             return Ok(Some(existing));
         }
@@ -536,6 +539,9 @@ impl IConversationRepository for StubConvRepo {
             }
         };
 
+        if row.user_id != user_id {
+            return Ok(None);
+        }
         self.rows.lock().unwrap().insert(id.to_owned(), row.clone());
         self.seed_sqlite_row(&row).await?;
         Ok(Some(row))

@@ -240,6 +240,17 @@ impl JobExecutor {
             .map_err(CronError::Database)
     }
 
+    pub async fn get_conversation_row_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::ConversationRow>, CronError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await
+            .map_err(CronError::Database)
+    }
+
     pub async fn auto_workspace_to_delete_for_conversation(
         &self,
         conversation_id: &str,
