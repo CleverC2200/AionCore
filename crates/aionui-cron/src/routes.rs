@@ -145,10 +145,11 @@ async fn system_resume(
 
 async fn create_conversation_cron(
     State(state): State<CronRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     headers: HeaderMap,
     body: Result<Json<CreateConversationCronRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CreateConversationCronResponse>>, ApiError> {
-    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let user_id = trusted_header_user_id(&headers, &current_user)?;
     let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
     let Json(req) = body.map_err(ApiError::from)?;
     let resp = state
@@ -160,9 +161,10 @@ async fn create_conversation_cron(
 
 async fn list_conversation_cron(
     State(state): State<CronRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<Vec<CronJobResponse>>>, ApiError> {
-    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let user_id = trusted_header_user_id(&headers, &current_user)?;
     let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
     let jobs = state
         .cron_service
@@ -174,11 +176,12 @@ async fn list_conversation_cron(
 
 async fn update_conversation_cron(
     State(state): State<CronRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Json<UpdateConversationCronRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
-    let user_id = header_value(&headers, "x-aionui-user-id")?;
+    let user_id = trusted_header_user_id(&headers, &current_user)?;
     let conversation_id = header_value(&headers, "x-aionui-conversation-id")?;
     let Json(req) = body.map_err(ApiError::from)?;
     let job = state
@@ -196,6 +199,19 @@ fn header_value(headers: &HeaderMap, name: &'static str) -> Result<String, ApiEr
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| ApiError::BadRequest(format!("missing required header: {name}")))
+}
+
+fn trusted_header_user_id(headers: &HeaderMap, current_user: &CurrentUser) -> Result<String, ApiError> {
+    let header_user_id = header_value(headers, "x-aionui-user-id")?;
+    if header_user_id != current_user.id {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "CRON_HELPER_USER_MISMATCH",
+            "Authenticated user does not match cron helper user header.",
+            None,
+        ));
+    }
+    Ok(header_user_id)
 }
 
 async fn save_skill(
@@ -263,6 +279,40 @@ mod tests {
         headers.insert("x-aionui-user-id", " user_1 ".parse().unwrap());
 
         assert_eq!(header_value(&headers, "x-aionui-user-id").unwrap(), "user_1");
+    }
+
+    #[test]
+    fn trusted_header_user_id_rejects_user_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aionui-user-id", "user_b".parse().unwrap());
+        let current_user = CurrentUser {
+            id: "user_a".to_owned(),
+            username: "alice".to_owned(),
+            user_type: aionui_db::UserType::Aionpro,
+            status: aionui_db::UserStatus::Active,
+        };
+
+        assert!(matches!(
+            trusted_header_user_id(&headers, &current_user),
+            Err(ApiError::Coded {
+                code: "CRON_HELPER_USER_MISMATCH",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn trusted_header_user_id_accepts_authenticated_user() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aionui-user-id", "user_a".parse().unwrap());
+        let current_user = CurrentUser {
+            id: "user_a".to_owned(),
+            username: "alice".to_owned(),
+            user_type: aionui_db::UserType::Aionpro,
+            status: aionui_db::UserStatus::Active,
+        };
+
+        assert_eq!(trusted_header_user_id(&headers, &current_user).unwrap(), "user_a");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use aionui_api_types::{
     CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
     WebSocketMessage,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
 use aionui_conversation::ConversationService;
 use aionui_cron::{CronRouterState, cron_routes};
@@ -32,6 +33,7 @@ use aionui_db::{
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
+use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 
@@ -44,6 +46,15 @@ use aionui_cron::types::JobStatus;
 use tower::ServiceExt;
 
 // ── Test infrastructure ────────────────────────────────────────────
+
+fn current_user(id: &str) -> CurrentUser {
+    CurrentUser {
+        id: id.to_owned(),
+        username: id.to_owned(),
+        user_type: aionui_db::UserType::Local,
+        status: aionui_db::UserStatus::Active,
+    }
+}
 
 async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &[&str]) {
     sqlx::query(
@@ -2553,7 +2564,8 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
-    });
+    })
+    .layer(Extension(current_user("u1")));
 
     let response = app
         .clone()
@@ -2637,7 +2649,8 @@ async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_use
     let app = cron_routes(CronRouterState {
         cron_service: Arc::new(svc),
         conversation_service: (*conv_service).clone(),
-    });
+    })
+    .layer(Extension(current_user("u1")));
 
     let missing_header = app
         .clone()
@@ -2698,9 +2711,9 @@ async fn conversation_cron_routes_reject_missing_headers_unclaimed_and_wrong_use
         )
         .await
         .unwrap();
-    assert_eq!(wrong_user.status(), StatusCode::NOT_FOUND);
+    assert_eq!(wrong_user.status(), StatusCode::FORBIDDEN);
     let body = String::from_utf8(to_bytes(wrong_user.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
-    assert!(body.contains("conv_1"));
+    assert!(body.contains("CRON_HELPER_USER_MISMATCH"));
 }
 
 #[tokio::test]
