@@ -126,7 +126,6 @@ pub struct EnsureExternalSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnsureExternalSessionResponse {
     pub user: PublicUser,
-    pub token: String,
     pub session_generation: i64,
 }
 

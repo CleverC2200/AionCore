@@ -28,6 +28,11 @@ pub struct AuthProvisionService {
     jwt_service: Arc<JwtService>,
 }
 
+pub struct ExternalSessionExchange {
+    pub response: EnsureExternalSessionResponse,
+    pub token: String,
+}
+
 impl AuthProvisionService {
     pub fn new(user_repo: Arc<dyn IUserRepository>, jwt_service: Arc<JwtService>) -> Self {
         Self { user_repo, jwt_service }
@@ -62,7 +67,7 @@ impl AuthProvisionService {
     pub async fn create_external_session(
         &self,
         request: EnsureExternalSessionRequest,
-    ) -> Result<EnsureExternalSessionResponse, ProvisionError> {
+    ) -> Result<ExternalSessionExchange, ProvisionError> {
         let user_type = map_external_user_type(request.user_type)?;
         let user = self
             .user_repo
@@ -80,10 +85,12 @@ impl AuthProvisionService {
             .sign_with_session_generation(&user.id, &username, user.session_generation)?;
         self.user_repo.update_last_login(&user.id).await?;
 
-        Ok(EnsureExternalSessionResponse {
-            user: PublicUser { id: user.id, username },
+        Ok(ExternalSessionExchange {
+            response: EnsureExternalSessionResponse {
+                user: PublicUser { id: user.id, username },
+                session_generation: user.session_generation,
+            },
             token,
-            session_generation: user.session_generation,
         })
     }
 

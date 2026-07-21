@@ -175,6 +175,21 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            cookie
+                .split(',')
+                .find(|part| part.trim_start().starts_with("aionui-session="))
+                .and_then(|part| part.trim_start().strip_prefix("aionui-session="))
+                .and_then(|value| value.split(';').next())
+                .map(str::to_owned)
+        })
+}
+
 /// Helper: login and return (token, user_id).
 async fn login(app: &mut Router, username: &str, password: &str) -> (String, String) {
     let req = json_post(
@@ -885,7 +900,7 @@ async fn external_user_provision_is_idempotent() {
 }
 
 #[tokio::test]
-async fn external_session_exchange_returns_cookie_and_token() {
+async fn external_session_exchange_returns_cookie_without_json_token() {
     let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
 
     let provision = app
@@ -910,11 +925,12 @@ async fn external_session_exchange_returns_cookie_and_token() {
         .unwrap();
     assert_eq!(session.status(), StatusCode::OK);
     assert!(session.headers().get(header::SET_COOKIE).is_some());
+    let token = extract_session_token(&session).unwrap();
     let json = body_json(session).await;
-    let token = json["data"]["token"].as_str().unwrap();
+    assert!(json["data"].get("token").is_none());
     assert_eq!(json["data"]["user"]["username"], "Pro User");
 
-    let user_resp = app.oneshot(get_with_token("/api/auth/user", token)).await.unwrap();
+    let user_resp = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
     assert_eq!(user_resp.status(), StatusCode::OK);
     let user_json = body_json(user_resp).await;
     assert_eq!(user_json["user"]["username"], "Pro User");
@@ -973,9 +989,10 @@ async fn external_session_revoke_invalidates_existing_token() {
         .await
         .unwrap();
     assert_eq!(session.status(), StatusCode::OK);
+    let token = extract_session_token(&session).unwrap();
     let session_json = body_json(session).await;
-    let token = session_json["data"]["token"].as_str().unwrap().to_owned();
     assert_eq!(session_json["data"]["session_generation"], 0);
+    assert!(session_json["data"].get("token").is_none());
 
     let revoke = app
         .clone()

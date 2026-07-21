@@ -354,16 +354,16 @@ async fn create_external_session_handler(
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
     let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
-    let response = service
+    let exchange = service
         .create_external_session(req)
         .await
         .map_err(provision_error_to_api_error)?;
     tracing::info!(
-        user_id = %response.user.id,
+        user_id = %exchange.response.user.id,
         "external core session exchange succeeded"
     );
-    let cookie = state.cookie_config.build_session_cookie(&response.token);
-    Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(response))).into_response())
+    let cookie = state.cookie_config.build_session_cookie(&exchange.token);
+    Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(exchange.response))).into_response())
 }
 
 // ---------------------------------------------------------------------------
