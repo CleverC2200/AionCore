@@ -41,6 +41,10 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
 }
 
 async fn run_migration(pool: &sqlx::SqlitePool, version: i64) {
+    run_migration_result(pool, version).await.unwrap();
+}
+
+async fn run_migration_result(pool: &sqlx::SqlitePool, version: i64) -> Result<(), sqlx::migrate::MigrateError> {
     let full = Migrator::new(Path::new("migrations")).await.unwrap();
     let migrations = full
         .migrations
@@ -54,7 +58,7 @@ async fn run_migration(pool: &sqlx::SqlitePool, version: i64) {
         locking: true,
         no_tx: false,
     };
-    migrator.run(pool).await.unwrap();
+    migrator.run(pool).await
 }
 
 #[tokio::test]
@@ -154,4 +158,58 @@ async fn migration_026_keeps_new_conversation_cron_jobs_unanchored_until_run() {
         .unwrap();
     assert_eq!(row.get::<String, _>("user_id"), "system_default_user");
     assert_eq!(row.get::<String, _>("conversation_id"), "");
+}
+
+#[tokio::test]
+async fn migration_026_rejects_channel_session_cross_user_conversation() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 25).await;
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at)
+         VALUES ('user_b', 'user_b', 'hash', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv_b', 'user_b', 'User B Conversation', 'chat', '{}', 'pending', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_users (
+             id, platform_user_id, platform_type, display_name, authorized_at, last_active, session_id
+         ) VALUES (
+             'channel_user_a', 'platform-user', 'telegram', NULL, 1, NULL, NULL
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_sessions (
+             id, user_id, agent_type, conversation_id, workspace, chat_id, created_at, last_activity
+         ) VALUES (
+             'session_cross_user', 'channel_user_a', 'acp', 'conv_b', NULL, 'chat-1', 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = run_migration_result(&pool, 26).await.unwrap_err();
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected migration error: {err}"
+    );
 }
