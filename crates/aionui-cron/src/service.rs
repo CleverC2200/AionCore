@@ -972,7 +972,7 @@ impl CronService {
             conversation_id: Some(conversation_id.to_owned()),
             ..Default::default()
         };
-        self.repo.update(&job.id, &params).await?;
+        self.repo.update_for_user(&job.user_id, &job.id, &params).await?;
         self.executor
             .bind_cron_job_to_conversation(
                 conversation_id,
@@ -1043,7 +1043,8 @@ impl CronService {
                 {
                     return;
                 }
-                self.update_job_after_success(job_id, &conversation_id).await;
+                self.update_job_after_success(&job.user_id, job_id, &conversation_id)
+                    .await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
                 if let Some(user_id) = owner_user_id.as_deref() {
                     self.emitter.emit_job_executed(user_id, job_id, "ok", None);
@@ -1057,7 +1058,7 @@ impl CronService {
                     retry_count: Some(attempt),
                     ..Default::default()
                 };
-                if let Err(e) = self.repo.update(job_id, &params).await {
+                if let Err(e) = self.repo.update_for_user(&job.user_id, job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update retry count");
                 }
             }
@@ -1073,7 +1074,7 @@ impl CronService {
                     retry_count: Some(0),
                     ..Default::default()
                 };
-                if let Err(e) = self.repo.update(job_id, &params).await {
+                if let Err(e) = self.repo.update_for_user(&job.user_id, job_id, &params).await {
                     error!(job_id, error = %e, "Failed to update skipped status");
                 }
                 self.reschedule_after_execution(&job, scheduled_at).await;
@@ -1088,7 +1089,7 @@ impl CronService {
                 {
                     return;
                 }
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(&job.user_id, job_id, &message).await;
                 self.reschedule_after_execution(&job, scheduled_at).await;
                 if let Some(user_id) = owner_user_id.as_deref() {
                     self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
@@ -1100,11 +1101,11 @@ impl CronService {
     async fn handle_run_now_result(&self, user_id: &str, job_id: &str, result: ExecutionResult) {
         match result {
             ExecutionResult::Success { conversation_id } => {
-                self.update_job_after_success(job_id, &conversation_id).await;
+                self.update_job_after_success(user_id, job_id, &conversation_id).await;
                 self.emitter.emit_job_executed(user_id, job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(user_id, job_id, &message).await;
                 self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
             }
             ExecutionResult::Retrying { attempt } => {
@@ -1112,7 +1113,7 @@ impl CronService {
                     retry_count: Some(attempt),
                     ..Default::default()
                 };
-                if let Err(err) = self.repo.update(job_id, &params).await {
+                if let Err(err) = self.repo.update_for_user(user_id, job_id, &params).await {
                     error!(
                         job_id,
                         error = %err,
@@ -1126,7 +1127,7 @@ impl CronService {
                     retry_count: Some(0),
                     ..Default::default()
                 };
-                if let Err(err) = self.repo.update(job_id, &params).await {
+                if let Err(err) = self.repo.update_for_user(user_id, job_id, &params).await {
                     error!(
                         job_id,
                         error = %err,
@@ -1138,8 +1139,8 @@ impl CronService {
         }
     }
 
-    async fn update_job_after_success(&self, job_id: &str, conversation_id: &str) {
-        let existing_row = match self.repo.get_by_id(job_id).await {
+    async fn update_job_after_success(&self, user_id: &str, job_id: &str, conversation_id: &str) {
+        let existing_row = match self.repo.get_by_id_for_user(user_id, job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
@@ -1165,7 +1166,7 @@ impl CronService {
             conversation_id: needs_conversation_bind.then(|| conversation_id.to_owned()),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(job_id, &params).await {
+        if let Err(e) = self.repo.update_for_user(user_id, job_id, &params).await {
             error!(job_id, error = %e, "Failed to update job after success");
             return;
         }
@@ -1185,8 +1186,8 @@ impl CronService {
         }
     }
 
-    async fn update_job_after_error(&self, job_id: &str, message: &str) {
-        let run_count = match self.repo.get_by_id(job_id).await {
+    async fn update_job_after_error(&self, user_id: &str, job_id: &str, message: &str) {
+        let run_count = match self.repo.get_by_id_for_user(user_id, job_id).await {
             Ok(Some(r)) => r.run_count,
             Ok(None) => return,
             Err(e) => {
@@ -1203,7 +1204,7 @@ impl CronService {
             run_count: Some(run_count + 1),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(job_id, &params).await {
+        if let Err(e) = self.repo.update_for_user(user_id, job_id, &params).await {
             error!(job_id, error = %e, "Failed to update job after error");
         }
     }
@@ -1227,7 +1228,7 @@ impl CronService {
                 next_run_at: Some(None),
                 ..Default::default()
             };
-            if let Err(e) = self.repo.update(&job.id, &params).await {
+            if let Err(e) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
                 error!(job_id = %job.id, error = %e, "Failed to disable at-type job");
             }
             self.scheduler.cancel_job(&job.id);
@@ -1255,7 +1256,7 @@ impl CronService {
             next_run_at: Some(next),
             ..Default::default()
         };
-        if let Err(e) = self.repo.update(&job.id, &params).await {
+        if let Err(e) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(job_id = %job.id, error = %e, "Failed to update next_run_at");
         }
         self.scheduler.reschedule_job(&updated);
@@ -1268,7 +1269,7 @@ impl CronService {
             retry_count: Some(0),
             ..Default::default()
         };
-        if let Err(err) = self.repo.update(&job.id, &params).await {
+        if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(
                 job_id = %job.id,
                 error = %err,
@@ -1317,7 +1318,7 @@ impl CronService {
                 next_run_at: Some(None),
                 ..Default::default()
             };
-            if let Err(err) = self.repo.update(&job.id, &params).await {
+            if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
                 error!(
                     job_id = %job.id,
                     error = %err,
@@ -1333,7 +1334,7 @@ impl CronService {
             next_run_at: Some(next),
             ..Default::default()
         };
-        if let Err(err) = self.repo.update(&job.id, &params).await {
+        if let Err(err) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(
                 job_id = %job.id,
                 error = %err,
@@ -1435,7 +1436,7 @@ impl CronService {
             retry_count: Some(0),
             ..Default::default()
         };
-        if let Err(error) = self.repo.update(&job.id, &params).await {
+        if let Err(error) = self.repo.update_for_user(&job.user_id, &job.id, &params).await {
             error!(job_id = %job.id, error = %error, "Failed to record queue-busy cron skip");
         }
     }
@@ -1522,7 +1523,7 @@ impl CronService {
                 agent_config: Some(Some(agent_config_json)),
                 ..Default::default()
             };
-            match self.repo.update(&row.id, &params).await {
+            match self.repo.update_for_user(&row.user_id, &row.id, &params).await {
                 Ok(()) => cleared += 1,
                 Err(err) => {
                     error!(
