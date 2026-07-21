@@ -349,7 +349,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 /// (Sentry ELECTRON-1BD).
 #[async_trait]
 impl OnConversationDelete for WorkerTaskManagerImpl {
-    async fn on_conversation_deleted(&self, conversation_id: &str) {
+    async fn on_conversation_deleted(&self, _user_id: &str, conversation_id: &str) {
         if let Err(e) = self.kill(conversation_id, Some(AgentKillReason::ConversationDeleted)) {
             warn!(
                 conversation_id,

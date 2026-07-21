@@ -253,9 +253,10 @@ impl JobExecutor {
 
     pub async fn auto_workspace_to_delete_for_conversation(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<PathBuf>, CronError> {
-        let Some(row) = self.get_conversation_row(conversation_id).await? else {
+        let Some(row) = self.get_conversation_row_for_user(user_id, conversation_id).await? else {
             return Ok(None);
         };
         Ok(self

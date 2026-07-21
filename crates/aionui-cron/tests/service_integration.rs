@@ -1081,6 +1081,52 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
     }
 }
 
+fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, workspace: &str) -> CronJobRow {
+    let now = now_ms();
+    CronJobRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        name: id.into(),
+        enabled: true,
+        schedule_kind: "every".into(),
+        schedule_value: "60000".into(),
+        schedule_tz: None,
+        schedule_description: Some("every minute".into()),
+        payload_message: "test message".into(),
+        execution_mode: "existing".into(),
+        agent_config: Some(
+            serde_json::to_string(&CronAgentConfig {
+                name: "Default Assistant".into(),
+                cli_path: None,
+                is_preset: None,
+                assistant_id: Some("assistant-default".into()),
+                custom_agent_id: None,
+                mode: Some("default".into()),
+                model_id: Some("claude-sonnet-4".into()),
+                model: None,
+                config_options: None,
+                workspace: Some(workspace.into()),
+            })
+            .unwrap(),
+        ),
+        conversation_id: conversation_id.into(),
+        conversation_title: Some("Test Conv".into()),
+        created_by: "user".into(),
+        skill_content: None,
+        description: None,
+        created_at: now,
+        updated_at: now,
+        next_run_at: Some(now + 60_000),
+        last_run_at: None,
+        last_status: None,
+        last_error: None,
+        run_count: 0,
+        retry_count: 0,
+        max_retries: 3,
+        queue_enabled: false,
+    }
+}
+
 async fn seed_assistant_definition(
     repo: &Arc<dyn IAssistantDefinitionRepository>,
     definition_id: &str,
@@ -3090,7 +3136,7 @@ async fn cd1_delete_by_conversation_preserves_jobs() {
 
     bc.take_events();
 
-    svc.delete_jobs_by_conversation("conv_cascade").await;
+    svc.delete_jobs_by_conversation("u1", "conv_cascade").await;
 
     assert!(svc.get_job("u1", &job_a.id).await.is_ok());
     assert!(svc.get_job("u1", &job_b.id).await.is_ok());
@@ -3117,7 +3163,7 @@ async fn cd2_delete_by_conversation_no_matching_jobs() {
         .unwrap();
     bc.take_events();
 
-    svc.delete_jobs_by_conversation("conv_nonexistent").await;
+    svc.delete_jobs_by_conversation("u1", "conv_nonexistent").await;
 
     let events = bc.take_events();
     assert!(events.is_empty(), "no events should be emitted when no jobs match");
@@ -3139,7 +3185,7 @@ async fn cd3_on_conversation_delete_trait_preserves_jobs() {
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
-    svc.on_conversation_deleted("conv_trait_del").await;
+    svc.on_conversation_deleted("u1", "conv_trait_del").await;
 
     assert!(svc.get_job("u1", &job.id).await.is_ok());
 
@@ -3185,7 +3231,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
         Some(deleted_workspace_path.to_str().unwrap())
     );
 
-    svc.on_conversation_deleted(&conversation_id).await;
+    svc.on_conversation_deleted("u1", &conversation_id).await;
 
     assert!(svc.get_job("u1", &job.id).await.is_ok());
     let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
@@ -3197,6 +3243,69 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
 
     let events = bc.take_events();
     assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn cd3b_on_conversation_delete_only_clears_current_user_jobs() {
+    use aionui_common::OnConversationDelete;
+
+    let (svc, cron_repo, _bc, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    let conversation_id = format!("conv_workspace_scope_{}", now_ms());
+    let deleted_workspace_path = std::env::temp_dir()
+        .join("conversations")
+        .join(format!("acp-temp-{conversation_id}"));
+    std::fs::create_dir_all(&deleted_workspace_path).unwrap();
+    let deleted_workspace = deleted_workspace_path.to_string_lossy().to_string();
+    conv_repo.set_conversation_extra(
+        &conversation_id,
+        serde_json::json!({
+            "workspace": deleted_workspace,
+        }),
+    );
+
+    let bound_conversation = conv_repo.get("u1", &conversation_id).await.unwrap().unwrap();
+    assert!(
+        conv_service
+            .auto_workspace_to_delete_for_row(&bound_conversation, &conversation_id)
+            .is_some(),
+        "test setup should use a workspace ConversationService will delete"
+    );
+
+    cron_repo
+        .insert(&make_cron_row_with_workspace(
+            "cron_workspace_scope_u1",
+            "u1",
+            &conversation_id,
+            &deleted_workspace,
+        ))
+        .await
+        .unwrap();
+    cron_repo
+        .insert(&make_cron_row_with_workspace(
+            "cron_workspace_scope_u2",
+            "u2",
+            &conversation_id,
+            &deleted_workspace,
+        ))
+        .await
+        .unwrap();
+
+    svc.on_conversation_deleted("u1", &conversation_id).await;
+
+    let u1_row = cron_repo.get_by_id("cron_workspace_scope_u1").await.unwrap().unwrap();
+    let u1_config: CronAgentConfig = serde_json::from_str(u1_row.agent_config.as_deref().unwrap()).unwrap();
+    assert!(
+        u1_config.workspace.is_none(),
+        "deleted conversation owner job should drop cached workspace"
+    );
+
+    let u2_row = cron_repo.get_by_id("cron_workspace_scope_u2").await.unwrap().unwrap();
+    let u2_config: CronAgentConfig = serde_json::from_str(u2_row.agent_config.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        u2_config.workspace.as_deref(),
+        Some(deleted_workspace.as_str()),
+        "other user job must not be changed by the delete hook"
+    );
 }
 
 #[tokio::test]
@@ -3219,7 +3328,7 @@ async fn cd3c_on_conversation_delete_preserves_custom_workspace_on_jobs() {
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
-    svc.on_conversation_deleted(&conversation_id).await;
+    svc.on_conversation_deleted("u1", &conversation_id).await;
 
     let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
@@ -3247,7 +3356,7 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
 
     bc.take_events();
 
-    svc.on_conversation_deleted("conv_generated_run").await;
+    svc.on_conversation_deleted("u1", "conv_generated_run").await;
 
     assert!(
         svc.get_job("u1", &new_conversation_job.id).await.is_ok(),

@@ -2178,8 +2178,8 @@ async fn delete_invokes_registered_hook() {
     struct RecordingHook(Mutex<Vec<String>>);
     #[async_trait::async_trait]
     impl OnConversationDelete for RecordingHook {
-        async fn on_conversation_deleted(&self, conversation_id: &str) {
-            self.0.lock().unwrap().push(conversation_id.to_owned());
+        async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+            self.0.lock().unwrap().push(format!("{user_id}:{conversation_id}"));
         }
     }
 
@@ -2191,7 +2191,7 @@ async fn delete_invokes_registered_hook() {
     svc.delete("user_1", &conv.id).await.unwrap();
 
     let calls = hook.0.lock().unwrap();
-    assert_eq!(calls.as_slice(), &[conv.id]);
+    assert_eq!(calls.as_slice(), &[format!("user_1:{}", conv.id)]);
 }
 
 #[tokio::test]
@@ -2205,8 +2205,8 @@ async fn delete_invokes_registered_hook_before_row_delete() {
 
     #[async_trait::async_trait]
     impl OnConversationDelete for RowVisibleHook {
-        async fn on_conversation_deleted(&self, conversation_id: &str) {
-            let exists = self.repo.get("user_1", conversation_id).await.unwrap().is_some();
+        async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+            let exists = self.repo.get(user_id, conversation_id).await.unwrap().is_some();
             self.observations.lock().unwrap().push(exists);
         }
     }

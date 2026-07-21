@@ -464,8 +464,9 @@ impl ConversationService {
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
-    /// `delete()` removes the conversation row. Used by `aionui-app` to wire up `WorkerTaskManagerImpl`
-    /// (kill the agent process) and `CronService` (cascade-delete cron jobs).
+    /// `delete()` removes the conversation row. Used by `aionui-app` to wire
+    /// up `WorkerTaskManagerImpl` (kill the agent process) and `CronService`
+    /// (clear deleted workspace references from cron jobs).
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
@@ -2139,7 +2140,7 @@ impl ConversationService {
         let hooks: Vec<Arc<dyn OnConversationDelete>> =
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
-            hook.on_conversation_deleted(id).await;
+            hook.on_conversation_deleted(user_id, id).await;
         }
 
         if let Err(err) = self.conversation_repo.delete(user_id, id).await {

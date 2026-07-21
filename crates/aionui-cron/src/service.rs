@@ -1005,7 +1005,7 @@ impl CronService {
         };
         let workspace_to_clear = match self
             .executor
-            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .auto_workspace_to_delete_for_conversation(&job.user_id, conversation_id)
             .await
         {
             Ok(Some(path)) => path,
@@ -1439,10 +1439,10 @@ impl CronService {
         }
     }
 
-    pub async fn delete_jobs_by_conversation(&self, conversation_id: &str) {
+    pub async fn delete_jobs_by_conversation(&self, user_id: &str, conversation_id: &str) {
         let workspace_to_clear = match self
             .executor
-            .auto_workspace_to_delete_for_conversation(conversation_id)
+            .auto_workspace_to_delete_for_conversation(user_id, conversation_id)
             .await
         {
             Ok(value) => value,
@@ -1461,16 +1461,17 @@ impl CronService {
             return;
         };
 
-        self.clear_deleted_workspace_from_jobs(conversation_id, &workspace_to_clear)
+        self.clear_deleted_workspace_from_jobs(user_id, conversation_id, &workspace_to_clear)
             .await;
         debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
     }
 
-    async fn clear_deleted_workspace_from_jobs(&self, conversation_id: &str, workspace_to_clear: &Path) {
-        let jobs = match self.repo.list_by_conversation(conversation_id).await {
+    async fn clear_deleted_workspace_from_jobs(&self, user_id: &str, conversation_id: &str, workspace_to_clear: &Path) {
+        let jobs = match self.repo.list_by_conversation_for_user(user_id, conversation_id).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(
+                    user_id,
                     conversation_id,
                     error = %err,
                     "Failed to list cron jobs for deleted workspace cleanup"
@@ -1962,8 +1963,8 @@ fn fallback_full_auto_mode(runtime_agent_type: &str, backend_hint: Option<&str>)
 
 #[async_trait::async_trait]
 impl aionui_common::OnConversationDelete for CronService {
-    async fn on_conversation_deleted(&self, conversation_id: &str) {
-        self.delete_jobs_by_conversation(conversation_id).await;
+    async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+        self.delete_jobs_by_conversation(user_id, conversation_id).await;
     }
 }
 
