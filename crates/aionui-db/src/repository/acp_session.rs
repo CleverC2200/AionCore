@@ -69,6 +69,9 @@ pub trait IAcpSessionRepository: Send + Sync {
     /// Fetch the full row by conversation id.
     async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError>;
 
+    /// Fetch the full row only when the owning conversation belongs to `user_id`.
+    async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError>;
+
     /// Insert a fresh `acp_session` row. Called by `ConversationService`
     /// when an ACP-type conversation is created; primary-key conflict
     /// surfaces as `DbError::Conflict`.
@@ -78,9 +81,20 @@ pub trait IAcpSessionRepository: Send + Sync {
     /// `session/load` succeeds. Returns `true` when the row existed.
     async fn update_session_id(&self, conversation_id: &str, session_id: &str) -> Result<bool, DbError>;
 
+    /// User-scoped variant of [`IAcpSessionRepository::update_session_id`].
+    async fn update_session_id_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError>;
+
     /// Delete the row. Called by the conversation delete hook — no DB
     /// foreign key, so this must be invoked explicitly.
     async fn delete(&self, conversation_id: &str) -> Result<bool, DbError>;
+
+    /// User-scoped variant of [`IAcpSessionRepository::delete`].
+    async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Decode and return the `session_config.runtime` sub-object.
     /// Returns `None` when the row does not exist or the JSON lacks a
@@ -88,11 +102,26 @@ pub trait IAcpSessionRepository: Send + Sync {
     /// is present but empty.
     async fn load_runtime_state(&self, conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError>;
 
+    /// User-scoped variant of [`IAcpSessionRepository::load_runtime_state`].
+    async fn load_runtime_state_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<PersistedSessionState>, DbError>;
+
     /// Merge a partial runtime update into `session_config.runtime`.
     /// Assumes the row exists (created alongside the conversation);
     /// returns `Ok(false)` when it does not.
     async fn save_runtime_state(
         &self,
+        conversation_id: &str,
+        params: &SaveRuntimeStateParams<'_>,
+    ) -> Result<bool, DbError>;
+
+    /// User-scoped variant of [`IAcpSessionRepository::save_runtime_state`].
+    async fn save_runtime_state_for_user(
+        &self,
+        user_id: &str,
         conversation_id: &str,
         params: &SaveRuntimeStateParams<'_>,
     ) -> Result<bool, DbError>;

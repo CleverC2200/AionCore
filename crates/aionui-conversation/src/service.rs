@@ -1318,7 +1318,7 @@ impl ConversationService {
                 context_usage_json: None,
             };
             self.acp_session_repo
-                .save_runtime_state(conversation_id, &params)
+                .save_runtime_state_for_user(user_id, conversation_id, &params)
                 .await
                 .map_err(|e| ConversationError::internal(format!("Failed to seed acp_session runtime state: {e}")))?;
         }
@@ -2092,7 +2092,7 @@ impl ConversationService {
 
         let runtime_state = self
             .acp_session_repo
-            .load_runtime_state(conversation_id)
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load runtime mode state: {e}")))?;
         let mut config_selections = runtime_state
@@ -2108,7 +2108,7 @@ impl ConversationService {
             ..Default::default()
         };
         self.acp_session_repo
-            .save_runtime_state(conversation_id, &params)
+            .save_runtime_state_for_user(user_id, conversation_id, &params)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to persist runtime mode: {e}")))?;
         Ok(())
@@ -2153,7 +2153,7 @@ impl ConversationService {
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete(id).await {
+        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
             warn!(
                 error = %ErrorChain(&err),
                 "Failed to delete acp_session row on conversation delete"

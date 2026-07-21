@@ -165,7 +165,9 @@ pub(super) async fn build(
     // Hand the service the domain event receiver so it can
     // persist user intent changes without reverse-engineering
     // them from CLI observations.
-    deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
+    deps.acp_agent_service
+        .attach(ctx.user_id, ctx.conversation_id, domain_rx)
+        .await;
 
     Ok(instance)
 }

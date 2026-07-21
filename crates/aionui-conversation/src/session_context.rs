@@ -225,7 +225,7 @@ impl<'a> SessionContextBuilder<'a> {
         let belongs_to_team = team.is_some();
         let session_row = self
             .acp_session_repo
-            .get(&row.id)
+            .get_for_user(&row.user_id, &row.id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session row: {e}")))?;
         self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
@@ -329,7 +329,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         let db_state = self
             .acp_session_repo
-            .load_runtime_state(&row.id)
+            .load_runtime_state_for_user(&row.user_id, &row.id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load acp_session runtime state: {e}")))?;
         let snapshot = db_state.map(decode_persisted_session_state);
@@ -605,11 +605,49 @@ mod tests {
         workspace_root: PathBuf,
         metadata_repo: Arc<dyn IAgentMetadataRepository>,
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
+        pool: sqlx::SqlitePool,
     }
 
     impl TestRepos {
         fn builder(&self) -> SessionContextBuilder<'_> {
             SessionContextBuilder::new(&self.workspace_root, &self.metadata_repo, &self.acp_session_repo)
+        }
+
+        async fn insert_conversation(&self, row: &ConversationRow) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO users \
+                    (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+                 VALUES (?, 'local', ?, 'hash', 'active', 0, ?, ?)",
+            )
+            .bind(&row.user_id)
+            .bind(&row.user_id)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations \
+                    (id, user_id, name, type, extra, model, status, source, \
+                     channel_chat_id, pinned, pinned_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.id)
+            .bind(&row.user_id)
+            .bind(&row.name)
+            .bind(&row.r#type)
+            .bind(&row.extra)
+            .bind(&row.model)
+            .bind(row.status.as_deref().unwrap_or("pending"))
+            .bind(&row.source)
+            .bind(&row.channel_chat_id)
+            .bind(row.pinned)
+            .bind(row.pinned_at)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
         }
     }
 
@@ -657,6 +695,7 @@ mod tests {
             workspace_root,
             metadata_repo,
             acp_session_repo,
+            pool: db.pool().clone(),
         }
     }
 
@@ -802,6 +841,16 @@ mod tests {
     async fn acp_persisted_runtime_is_loaded_before_legacy_seed() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "current_mode_id": "legacy-mode",
+                "current_model_id": "legacy-model"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
@@ -813,12 +862,13 @@ mod tests {
             .unwrap();
         repos
             .acp_session_repo
-            .update_session_id("conv-1", "sess-1")
+            .update_session_id_for_user("user-1", "conv-1", "sess-1")
             .await
             .unwrap();
         repos
             .acp_session_repo
-            .save_runtime_state(
+            .save_runtime_state_for_user(
+                "user-1",
                 "conv-1",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("persisted-mode")),
@@ -829,15 +879,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = row(
-            "acp",
-            serde_json::json!({
-                "backend": "claude",
-                "current_mode_id": "legacy-mode",
-                "current_model_id": "legacy-model"
-            }),
-            None,
-        );
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
@@ -852,6 +893,16 @@ mod tests {
     async fn acp_unassigned_session_runtime_is_startup_seed_not_resume_snapshot() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "current_mode_id": "full-access",
+                "current_model_id": "gpt-5.5"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
@@ -863,7 +914,8 @@ mod tests {
             .unwrap();
         repos
             .acp_session_repo
-            .save_runtime_state(
+            .save_runtime_state_for_user(
+                "user-1",
                 "conv-1",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("full-access")),
@@ -874,15 +926,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = row(
-            "acp",
-            serde_json::json!({
-                "backend": "codex",
-                "current_mode_id": "full-access",
-                "current_model_id": "gpt-5.5"
-            }),
-            None,
-        );
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
@@ -896,6 +939,8 @@ mod tests {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
         upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
@@ -905,7 +950,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);

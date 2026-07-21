@@ -994,6 +994,9 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         Ok(Some(self.row_for(conversation_id)))
     }
+    async fn get_for_user(&self, _user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        self.get(conversation_id).await
+    }
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
             conversation_id: params.conversation_id.to_owned(),
@@ -1017,8 +1020,19 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
         *self.session_id.lock().unwrap() = Some(session_id.to_owned());
         Ok(true)
     }
+    async fn update_session_id_for_user(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        self.update_session_id(conversation_id, session_id).await
+    }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
+        self.delete(conversation_id).await
     }
     async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
         Ok(Some(self.runtime_state.lock().unwrap().clone().unwrap_or(
@@ -1027,6 +1041,13 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
                 ..Default::default()
             },
         )))
+    }
+    async fn load_runtime_state_for_user(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<PersistedSessionState>, DbError> {
+        self.load_runtime_state(conversation_id).await
     }
     async fn save_runtime_state(
         &self,
@@ -1040,6 +1061,14 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
             config_selections_json: params.config_selections_json.map(|outer| outer.map(ToOwned::to_owned)),
         });
         Ok(true)
+    }
+    async fn save_runtime_state_for_user(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        params: &SaveRuntimeStateParams<'_>,
+    ) -> Result<bool, DbError> {
+        self.save_runtime_state(conversation_id, params).await
     }
 }
 

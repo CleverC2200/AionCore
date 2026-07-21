@@ -135,6 +135,7 @@ impl ConversationService {
 
     async fn clear_persisted_acp_model_after_model_not_found(
         &self,
+        user_id: &str,
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
@@ -148,11 +149,16 @@ impl ConversationService {
             return;
         }
 
-        let previous_model_id = match self.acp_session_repo().load_runtime_state(conversation_id).await {
+        let previous_model_id = match self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await
+        {
             Ok(Some(state)) => state.current_model_id,
             Ok(None) => None,
             Err(err) => {
                 warn!(
+                    user_id,
                     conversation_id,
                     error = %err,
                     "Failed to load ACP persisted model before clearing after model_not_found"
@@ -167,11 +173,12 @@ impl ConversationService {
         };
         match self
             .acp_session_repo()
-            .save_runtime_state(conversation_id, &params)
+            .save_runtime_state_for_user(user_id, conversation_id, &params)
             .await
         {
             Ok(true) => {
                 info!(
+                    user_id,
                     conversation_id,
                     ?previous_model_id,
                     error_code = ?error_code,
@@ -181,6 +188,7 @@ impl ConversationService {
             }
             Ok(false) => {
                 warn!(
+                    user_id,
                     conversation_id,
                     ?previous_model_id,
                     error_code = ?error_code,
@@ -190,6 +198,7 @@ impl ConversationService {
             }
             Err(err) => {
                 warn!(
+                    user_id,
                     conversation_id,
                     ?previous_model_id,
                     error = %err,
@@ -227,7 +236,7 @@ impl ConversationService {
         task_manager
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
             .await;
-        self.clear_persisted_acp_model_after_model_not_found(conversation_id, error_code)
+        self.clear_persisted_acp_model_after_model_not_found(user_id, conversation_id, error_code)
             .await;
         self.clear_conversation_model_seed_after_model_not_found(user_id, conversation_id, error_code)
             .await;
