@@ -270,15 +270,17 @@ fn preview_error_code(error: &OfficeError) -> &'static str {
 
 async fn ppt_proxy(
     State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<ProxyPortPath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let path = params.path.as_deref().unwrap_or("/");
-    proxy_forward(state, params.port, path, DocType::Ppt, &headers).await
+    proxy_forward(state, &user.id, params.port, path, DocType::Ppt, &headers).await
 }
 
 async fn office_watch_proxy(
     State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<ProxyPortPath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -290,7 +292,7 @@ async fn office_watch_proxy(
 
     let proxy_resp = state
         .proxy_service
-        .forward_watch(params.port, path, &request_headers)
+        .forward_watch_for_user(&user.id, params.port, path, &request_headers)
         .await?;
 
     let status = StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -307,6 +309,7 @@ async fn office_watch_proxy(
 
 async fn proxy_forward(
     state: OfficeRouterState,
+    user_id: &str,
     port: u16,
     path: &str,
     doc_type: DocType,
@@ -319,7 +322,7 @@ async fn proxy_forward(
 
     let proxy_resp = state
         .proxy_service
-        .forward(port, path, doc_type, &request_headers)
+        .forward_for_user(user_id, port, path, doc_type, &request_headers)
         .await?;
 
     let status = StatusCode::from_u16(proxy_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

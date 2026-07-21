@@ -49,6 +49,7 @@ pub trait ProcessHandle: Send + Sync {
 // ---------------------------------------------------------------------------
 
 struct WatchSession {
+    user_id: String,
     port: u16,
     process: Box<dyn ProcessHandle>,
     file_path: String,
@@ -141,6 +142,7 @@ impl OfficecliWatchManager {
                     self.sessions.insert(
                         key,
                         WatchSession {
+                            user_id: user_id.to_owned(),
                             port,
                             process,
                             file_path: resolved.to_owned(),
@@ -232,10 +234,22 @@ impl OfficecliWatchManager {
             .any(|entry| entry.port == port && entry.doc_type == doc_type)
     }
 
+    pub fn is_active_port_for_user(&self, user_id: &str, port: u16, doc_type: DocType) -> bool {
+        self.sessions
+            .iter()
+            .any(|entry| entry.user_id == user_id && entry.port == port && entry.doc_type == doc_type)
+    }
+
     pub fn is_active_watch_port(&self, port: u16) -> bool {
         self.sessions
             .iter()
             .any(|entry| entry.port == port && matches!(entry.doc_type, DocType::Word | DocType::Excel))
+    }
+
+    pub fn is_active_watch_port_for_user(&self, user_id: &str, port: u16) -> bool {
+        self.sessions.iter().any(|entry| {
+            entry.user_id == user_id && entry.port == port && matches!(entry.doc_type, DocType::Word | DocType::Excel)
+        })
     }
 
     pub fn active_session_count(&self) -> usize {
@@ -744,7 +758,10 @@ mod tests {
         mgr.stop_for_user("user-a", path, DocType::Word).await;
         assert_eq!(mgr.active_session_count(), 1);
         assert!(!mgr.is_active_port(user_a_port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("user-a", user_a_port, DocType::Word));
         assert!(mgr.is_active_port(user_b_port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("user-b", user_b_port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("user-a", user_b_port, DocType::Word));
 
         mgr.stop_for_user("user-b", path, DocType::Word).await;
         assert_eq!(mgr.active_session_count(), 0);
@@ -836,6 +853,8 @@ mod tests {
 
         let port = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
         assert!(mgr.is_active_port(port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("system_default_user", port, DocType::Word));
+        assert!(!mgr.is_active_port_for_user("other-user", port, DocType::Word));
         assert!(!mgr.is_active_port(port, DocType::Ppt));
         assert!(!mgr.is_active_port(12345, DocType::Word));
     }
@@ -860,6 +879,9 @@ mod tests {
 
         assert!(mgr.is_active_watch_port(word_port));
         assert!(mgr.is_active_watch_port(excel_port));
+        assert!(mgr.is_active_watch_port_for_user("system_default_user", word_port));
+        assert!(mgr.is_active_watch_port_for_user("system_default_user", excel_port));
+        assert!(!mgr.is_active_watch_port_for_user("other-user", word_port));
         assert!(!mgr.is_active_watch_port(ppt_port));
         assert!(!mgr.is_active_watch_port(12345));
     }

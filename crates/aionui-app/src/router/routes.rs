@@ -253,8 +253,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Office proxy routes — exempt from auth (serve iframe content)
-    let office_proxy = office_proxy_routes(states.office);
+    // Office proxy routes serve iframe content but still require auth so
+    // preview ports remain scoped to the active Core user.
+    let office_proxy =
+        office_proxy_routes(states.office).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let public_assets = asset_routes(AssetRouterState::default());
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
