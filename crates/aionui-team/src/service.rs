@@ -296,15 +296,11 @@ impl TeamSessionService {
     }
 
     async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
-        let row = self
+        self
             .repo
-            .get_team_for_restore(team_id)
+            .get_team(user_id, team_id)
             .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden("team belongs to another user".into()));
-        }
-        Ok(row)
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
     }
 
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
