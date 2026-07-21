@@ -32,12 +32,13 @@ async fn test_app_with_local(local: bool) -> (Router, TestContext) {
 }
 
 async fn test_app_with_options(local: bool, bootstrap_secret: Option<&str>) -> (Router, TestContext) {
-    test_app_with_options_and_hook(local, bootstrap_secret, None).await
+    test_app_with_options_and_hook(local, bootstrap_secret, false, None).await
 }
 
 async fn test_app_with_options_and_hook(
     local: bool,
     bootstrap_secret: Option<&str>,
+    aionpro_mode: bool,
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
 ) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
@@ -62,6 +63,7 @@ async fn test_app_with_options_and_hook(
         bootstrap_secret: bootstrap_secret.map(Arc::<str>::from),
         session_revoked_hook,
         local,
+        aionpro_mode,
     };
 
     let app = auth_routes(state);
@@ -748,6 +750,19 @@ async fn t11_5_qr_login_missing_token() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn qr_login_rejects_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    let qr_token = ctx.qr_token_store.generate();
+
+    let body = format!(r#"{{"qr_token":"{qr_token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/qr-login", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
 // ===========================================================================
 // QR Login Page (GET /qr-login)
 // ===========================================================================
@@ -897,6 +912,7 @@ async fn external_session_revoke_invalidates_existing_token() {
     let (app, _ctx) = test_app_with_options_and_hook(
         false,
         Some("bootstrap-secret"),
+        false,
         Some(Arc::new(move |user_id: &str| {
             hook_users.lock().unwrap().push(user_id.to_owned());
         })),

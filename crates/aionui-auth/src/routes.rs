@@ -75,6 +75,7 @@ pub struct AuthRouterState {
     pub bootstrap_secret: Option<Arc<str>>,
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
+    pub aionpro_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -791,6 +792,15 @@ async fn qr_login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<QrLoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if state.aionpro_mode {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        ));
+    }
+
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Validate and consume QR token (one-time use)
