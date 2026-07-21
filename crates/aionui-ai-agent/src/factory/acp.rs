@@ -7,9 +7,10 @@ use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
+use crate::registry::AgentRegistry;
 use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
-use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -31,16 +32,7 @@ pub(super) async fn build(
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
-    let meta = if let Some(ref agent_id) = config.agent_id {
-        deps.agent_registry.get(agent_id).await
-    } else if let Some(ref vendor) = config.backend {
-        deps.agent_registry
-            .find_builtin_by_backend_for_user(&ctx.user_id, vendor)
-            .await
-    } else {
-        None
-    }
-    .ok_or_else(|| AgentError::bad_request("ACP agent requires either agent_id or backend in extra"))?;
+    let meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
@@ -175,6 +167,30 @@ pub(super) async fn build(
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
 
     Ok(instance)
+}
+
+async fn resolve_catalog_metadata(
+    registry: &Arc<AgentRegistry>,
+    config: &aionui_api_types::AcpBuildExtra,
+    user_id: &str,
+) -> Result<AgentMetadata, AgentError> {
+    if let Some(ref agent_id) = config.agent_id {
+        return registry
+            .get_for_user(user_id, agent_id)
+            .await?
+            .ok_or_else(|| AgentError::bad_request("ACP agent_id is not available for this user"));
+    }
+
+    if let Some(ref vendor) = config.backend {
+        return registry
+            .find_builtin_by_backend_for_user(user_id, vendor)
+            .await
+            .ok_or_else(|| AgentError::bad_request("ACP backend is not available for this user"));
+    }
+
+    Err(AgentError::bad_request(
+        "ACP agent requires either agent_id or backend in extra",
+    ))
 }
 
 async fn resolve_agent_command_spec(
@@ -530,6 +546,10 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::AcpBuildExtra;
+    use aionui_db::{
+        IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
+    };
     use aionui_realtime::BroadcastEventBus;
     use aionui_runtime::{ManagedResourcesMode, init as init_runtime, set_managed_resources_mode};
     use std::sync::OnceLock;
@@ -586,6 +606,84 @@ mod tests {
 
     fn is_npx_command_path(command: &str) -> bool {
         command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
+    }
+
+    async fn seed_user(pool: &sqlx::SqlitePool, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 0, 0)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn custom_agent_params<'a>(id: &'a str, name: &'a str, command: &'a str) -> UpsertAgentMetadataParams<'a> {
+        UpsertAgentMetadataParams {
+            id,
+            icon: None,
+            name,
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("custom"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"custom"}"#),
+            enabled: true,
+            command: Some(command),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_catalog_metadata_rejects_other_users_custom_agent_id() {
+        let db = init_database_memory().await.unwrap();
+        seed_user(db.pool(), "user-a").await;
+        seed_user(db.pool(), "user-b").await;
+
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        repo.upsert_for_user(
+            "user-b",
+            &custom_agent_params("custom-agent-b", "User B Agent", &command),
+        )
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+        let config = AcpBuildExtra {
+            agent_id: Some("custom-agent-b".to_owned()),
+            ..Default::default()
+        };
+
+        let err = resolve_catalog_metadata(&registry, &config, "user-a")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not available for this user"),
+            "unexpected error: {err}"
+        );
+
+        let meta = resolve_catalog_metadata(&registry, &config, "user-b").await.unwrap();
+        assert_eq!(meta.id, "custom-agent-b");
     }
 
     #[cfg(unix)]
