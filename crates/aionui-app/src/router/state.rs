@@ -880,12 +880,16 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
+    let identity_mode = services.identity_mode;
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
         Box::pin(async move {
             let payload = jwt_service.verify(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
+            if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
+                return None;
+            }
             (payload.session_generation == user.session_generation).then_some(user.id)
         })
     });
@@ -1082,6 +1086,27 @@ mod tests {
             .user_repo
             .increment_session_generation("system_default_user")
             .await
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token).await;
+        assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_aionpro_rejects_local_user_token() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            identity_mode: IdentityMode::AionPro,
+            bootstrap_secret: Some("bootstrap-secret".to_owned()),
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let ws_state = build_ws_state(&services);
+        let token = services
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 0)
             .unwrap();
 
         let resolved = (ws_state.token_user_resolver)(token).await;
