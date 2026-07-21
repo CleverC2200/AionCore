@@ -983,6 +983,8 @@ mod tests {
 
     impl IMockAgent for ChannelStateNoopAgent {}
 
+    type CapturedRuntimeEnv = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
     fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(|opts: BuildTaskOptions| {
             Box::pin(async move {
@@ -996,9 +998,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    fn capturing_worker_task_manager(
-        captured_env: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-    ) -> Arc<dyn IWorkerTaskManager> {
+    fn capturing_worker_task_manager(captured_env: CapturedRuntimeEnv) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -1015,7 +1015,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &CapturedRuntimeEnv) -> Vec<(String, String)> {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;
