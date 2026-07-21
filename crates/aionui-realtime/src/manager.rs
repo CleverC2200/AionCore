@@ -79,6 +79,49 @@ impl WebSocketManager {
             .count()
     }
 
+    /// Close and remove every active connection authenticated as `user_id`.
+    ///
+    /// Returns the number of connections removed. The close is best-effort:
+    /// saturated or already-closed outbound queues are still removed from the
+    /// manager so no future events are delivered to revoked sessions.
+    pub fn disconnect_user(&self, user_id: &str, reason: &str) -> usize {
+        let mut to_remove = Vec::new();
+
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+
+            let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, reason);
+            match client.tx.try_send(outbound) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                    to_remove.push(conn_id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id = %user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user disconnect close dropped"
+                    );
+                    to_remove.push(conn_id);
+                }
+            }
+        }
+
+        for conn_id in &to_remove {
+            self.remove_client(*conn_id);
+        }
+
+        let removed = to_remove.len();
+        if removed > 0 {
+            info!(user_id = %user_id, removed, "websocket user connections disconnected");
+        }
+        removed
+    }
+
     /// Send a message to all connected clients.
     ///
     /// Uses `try_send` for backpressure. A saturated channel cannot reliably
@@ -439,6 +482,50 @@ mod tests {
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_err());
         assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn disconnect_user_closes_and_removes_only_matching_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = new_client_tx();
+        let (tx2, mut rx2) = new_client_tx();
+        let (tx3, mut rx3) = new_client_tx();
+
+        mgr.add_client_for_user("user-a".into(), "t1".into(), tx1);
+        mgr.add_client_for_user("user-b".into(), "t2".into(), tx2);
+        mgr.add_client_for_user("user-a".into(), "t3".into(), tx3);
+
+        let removed = mgr.disconnect_user("user-a", "session revoked");
+
+        assert_eq!(removed, 2);
+        assert_eq!(mgr.client_count_for_user("user-a"), 0);
+        assert_eq!(mgr.client_count_for_user("user-b"), 1);
+        for msg in [rx1.try_recv().unwrap(), rx3.try_recv().unwrap()] {
+            match msg {
+                WsOutbound::TextThenClose(text, code, reason) => {
+                    assert_realtime_auth_expired(&text);
+                    assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+                    assert_eq!(reason, "session revoked");
+                }
+                other => panic!("expected terminal auth close, got {other:?}"),
+            }
+        }
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnect_user_removes_matching_connections_when_queue_is_full() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::Text("queued".into())).unwrap();
+        mgr.add_client_for_user("user-a".into(), "token".into(), tx);
+
+        let removed = mgr.disconnect_user("user-a", "session revoked");
+
+        assert_eq!(removed, 1);
+        assert_eq!(mgr.client_count(), 0);
+        assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
