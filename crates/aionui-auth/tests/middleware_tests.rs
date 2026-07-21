@@ -131,10 +131,18 @@ async fn auth_app(jwt_service: Arc<JwtService>) -> Router {
 }
 
 fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
+    protected_auth_app_with_mode(jwt_service, user_repo, AuthIdentityMode::UserSession)
+}
+
+fn protected_auth_app_with_mode(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    identity_mode: AuthIdentityMode,
+) -> Router {
     let state = AuthState {
         jwt_service,
         user_repo,
-        identity_mode: AuthIdentityMode::UserSession,
+        identity_mode,
     };
 
     Router::new()
@@ -263,6 +271,31 @@ async fn auth_middleware_session_generation_mismatch_returns_unauthorized_code()
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = json_body(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_aionpro_rejects_local_user_token() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let token = jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone()));
+    let app = protected_auth_app_with_mode(jwt_service, repo as Arc<dyn IUserRepository>, AuthIdentityMode::AionPro);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
 }
 
 #[tokio::test]

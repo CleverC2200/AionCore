@@ -175,6 +175,15 @@ fn provision_error_to_api_error(err: ProvisionError) -> ApiError {
     }
 }
 
+fn user_context_required() -> ApiError {
+    ApiError::coded(
+        StatusCode::UNAUTHORIZED,
+        "USER_CONTEXT_REQUIRED",
+        "User context required.",
+        None,
+    )
+}
+
 /// Build the auth router with all endpoints and middleware layers.
 ///
 /// Returns a `Router` with these endpoints:
@@ -205,7 +214,11 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
-        identity_mode: AuthIdentityMode::UserSession,
+        identity_mode: if state.aionpro_mode {
+            AuthIdentityMode::AionPro
+        } else {
+            AuthIdentityMode::UserSession
+        },
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -388,6 +401,10 @@ async fn login_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if state.aionpro_mode {
+        return Err(user_context_required());
+    }
+
     let Json(req) = body.map_err(ApiError::from)?;
 
     // Input length validation (per API spec)
@@ -735,6 +752,10 @@ async fn refresh_handler(
         })?
         .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
 
+    if state.aionpro_mode && user.user_type != aionui_db::UserType::Aionpro {
+        return Err(user_context_required());
+    }
+
     if payload.session_generation != user.session_generation {
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
@@ -793,12 +814,7 @@ async fn qr_login_handler(
     body: Result<Json<QrLoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     if state.aionpro_mode {
-        return Err(ApiError::coded(
-            StatusCode::UNAUTHORIZED,
-            "USER_CONTEXT_REQUIRED",
-            "User context required.",
-            None,
-        ));
+        return Err(user_context_required());
     }
 
     let Json(req) = body.map_err(ApiError::from)?;

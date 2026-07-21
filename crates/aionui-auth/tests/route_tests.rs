@@ -57,6 +57,8 @@ async fn test_app_with_options_and_hook(
         qr_token_store: qr_token_store.clone(),
         identity_mode: if local {
             AuthIdentityMode::Local
+        } else if aionpro_mode {
+            AuthIdentityMode::AionPro
         } else {
             AuthIdentityMode::UserSession
         },
@@ -266,6 +268,21 @@ async fn t4_4_login_missing_fields() {
     let req = json_post("/login", r#"{}"#);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn login_rejects_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+
+    let resp = app
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
 }
 
 #[tokio::test]
@@ -630,6 +647,22 @@ async fn t9_3_refresh_missing_token() {
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn refresh_rejects_local_user_token_in_aionpro_mode() {
+    let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    let token = ctx
+        .jwt_service
+        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .unwrap();
+
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
 }
 
 // ===========================================================================

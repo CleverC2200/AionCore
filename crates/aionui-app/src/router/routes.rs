@@ -336,10 +336,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 }
 
 fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentityMode {
-    if identity_mode.is_local() {
-        AuthIdentityMode::Local
-    } else {
-        AuthIdentityMode::UserSession
+    match identity_mode {
+        crate::config::IdentityMode::Local => AuthIdentityMode::Local,
+        crate::config::IdentityMode::WebUi => AuthIdentityMode::UserSession,
+        crate::config::IdentityMode::AionPro => AuthIdentityMode::AionPro,
     }
 }
 

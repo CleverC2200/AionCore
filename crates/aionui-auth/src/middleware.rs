@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -16,6 +17,7 @@ use crate::extract::extract_token_from_headers;
 pub enum AuthIdentityMode {
     Local,
     UserSession,
+    AionPro,
 }
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -92,6 +94,15 @@ pub async fn auth_middleware(
             ApiError::Internal("Authentication service unavailable".into())
         })?
         .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+
+    if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        ));
+    }
 
     if payload.session_generation != user.session_generation {
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
