@@ -3790,11 +3790,15 @@ async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
         ),
         context_usage_json: None,
     }));
-    let (svc, _, _, _) = make_service_with_resolver_and_acp_session_repo(
+    let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
         Arc::new(FixedSkillResolver { names: vec![] }),
         acp_repo.clone(),
     );
-    svc.save_acp_runtime_mode("conv_1", "full-access").await.unwrap();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    svc.save_acp_runtime_mode("user_1", &conv.id, "full-access")
+        .await
+        .unwrap();
 
     let saves = acp_repo.runtime_state_saves();
     assert_eq!(saves.len(), 1);
@@ -3804,6 +3808,27 @@ async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
     assert_eq!(selections["mode"], "full-access");
     assert_eq!(selections["model"], "gpt-5.3-codex");
     assert_eq!(selections["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_rejects_wrong_user() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_runtime_state(PersistedSessionState {
+        current_mode_id: Some("read-only".to_owned()),
+        ..Default::default()
+    }));
+    let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let err = svc
+        .save_acp_runtime_mode("user_2", &conv.id, "full-access")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::NotFound { .. }));
+    assert!(acp_repo.runtime_state_saves().is_empty());
 }
 
 #[tokio::test]

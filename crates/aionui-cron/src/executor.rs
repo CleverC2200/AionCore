@@ -372,7 +372,7 @@ impl JobExecutor {
 
         if is_acp_conversation && let Some(mode) = session_mode {
             self.conversation_service
-                .save_acp_runtime_mode(conversation_id, mode)
+                .save_acp_runtime_mode(&row.user_id, conversation_id, mode)
                 .await?;
         }
 

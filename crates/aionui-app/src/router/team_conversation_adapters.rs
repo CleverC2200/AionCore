@@ -281,8 +281,9 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
-            .save_acp_runtime_mode(conversation_id, mode)
+            .save_acp_runtime_mode(&user_id, conversation_id, mode)
             .await
             .map_err(map_conversation_update_error)
     }

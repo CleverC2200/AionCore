@@ -2076,7 +2076,19 @@ impl ConversationService {
         Ok(())
     }
 
-    pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), ConversationError> {
+    pub async fn save_acp_runtime_mode(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        mode: &str,
+    ) -> Result<(), ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
         let runtime_state = self
             .acp_session_repo
             .load_runtime_state(conversation_id)
