@@ -1318,7 +1318,7 @@ async fn resolve_top_level_selectors(
         object.insert("conversation_id".into(), Value::String(env.conversation_id.clone()));
         selectors.insert("conversation_id", env.conversation_id.clone());
     }
-    if is_current_selector(object.get("user_id")) {
+    if object.contains_key("user_id") {
         object.insert("user_id".into(), Value::String(env.user_id.clone()));
         selectors.insert("user_id", env.user_id.clone());
     }
@@ -1798,5 +1798,27 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[tokio::test]
+    async fn top_level_user_id_is_always_bound_to_config_env() {
+        let client = reqwest::Client::new();
+        let env = ConfigEnv {
+            base_url: "http://127.0.0.1".into(),
+            conversation_id: "conv-current".into(),
+            user_id: "user-current".into(),
+        };
+        let mut payload = json!({
+            "user_id": "user-other",
+            "name": "Task"
+        });
+        let mut selectors = SelectorMeta::default();
+
+        resolve_top_level_selectors(&client, &env, "config cron jobs update", &mut payload, &mut selectors)
+            .await
+            .unwrap();
+
+        assert_eq!(payload["user_id"], "user-current");
+        assert_eq!(selectors.into_map()["resolved_selectors"]["user_id"], "user-current");
     }
 }
