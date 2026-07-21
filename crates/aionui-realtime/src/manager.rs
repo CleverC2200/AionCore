@@ -267,7 +267,19 @@ impl Default for WebSocketManager {
 
 impl EventBroadcaster for WebSocketManager {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
-        self.broadcast_all(event);
+        let Some(user_id) = event
+            .data
+            .get("user_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        else {
+            warn!(
+                event_name = %event.name,
+                "dropping websocket manager event without user_id"
+            );
+            return;
+        };
+        self.broadcast_to_user(&user_id, event);
     }
 }
 
@@ -791,13 +803,15 @@ mod tests {
     }
 
     #[test]
-    fn event_broadcaster_impl_delegates_to_broadcast_all() {
+    fn event_broadcaster_impl_routes_to_event_user() {
         let mgr = WebSocketManager::new();
         let (tx, mut rx) = new_client_tx();
-        mgr.add_client("tok".into(), tx);
+        mgr.add_client_for_user("user-a".into(), "tok".into(), tx);
+        let (tx_other, mut rx_other) = new_client_tx();
+        mgr.add_client_for_user("user-b".into(), "tok-other".into(), tx_other);
 
         let broadcaster: &dyn EventBroadcaster = &mgr;
-        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({})));
+        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({"user_id": "user-a"})));
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -806,6 +820,19 @@ mod tests {
             }
             _ => panic!("expected Text"),
         }
+        assert!(rx_other.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_broadcaster_impl_drops_unscoped_events() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = new_client_tx();
+        mgr.add_client_for_user("user-a".into(), "tok".into(), tx);
+
+        let broadcaster: &dyn EventBroadcaster = &mgr;
+        broadcaster.broadcast(WebSocketMessage::new("via-trait", json!({})));
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
