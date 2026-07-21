@@ -330,6 +330,29 @@ impl ChannelManager {
         info!("all plugins shut down");
     }
 
+    /// Stops all active plugin connections for one owner user.
+    ///
+    /// Called when an external Core session is revoked so no channel runtime
+    /// continues handling messages for the old account.
+    pub async fn shutdown_for_user(&self, owner_user_id: &str) -> usize {
+        let prefix = format!("{owner_user_id}:");
+        let keys: Vec<String> = self
+            .plugins
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .collect();
+        let stopped = keys.len();
+
+        for key in keys {
+            self.stop_plugin_by_key(&key).await;
+        }
+        if stopped > 0 {
+            info!(owner_user_id = %owner_user_id, stopped, "channel plugins shut down for user");
+        }
+        stopped
+    }
+
     /// Returns the number of currently active (in-memory) plugins.
     pub fn active_plugin_count(&self) -> usize {
         self.plugins.len()
@@ -1455,6 +1478,26 @@ mod tests {
 
         mgr.shutdown().await;
         assert_eq!(mgr.active_plugin_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_for_user_stops_only_matching_owner_plugins() {
+        let (mgr, _repo, _bc) = make_manager();
+        let factory = make_factory();
+
+        mgr.enable_plugin(OWNER_ID, "telegram", &make_test_config(), &factory)
+            .await
+            .unwrap();
+        mgr.enable_plugin("other-owner", "telegram", &make_test_config(), &factory)
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.shutdown_for_user(OWNER_ID).await, 1);
+        assert_eq!(mgr.active_plugin_count(), 1);
+        assert!(!mgr.is_plugin_running(OWNER_ID, "telegram"));
+        assert!(mgr.is_plugin_running("other-owner", "telegram"));
+
+        mgr.shutdown().await;
     }
 
     // ── send_message / edit_message ────────────────────────────────────
