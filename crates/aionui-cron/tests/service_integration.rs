@@ -1071,36 +1071,39 @@ async fn seed_assistant_definition(
     agent_backend: &str,
 ) {
     let agent_id = seeded_agent_id(agent_backend);
-    repo.upsert(&UpsertAssistantDefinitionParams {
-        id: definition_id,
-        assistant_id,
-        source: "user",
-        owner_type: "user",
-        source_ref: Some(assistant_id),
-        name: assistant_id,
-        name_i18n: "{}",
-        description: Some("test assistant"),
-        description_i18n: "{}",
-        avatar_type: "emoji",
-        avatar_value: Some("🤖"),
-        agent_id,
-        rule_resource_type: "user_file",
-        rule_resource_ref: None,
-        recommended_prompts: "[]",
-        recommended_prompts_i18n: "{}",
-        default_model_mode: "auto",
-        default_model_value: None,
-        default_permission_mode: "auto",
-        default_permission_value: None,
-        default_thought_level_mode: "auto",
-        default_thought_level_value: None,
-        default_skills_mode: "auto",
-        default_skill_ids: "[]",
-        custom_skill_names: "[]",
-        default_disabled_builtin_skill_ids: "[]",
-        default_mcps_mode: "auto",
-        default_mcp_ids: "[]",
-    })
+    repo.upsert_for_user(
+        "u1",
+        &UpsertAssistantDefinitionParams {
+            id: definition_id,
+            assistant_id,
+            source: "user",
+            owner_type: "user",
+            source_ref: Some(assistant_id),
+            name: assistant_id,
+            name_i18n: "{}",
+            description: Some("test assistant"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_id,
+            rule_resource_type: "user_file",
+            rule_resource_ref: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        },
+    )
     .await
     .unwrap();
 }
@@ -1121,13 +1124,16 @@ async fn seed_assistant_overlay(
     agent_backend_override: Option<&str>,
 ) {
     let agent_id_override = agent_backend_override.map(seeded_agent_id);
-    repo.upsert(&UpsertAssistantOverlayParams {
-        assistant_definition_id: definition_id,
-        enabled: true,
-        sort_order: 0,
-        agent_id_override,
-        last_used_at: None,
-    })
+    repo.upsert_for_user(
+        "u1",
+        &UpsertAssistantOverlayParams {
+            assistant_definition_id: definition_id,
+            enabled: true,
+            sort_order: 0,
+            agent_id_override,
+            last_used_at: None,
+        },
+    )
     .await
     .unwrap();
 }
