@@ -177,33 +177,36 @@ async fn stop_preview(
 
 async fn list_snapshots(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let snapshots = state.snapshot_service.list(&req.target).await?;
+    let snapshots = state.snapshot_service.list_for_user(&user.id, &req.target).await?;
     Ok(Json(ApiResponse::ok(snapshots)))
 }
 
 async fn save_snapshot(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let info = state.snapshot_service.save(&req.target, &req.content).await?;
+    let info = state
+        .snapshot_service
+        .save_for_user(&user.id, &req.target, &req.content)
+        .await?;
     Ok(Json(ApiResponse::ok(info)))
 }
 
 async fn get_snapshot_content(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .snapshot_service
-        .get_content(&req.target, &req.snapshot_id)
+        .get_content_for_user(&user.id, &req.target, &req.snapshot_id)
         .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
