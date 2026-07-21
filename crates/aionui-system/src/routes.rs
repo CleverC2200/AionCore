@@ -309,21 +309,26 @@ async fn check_update(
 
 async fn ensure_node_runtime(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnsureNodeRuntimeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<EnsureNodeRuntimeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.runtime_prepare_service.ensure_node_runtime(req.scope).await?;
+    let result = state
+        .runtime_prepare_service
+        .ensure_node_runtime_for_user(&user.id, req.scope)
+        .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn ensure_managed_acp_tool(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<EnsureManagedAcpToolRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<EnsureManagedAcpToolResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .runtime_prepare_service
-        .ensure_managed_acp_tool(req.scope, &req.tool_id)
+        .ensure_managed_acp_tool_for_user(&user.id, req.scope, &req.tool_id)
         .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
