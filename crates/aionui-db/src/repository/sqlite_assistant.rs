@@ -296,7 +296,7 @@ impl SqliteAssistantDefinitionRepository {
     ) -> Result<AssistantDefinitionRow, DbError> {
         let now = now_ms();
 
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO assistant_definitions (
                 id, user_id, assistant_id, source, owner_type, source_ref,
                 name, name_i18n, description, description_i18n, avatar_type, avatar_value,
@@ -310,7 +310,6 @@ impl SqliteAssistantDefinitionRepository {
                 created_at, updated_at, deleted_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
-                user_id = excluded.user_id,
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
                 owner_type = excluded.owner_type,
@@ -339,7 +338,8 @@ impl SqliteAssistantDefinitionRepository {
                 default_mcps_mode = excluded.default_mcps_mode,
                 default_mcp_ids = excluded.default_mcp_ids,
                 updated_at = excluded.updated_at,
-                deleted_at = NULL",
+                deleted_at = NULL
+             WHERE assistant_definitions.user_id IS excluded.user_id",
         )
         .bind(params.id)
         .bind(user_id)
@@ -374,6 +374,13 @@ impl SqliteAssistantDefinitionRepository {
         .bind(now)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Assistant definition with id '{}' already exists for another scope",
+                params.id
+            )));
+        }
 
         let row = match user_id {
             Some(user_id) => self.get_by_id_for_user(user_id, params.id).await?,
@@ -1507,6 +1514,61 @@ mod tests {
         assert_eq!(user_a.name, "User A Definition");
         assert_eq!(user_b.id, "def_b");
         assert_eq!(user_b.name, "User B Definition");
+    }
+
+    #[tokio::test]
+    async fn definition_upsert_rejects_cross_scope_id_takeover() {
+        let (d, _s, _p, _db) = setup_v2().await;
+        d.upsert_for_user(
+            USER_A,
+            &definition_params_with_id("shared_def", "assistant-a", Some("ref-a"), "User A Definition"),
+        )
+        .await
+        .unwrap();
+
+        let err = d
+            .upsert_for_user(
+                USER_B,
+                &definition_params_with_id("shared_def", "assistant-b", Some("ref-b"), "User B Definition"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Conflict(_)));
+
+        let user_a = d.get_by_id_for_user(USER_A, "shared_def").await.unwrap().unwrap();
+        assert_eq!(user_a.assistant_id, "assistant-a");
+        assert_eq!(user_a.name, "User A Definition");
+        assert!(d.get_by_id_for_user(USER_B, "shared_def").await.unwrap().is_none());
+
+        d.upsert_global(&builtin_definition_params(
+            "builtin_shared_def",
+            "builtin-a",
+            Some("builtin-a"),
+            "Builtin Definition",
+        ))
+        .await
+        .unwrap();
+        d.upsert_global(&builtin_definition_params(
+            "builtin_shared_def",
+            "builtin-a",
+            Some("builtin-a"),
+            "Builtin Definition Updated",
+        ))
+        .await
+        .unwrap();
+
+        let err = d
+            .upsert_for_user(
+                USER_A,
+                &definition_params_with_id("builtin_shared_def", "user-a", Some("user-a"), "User Definition"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Conflict(_)));
+
+        let global = d.get_by_id("builtin_shared_def").await.unwrap().unwrap();
+        assert_eq!(global.assistant_id, "builtin-a");
+        assert_eq!(global.name, "Builtin Definition Updated");
     }
 
     #[tokio::test]

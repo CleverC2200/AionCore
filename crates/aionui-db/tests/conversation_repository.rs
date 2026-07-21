@@ -1,7 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow,
-    models::MessageRow,
+    ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory,
+    models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -10,6 +10,16 @@ async fn setup() -> (SqliteConversationRepository, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let repo = SqliteConversationRepository::new(db.pool().clone());
     (repo, db)
+}
+
+async fn create_user_2(db: &aionui_db::Database) {
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('user_2', 'other', 'hash', 1000, 1000)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
 }
 
 fn make_conversation(suffix: &str) -> ConversationRow {
@@ -1172,14 +1182,7 @@ async fn delete_artifacts_by_conversation_removes_rows() {
 async fn list_paginated_scoped_to_user() {
     let (repo, db) = setup().await;
 
-    // Create a second user
-    sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-         VALUES ('user_2', 'other', 'hash', 1000, 1000)",
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
+    create_user_2(&db).await;
 
     let c1 = make_conversation("user1-conv");
     repo.create(&c1).await.unwrap();
@@ -1201,4 +1204,81 @@ async fn list_paginated_scoped_to_user() {
         .unwrap();
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].user_id, USER_ID);
+}
+
+#[tokio::test]
+async fn upsert_message_rejects_cross_user_id_takeover() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+
+    let c1 = make_conversation("user1-message");
+    repo.create(&c1).await.unwrap();
+
+    let mut c2 = make_conversation("user2-message");
+    c2.user_id = "user_2".to_string();
+    repo.create(&c2).await.unwrap();
+
+    let mut user_2_msg = make_message(&c2.id, "user 2 original");
+    user_2_msg.id = "shared_msg".to_string();
+    repo.upsert_message("user_2", &user_2_msg).await.unwrap();
+
+    let mut takeover = make_message(&c1.id, "user 1 takeover");
+    takeover.id = "shared_msg".to_string();
+    let err = repo.upsert_message(USER_ID, &takeover).await.unwrap_err();
+    assert!(matches!(err, DbError::Conflict(_)));
+
+    let user_2_messages = repo
+        .list_messages_page(
+            "user_2",
+            &c2.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_2_messages.items.len(), 1);
+    assert_eq!(user_2_messages.items[0].content, r#"{"content":"user 2 original"}"#);
+
+    let user_1_messages = repo
+        .list_messages_page(
+            USER_ID,
+            &c1.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(user_1_messages.items.is_empty());
+}
+
+#[tokio::test]
+async fn upsert_artifact_rejects_cross_user_id_takeover() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+
+    let c1 = make_conversation("user1-artifact");
+    repo.create(&c1).await.unwrap();
+
+    let mut c2 = make_conversation("user2-artifact");
+    c2.user_id = "user_2".to_string();
+    repo.create(&c2).await.unwrap();
+
+    let user_2_artifact = make_artifact(&c2.id, "shared_artifact");
+    repo.upsert_artifact("user_2", &user_2_artifact).await.unwrap();
+
+    let takeover = make_artifact(&c1.id, "shared_artifact");
+    let err = repo.upsert_artifact(USER_ID, &takeover).await.unwrap_err();
+    assert!(matches!(err, DbError::Conflict(_)));
+
+    let user_2_artifacts = repo.list_artifacts("user_2", &c2.id).await.unwrap();
+    assert_eq!(user_2_artifacts.len(), 1);
+    assert_eq!(user_2_artifacts[0].conversation_id, c2.id);
+    assert_eq!(user_2_artifacts[0].payload, user_2_artifact.payload);
+
+    let user_1_artifacts = repo.list_artifacts(USER_ID, &c1.id).await.unwrap();
+    assert!(user_1_artifacts.is_empty());
 }

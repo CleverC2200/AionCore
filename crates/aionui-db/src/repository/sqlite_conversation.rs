@@ -68,7 +68,7 @@ impl SqliteConversationRepository {
     async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         self.ensure_conversation_for_user(user_id, &message.conversation_id)
             .await?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
@@ -96,7 +96,12 @@ impl SqliteConversationRepository {
                 END, \
                 position = COALESCE(messages.position, excluded.position), \
                 hidden = excluded.hidden, \
-                created_at = MIN(messages.created_at, excluded.created_at)",
+                created_at = MIN(messages.created_at, excluded.created_at) \
+             WHERE messages.conversation_id = excluded.conversation_id \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = messages.conversation_id AND c.user_id = ? \
+               )",
         )
         .bind(&message.id)
         .bind(&message.conversation_id)
@@ -107,8 +112,16 @@ impl SqliteConversationRepository {
         .bind(&message.status)
         .bind(message.hidden)
         .bind(message.created_at)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Message with id '{}' already exists outside the requested conversation",
+                message.id
+            )));
+        }
 
         Ok(())
     }
@@ -995,7 +1008,7 @@ impl IConversationRepository for SqliteConversationRepository {
     ) -> Result<ConversationArtifactRow, DbError> {
         self.ensure_conversation_for_user(user_id, &artifact.conversation_id)
             .await?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO conversation_artifacts \
                 (id, conversation_id, cron_job_id, kind, status, payload, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
@@ -1005,7 +1018,12 @@ impl IConversationRepository for SqliteConversationRepository {
                 kind = excluded.kind, \
                 status = excluded.status, \
                 payload = excluded.payload, \
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at \
+             WHERE conversation_artifacts.conversation_id = excluded.conversation_id \
+               AND EXISTS ( \
+                    SELECT 1 FROM conversations c \
+                    WHERE c.id = conversation_artifacts.conversation_id AND c.user_id = ? \
+               )",
         )
         .bind(&artifact.id)
         .bind(&artifact.conversation_id)
@@ -1015,8 +1033,16 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(&artifact.payload)
         .bind(artifact.created_at)
         .bind(artifact.updated_at)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Conversation artifact with id '{}' already exists outside the requested conversation",
+                artifact.id
+            )));
+        }
 
         self.get_artifact(user_id, &artifact.conversation_id, &artifact.id)
             .await?
