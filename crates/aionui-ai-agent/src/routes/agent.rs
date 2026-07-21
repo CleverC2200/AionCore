@@ -97,14 +97,14 @@ async fn provider_health_check(
 
 async fn try_connect_custom(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<TryConnectCustomAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TryConnectCustomAgentResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .try_connect_custom_agent(req)
+            .try_connect_custom_agent(&user.id, req)
             .await
             .map_err(agent_error_to_api_error)?,
     )))

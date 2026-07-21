@@ -205,6 +205,7 @@ async fn test_connection(
         .test_connection_with_runtime_scope(
             &req.name,
             &transport,
+            Some(&user.id),
             req.runtime_scope_id.as_deref().or(req.id.as_deref()),
         )
         .await;

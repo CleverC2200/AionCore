@@ -65,6 +65,7 @@ pub(super) async fn build(
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
+        &ctx.user_id,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
@@ -472,7 +473,7 @@ async fn load_user_mcp_servers(
             continue;
         }
 
-        match row_to_mcp_server_config(&row, conversation_id, broadcaster.clone()).await {
+        match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 servers.insert(row.name.clone(), config);
             }
@@ -493,6 +494,7 @@ async fn load_user_mcp_servers(
 
 async fn row_to_mcp_server_config(
     row: &McpServerRow,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -520,7 +522,7 @@ async fn row_to_mcp_server_config(
                 })
                 .unwrap_or_default();
             let (resolved_command, args, env) =
-                ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, &args, &env_entries, user_id, conversation_id, broadcaster).await?;
 
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
@@ -591,6 +593,7 @@ async fn row_to_mcp_server_config(
 
 async fn session_server_to_mcp_server_config(
     server: &SessionMcpServer,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -601,7 +604,7 @@ async fn session_server_to_mcp_server_config(
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let (command, args, env) =
-                ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
                 command: Some(command),
@@ -664,11 +667,12 @@ async fn session_server_to_mcp_server_config(
 async fn merge_session_snapshot_mcp_servers(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
     session_mcp_servers: &[SessionMcpServer],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) {
     for server in session_mcp_servers {
-        match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
+        match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
@@ -695,10 +699,11 @@ async fn ensure_stdio_launch(
     command: &str,
     args: &[String],
     env: &[(String, String)],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<(String, Vec<String>, HashMap<String, String>), String> {
-    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| error.to_string())?;
@@ -1001,7 +1006,7 @@ mod tests {
             false,
         );
 
-        let config = row_to_mcp_server_config(&row, "conv-row", test_broadcaster())
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
             .await
             .expect("convert");
         let command = config.command.as_deref().expect("resolved command");
@@ -1834,7 +1839,14 @@ mod tests {
             },
         }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
+        merge_session_snapshot_mcp_servers(
+            &mut servers,
+            &snapshot,
+            "user-override",
+            "conv-override",
+            test_broadcaster(),
+        )
+        .await;
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);

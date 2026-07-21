@@ -34,15 +34,15 @@ impl AgentService {
     /// below.
     pub async fn try_connect_custom_agent(
         &self,
+        user_id: &str,
         req: TryConnectCustomAgentRequest,
     ) -> Result<TryConnectCustomAgentResponse, AgentError> {
         if req.command.trim().is_empty() {
             return Err(AgentError::bad_request("command must not be empty"));
         }
-        let reporter = req
-            .runtime_scope_id
-            .as_ref()
-            .map(|scope_id| custom_agent_runtime_reporter(self.broadcaster().clone(), scope_id.clone()));
+        let reporter = req.runtime_scope_id.as_ref().map(|scope_id| {
+            custom_agent_runtime_reporter(self.broadcaster().clone(), user_id.to_owned(), scope_id.clone())
+        });
         Ok(probe(&req.command, &req.acp_args, &req.env, reporter.as_deref()).await)
     }
 

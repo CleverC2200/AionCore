@@ -52,8 +52,14 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    let mut command_spec =
-        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
+    let mut command_spec = resolve_agent_command_spec(
+        &meta,
+        &ctx.user_id,
+        &ctx.workspace,
+        &ctx.conversation_id,
+        deps.broadcaster.clone(),
+    )
+    .await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -172,6 +178,7 @@ pub(super) async fn build(
 
 async fn resolve_agent_command_spec(
     meta: &aionui_api_types::AgentMetadata,
+    user_id: &str,
     workspace: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
@@ -180,7 +187,8 @@ async fn resolve_agent_command_spec(
         && let Some(backend) = meta.backend.as_deref()
         && let Some(tool) = ManagedAcpToolId::from_backend(backend)
     {
-        return resolve_builtin_managed_acp_command_spec(meta, workspace, conversation_id, broadcaster, tool).await;
+        return resolve_builtin_managed_acp_command_spec(meta, workspace, user_id, conversation_id, broadcaster, tool)
+            .await;
     }
 
     let command = meta
@@ -188,7 +196,7 @@ async fn resolve_agent_command_spec(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AgentError::bad_request(format!("Agent '{}' has no spawn command configured", meta.name)))?;
-    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
@@ -233,6 +241,7 @@ async fn resolve_agent_command_spec(
 async fn resolve_builtin_managed_acp_command_spec(
     meta: &aionui_api_types::AgentMetadata,
     workspace: &str,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
     tool: ManagedAcpToolId,
@@ -246,12 +255,14 @@ async fn resolve_builtin_managed_acp_command_spec(
         )));
     }
 
-    let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
+    let node_reporter =
+        conversation_runtime_reporter(broadcaster.clone(), user_id.to_owned(), conversation_id.to_owned());
     let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
         .await
         .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
-    let tool_reporter = conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
+    let tool_reporter =
+        conversation_acp_tool_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned(), tool);
     let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
         .await
         .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
@@ -740,6 +751,7 @@ mod tests {
 
         let spec = resolve_agent_command_spec(
             &meta,
+            "user-acp",
             "/tmp/workspace",
             "conv-acp",
             Arc::new(BroadcastEventBus::new(16)),
@@ -761,6 +773,7 @@ mod tests {
         meta.args = vec!["-y".into(), "pi-acp".into()];
         let spec = resolve_agent_command_spec(
             &meta,
+            "user-acp",
             "/tmp/workspace",
             "conv-acp",
             Arc::new(BroadcastEventBus::new(16)),

@@ -57,6 +57,7 @@ impl RuntimePrepareService {
         let broadcaster = self.broadcaster.clone();
         Arc::new(move |update: NodeRuntimeProgress| {
             let payload = RuntimeStatusPayload {
+                user_id: None,
                 resource: RuntimeResourceKind::Node,
                 resource_id: None,
                 scope: scope.clone(),
@@ -78,6 +79,7 @@ impl RuntimePrepareService {
         let broadcaster = self.broadcaster.clone();
         Arc::new(move |update: ManagedAcpToolProgress| {
             let payload = RuntimeStatusPayload {
+                user_id: None,
                 resource: RuntimeResourceKind::AcpTool,
                 resource_id: Some(tool.slug().to_owned()),
                 scope: scope.clone(),
