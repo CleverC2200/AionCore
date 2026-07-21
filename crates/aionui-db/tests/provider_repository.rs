@@ -184,6 +184,7 @@ async fn update_model_settings_replaces_per_model_overrides() {
 
     let updated = r
         .update(
+            USER_ID,
             &created.id,
             UpdateProviderParams {
                 model_settings: Some(r#"{"gpt-5.6-sol":{"openai_api_mode":"responses"}}"#),

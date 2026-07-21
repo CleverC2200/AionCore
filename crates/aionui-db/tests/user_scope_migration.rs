@@ -62,7 +62,7 @@ async fn run_migration_result(pool: &sqlx::SqlitePool, version: i64) -> Result<(
 }
 
 #[tokio::test]
-async fn migration_026_adds_core_user_projection_columns() {
+async fn migration_028_adds_core_user_projection_columns() {
     let db = init_database_memory().await.unwrap();
     let columns = table_columns(db.pool(), "users").await;
     for column in ["user_type", "external_user_id", "status", "session_generation"] {
@@ -80,7 +80,7 @@ async fn migration_026_adds_core_user_projection_columns() {
 }
 
 #[tokio::test]
-async fn migration_026_adds_user_scope_to_independent_roots() {
+async fn migration_028_adds_user_scope_to_independent_roots() {
     let db = init_database_memory().await.unwrap();
     for (table, column) in [
         ("cron_jobs", "user_id"),
@@ -103,13 +103,13 @@ async fn migration_026_adds_user_scope_to_independent_roots() {
 }
 
 #[tokio::test]
-async fn migration_026_migrates_cron_skills_as_global_rows() {
+async fn migration_028_migrates_cron_skills_as_global_rows() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 25).await;
+    run_migrations_through(&pool, 26).await;
 
     sqlx::query(
         "INSERT INTO skills (id, name, description, path, source, enabled, created_at, updated_at)
@@ -119,7 +119,7 @@ async fn migration_026_migrates_cron_skills_as_global_rows() {
     .await
     .unwrap();
 
-    run_migration(&pool, 26).await;
+    run_migration(&pool, 28).await;
 
     let row = sqlx::query("SELECT user_id, source FROM skills WHERE id = 'legacy-cron-skill'")
         .fetch_one(&pool)
@@ -130,7 +130,7 @@ async fn migration_026_migrates_cron_skills_as_global_rows() {
 }
 
 #[tokio::test]
-async fn migration_026_keeps_new_conversation_cron_jobs_unanchored_until_run() {
+async fn migration_028_keeps_new_conversation_cron_jobs_unanchored_until_run() {
     let db = init_database_memory().await.unwrap();
     let now = aionui_common::now_ms();
 
@@ -161,13 +161,13 @@ async fn migration_026_keeps_new_conversation_cron_jobs_unanchored_until_run() {
 }
 
 #[tokio::test]
-async fn migration_026_rejects_channel_session_cross_user_conversation() {
+async fn migration_028_rejects_channel_session_cross_user_conversation() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 25).await;
+    run_migrations_through(&pool, 26).await;
 
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at)
@@ -207,7 +207,7 @@ async fn migration_026_rejects_channel_session_cross_user_conversation() {
     .await
     .unwrap();
 
-    let err = run_migration_result(&pool, 26).await.unwrap_err();
+    let err = run_migration_result(&pool, 28).await.unwrap_err();
     assert!(
         err.to_string().contains("CHECK constraint failed"),
         "unexpected migration error: {err}"

@@ -1,4 +1,4 @@
--- Migration 026: add user scope for local, aggregate, and configuration data.
+-- Migration 028: add user scope for local, aggregate, and configuration data.
 
 PRAGMA foreign_keys = OFF;
 
