@@ -7,7 +7,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_db::IUserRepository;
+use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
 use crate::extract::extract_token_from_headers;
@@ -28,6 +28,21 @@ pub struct CurrentUser {
     pub id: String,
     /// Username.
     pub username: String,
+    /// Internal identity source for the current user.
+    pub user_type: UserType,
+    /// Current account status. Authenticated requests only receive active users.
+    pub status: UserStatus,
+}
+
+impl CurrentUser {
+    pub fn local_default() -> Self {
+        Self {
+            id: "system_default_user".to_string(),
+            username: "system_default_user".to_string(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+        }
+    }
 }
 
 /// Shared state for the authentication middleware.
@@ -56,10 +71,7 @@ pub async fn auth_middleware(
 ) -> Result<Response, ApiError> {
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.identity_mode == AuthIdentityMode::Local {
-        request.extensions_mut().insert(CurrentUser {
-            id: "system_default_user".to_string(),
-            username: "system_default_user".to_string(),
-        });
+        request.extensions_mut().insert(CurrentUser::local_default());
         return Ok(next.run(request).await);
     }
 
@@ -88,6 +100,8 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
+        user_type: user.user_type,
+        status: user.status,
     });
 
     Ok(next.run(request).await)
@@ -98,10 +112,7 @@ pub async fn auth_middleware(
 /// Injects a fixed `CurrentUser` with id and username `system_default_user`.
 /// Used when the server runs as an embedded subprocess inside Electron.
 pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
-    request.extensions_mut().insert(CurrentUser {
-        id: "system_default_user".to_string(),
-        username: "system_default_user".to_string(),
-    });
+    request.extensions_mut().insert(CurrentUser::local_default());
     next.run(request).await
 }
 

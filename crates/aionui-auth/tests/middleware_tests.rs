@@ -14,7 +14,7 @@ use aionui_auth::{
     api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
     csrf_middleware, security_headers_middleware,
 };
-use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
+use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory};
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -436,6 +436,8 @@ async fn authenticated_action_limit_uses_user_id_key() {
                 request.extensions_mut().insert(CurrentUser {
                     id: "user_42".into(),
                     username: "admin".into(),
+                    user_type: UserType::Local,
+                    status: UserStatus::Active,
                 });
                 Ok::<_, std::convert::Infallible>(next.run(request).await)
             },

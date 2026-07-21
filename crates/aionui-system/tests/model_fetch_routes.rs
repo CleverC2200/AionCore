@@ -17,7 +17,7 @@ use aionui_auth::CurrentUser;
 use aionui_common::encrypt_string;
 use aionui_db::{
     CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
-    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
+    SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_realtime::BroadcastEventBus;
 use aionui_system::{
@@ -106,6 +106,8 @@ fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
     req.extensions_mut().insert(CurrentUser {
         id: TEST_USER_ID.to_owned(),
         username: TEST_USER_ID.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }

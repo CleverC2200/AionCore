@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use aionui_auth::CurrentUser;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 use aionui_system::{
     ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
@@ -72,6 +72,8 @@ fn get_request(uri: &str) -> Request<Body> {
     req.extensions_mut().insert(CurrentUser {
         id: TEST_USER_ID.to_owned(),
         username: TEST_USER_ID.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }
@@ -86,6 +88,8 @@ fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Bod
     req.extensions_mut().insert(CurrentUser {
         id: TEST_USER_ID.to_owned(),
         username: TEST_USER_ID.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }
@@ -99,6 +103,8 @@ fn delete_request(uri: &str) -> Request<Body> {
     req.extensions_mut().insert(CurrentUser {
         id: TEST_USER_ID.to_owned(),
         username: TEST_USER_ID.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }
