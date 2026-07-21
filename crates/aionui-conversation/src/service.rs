@@ -997,7 +997,10 @@ impl ConversationService {
             )
             .await
         {
-            let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
+            let resolved = self
+                .skill_resolver
+                .resolve_skills_for_user(user_id, &initial_skills)
+                .await;
             if !resolved.is_empty() {
                 let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
                 let n = self
@@ -3414,7 +3417,10 @@ impl ConversationService {
             return;
         }
 
-        let resolved = self.skill_resolver.resolve_skills(&skill_names).await;
+        let resolved = self
+            .skill_resolver
+            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .await;
         if resolved.is_empty() {
             return;
         }
