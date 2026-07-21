@@ -255,6 +255,57 @@ async fn stop_office_watch_stops_events() {
 }
 
 #[tokio::test]
+async fn stop_all_office_watches_for_user_keeps_other_user_subscriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, recorder) = make_service();
+    let ws = dir.path().to_str().unwrap();
+
+    svc.start_office_watch_for_user("user_a", ws).await.unwrap();
+    svc.start_office_watch_for_user("user_b", ws).await.unwrap();
+    settle().await;
+
+    svc.stop_all_office_watches_for_user("user_a").await.unwrap();
+    recorder.take_events();
+
+    std::fs::write(dir.path().join("owned_by_b.docx"), "data").unwrap();
+    settle().await;
+
+    let events = recorder.take_events();
+    let office_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.name == "workspaceOfficeWatch.fileAdded")
+        .collect();
+    assert_eq!(office_events.len(), 1, "expected only user_b event, got: {events:?}");
+    assert_eq!(office_events[0].data["user_id"].as_str(), Some("user_b"));
+}
+
+#[tokio::test]
+async fn stop_all_office_watches_for_user_stops_owned_subscriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, recorder) = make_service();
+    let ws = dir.path().to_str().unwrap();
+
+    svc.start_office_watch_for_user("user_a", ws).await.unwrap();
+    settle().await;
+
+    svc.stop_all_office_watches_for_user("user_a").await.unwrap();
+    recorder.take_events();
+
+    std::fs::write(dir.path().join("after_stop_all.docx"), "data").unwrap();
+    settle().await;
+
+    let events = recorder.take_events();
+    let office_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.name == "workspaceOfficeWatch.fileAdded")
+        .collect();
+    assert!(
+        office_events.is_empty(),
+        "expected no office events after user stop-all, got: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn idempotent_office_watch() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, _recorder) = make_service();

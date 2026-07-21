@@ -328,6 +328,18 @@ impl crate::traits::IFileWatchService for FileWatchService {
         watchers.remove(&key);
         Ok(())
     }
+
+    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let keys: Vec<String> = self
+            .office_watch_users
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            self.stop_office_watch_for_user(user_id, &key).await?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

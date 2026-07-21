@@ -212,6 +212,12 @@ pub trait IFileWatchService: Send + Sync {
         let _ = user_id;
         self.stop_office_watch(workspace).await
     }
+
+    /// Stop all active Office workspace watches for one WebUI user.
+    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        Ok(())
+    }
 }
 
 /// Git-based workspace snapshot system for tracking file changes.

@@ -144,6 +144,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/watch/stop-all", post(stop_all_watches))
         .route("/api/fs/office-watch/start", post(start_office_watch))
         .route("/api/fs/office-watch/stop", post(stop_office_watch))
+        .route("/api/fs/office-watch/stop-all", post(stop_all_office_watches))
         // E. Workspace snapshot
         .route("/api/fs/snapshot/init", post(snapshot_init))
         .route("/api/fs/snapshot/info", post(snapshot_info))
@@ -541,6 +542,14 @@ async fn stop_office_watch(
         .watch_service
         .stop_office_watch_for_user(&user.id, &req.workspace)
         .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn stop_all_office_watches(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.watch_service.stop_all_office_watches_for_user(&user.id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
