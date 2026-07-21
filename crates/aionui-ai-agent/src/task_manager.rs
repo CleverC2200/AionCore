@@ -62,6 +62,12 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Number of active tasks (useful for diagnostics).
     fn active_count(&self) -> usize;
 
+    /// Conversation IDs for active tasks, used by callers that need to apply
+    /// owner-aware filtering outside the task manager.
+    fn active_conversation_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Collect tasks eligible for idle cleanup.
     ///
     /// Returns conversation IDs of tasks that:
@@ -281,6 +287,13 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 
     fn active_count(&self) -> usize {
         self.tasks.iter().filter(|entry| entry.value().get().is_some()).count()
+    }
+
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter_map(|entry| entry.value().get().map(|_| entry.key().clone()))
+            .collect()
     }
 
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String> {
@@ -571,6 +584,18 @@ mod tests {
         let instance = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
         assert_eq!(instance.conversation_id(), "conv-1");
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_conversation_ids_returns_initialized_tasks() {
+        let mgr = make_manager();
+        mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+        mgr.get_or_build_task("conv-2", make_options("conv-2")).await.unwrap();
+
+        let mut ids = mgr.active_conversation_ids();
+        ids.sort();
+
+        assert_eq!(ids, vec!["conv-1".to_owned(), "conv-2".to_owned()]);
     }
 
     #[tokio::test]

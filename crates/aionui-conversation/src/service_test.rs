@@ -3159,6 +3159,10 @@ impl IWorkerTaskManager for MockTaskManager {
         self.agents.lock().unwrap().len()
     }
 
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.agents.lock().unwrap().keys().cloned().collect()
+    }
+
     fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
         vec![]
     }
@@ -3279,6 +3283,10 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
     fn active_count(&self) -> usize {
         self.agents.lock().unwrap().len()
+    }
+
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.agents.lock().unwrap().keys().cloned().collect()
     }
 
     fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
@@ -3631,6 +3639,26 @@ async fn get_config_options_rejects_cross_user_active_task() {
     let err = svc.get_config_options("user_2", &conv.id).await.unwrap_err();
 
     assert!(matches!(err, ConversationError::NotFound { id } if id == conv.id));
+}
+
+#[tokio::test]
+async fn active_count_for_user_counts_only_owned_active_tasks() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let user_1_conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_2_conv = svc.create("user_2", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &user_1_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_1_conv.id))),
+    );
+    task_mgr.insert_agent(
+        &user_2_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_2_conv.id))),
+    );
+
+    assert_eq!(svc.active_count_for_user("user_1").await.unwrap(), 1);
+    assert_eq!(svc.active_count_for_user("user_2").await.unwrap(), 1);
+    assert_eq!(svc.active_count_for_user("user_3").await.unwrap(), 0);
 }
 
 #[tokio::test]

@@ -584,6 +584,22 @@ impl ConversationService {
             .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
     }
 
+    pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
+        let mut count = 0;
+        for conversation_id in self.task_manager.active_conversation_ids() {
+            let belongs_to_user = self
+                .conversation_repo
+                .get(user_id, &conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+                .is_some();
+            if belongs_to_user {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     async fn send_message_response(
         &self,
         conversation_id: &str,

@@ -419,9 +419,9 @@ async fn check_approval(
 
 async fn active_count(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<ActiveCountResponse>>, ApiError> {
-    let count = state.task_manager.active_count();
+    let count = state.service.active_count_for_user(&user.id).await?;
     Ok(Json(ApiResponse::ok(ActiveCountResponse { count })))
 }
 
