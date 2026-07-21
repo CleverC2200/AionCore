@@ -36,7 +36,7 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, WsHandlerState};
+use aionui_realtime::{NoopMessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -871,7 +871,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
             manager: services.ws_manager.clone(),
             router: Arc::new(NoopMessageRouter),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Some("system_default_user".to_owned())),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }
@@ -879,8 +879,16 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     let jwt_service = services.jwt_service.clone();
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
     let jwt_service = services.jwt_service.clone();
-    let token_user_resolver =
-        Arc::new(move |token: &str| jwt_service.verify(token).ok().map(|payload| payload.user_id));
+    let user_repo = services.user_repo.clone();
+    let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
+        let jwt_service = jwt_service.clone();
+        let user_repo = user_repo.clone();
+        Box::pin(async move {
+            let payload = jwt_service.verify(&token).ok()?;
+            let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
+            (payload.session_generation == user.session_generation).then_some(user.id)
+        })
+    });
 
     let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
 
@@ -1055,6 +1063,31 @@ mod tests {
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
         }
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_rejects_stale_session_generation() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let ws_state = build_ws_state(&services);
+        let token = services
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 0)
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token.clone()).await;
+        assert_eq!(resolved.as_deref(), Some("system_default_user"));
+
+        services
+            .user_repo
+            .increment_session_generation("system_default_user")
+            .await
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token).await;
+        assert_eq!(resolved, None);
+
+        services.database.close().await;
     }
 
     #[tokio::test]

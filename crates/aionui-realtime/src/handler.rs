@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
 use aionui_api_types::WebSocketMessage;
 use axum::extract::WebSocketUpgrade;
@@ -20,8 +21,8 @@ use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocket
 /// so that `aionui-realtime` does not depend on `aionui-auth` directly.
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
-/// Resolves a verified JWT token to the internal user ID carried by it.
-pub type TokenUserResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Resolves a verified JWT token to the active internal user ID it represents.
+pub type TokenUserResolver = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
@@ -79,7 +80,7 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         return;
     }
 
-    let Some(user_id) = (state.token_user_resolver)(&token) else {
+    let Some(user_id) = (state.token_user_resolver)(token.clone()).await else {
         send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     };
@@ -269,7 +270,7 @@ mod tests {
             manager,
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Some("system_default_user".into())),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
         }
     }
@@ -515,7 +516,7 @@ mod tests {
             manager,
             router: router.clone(),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Some("system_default_user".into())),
+            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
         };
 
