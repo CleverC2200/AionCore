@@ -1451,7 +1451,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
     cron_repo
         .insert(&CronJobRow {
             id: "cron_legacy_custom_agent".into(),
-            user_id: "user1".into(),
+            user_id: "u1".into(),
             name: "Legacy custom agent job".into(),
             enabled: true,
             schedule_kind: "every".into(),
@@ -2277,20 +2277,22 @@ async fn oc1_rejects_lazy_existing_jobs() {
 }
 
 #[tokio::test]
-async fn oc1b_rejects_new_conversation_jobs_without_owner_anchor() {
+async fn oc1b_allows_new_conversation_jobs_without_owner_anchor() {
     let (svc, _repo, _) = setup().await;
 
     let mut empty_req = make_create_req("New-conv empty", every_60s());
     empty_req.conversation_id = "".into();
     empty_req.execution_mode = Some("new_conversation".into());
-    let empty_err = svc.add_job("u1", empty_req).await.unwrap_err();
-    assert!(matches!(empty_err, aionui_cron::error::CronError::Conversation(_)));
+    let empty_job = svc.add_job("u1", empty_req).await.unwrap();
+    assert_eq!(empty_job.user_id, "u1");
+    assert_eq!(empty_job.conversation_id, "");
 
     let mut stale_req = make_create_req("New-conv with stale id", every_60s());
     stale_req.conversation_id = "missing-conv-that-no-longer-exists".into();
     stale_req.execution_mode = Some("new_conversation".into());
-    let stale_err = svc.add_job("u1", stale_req).await.unwrap_err();
-    assert!(matches!(stale_err, aionui_cron::error::CronError::Conversation(_)));
+    let stale_job = svc.add_job("u1", stale_req).await.unwrap();
+    assert_eq!(stale_job.user_id, "u1");
+    assert_eq!(stale_job.conversation_id, "missing-conv-that-no-longer-exists");
 }
 
 #[tokio::test]
