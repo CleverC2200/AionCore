@@ -909,7 +909,7 @@ impl AssistantService {
             }
             let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
             let preference = self.preference_repo.get_for_user(user_id, &definition.id).await?;
-            let rules_content = self.read_rule(id, locale).await?;
+            let rules_content = self.read_rule_for_user(user_id, id, locale).await?;
             let projection = self
                 .project_definition(&definition, state.as_ref(), &projections)
                 .await?;
@@ -1755,9 +1755,21 @@ impl AssistantService {
 
     /// Read an assistant rule file, dispatching by source.
     pub async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
-        match self.classify_source(id).await {
+        self.read_rule_for_user(DEFAULT_USER_ID, id, locale).await
+    }
+
+    /// Read an assistant rule file for the current owner, dispatching by source.
+    pub async fn read_rule_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+    ) -> Result<String, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Ok(self.read_builtin_rule_with_fallback(id, locale)),
-            AssistantSource::Generated | AssistantSource::User => Ok(self.read_user_rule_with_fallback(id, locale)),
+            AssistantSource::Generated | AssistantSource::User => {
+                Ok(self.read_user_rule_with_fallback(user_id, id, locale))
+            }
         }
     }
 
@@ -1790,8 +1802,8 @@ impl AssistantService {
     /// when the locale-specific `<id>.<locale>.md` is absent. Scheduled/cron runs
     /// create the conversation with `assistant: None`, so no UI locale reaches
     /// rule resolution and the localized file would otherwise be missed.
-    fn read_user_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
-        let rules_dir = self.user_rules_dir();
+    fn read_user_rule_with_fallback(&self, user_id: &str, id: &str, locale: Option<&str>) -> String {
+        let rules_dir = self.user_rules_dir_for_user(user_id);
         let content = read_assistant_md_with_legacy(&rules_dir, id, locale);
         if !content.is_empty() {
             return content;
@@ -1804,18 +1816,39 @@ impl AssistantService {
             }
         }
 
-        read_first_assistant_md(&rules_dir, id)
+        let content = read_first_assistant_md(&rules_dir, id);
+        if !content.is_empty() || user_id != DEFAULT_USER_ID {
+            return content;
+        }
+
+        let legacy_rules_dir = self.user_rules_root_dir();
+        let content = read_assistant_md_with_legacy(&legacy_rules_dir, id, locale);
+        if !content.is_empty() {
+            return content;
+        }
+        read_first_assistant_md(&legacy_rules_dir, id)
     }
 
     /// Write an assistant rule file. User-authored and generated assistants
     /// keep editable configuration in the local profile; built-ins reject.
     pub async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AssistantError> {
-        match self.classify_source(id).await {
+        self.write_rule_for_user(DEFAULT_USER_ID, id, locale, content).await
+    }
+
+    /// Write an assistant rule file for the current owner.
+    pub async fn write_rule_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write rule for built-in assistant".into(),
             )),
             AssistantSource::Generated | AssistantSource::User => {
-                let path = self.user_rule_path(id, locale);
+                let path = self.user_rule_path_for_user(user_id, id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| AssistantError::Internal(format!("create dir failed: {e}")))?;
@@ -1828,32 +1861,60 @@ impl AssistantService {
 
     /// Delete all locale versions of an assistant rule.
     pub async fn delete_rule(&self, id: &str) -> Result<bool, AssistantError> {
-        match self.classify_source(id).await {
+        self.delete_rule_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    /// Delete all locale versions of an assistant rule for the current owner.
+    pub async fn delete_rule_for_user(&self, user_id: &str, id: &str) -> Result<bool, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete rule for built-in assistant".into(),
             )),
             AssistantSource::Generated | AssistantSource::User => {
-                Ok(remove_assistant_md_files(&self.user_rules_dir(), id))
+                Ok(remove_assistant_md_files(&self.user_rules_dir_for_user(user_id), id))
             }
         }
     }
 
     pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
-        match self.classify_source(id).await {
+        self.read_skill_for_user(DEFAULT_USER_ID, id, locale).await
+    }
+
+    pub async fn read_skill_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+    ) -> Result<String, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Ok(String::new()),
             AssistantSource::Generated | AssistantSource::User => {
-                Ok(read_assistant_md_with_legacy(&self.user_skills_dir(), id, locale))
+                let content = read_assistant_md_with_legacy(&self.user_skills_dir_for_user(user_id), id, locale);
+                if !content.is_empty() || user_id != DEFAULT_USER_ID {
+                    return Ok(content);
+                }
+                Ok(read_assistant_md_with_legacy(&self.user_skills_root_dir(), id, locale))
             }
         }
     }
 
     pub async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), AssistantError> {
-        match self.classify_source(id).await {
+        self.write_skill_for_user(DEFAULT_USER_ID, id, locale, content).await
+    }
+
+    pub async fn write_skill_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write skill for built-in assistant".into(),
             )),
             AssistantSource::Generated | AssistantSource::User => {
-                let path = self.user_skill_path(id, locale);
+                let path = self.user_skill_path_for_user(user_id, id, locale);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| AssistantError::Internal(format!("create dir failed: {e}")))?;
@@ -1865,12 +1926,16 @@ impl AssistantService {
     }
 
     pub async fn delete_skill(&self, id: &str) -> Result<bool, AssistantError> {
-        match self.classify_source(id).await {
+        self.delete_skill_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    pub async fn delete_skill_for_user(&self, user_id: &str, id: &str) -> Result<bool, AssistantError> {
+        match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot delete skill for built-in assistant".into(),
             )),
             AssistantSource::Generated | AssistantSource::User => {
-                Ok(remove_assistant_md_files(&self.user_skills_dir(), id))
+                Ok(remove_assistant_md_files(&self.user_skills_dir_for_user(user_id), id))
             }
         }
     }
@@ -1922,11 +1987,27 @@ impl AssistantService {
     // -----------------------------------------------------------------------
 
     fn user_rules_dir(&self) -> PathBuf {
+        self.user_rules_dir_for_user(DEFAULT_USER_ID)
+    }
+
+    fn user_rules_root_dir(&self) -> PathBuf {
         self.user_data_dir.join("assistant-rules")
     }
 
+    fn user_rules_dir_for_user(&self, user_id: &str) -> PathBuf {
+        self.user_rules_root_dir().join(encode_filename_component(user_id))
+    }
+
     fn user_skills_dir(&self) -> PathBuf {
+        self.user_skills_dir_for_user(DEFAULT_USER_ID)
+    }
+
+    fn user_skills_root_dir(&self) -> PathBuf {
         self.user_data_dir.join("assistant-skills")
+    }
+
+    fn user_skills_dir_for_user(&self, user_id: &str) -> PathBuf {
+        self.user_skills_root_dir().join(encode_filename_component(user_id))
     }
 
     fn user_avatars_dir(&self) -> PathBuf {
@@ -2165,12 +2246,12 @@ impl AssistantService {
         self.read_user_avatar_asset_by_filename(value).is_some()
     }
 
-    fn user_rule_path(&self, id: &str, locale: Option<&str>) -> PathBuf {
-        assistant_md_path(&self.user_rules_dir(), id, locale)
+    fn user_rule_path_for_user(&self, user_id: &str, id: &str, locale: Option<&str>) -> PathBuf {
+        assistant_md_path(&self.user_rules_dir_for_user(user_id), id, locale)
     }
 
-    fn user_skill_path(&self, id: &str, locale: Option<&str>) -> PathBuf {
-        assistant_md_path(&self.user_skills_dir(), id, locale)
+    fn user_skill_path_for_user(&self, user_id: &str, id: &str, locale: Option<&str>) -> PathBuf {
+        assistant_md_path(&self.user_skills_dir_for_user(user_id), id, locale)
     }
 
     async fn resolve_definition_identity_for_user(
@@ -2246,38 +2327,50 @@ impl AssistantClassifier for AssistantService {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for AssistantService {
-    async fn read_rule(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
-        AssistantService::read_rule(self, id, locale)
+    async fn read_rule(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+        AssistantService::read_rule_for_user(self, user_id, id, locale)
             .await
             .map_err(assistant_error_to_extension_error)
     }
 
-    async fn write_rule(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
-        AssistantService::write_rule(self, id, locale, content)
+    async fn write_rule(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError> {
+        AssistantService::write_rule_for_user(self, user_id, id, locale, content)
             .await
             .map_err(assistant_error_to_extension_error)
     }
 
-    async fn delete_rule(&self, id: &str) -> Result<bool, ExtensionError> {
-        AssistantService::delete_rule(self, id)
+    async fn delete_rule(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError> {
+        AssistantService::delete_rule_for_user(self, user_id, id)
             .await
             .map_err(assistant_error_to_extension_error)
     }
 
-    async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
-        AssistantService::read_skill(self, id, locale)
+    async fn read_skill(&self, user_id: &str, id: &str, locale: Option<&str>) -> Result<String, ExtensionError> {
+        AssistantService::read_skill_for_user(self, user_id, id, locale)
             .await
             .map_err(assistant_error_to_extension_error)
     }
 
-    async fn write_skill(&self, id: &str, locale: Option<&str>, content: &str) -> Result<(), ExtensionError> {
-        AssistantService::write_skill(self, id, locale, content)
+    async fn write_skill(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), ExtensionError> {
+        AssistantService::write_skill_for_user(self, user_id, id, locale, content)
             .await
             .map_err(assistant_error_to_extension_error)
     }
 
-    async fn delete_skill(&self, id: &str) -> Result<bool, ExtensionError> {
-        AssistantService::delete_skill(self, id)
+    async fn delete_skill(&self, user_id: &str, id: &str) -> Result<bool, ExtensionError> {
+        AssistantService::delete_skill_for_user(self, user_id, id)
             .await
             .map_err(assistant_error_to_extension_error)
     }
@@ -6057,6 +6150,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_and_skill_files_are_scoped_by_user() {
+        let fx = fixture().await;
+
+        fx.service
+            .write_rule_for_user("user-a", "shared-assistant", Some("en-US"), "rule A")
+            .await
+            .unwrap();
+        fx.service
+            .write_rule_for_user("user-b", "shared-assistant", Some("en-US"), "rule B")
+            .await
+            .unwrap();
+        fx.service
+            .write_skill_for_user("user-a", "shared-assistant", None, "skill A")
+            .await
+            .unwrap();
+        fx.service
+            .write_skill_for_user("user-b", "shared-assistant", None, "skill B")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fx.service
+                .read_rule_for_user("user-a", "shared-assistant", Some("en-US"))
+                .await
+                .unwrap(),
+            "rule A"
+        );
+        assert_eq!(
+            fx.service
+                .read_rule_for_user("user-b", "shared-assistant", Some("en-US"))
+                .await
+                .unwrap(),
+            "rule B"
+        );
+        assert_eq!(
+            fx.service
+                .read_skill_for_user("user-a", "shared-assistant", None)
+                .await
+                .unwrap(),
+            "skill A"
+        );
+        assert_eq!(
+            fx.service
+                .read_skill_for_user("user-b", "shared-assistant", None)
+                .await
+                .unwrap(),
+            "skill B"
+        );
+    }
+
+    #[tokio::test]
     async fn read_rule_user_falls_back_to_saved_locale_when_locale_missing() {
         // Scheduled/cron runs resolve rules without a locale (conversation is
         // created with `assistant: None`). The rule is stored locale-suffixed
@@ -6133,7 +6277,7 @@ mod tests {
         assert!(
             fx._tmp
                 .path()
-                .join("assistant-rules/bare%3Aagent-claude.en-US.md")
+                .join("assistant-rules/system_default_user/bare%3Aagent-claude.en-US.md")
                 .is_file()
         );
         assert!(

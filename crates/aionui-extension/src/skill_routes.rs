@@ -410,11 +410,14 @@ async fn materialize_for_agent(
 /// back to user-directory-only legacy behavior otherwise.
 async fn read_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let content = dispatcher.read_rule(&req.assistant_id, req.locale.as_deref()).await?;
+        let content = dispatcher
+            .read_rule(&current_user.id, &req.assistant_id, req.locale.as_deref())
+            .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
     let content =
@@ -427,12 +430,13 @@ async fn read_assistant_rule(
 /// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
-            .write_rule(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .write_rule(&current_user.id, &req.assistant_id, req.locale.as_deref(), &req.content)
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
@@ -449,10 +453,11 @@ async fn write_assistant_rule(
 /// `DELETE /api/skills/assistant-rule/:id` — delete all locale versions.
 async fn delete_assistant_rule(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let ok = dispatcher.delete_rule(&id).await?;
+        let ok = dispatcher.delete_rule(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
     let ok = skill_service::delete_assistant_rule(&state.skill_paths, &id).await?;
@@ -468,11 +473,14 @@ async fn delete_assistant_rule(
 /// Dispatches by source via [`AssistantRuleDispatcher`] when wired.
 async fn read_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ReadAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let content = dispatcher.read_skill(&req.assistant_id, req.locale.as_deref()).await?;
+        let content = dispatcher
+            .read_skill(&current_user.id, &req.assistant_id, req.locale.as_deref())
+            .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
     let content =
@@ -485,12 +493,13 @@ async fn read_assistant_skill(
 /// Dispatches by source: builtin / extension ids reject with 400.
 async fn write_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<WriteAssistantRuleRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     if let Some(dispatcher) = &state.assistant_dispatcher {
         dispatcher
-            .write_skill(&req.assistant_id, req.locale.as_deref(), &req.content)
+            .write_skill(&current_user.id, &req.assistant_id, req.locale.as_deref(), &req.content)
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
@@ -507,10 +516,11 @@ async fn write_assistant_skill(
 /// `DELETE /api/skills/assistant-skill/:id` — delete all locale versions.
 async fn delete_assistant_skill(
     State(state): State<SkillRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     if let Some(dispatcher) = &state.assistant_dispatcher {
-        let ok = dispatcher.delete_skill(&id).await?;
+        let ok = dispatcher.delete_skill(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
     let ok = skill_service::delete_assistant_skill(&state.skill_paths, &id).await?;

@@ -1439,7 +1439,7 @@ impl ConversationService {
 
         let rules_content = if let Some(dispatcher) = self.assistant_dispatcher() {
             dispatcher
-                .read_rule(assistant_id, locale)
+                .read_rule(user_id, assistant_id, locale)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant rule lookup failed: {e}")))?
         } else {

@@ -75,27 +75,39 @@ struct StaticAssistantDispatcher {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for StaticAssistantDispatcher {
-    async fn read_rule(&self, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_rule(&self, _user_id: &str, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
         Ok(self.rules.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_rule(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+    async fn write_rule(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _locale: Option<&str>,
+        _content: &str,
+    ) -> Result<(), ExtensionError> {
         Ok(())
     }
 
-    async fn delete_rule(&self, _id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_rule(&self, _user_id: &str, _id: &str) -> Result<bool, ExtensionError> {
         Ok(true)
     }
 
-    async fn read_skill(&self, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_skill(&self, _user_id: &str, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
         Ok(String::new())
     }
 
-    async fn write_skill(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+    async fn write_skill(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _locale: Option<&str>,
+        _content: &str,
+    ) -> Result<(), ExtensionError> {
         Ok(())
     }
 
-    async fn delete_skill(&self, _id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_skill(&self, _user_id: &str, _id: &str) -> Result<bool, ExtensionError> {
         Ok(true)
     }
 }
