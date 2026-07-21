@@ -1961,6 +1961,7 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
     AgentMetadataRow {
         id: id.to_owned(),
+        user_id: None,
         icon: Some(icon.to_owned()),
         name: backend.to_owned(),
         name_i18n: None,

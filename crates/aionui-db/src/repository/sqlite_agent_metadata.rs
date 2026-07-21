@@ -178,6 +178,7 @@ impl AgentMetadataSafeRow {
         (
             AgentMetadataRow {
                 id: self.id,
+                user_id: self.user_id,
                 icon: self.icon,
                 name: self.name,
                 name_i18n: self.name_i18n,

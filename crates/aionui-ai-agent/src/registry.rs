@@ -156,7 +156,8 @@ impl AgentRegistry {
             return Ok(());
         };
 
-        if let Some((mut meta, reason)) = decode_row(row, AvailabilityProjection::Cached) {
+        let can_update_global_cache = row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+        if can_update_global_cache && let Some((mut meta, reason)) = decode_row(row, AvailabilityProjection::Cached) {
             let existing_availability = self
                 .by_id
                 .read()
@@ -404,10 +405,14 @@ impl AgentRegistry {
         let cached_reasons = self.unavailable_reasons.read().await.clone();
         let mut rows: Vec<AgentManagementRow> = rows
             .into_iter()
-            .filter_map(|row| decode_row(row, AvailabilityProjection::Cached))
-            .map(|(mut meta, mut reason)| {
-                let cached_meta = cached_rows.get(&meta.id);
-                let cached_reason = cached_reasons.get(&meta.id);
+            .filter_map(|row| {
+                let can_use_global_cache =
+                    row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+                decode_row(row, AvailabilityProjection::Cached).map(|decoded| (decoded, can_use_global_cache))
+            })
+            .map(|((mut meta, mut reason), can_use_global_cache)| {
+                let cached_meta = can_use_global_cache.then(|| cached_rows.get(&meta.id)).flatten();
+                let cached_reason = can_use_global_cache.then(|| cached_reasons.get(&meta.id)).flatten();
                 if cached_meta.is_some() {
                     (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta, cached_reason);
                 } else if !has_availability_snapshot(&meta) {
@@ -449,11 +454,23 @@ impl AgentRegistry {
             .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("load agent_metadata '{id}' for user: {e}")))?;
-        let Some((mut meta, mut reason)) = row.and_then(|row| decode_row(row, AvailabilityProjection::Cached)) else {
+        let Some(row) = row else {
             return Ok(None);
         };
-        let cached_meta = self.by_id.read().await.get(&meta.id).cloned();
-        let cached_reason = self.unavailable_reasons.read().await.get(&meta.id).cloned();
+        let can_use_global_cache = row.user_id.is_none() || row.user_id.as_deref() == Some(SYSTEM_DEFAULT_USER_ID);
+        let Some((mut meta, mut reason)) = decode_row(row, AvailabilityProjection::Cached) else {
+            return Ok(None);
+        };
+        let cached_meta = if can_use_global_cache {
+            self.by_id.read().await.get(&meta.id).cloned()
+        } else {
+            None
+        };
+        let cached_reason = if can_use_global_cache {
+            self.unavailable_reasons.read().await.get(&meta.id).cloned()
+        } else {
+            None
+        };
         if cached_meta.is_some() {
             (meta, reason) = overlay_hydrated_availability(meta, reason, cached_meta.as_ref(), cached_reason.as_ref());
         } else if !has_availability_snapshot(&meta) {
@@ -1706,6 +1723,24 @@ mod tests {
                 .as_deref()
                 .is_none_or(|value| !value.contains(r#""id":"mode""#))
         );
+
+        let default_management = reg
+            .management_row_by_id_for_user(SYSTEM_DEFAULT_USER_ID, "custom-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        let default_options = default_management.config_options.unwrap();
+        assert!(default_options.to_string().contains(r#""mode""#));
+        assert!(!default_options.to_string().contains(r#""model""#));
+
+        let user_b_management = reg
+            .management_row_by_id_for_user("user-b", "custom-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        let user_b_options = user_b_management.config_options.unwrap();
+        assert!(user_b_options.to_string().contains(r#""model""#));
+        assert!(!user_b_options.to_string().contains(r#""mode""#));
     }
 
     /// Partial updates must leave unrelated columns untouched.
@@ -1862,6 +1897,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "test-agent".to_string(),
+            user_id: None,
             icon: None,
             name: "Test Agent".to_string(),
             name_i18n: None,
@@ -1908,6 +1944,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "632f31d2".to_string(),
+            user_id: None,
             icon: None,
             name: "Aion CLI".to_string(),
             name_i18n: None,
@@ -1963,6 +2000,7 @@ mod tests {
         use aionui_db::AgentMetadataRow;
         let row = AgentMetadataRow {
             id: "test-agent-2".to_string(),
+            user_id: None,
             icon: None,
             name: "Test Agent 2".to_string(),
             name_i18n: None,
