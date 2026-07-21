@@ -92,7 +92,17 @@ impl AcpSkillManager {
         enabled_skills: Option<&[String]>,
         exclude_builtin_skills: Option<&[String]>,
     ) -> Vec<SkillIndex> {
-        let items = match self.list_available_skills().await {
+        self.discover_skills_for_user("system_default_user", enabled_skills, exclude_builtin_skills)
+            .await
+    }
+
+    pub async fn discover_skills_for_user(
+        &self,
+        user_id: &str,
+        enabled_skills: Option<&[String]>,
+        exclude_builtin_skills: Option<&[String]>,
+    ) -> Vec<SkillIndex> {
+        let items = match self.list_available_skills_for_user(user_id).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "Failed to list skills via extension service");
@@ -159,6 +169,10 @@ impl AcpSkillManager {
     /// auto-inject/opt-in). Returns the resulting index. Used by the
     /// snapshot-driven first-message injector.
     pub async fn discover_by_names(&self, names: &[String]) -> Vec<SkillIndex> {
+        self.discover_by_names_for_user("system_default_user", names).await
+    }
+
+    pub async fn discover_by_names_for_user(&self, user_id: &str, names: &[String]) -> Vec<SkillIndex> {
         // Always reset state so repeated calls produce a deterministic cache.
         if names.is_empty() {
             let mut cache = self.cache.write().await;
@@ -167,7 +181,7 @@ impl AcpSkillManager {
             *discovered = true;
             return Vec::new();
         }
-        let items = match self.list_available_skills().await {
+        let items = match self.list_available_skills_for_user(user_id).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "discover_by_names: list_available_skills failed");
@@ -205,11 +219,12 @@ impl AcpSkillManager {
             .collect()
     }
 
-    async fn list_available_skills(
+    async fn list_available_skills_for_user(
         &self,
+        user_id: &str,
     ) -> Result<Vec<aionui_extension::SkillListItem>, aionui_extension::ExtensionError> {
         if let Some(repo) = &self.skill_repo {
-            aionui_extension::list_available_skills_with_repo(&self.paths, repo.as_ref()).await
+            aionui_extension::list_available_skills_with_repo_for_user(&self.paths, repo.as_ref(), user_id).await
         } else {
             aionui_extension::list_available_skills(&self.paths).await
         }

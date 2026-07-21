@@ -123,6 +123,7 @@ pub(super) async fn build(
     let params = Arc::new(
         assemble_acp_params(
             ctx.conversation_id.clone(),
+            ctx.user_id.clone(),
             WorkspaceInfo {
                 path: ctx.workspace,
                 is_custom: ctx.is_custom_workspace,
