@@ -533,7 +533,7 @@ pub async fn import_skill_with_repo_for_user(
     user_id: &str,
     skill_path: &Path,
 ) -> Result<ImportedSkill, ExtensionError> {
-    let copied = copy_skill_into_user_dir(paths, skill_path).await?;
+    let copied = copy_skill_into_user_dir_for_user(paths, user_id, skill_path).await?;
     let overwritten = repo.find_by_name_for_user(user_id, &copied.name).await?.is_some();
     let row = repo
         .upsert_for_user(
@@ -570,13 +570,22 @@ struct CopiedSkill {
 }
 
 async fn copy_skill_into_user_dir(paths: &SkillPaths, skill_path: &Path) -> Result<CopiedSkill, ExtensionError> {
+    copy_skill_into_user_dir_for_user(paths, DEFAULT_USER_ID, skill_path).await
+}
+
+async fn copy_skill_into_user_dir_for_user(
+    paths: &SkillPaths,
+    user_id: &str,
+    skill_path: &Path,
+) -> Result<CopiedSkill, ExtensionError> {
     let (name, description) = read_skill_info(skill_path).await?;
     validate_filename(&name)?;
 
-    let target_dir = paths.user_skills_dir.join(&name);
-    tokio::fs::create_dir_all(&paths.user_skills_dir).await?;
+    let user_skill_root = user_skill_root_for_user(paths, user_id);
+    let target_dir = user_skill_root.join(&name);
+    tokio::fs::create_dir_all(&user_skill_root).await?;
 
-    let staging_dir = import_staging_dir(paths, &name);
+    let staging_dir = import_staging_dir(&user_skill_root, &name);
     replace_existing_path(&staging_dir).await?;
     let mut budget = SkillImportBudget::default();
     if let Err(err) = copy_skill_dir_for_import(skill_path, &staging_dir, skill_path, &mut budget).await {
@@ -1050,12 +1059,23 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-fn import_staging_dir(paths: &SkillPaths, skill_name: &str) -> PathBuf {
+fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
+    if user_id == DEFAULT_USER_ID {
+        return paths.user_skills_dir.clone();
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    let digest = hasher.finalize();
+    paths.user_skills_dir.join(".users").join(hex::encode(&digest[..12]))
+}
+
+fn import_staging_dir(user_skill_root: &Path, skill_name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    paths.user_skills_dir.join(format!(
+    user_skill_root.join(format!(
         "{IMPORT_STAGING_PREFIX}{skill_name}-{}-{nonce}",
         std::process::id()
     ))
@@ -1742,10 +1762,17 @@ async fn sync_disk_user_skills_into_repo_for_user(
     repo: &dyn ISkillRepository,
     user_id: &str,
 ) -> Result<(), ExtensionError> {
+    if user_id != DEFAULT_USER_ID {
+        return Ok(());
+    }
+
     let scanned = scan_skill_dirs(&paths.user_skills_dir).await?;
     let mut backfilled = 0usize;
 
     for skill in scanned {
+        if is_user_scoped_skill_storage_path(Path::new(&skill.path)) {
+            continue;
+        }
         if let Err(err) = validate_filename(&skill.name) {
             warn!(
                 skill = %skill.name,
@@ -1780,6 +1807,15 @@ async fn sync_disk_user_skills_into_repo_for_user(
     }
 
     Ok(())
+}
+
+fn is_user_scoped_skill_storage_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name) if name == std::ffi::OsStr::new(".users")
+        )
+    })
 }
 
 fn skill_row_to_list_item(paths: &SkillPaths, row: SkillRow, description: String) -> SkillListItem {
