@@ -537,7 +537,12 @@ impl JobExecutor {
                         .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
                         .await;
                 }
-                if !self.conversation_exists(conversation_id).await? {
+                let Some(owner_user_id) = self
+                    .conversation_repo
+                    .owner_user_id(conversation_id)
+                    .await
+                    .map_err(CronError::Database)?
+                else {
                     warn!(
                         job_id = %job.id,
                         conversation_id,
@@ -546,6 +551,19 @@ impl JobExecutor {
                     return self
                         .create_new_conversation(job, saved_skill, ConversationPurpose::ExistingReplacement)
                         .await;
+                };
+                if !job.user_id.trim().is_empty() && owner_user_id != job.user_id {
+                    warn!(
+                        job_id = %job.id,
+                        job_user_id = %job.user_id,
+                        conversation_id,
+                        conversation_user_id = %owner_user_id,
+                        "Cron existing-mode conversation owner mismatch; refusing to dispatch"
+                    );
+                    return Err(CronError::Scheduler(format!(
+                        "cron job {} targets conversation {} owned by another user",
+                        job.id, conversation_id
+                    )));
                 }
                 Ok(job.conversation_id.clone())
             }
@@ -1471,6 +1489,28 @@ mod tests {
         assert_eq!(result, ExecutionResult::Skipped);
         assert_eq!(agent.send_calls(), 0, "queue protection should avoid send attempts");
         drop(claim);
+    }
+
+    #[tokio::test]
+    async fn prepare_scheduled_rejects_cross_user_existing_conversation() {
+        let agent = Arc::new(RecordingAgent::new("conv_1", "default", true));
+        let task_manager = Arc::new(RecordingTaskManager::new(AgentInstance::Mock(agent.clone())));
+        let repo = Arc::new(MissingWorkspaceConversationRepo::new(
+            "conv_1",
+            serde_json::json!({
+                "workspace": ensure_named_workspace_path("aionui-cron-cross-user-conversation-workspace")
+            }),
+        ));
+        let executor = make_executor_with_task_manager_and_repo(task_manager, repo);
+        let result = executor.prepare_scheduled(&sample_job()).await.unwrap_err();
+
+        match result {
+            ExecutionResult::Error { message } => {
+                assert!(message.contains("owned by another user"), "unexpected error: {message}");
+            }
+            other => panic!("expected owner mismatch error, got {other:?}"),
+        }
+        assert_eq!(agent.send_calls(), 0, "owner mismatch must not dispatch");
     }
 
     #[tokio::test]
@@ -2914,7 +2954,7 @@ mod tests {
         ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::ConversationRow {
                 id: id.to_owned(),
-                user_id: "cron".into(),
+                user_id: "user1".into(),
                 name: "Cron Conversation".into(),
                 r#type: "acp".into(),
                 extra: serde_json::json!({
@@ -2933,7 +2973,7 @@ mod tests {
         }
 
         async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, aionui_db::DbError> {
-            Ok(Some("cron".into()))
+            Ok(Some("user1".into()))
         }
 
         async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
