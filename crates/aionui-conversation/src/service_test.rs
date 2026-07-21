@@ -3614,10 +3614,23 @@ async fn get_config_options_returns_active_agent_snapshot() {
     }]);
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
 
-    let result = svc.get_config_options(&conv.id).await.unwrap();
+    let result = svc.get_config_options("user_1", &conv.id).await.unwrap();
 
     assert_eq!(result.config_options[0].id, "model");
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn get_config_options_rejects_cross_user_active_task() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let err = svc.get_config_options("user_2", &conv.id).await.unwrap_err();
+
+    assert!(matches!(err, ConversationError::NotFound { id } if id == conv.id));
 }
 
 #[tokio::test]

@@ -47,24 +47,24 @@ async fn set_config_option(
 
 async fn get_usage(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_usage(&id).await.map_err(ApiError::from)?,
+        state.service.get_usage(&user.id, &id).await.map_err(ApiError::from)?,
     )))
 }
 
 async fn side_question(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Json(req): Json<SideQuestionRequest>,
 ) -> Result<Json<ApiResponse<SideQuestionResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .handle_side_question(&id, req)
+            .handle_side_question(&user.id, &id, req)
             .await
             .map_err(ApiError::from)?,
     )))
@@ -72,11 +72,15 @@ async fn side_question(
 
 async fn get_slash_commands(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_slash_commands(&id).await.map_err(ApiError::from)?,
+        state
+            .service
+            .get_slash_commands(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
     )))
 }
 
