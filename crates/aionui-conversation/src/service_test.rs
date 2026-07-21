@@ -3703,6 +3703,39 @@ async fn active_count_for_user_counts_only_owned_active_tasks() {
 }
 
 #[tokio::test]
+async fn terminate_runtime_for_user_kills_only_owned_active_tasks() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let user_1_conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_2_conv = svc.create("user_2", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &user_1_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_1_conv.id))),
+    );
+    task_mgr.insert_agent(
+        &user_2_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_2_conv.id))),
+    );
+    let runtime_state = svc.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn(&user_1_conv.id, "turn-1")
+        .expect("claim should be created");
+    runtime_state.mark_cancelling(&user_1_conv.id);
+
+    let terminated = svc.terminate_runtime_for_user("user_1").await.unwrap();
+
+    assert_eq!(terminated, 1);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(user_1_conv.id.clone(), Some(AgentKillReason::SessionRevoked))]
+    );
+    assert!(!runtime_state.is_claimed(&user_1_conv.id));
+    assert!(!runtime_state.is_cancelling(&user_1_conv.id));
+    assert_eq!(task_mgr.active_count(), 1);
+    assert!(task_mgr.get_task(&user_2_conv.id).is_some());
+}
+
+#[tokio::test]
 async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());

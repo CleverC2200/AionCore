@@ -601,6 +601,35 @@ impl ConversationService {
         Ok(count)
     }
 
+    pub async fn terminate_runtime_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
+        let mut terminated = 0;
+        for conversation_id in self.task_manager.active_conversation_ids() {
+            let belongs_to_user = self
+                .conversation_repo
+                .get(user_id, &conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+                .is_some();
+            if !belongs_to_user {
+                continue;
+            }
+
+            self.task_manager
+                .kill_and_wait(&conversation_id, Some(AgentKillReason::SessionRevoked))
+                .await;
+            self.runtime_state.clear_conversation(&conversation_id);
+            terminated += 1;
+        }
+        if terminated > 0 {
+            tracing::info!(
+                user_id,
+                terminated,
+                "terminated conversation runtimes for revoked session"
+            );
+        }
+        Ok(terminated)
+    }
+
     async fn send_message_response(
         &self,
         conversation_id: &str,
