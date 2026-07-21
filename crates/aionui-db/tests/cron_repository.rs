@@ -44,7 +44,7 @@ fn make_job(id: &str) -> CronJobRow {
     let now = now_ms();
     CronJobRow {
         id: id.into(),
-        user_id: "user1".into(),
+        user_id: "user_1".into(),
         name: "Test Job".into(),
         enabled: true,
         schedule_kind: "every".into(),
@@ -201,12 +201,13 @@ async fn cj7_list_by_conversation() {
 }
 
 #[tokio::test]
-async fn scoped_crud_filters_by_conversation_owner() {
+async fn scoped_crud_filters_by_job_user_id() {
     let (r, db) = repo().await;
     insert_user_and_conversation(&db, "user_2", "conv_2").await;
 
     r.insert(&make_job("cron_user_1")).await.unwrap();
     let mut other = make_job("cron_user_2");
+    other.user_id = "user_2".into();
     other.conversation_id = "conv_2".into();
     r.insert(&other).await.unwrap();
 
@@ -243,17 +244,17 @@ async fn scoped_crud_filters_by_conversation_owner() {
 }
 
 #[tokio::test]
-async fn scheduler_enabled_scan_requires_conversation_owner() {
+async fn scheduler_enabled_scan_uses_job_user_id() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_owned")).await.unwrap();
     let mut orphan = make_job("cron_orphan");
     orphan.conversation_id = "missing_conversation".into();
-    let orphan_insert = r.insert(&orphan).await;
-    assert!(orphan_insert.is_err());
+    r.insert(&orphan).await.unwrap();
 
     let enabled = r.list_enabled().await.unwrap();
 
     assert!(enabled.iter().any(|job| job.id == "cron_owned"));
+    assert!(enabled.iter().any(|job| job.id == "cron_orphan"));
 }
 
 #[tokio::test]
