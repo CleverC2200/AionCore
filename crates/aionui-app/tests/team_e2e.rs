@@ -489,9 +489,9 @@ async fn team_api_rejects_cross_user_access() {
 
     let req = get_with_token(&format!("/api/teams/{team_id}"), &other_token);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let forbidden_requests = [
+    let hidden_requests = [
         json_with_token(
             "PATCH",
             &format!("/api/teams/{team_id}/name"),
@@ -536,9 +536,9 @@ async fn team_api_rejects_cross_user_access() {
         ),
     ];
 
-    for req in forbidden_requests {
+    for req in hidden_requests {
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -658,9 +658,9 @@ async fn trs5_run_state_rejects_cross_user_access() {
     let req = get_with_token(&format!("/api/teams/{team_id}/run-state"), &other_token);
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["code"], "NOT_FOUND");
 }
 
 // TL-3: Each team contains full assistants info
