@@ -881,6 +881,52 @@ async fn external_session_exchange_rejects_unprovisioned_user() {
 }
 
 #[tokio::test]
+async fn external_session_revoke_invalidates_existing_token() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let provision = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-users/pro-revoke",
+            r#"{"user_type":"aionpro","username":"Pro User"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provision.status(), StatusCode::OK);
+
+    let session = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            r#"{"user_type":"aionpro","external_user_id":"pro-revoke"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let session_json = body_json(session).await;
+    let token = session_json["data"]["token"].as_str().unwrap().to_owned();
+    assert_eq!(session_json["data"]["session_generation"], 0);
+
+    let revoke = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions/revoke",
+            r#"{"user_type":"aionpro","external_user_id":"pro-revoke"}"#,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    let revoke_json = body_json(revoke).await;
+    assert_eq!(revoke_json["data"]["session_generation"], 1);
+
+    let user_resp = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
+    assert_eq!(user_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn external_session_exchange_rejects_disabled_user() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     let provision = app

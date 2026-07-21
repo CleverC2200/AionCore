@@ -38,7 +38,7 @@ pub async fn csrf_middleware(
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
-        || path == "/api/auth/internal/external-sessions";
+        || path.starts_with("/api/auth/internal/external-sessions");
 
     if needs_validation && !is_exempt {
         let header_token = request

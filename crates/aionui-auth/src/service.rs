@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     EnsureExternalSessionRequest, EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse,
-    ExternalUserType, PublicUser,
+    ExternalUserType, PublicUser, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
 };
 use aionui_db::{ExternalUserProjection, IUserRepository, UserStatus, UserType, models::User};
 
@@ -84,6 +84,23 @@ impl AuthProvisionService {
             user: PublicUser { id: user.id, username },
             token,
             session_generation: user.session_generation,
+        })
+    }
+
+    pub async fn revoke_external_session(
+        &self,
+        request: RevokeExternalSessionRequest,
+    ) -> Result<RevokeExternalSessionResponse, ProvisionError> {
+        let user_type = map_external_user_type(request.user_type)?;
+        let user = self
+            .user_repo
+            .find_by_external_user_id(user_type, &request.external_user_id)
+            .await?
+            .ok_or(ProvisionError::UserNotProvisioned)?;
+        let session_generation = self.user_repo.increment_session_generation(&user.id).await?;
+        Ok(RevokeExternalSessionResponse {
+            user_id: user.id,
+            session_generation,
         })
     }
 }

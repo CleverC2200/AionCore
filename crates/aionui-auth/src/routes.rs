@@ -15,8 +15,9 @@ use serde::Deserialize;
 use aionui_api_types::{
     ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
     EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
-    RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
+    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
+    WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
@@ -222,6 +223,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
             post(create_external_session_handler),
         )
         .route(
+            "/api/auth/internal/external-sessions/revoke",
+            post(revoke_external_session_handler),
+        )
+        .route(
             "/api/auth/internal/users",
             get(list_internal_users_handler).post(create_internal_user_handler),
         )
@@ -342,6 +347,30 @@ async fn create_external_session_handler(
     );
     let cookie = state.cookie_config.build_session_cookie(&response.token);
     Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(response))).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/auth/internal/external-sessions/revoke
+// ---------------------------------------------------------------------------
+
+async fn revoke_external_session_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<RevokeExternalSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RevokeExternalSessionResponse>>, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let response = service
+        .revoke_external_session(req)
+        .await
+        .map_err(provision_error_to_api_error)?;
+    tracing::info!(
+        user_id = %response.user_id,
+        session_generation = response.session_generation,
+        "external core session revoked"
+    );
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 // ---------------------------------------------------------------------------
