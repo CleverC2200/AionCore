@@ -169,9 +169,18 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         session_revoked_hook: {
             let ws_manager = services.ws_manager.clone();
             let conversation_service = states.conversation.service.clone();
+            let team_service = states.team.service.clone();
             let file_watch_service = states.file.watch_service.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
+                let stopped_team_sessions = team_service.stop_sessions_for_user(user_id);
+                if stopped_team_sessions > 0 {
+                    tracing::info!(
+                        user_id = %user_id,
+                        stopped_team_sessions,
+                        "stopped team sessions after session revocation"
+                    );
+                }
                 let user_id = user_id.to_owned();
                 let conversation_service = conversation_service.clone();
                 let file_watch_service = file_watch_service.clone();

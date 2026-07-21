@@ -1817,6 +1817,20 @@ impl TeamSessionService {
         Ok(())
     }
 
+    pub fn stop_sessions_for_user(&self, user_id: &str) -> usize {
+        let team_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.session.user_id() == user_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let stopped = team_ids.len();
+        for team_id in team_ids {
+            self.stop_session_unchecked(&team_id);
+        }
+        stopped
+    }
+
     fn stop_session_unchecked(&self, team_id: &str) {
         if let Some((_, entry)) = self.sessions.remove(team_id) {
             entry.slow_monitor_handle.abort();
@@ -2478,6 +2492,29 @@ mod tests {
 
         assert!(svc.session_has_slow_monitor(&created.id));
         svc.stop_session("user-test", &created.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_sessions_for_user_keeps_other_user_sessions() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let owned = svc
+            .create_team("user-test", single_agent_team_request("Owned Session"))
+            .await
+            .unwrap();
+        let other = svc
+            .create_team("user-other", single_agent_team_request("Other Session"))
+            .await
+            .unwrap();
+
+        svc.ensure_session("user-test", &owned.id).await.unwrap();
+        svc.ensure_session("user-other", &other.id).await.unwrap();
+
+        assert_eq!(svc.stop_sessions_for_user("user-test"), 1);
+        assert_eq!(svc.session_count_for_test(), 1);
+        assert!(!svc.session_has_slow_monitor(&owned.id));
+        assert!(svc.session_has_slow_monitor(&other.id));
+
+        svc.stop_session("user-other", &other.id).await.unwrap();
     }
 
     #[tokio::test]
