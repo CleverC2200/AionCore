@@ -10,7 +10,7 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
     ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
@@ -21,7 +21,7 @@ use aionui_api_types::{
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
-use aionui_db::{DbError, IUserRepository, models::User};
+use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
 use crate::extract::extract_token_from_headers;
@@ -103,6 +103,39 @@ struct UpdateUsernameRequest {
 #[derive(Debug, Deserialize)]
 struct UpdateJwtSecretRequest {
     jwt_secret: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalUserResponse {
+    id: String,
+    user_type: UserType,
+    external_user_id: Option<String>,
+    username: Option<String>,
+    email: Option<String>,
+    avatar_path: Option<String>,
+    status: UserStatus,
+    session_generation: i64,
+    created_at: i64,
+    updated_at: i64,
+    last_login: Option<i64>,
+}
+
+impl From<User> for InternalUserResponse {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id,
+            user_type: user.user_type,
+            external_user_id: user.external_user_id,
+            username: user.username,
+            email: user.email,
+            avatar_path: user.avatar_path,
+            status: user.status,
+            session_generation: user.session_generation,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            last_login: user.last_login,
+        }
+    }
 }
 
 fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
@@ -531,46 +564,48 @@ async fn status_handler(
 
 async fn list_internal_users_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Vec<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Vec<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(users)))
+    Ok(Json(ApiResponse::ok(
+        users.into_iter().map(InternalUserResponse::from).collect(),
+    )))
 }
 
 async fn get_system_user_handler(
     State(state): State<AuthRouterState>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.get_system_user().await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn find_user_by_username_handler(
     State(state): State<AuthRouterState>,
     Path(username): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state
         .user_repo
         .find_by_username(&username)
         .await
         .map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn find_user_by_id_handler(
     State(state): State<AuthRouterState>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Option<User>>>, ApiError> {
+) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
     ensure_local_mode(state.local)?;
     let user = state.user_repo.find_by_id(&id).await.map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
 
 async fn create_internal_user_handler(
     State(state): State<AuthRouterState>,
     body: Result<Json<CreateInternalUserRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<User>>, ApiError> {
+) -> Result<Json<ApiResponse<InternalUserResponse>>, ApiError> {
     ensure_local_mode(state.local)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let user = state
@@ -578,7 +613,7 @@ async fn create_internal_user_handler(
         .create_user(&req.username, &req.password_hash)
         .await
         .map_err(db_error_to_api_error)?;
-    Ok(Json(ApiResponse::ok(user)))
+    Ok(Json(ApiResponse::ok(InternalUserResponse::from(user))))
 }
 
 async fn set_system_user_credentials_handler(

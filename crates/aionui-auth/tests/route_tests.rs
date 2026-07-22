@@ -1074,6 +1074,8 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     assert_eq!(system_resp.status(), StatusCode::OK);
     let system_json = body_json(system_resp).await;
     assert_eq!(system_json["data"]["id"], "system_default_user");
+    assert!(system_json["data"].get("password_hash").is_none());
+    assert!(system_json["data"].get("jwt_secret").is_none());
 
     let user_resp = app
         .clone()
@@ -1082,6 +1084,8 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
         .unwrap();
     assert_eq!(user_resp.status(), StatusCode::OK);
     let user_json = body_json(user_resp).await;
+    assert!(user_json["data"].get("password_hash").is_none());
+    assert!(user_json["data"].get("jwt_secret").is_none());
     let user_id = user_json["data"]["id"].as_str().unwrap().to_owned();
 
     let update_resp = app
