@@ -735,6 +735,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
     .into_iter()
     .map(|(id, backend, agent_type, name, sort_order)| AgentMetadataRow {
         id: id.to_owned(),
+        user_id: None,
         icon: None,
         name: name.to_owned(),
         name_i18n: None,
@@ -835,6 +836,7 @@ struct ClaudeNativeSkillMetadataRepo;
 fn claude_metadata_row() -> AgentMetadataRow {
     AgentMetadataRow {
         id: "agent-claude".into(),
+        user_id: None,
         icon: None,
         name: "Claude Code".into(),
         name_i18n: None,
@@ -7777,25 +7779,28 @@ async fn seed_aionrs_conversation_with_snapshot(
         updated_at: 1,
     };
     repo.create(&row).await.unwrap();
-    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
-        conversation_id: &row.id,
-        assistant_definition_id: "asstdef-seed",
-        assistant_id: "assistant-seed",
-        assistant_source: "builtin",
-        agent_id: "agent-seed",
-        rules_content: "",
-        default_model_mode: "auto",
-        resolved_model_id: None,
-        default_permission_mode,
-        resolved_permission_value,
-        default_thought_level_mode: "auto",
-        resolved_thought_level_value: None,
-        default_skills_mode: "auto",
-        resolved_skill_ids: "[]",
-        resolved_disabled_builtin_skill_ids: "[]",
-        default_mcps_mode: "auto",
-        resolved_mcp_ids: "[]",
-    })
+    repo.upsert_assistant_snapshot(
+        &row.user_id,
+        &UpsertConversationAssistantSnapshotParams {
+            conversation_id: &row.id,
+            assistant_definition_id: "asstdef-seed",
+            assistant_id: "assistant-seed",
+            assistant_source: "builtin",
+            agent_id: "agent-seed",
+            rules_content: "",
+            default_model_mode: "auto",
+            resolved_model_id: None,
+            default_permission_mode,
+            resolved_permission_value,
+            default_thought_level_mode: "auto",
+            resolved_thought_level_value: None,
+            default_skills_mode: "auto",
+            resolved_skill_ids: "[]",
+            resolved_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            resolved_mcp_ids: "[]",
+        },
+    )
     .await
     .unwrap();
     row

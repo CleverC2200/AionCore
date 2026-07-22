@@ -3345,7 +3345,7 @@ impl ConversationService {
         }
         let snapshot = self
             .conversation_repo
-            .get_assistant_snapshot(&row.id)
+            .get_assistant_snapshot(&row.user_id, &row.id)
             .await
             .map_err(|e| {
                 ConversationError::internal(format!(
