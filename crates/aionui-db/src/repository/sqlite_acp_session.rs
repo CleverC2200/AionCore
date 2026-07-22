@@ -20,6 +20,7 @@ impl SqliteAcpSessionRepository {
         Self { pool }
     }
 
+    #[cfg(test)]
     async fn get_unscoped(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         let row = sqlx::query_as::<_, AcpSessionRow>("SELECT * FROM acp_session WHERE conversation_id = ?")
             .bind(conversation_id)
@@ -203,16 +204,19 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
 
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         let now = now_ms();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO acp_session \
                 (conversation_id, agent_source, agent_id, \
                  session_id, session_status, session_config, last_active_at) \
-             VALUES (?, ?, ?, NULL, 'idle', '{}', ?)",
+             SELECT c.id, ?, ?, NULL, 'idle', '{}', ? \
+             FROM conversations c \
+             WHERE c.id = ? AND c.user_id = ?",
         )
-        .bind(params.conversation_id)
         .bind(params.agent_source)
         .bind(params.agent_id)
         .bind(now)
+        .bind(params.conversation_id)
+        .bind(params.user_id)
         .execute(&self.pool)
         .await
         .map_err(|e| match &e {
@@ -223,12 +227,21 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
             _ => DbError::Query(e),
         })?;
 
-        self.get_unscoped(params.conversation_id).await?.ok_or_else(|| {
-            DbError::Init(format!(
-                "create did not produce acp_session row for '{}'",
-                params.conversation_id
-            ))
-        })
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "conversation '{}' for user '{}'",
+                params.conversation_id, params.user_id
+            )));
+        }
+
+        self.get_for_user(params.user_id, params.conversation_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Init(format!(
+                    "create did not produce acp_session row for '{}'",
+                    params.conversation_id
+                ))
+            })
     }
 
     async fn update_session_id_for_user(
@@ -336,11 +349,13 @@ mod tests {
     async fn setup() -> (SqliteAcpSessionRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
         let repo = SqliteAcpSessionRepository::new(db.pool().clone());
+        insert_conversation(&repo, "user-1", "conv-1").await;
         (repo, db)
     }
 
     fn create_params<'a>(conversation_id: &'a str) -> CreateAcpSessionParams<'a> {
         CreateAcpSessionParams {
+            user_id: "user-1",
             conversation_id,
             agent_source: "builtin",
             agent_id: "2d23ff1c",
@@ -362,7 +377,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO conversations \
+            "INSERT OR IGNORE INTO conversations \
                 (id, user_id, name, type, extra, model, status, source, \
                  channel_chat_id, pinned, pinned_at, created_at, updated_at) \
              VALUES (?, ?, 'Test', 'acp', '{}', NULL, 'pending', NULL, NULL, 0, NULL, ?, ?)",
@@ -396,6 +411,23 @@ mod tests {
         repo.create(&create_params("conv-1")).await.unwrap();
         let err = repo.create(&create_params("conv-1")).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_cross_user_parent() {
+        let (repo, _db) = setup().await;
+        let err = repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-2",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "2d23ff1c",
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DbError::NotFound(_)));
+        assert!(repo.get_for_user("user-1", "conv-1").await.unwrap().is_none());
     }
 
     #[tokio::test]

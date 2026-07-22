@@ -317,6 +317,7 @@ mod tests {
         .unwrap();
         let repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
         repo.create(&CreateAcpSessionParams {
+            user_id: "user-1",
             conversation_id: "conv-1",
             agent_source: "builtin",
             agent_id: "2d23ff1c",

@@ -1318,6 +1318,7 @@ impl ConversationService {
         };
 
         let params = CreateAcpSessionParams {
+            user_id,
             conversation_id,
             agent_source,
             agent_id: &resolved_agent_id,

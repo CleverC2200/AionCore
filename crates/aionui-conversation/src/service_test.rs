@@ -781,8 +781,14 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows())
     }
+    async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        self.list_all().await
+    }
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows().into_iter().find(|row| row.id == id))
+    }
+    async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.get(id).await
     }
     async fn find_by_source_and_name(
         &self,
@@ -791,13 +797,35 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn find_by_source_and_name_for_user(
+        &self,
+        _user_id: &str,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_by_source_and_name(agent_source, name).await
+    }
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows()
             .into_iter()
             .find(|row| row.agent_source == "builtin" && row.backend.as_deref() == Some(backend)))
     }
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        _user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_builtin_by_backend(backend).await
+    }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
+    }
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
     }
     async fn apply_handshake(
         &self,
@@ -806,12 +834,28 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn apply_handshake_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.apply_handshake(id, params).await
+    }
     async fn update_availability_snapshot(
         &self,
         _id: &str,
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.update_availability_snapshot(id, params).await
     }
     async fn update_agent_overrides(
         &self,
@@ -821,11 +865,26 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<(), DbError> {
         Ok(())
     }
+    async fn update_agent_overrides_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.update_agent_overrides(id, command_override, env_override).await
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
+    async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+        self.set_enabled(id, enabled).await
+    }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+        self.delete(id).await
     }
 }
 
@@ -881,8 +940,14 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(vec![claude_metadata_row()])
     }
+    async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        self.list_all().await
+    }
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((id == "agent-claude").then(claude_metadata_row))
+    }
+    async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.get(id).await
     }
     async fn find_by_source_and_name(
         &self,
@@ -891,11 +956,33 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((agent_source == "builtin" && name == "Claude Code").then(claude_metadata_row))
     }
+    async fn find_by_source_and_name_for_user(
+        &self,
+        _user_id: &str,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_by_source_and_name(agent_source, name).await
+    }
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((backend == "claude").then(claude_metadata_row))
     }
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        _user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_builtin_by_backend(backend).await
+    }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
+    }
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
     }
     async fn apply_handshake(
         &self,
@@ -904,12 +991,28 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn apply_handshake_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.apply_handshake(id, params).await
+    }
     async fn update_availability_snapshot(
         &self,
         _id: &str,
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.update_availability_snapshot(id, params).await
     }
     async fn update_agent_overrides(
         &self,
@@ -919,11 +1022,26 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<(), DbError> {
         Ok(())
     }
+    async fn update_agent_overrides_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.update_agent_overrides(id, command_override, env_override).await
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
+    async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+        self.set_enabled(id, enabled).await
+    }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+        self.delete(id).await
     }
 }
 
@@ -986,6 +1104,7 @@ impl StubAcpSessionRepo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CreateAcpSessionCall {
+    user_id: String,
     conversation_id: String,
     agent_source: String,
     agent_id: String,
@@ -998,6 +1117,7 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     }
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
+            user_id: params.user_id.to_owned(),
             conversation_id: params.conversation_id.to_owned(),
             agent_source: params.agent_source.to_owned(),
             agent_id: params.agent_id.to_owned(),
@@ -7149,6 +7269,7 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
 
     let create_calls = acp_repo.create_calls();
     assert_eq!(create_calls.len(), 1);
+    assert_eq!(create_calls[0].user_id, "user-1");
     assert_eq!(create_calls[0].agent_id, "8e1acf31");
     assert_eq!(create_calls[0].agent_source, "builtin");
     assert_eq!(create_calls[0].agent_id, "8e1acf31");

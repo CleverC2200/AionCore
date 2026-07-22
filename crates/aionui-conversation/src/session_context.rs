@@ -854,6 +854,7 @@ mod tests {
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-claude-test",
@@ -906,6 +907,7 @@ mod tests {
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-codex-test",
@@ -944,6 +946,7 @@ mod tests {
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
+                user_id: "user-1",
                 conversation_id: "conv-1",
                 agent_source: "builtin",
                 agent_id: "builtin-codex-test",

@@ -22,6 +22,7 @@ use crate::models::AcpSessionRow;
 /// it through [`IAcpSessionRepository::update_session_id_for_user`].
 #[derive(Debug, Clone)]
 pub struct CreateAcpSessionParams<'a> {
+    pub user_id: &'a str,
     pub conversation_id: &'a str,
     pub agent_source: &'a str,
     pub agent_id: &'a str,
