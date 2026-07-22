@@ -322,7 +322,7 @@ impl AssistantService {
 
         for definition in self
             .definition_repo
-            .list()
+            .list_for_user(DEFAULT_USER_ID)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?
         {
@@ -352,8 +352,11 @@ impl AssistantService {
     }
 
     async fn sync_legacy_user_assistants_to_new_tables(&self) -> Result<(), AssistantError> {
-        for row in self.repo.list().await? {
-            if let Err(error) = self.sync_legacy_user_assistant_to_new_tables(&row).await {
+        for row in self.repo.list_for_user(DEFAULT_USER_ID).await? {
+            if let Err(error) = self
+                .sync_legacy_user_assistant_to_new_tables_for_user(DEFAULT_USER_ID, &row)
+                .await
+            {
                 warn!(
                     assistant_id = %row.id,
                     error = %error,
@@ -364,35 +367,44 @@ impl AssistantService {
         Ok(())
     }
 
-    async fn sync_legacy_user_assistant_to_new_tables(&self, row: &AssistantRow) -> Result<(), AssistantError> {
+    async fn sync_legacy_user_assistant_to_new_tables_for_user(
+        &self,
+        user_id: &str,
+        row: &AssistantRow,
+    ) -> Result<(), AssistantError> {
         if self.builtin.has(&row.id) {
             return Ok(());
         }
         if self
             .definition_repo
-            .get_by_source_ref_including_deleted("user", &row.id)
+            .get_by_source_ref_including_deleted_for_user(user_id, "user", &row.id)
             .await
             .map_err(|e| AssistantError::Internal(format!("get user definition by source_ref: {e}")))?
             .is_some()
             || self
                 .definition_repo
-                .get_by_assistant_id_including_deleted(&row.id)
+                .get_by_assistant_id_including_deleted_for_user(user_id, &row.id)
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get user definition by assistant_id: {e}")))?
                 .is_some()
         {
             return Ok(());
         }
-        self.upsert_definition_from_legacy_user_row(row, None).await?;
+        self.upsert_definition_from_legacy_user_row_for_user(user_id, row, None)
+            .await?;
         Ok(())
     }
 
     async fn reconcile_user_avatar_assets(&self) -> Result<(), AssistantError> {
-        let definitions = self.definition_repo.list_including_deleted().await.map_err(|e| {
-            AssistantError::Internal(format!(
-                "list assistant definitions including deleted for avatar reconcile: {e}"
-            ))
-        })?;
+        let definitions = self
+            .definition_repo
+            .list_including_deleted_for_user(DEFAULT_USER_ID)
+            .await
+            .map_err(|e| {
+                AssistantError::Internal(format!(
+                    "list assistant definitions including deleted for avatar reconcile: {e}"
+                ))
+            })?;
 
         for mut definition in definitions {
             if definition.avatar_type != "user_asset" {
@@ -424,10 +436,10 @@ impl AssistantService {
     }
 
     async fn sync_legacy_overrides_to_new_states(&self) -> Result<(), AssistantError> {
-        for override_row in self.override_repo.get_all().await? {
+        for override_row in self.override_repo.get_all_for_user(DEFAULT_USER_ID).await? {
             let Some(definition) = self
                 .definition_repo
-                .get_by_assistant_id(&override_row.assistant_id)
+                .get_by_assistant_id_for_user(DEFAULT_USER_ID, &override_row.assistant_id)
                 .await?
             else {
                 warn!(
@@ -439,7 +451,7 @@ impl AssistantService {
 
             let existing_state = self
                 .state_repo
-                .get(&definition.id)
+                .get_for_user(DEFAULT_USER_ID, &definition.id)
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
 
@@ -453,13 +465,16 @@ impl AssistantService {
             }
 
             self.state_repo
-                .upsert(&UpsertAssistantOverlayParams {
-                    assistant_definition_id: &definition.id,
-                    enabled: override_row.enabled,
-                    sort_order: override_row.sort_order,
-                    agent_id_override: None,
-                    last_used_at: override_row.last_used_at,
-                })
+                .upsert_for_user(
+                    DEFAULT_USER_ID,
+                    &UpsertAssistantOverlayParams {
+                        assistant_definition_id: &definition.id,
+                        enabled: override_row.enabled,
+                        sort_order: override_row.sort_order,
+                        agent_id_override: None,
+                        last_used_at: override_row.last_used_at,
+                    },
+                )
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
         }
@@ -672,15 +687,6 @@ impl AssistantService {
         }
 
         Ok(())
-    }
-
-    async fn upsert_definition_from_legacy_user_row(
-        &self,
-        row: &AssistantRow,
-        requested_agent_id: Option<&str>,
-    ) -> Result<(), AssistantError> {
-        self.upsert_definition_from_legacy_user_row_for_user(DEFAULT_USER_ID, row, requested_agent_id)
-            .await
     }
 
     async fn upsert_definition_from_legacy_user_row_for_user(
