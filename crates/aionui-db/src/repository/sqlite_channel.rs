@@ -365,6 +365,32 @@ impl IChannelRepository for SqliteChannelRepository {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
+            let session_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM assistant_sessions s \
+                 JOIN assistant_users u ON u.id = s.user_id \
+                 WHERE s.id = ? AND u.owner_user_id = ?",
+            )
+            .bind(id)
+            .bind(owner_user_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+            if session_exists > 0 {
+                let conversation_owner =
+                    sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
+                        .bind(conversation_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+
+                if conversation_owner
+                    .as_deref()
+                    .is_some_and(|user_id| user_id != owner_user_id)
+                {
+                    return Err(DbError::Conflict(
+                        "CROSS_ACCOUNT_REFERENCE: channel session conversation belongs to another user".into(),
+                    ));
+                }
+            }
             return Err(DbError::NotFound(format!("Session '{id}' not found")));
         }
         Ok(())
@@ -1159,7 +1185,10 @@ mod tests {
             .update_session_conversation(OWNER_A, "sess-1", "conv-other")
             .await
             .unwrap_err();
-        assert!(matches!(err, DbError::NotFound(_)));
+        assert!(matches!(
+            err,
+            DbError::Conflict(msg) if msg.starts_with("CROSS_ACCOUNT_REFERENCE:")
+        ));
         assert!(
             repo.get_session(OWNER_A, "sess-1")
                 .await

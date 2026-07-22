@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use tracing::warn;
 
@@ -48,6 +49,9 @@ pub struct ChannelRouterState {
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
         DbError::NotFound(msg) => ApiError::NotFound(msg),
+        DbError::Conflict(msg) if msg.starts_with("CROSS_ACCOUNT_REFERENCE:") => {
+            ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
+        }
         DbError::Conflict(msg) => ApiError::Conflict(msg),
         DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
         DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
@@ -880,6 +884,16 @@ mod tests {
     fn plugin_already_running_maps_to_conflict() {
         let err = ApiError::from(ChannelError::PluginAlreadyRunning("telegram".into()));
         assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn cross_account_db_conflict_maps_to_stable_code() {
+        let err = db_error_to_api_error(DbError::Conflict(
+            "CROSS_ACCOUNT_REFERENCE: channel session conversation belongs to another user".into(),
+        ));
+
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "CROSS_ACCOUNT_REFERENCE");
     }
 
     #[test]
