@@ -809,73 +809,87 @@ impl ITeamRepository for FullMockTeamRepo {
         Ok(())
     }
 
-    async fn write_message(&self, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+    async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
         if *self.fail_message_writes.lock().unwrap() {
             return Err(DbError::Init("forced mailbox write failure".into()));
         }
-        self.inner.write_message(row).await
+        self.inner.write_message(user_id, row).await
     }
     async fn read_unread_and_mark(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.read_unread_and_mark(team_id, to_agent_id).await
+        self.inner.read_unread_and_mark(user_id, team_id, to_agent_id).await
     }
     async fn peek_unread(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.peek_unread(team_id, to_agent_id).await
+        self.inner.peek_unread(user_id, team_id, to_agent_id).await
     }
-    async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), DbError> {
-        self.inner.mark_read_batch(team_id, ids).await
+    async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
+        self.inner.mark_read_batch(user_id, team_id, ids).await
     }
     async fn get_history(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.get_history(team_id, to_agent_id, limit).await
+        self.inner.get_history(user_id, team_id, to_agent_id, limit).await
     }
     async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_mailbox_by_team(user_id, team_id).await
     }
 
-    async fn create_task(&self, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
-        self.inner.create_task(row).await
+    async fn create_task(&self, user_id: &str, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
+        self.inner.create_task(user_id, row).await
     }
     async fn find_task_by_id(
         &self,
+        user_id: &str,
         team_id: &str,
         task_id: &str,
     ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.find_task_by_id(team_id, task_id).await
+        self.inner.find_task_by_id(user_id, team_id, task_id).await
     }
     async fn update_task(
         &self,
+        user_id: &str,
         team_id: &str,
         task_id: &str,
         params: &aionui_db::UpdateTaskParams,
     ) -> Result<(), DbError> {
-        self.inner.update_task(team_id, task_id, params).await
+        self.inner.update_task(user_id, team_id, task_id, params).await
     }
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.list_tasks(team_id).await
+    async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks(user_id, team_id).await
     }
-    async fn append_to_blocks(&self, team_id: &str, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
-        self.inner.append_to_blocks(team_id, task_id, blocked_task_id).await
+    async fn append_to_blocks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        blocked_task_id: &str,
+    ) -> Result<(), DbError> {
+        self.inner
+            .append_to_blocks(user_id, team_id, task_id, blocked_task_id)
+            .await
     }
     async fn remove_from_blocked_by(
         &self,
+        user_id: &str,
         team_id: &str,
         task_id: &str,
         unblocked_task_id: &str,
     ) -> Result<(), DbError> {
         self.inner
-            .remove_from_blocked_by(team_id, task_id, unblocked_task_id)
+            .remove_from_blocked_by(user_id, team_id, task_id, unblocked_task_id)
             .await
     }
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
@@ -1724,18 +1738,21 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
         .expect("clear existing session");
 
     team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-orphan-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: lead_slot_id.clone(),
-            from_agent_id: "worker-or-user".into(),
-            msg_type: "message".into(),
-            content: "orphan backlog".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
+        .write_message(
+            "user1",
+            &aionui_db::models::MailboxMessageRow {
+                id: "mailbox-orphan-1".into(),
+                team_id: created.id.clone(),
+                to_agent_id: lead_slot_id.clone(),
+                from_agent_id: "worker-or-user".into(),
+                msg_type: "message".into(),
+                content: "orphan backlog".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            },
+        )
         .await
         .expect("seed orphan mailbox");
 
@@ -1781,18 +1798,21 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
         .expect("clear existing session");
 
     team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-worker-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: worker_slot_id.clone(),
-            from_agent_id: "user".into(),
-            msg_type: "message".into(),
-            content: "do X".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
+        .write_message(
+            "user1",
+            &aionui_db::models::MailboxMessageRow {
+                id: "mailbox-worker-1".into(),
+                team_id: created.id.clone(),
+                to_agent_id: worker_slot_id.clone(),
+                from_agent_id: "user".into(),
+                msg_type: "message".into(),
+                content: "do X".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            },
+        )
         .await
         .expect("seed teammate mailbox");
 
@@ -1851,18 +1871,21 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
         .expect("clear existing session");
 
     team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-self-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: lead_slot_id.clone(),
-            from_agent_id: lead_slot_id,
-            msg_type: "message".into(),
-            content: "self backlog".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
+        .write_message(
+            "user1",
+            &aionui_db::models::MailboxMessageRow {
+                id: "mailbox-self-1".into(),
+                team_id: created.id.clone(),
+                to_agent_id: lead_slot_id.clone(),
+                from_agent_id: lead_slot_id,
+                msg_type: "message".into(),
+                content: "self backlog".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            },
+        )
         .await
         .expect("seed self mailbox");
 
@@ -3887,7 +3910,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
     );
 
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
-    let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
+    let leader_messages = team_repo
+        .get_history("user1", &created.id, lead_slot_id, None)
+        .await
+        .unwrap();
     assert!(
         leader_messages
             .iter()

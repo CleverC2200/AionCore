@@ -10,11 +10,19 @@ use crate::types::{MailboxMessage, MailboxMessageType};
 
 pub struct Mailbox {
     repo: Arc<dyn ITeamRepository>,
+    user_id: String,
 }
 
 impl Mailbox {
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
-        Self { repo }
+        Self::new_for_user(repo, "system_default_user")
+    }
+
+    pub fn new_for_user(repo: Arc<dyn ITeamRepository>, user_id: impl Into<String>) -> Self {
+        Self {
+            repo,
+            user_id: user_id.into(),
+        }
     }
 
     pub async fn write(
@@ -57,7 +65,7 @@ impl Mailbox {
             created_at: now_ms(),
         };
 
-        self.repo.write_message(&row).await?;
+        self.repo.write_message(&self.user_id, &row).await?;
 
         debug!(
             team_id,
@@ -72,7 +80,7 @@ impl Mailbox {
     }
 
     pub async fn read_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.read_unread_and_mark(team_id, agent_id).await?;
+        let rows = self.repo.read_unread_and_mark(&self.user_id, team_id, agent_id).await?;
 
         debug!(team_id, agent_id, count = rows.len(), "mailbox unread messages read");
 
@@ -83,7 +91,7 @@ impl Mailbox {
     /// Reads all unread messages without marking them as read.
     /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
     pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.peek_unread(team_id, agent_id).await?;
+        let rows = self.repo.peek_unread(&self.user_id, team_id, agent_id).await?;
         debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
@@ -91,7 +99,7 @@ impl Mailbox {
 
     /// Marks the given message IDs as read. Called after successful prompt delivery.
     pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
-        self.repo.mark_read_batch(team_id, ids).await?;
+        self.repo.mark_read_batch(&self.user_id, team_id, ids).await?;
         Ok(())
     }
 
@@ -120,13 +128,13 @@ impl Mailbox {
         agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, limit).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, limit).await?;
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
     pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, None).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, None).await?;
         Ok(rows.iter().any(|r| !r.read))
     }
 

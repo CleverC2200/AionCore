@@ -63,7 +63,7 @@ impl ITeamRepository for MockTeamRepo {
 
     // ── Mailbox ─────────────────────────────────────────────────────
 
-    async fn write_message(&self, row: &MailboxMessageRow) -> Result<(), DbError> {
+    async fn write_message(&self, _user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
         if state.fail_message_writes {
             return Err(DbError::Init("forced mailbox write failure".into()));
@@ -72,7 +72,12 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn read_unread_and_mark(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let mut state = self.state.lock().unwrap();
         let mut result = vec![];
         for msg in &mut state.messages {
@@ -84,7 +89,12 @@ impl ITeamRepository for MockTeamRepo {
         Ok(result)
     }
 
-    async fn peek_unread(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn peek_unread(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
         let result = state
             .messages
@@ -95,7 +105,7 @@ impl ITeamRepository for MockTeamRepo {
         Ok(result)
     }
 
-    async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), DbError> {
+    async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
         for msg in &mut state.messages {
             if msg.team_id == team_id && ids.contains(&msg.id) {
@@ -107,6 +117,7 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn get_history(
         &self,
+        _user_id: &str,
         team_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
@@ -130,12 +141,17 @@ impl ITeamRepository for MockTeamRepo {
 
     // ── TaskBoard ───────────────────────────────────────────────────
 
-    async fn create_task(&self, row: &TeamTaskRow) -> Result<(), DbError> {
+    async fn create_task(&self, _user_id: &str, row: &TeamTaskRow) -> Result<(), DbError> {
         self.state.lock().unwrap().tasks.push(row.clone());
         Ok(())
     }
 
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
+    async fn find_task_by_id(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
         let found = state
             .tasks
@@ -145,7 +161,13 @@ impl ITeamRepository for MockTeamRepo {
         Ok(found)
     }
 
-    async fn update_task(&self, team_id: &str, task_id: &str, params: &UpdateTaskParams) -> Result<(), DbError> {
+    async fn update_task(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        params: &UpdateTaskParams,
+    ) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
         let task = state
             .tasks
@@ -171,7 +193,7 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+    async fn list_tasks(&self, _user_id: &str, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         let state = self.state.lock().unwrap();
         if state.fail_task_lists {
             return Err(DbError::Init("forced task list failure".into()));
@@ -180,7 +202,13 @@ impl ITeamRepository for MockTeamRepo {
         Ok(tasks)
     }
 
-    async fn append_to_blocks(&self, team_id: &str, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
+    async fn append_to_blocks(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        blocked_task_id: &str,
+    ) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
         let task = state
             .tasks
@@ -195,6 +223,7 @@ impl ITeamRepository for MockTeamRepo {
 
     async fn remove_from_blocked_by(
         &self,
+        _user_id: &str,
         team_id: &str,
         task_id: &str,
         unblocked_task_id: &str,
@@ -512,12 +541,17 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn write_message(&self, _row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+        async fn write_message(
+            &self,
+            _user_id: &str,
+            _row: &aionui_db::models::MailboxMessageRow,
+        ) -> Result<(), DbError> {
             Ok(())
         }
 
         async fn read_unread_and_mark(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
@@ -526,18 +560,20 @@ pub(crate) mod workspace_harness {
 
         async fn peek_unread(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
             Ok(vec![])
         }
 
-        async fn mark_read_batch(&self, _team_id: &str, _ids: &[String]) -> Result<(), DbError> {
+        async fn mark_read_batch(&self, _user_id: &str, _team_id: &str, _ids: &[String]) -> Result<(), DbError> {
             Ok(())
         }
 
         async fn get_history(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _to_agent_id: &str,
             _limit: Option<i64>,
@@ -549,16 +585,22 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn create_task(&self, _row: &TeamTaskRow) -> Result<(), DbError> {
+        async fn create_task(&self, _user_id: &str, _row: &TeamTaskRow) -> Result<(), DbError> {
             Ok(())
         }
 
-        async fn find_task_by_id(&self, _team_id: &str, _task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
+        async fn find_task_by_id(
+            &self,
+            _user_id: &str,
+            _team_id: &str,
+            _task_id: &str,
+        ) -> Result<Option<TeamTaskRow>, DbError> {
             Ok(None)
         }
 
         async fn update_task(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _task_id: &str,
             _params: &aionui_db::UpdateTaskParams,
@@ -566,12 +608,13 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn list_tasks(&self, _team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        async fn list_tasks(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
             Ok(vec![])
         }
 
         async fn append_to_blocks(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _task_id: &str,
             _blocked_task_id: &str,
@@ -581,6 +624,7 @@ pub(crate) mod workspace_harness {
 
         async fn remove_from_blocked_by(
             &self,
+            _user_id: &str,
             _team_id: &str,
             _task_id: &str,
             _unblocked_task_id: &str,

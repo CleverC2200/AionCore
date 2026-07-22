@@ -55,22 +55,33 @@ pub trait ITeamRepository: Send + Sync {
     // ── Mailbox ──────────────────────────────────────────────────────
 
     /// Writes a message to the mailbox.
-    async fn write_message(&self, row: &MailboxMessageRow) -> Result<(), DbError>;
+    async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError>;
 
     /// Atomically reads all unread messages for `to_agent_id` in a team
     /// and marks them as read. Uses `BEGIN IMMEDIATE` for atomicity.
-    async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError>;
+    async fn read_unread_and_mark(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
     /// Reads all unread messages for `to_agent_id` without marking them as read.
-    async fn peek_unread(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError>;
+    async fn peek_unread(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
     /// Marks the given message IDs as read. IDs that don't exist are silently ignored.
-    async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), DbError>;
+    async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError>;
 
     /// Returns message history for an agent, optionally limited.
     /// Messages are ordered by `created_at` ascending.
     async fn get_history(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
@@ -82,26 +93,44 @@ pub trait ITeamRepository: Send + Sync {
     // ── Tasks ────────────────────────────────────────────────────────
 
     /// Creates a new task.
-    async fn create_task(&self, row: &TeamTaskRow) -> Result<(), DbError>;
+    async fn create_task(&self, user_id: &str, row: &TeamTaskRow) -> Result<(), DbError>;
 
     /// Finds a task by exact id within a team.
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError>;
+    async fn find_task_by_id(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError>;
 
     /// Updates a task by id with the provided fields.
     /// Returns `DbError::NotFound` if absent.
-    async fn update_task(&self, team_id: &str, task_id: &str, params: &UpdateTaskParams) -> Result<(), DbError>;
+    async fn update_task(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        params: &UpdateTaskParams,
+    ) -> Result<(), DbError>;
 
     /// Returns all tasks for a team, ordered by `created_at` ascending.
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError>;
+    async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError>;
 
     /// Appends `blocked_task_id` to the `blocks` JSON array of `task_id`.
     /// This is a transactional JSON array append operation.
-    async fn append_to_blocks(&self, team_id: &str, task_id: &str, blocked_task_id: &str) -> Result<(), DbError>;
+    async fn append_to_blocks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        blocked_task_id: &str,
+    ) -> Result<(), DbError>;
 
     /// Removes `unblocked_task_id` from the `blocked_by` JSON array of `task_id`.
     /// This is a transactional JSON array removal operation.
     async fn remove_from_blocked_by(
         &self,
+        user_id: &str,
         team_id: &str,
         task_id: &str,
         unblocked_task_id: &str,
