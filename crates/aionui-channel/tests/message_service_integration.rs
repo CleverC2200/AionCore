@@ -351,7 +351,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
         .unwrap();
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
     let session_row = acp_session_repo
-        .get(&result.conversation_id)
+        .get_for_user(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap()
         .expect("acp_session row should exist for ACP assistant conversations");

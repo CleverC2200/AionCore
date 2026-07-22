@@ -881,8 +881,14 @@ mod tests {
         async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
             Ok(Vec::new())
         }
+        async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+            self.list_all().await
+        }
         async fn get(&self, _id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
+        }
+        async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.get(id).await
         }
         async fn find_by_source_and_name(
             &self,
@@ -891,11 +897,33 @@ mod tests {
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn find_by_source_and_name_for_user(
+            &self,
+            _user_id: &str,
+            agent_source: &str,
+            name: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.find_by_source_and_name(agent_source, name).await
+        }
         async fn find_builtin_by_backend(&self, _backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn find_builtin_by_backend_for_user(
+            &self,
+            _user_id: &str,
+            backend: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.find_builtin_by_backend(backend).await
+        }
         async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
             Err(DbError::Init("unused".into()))
+        }
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAgentMetadataParams<'_>,
+        ) -> Result<AgentMetadataRow, DbError> {
+            self.upsert(params).await
         }
         async fn apply_handshake(
             &self,
@@ -904,12 +932,28 @@ mod tests {
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
         }
+        async fn apply_handshake_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.apply_handshake(id, params).await
+        }
         async fn update_availability_snapshot(
             &self,
             _id: &str,
             _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
         ) -> Result<Option<AgentMetadataRow>, DbError> {
             Ok(None)
+        }
+        async fn update_availability_snapshot_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            self.update_availability_snapshot(id, params).await
         }
         async fn update_agent_overrides(
             &self,
@@ -919,11 +963,26 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
+        async fn update_agent_overrides_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            command_override: Option<&str>,
+            env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            self.update_agent_overrides(id, command_override, env_override).await
+        }
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
             Ok(false)
         }
+        async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+            self.set_enabled(id, enabled).await
+        }
         async fn delete(&self, _id: &str) -> Result<bool, DbError> {
             Ok(false)
+        }
+        async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+            self.delete(id).await
         }
     }
 

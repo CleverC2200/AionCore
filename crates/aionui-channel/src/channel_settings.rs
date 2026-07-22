@@ -615,12 +615,47 @@ mod tests {
             Ok(self.rows.clone())
         }
 
+        async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            self.list().await
+        }
+
+        async fn list_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            self.list().await
+        }
+
         async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
         }
 
+        async fn get_by_assistant_id_for_user(
+            &self,
+            _user_id: &str,
+            assistant_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_assistant_id(assistant_id).await
+        }
+
+        async fn get_by_assistant_id_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+            assistant_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_assistant_id(assistant_id).await
+        }
+
         async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
             Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+        }
+
+        async fn get_by_id_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_id(definition_id).await
         }
 
         async fn get_by_source_ref(
@@ -635,6 +670,24 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_by_source_ref_for_user(
+            &self,
+            _user_id: &str,
+            source: &str,
+            source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_source_ref(source, source_ref).await
+        }
+
+        async fn get_by_source_ref_including_deleted_for_user(
+            &self,
+            _user_id: &str,
+            source: &str,
+            source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            self.get_by_source_ref(source, source_ref).await
+        }
+
         async fn upsert(
             &self,
             _params: &UpsertAssistantDefinitionParams<'_>,
@@ -642,8 +695,25 @@ mod tests {
             panic!("unused in channel settings tests")
         }
 
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            self.upsert(params).await
+        }
+
         async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
             panic!("unused in channel settings tests")
+        }
+
+        async fn soft_delete_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+            deleted_at: i64,
+        ) -> Result<bool, DbError> {
+            self.soft_delete(definition_id, deleted_at).await
         }
     }
 
@@ -661,16 +731,40 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_for_user(
+            &self,
+            _user_id: &str,
+            definition_id: &str,
+        ) -> Result<Option<AssistantOverlayRow>, DbError> {
+            self.get(definition_id).await
+        }
+
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
             Ok(self.rows.clone())
+        }
+
+        async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            self.list().await
         }
 
         async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
             panic!("unused in channel settings tests")
         }
 
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &UpsertAssistantOverlayParams<'_>,
+        ) -> Result<AssistantOverlayRow, DbError> {
+            self.upsert(params).await
+        }
+
         async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
             panic!("unused in channel settings tests")
+        }
+
+        async fn delete_for_user(&self, _user_id: &str, definition_id: &str) -> Result<bool, DbError> {
+            self.delete(definition_id).await
         }
     }
 
