@@ -67,7 +67,7 @@ impl ICronRepository for SqliteCronRepository {
         Ok(())
     }
 
-    async fn update(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
+    async fn update_system(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
         self.update_inner(None, id, params).await
     }
 
@@ -75,7 +75,7 @@ impl ICronRepository for SqliteCronRepository {
         self.update_inner(Some(user_id), id, params).await
     }
 
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
+    async fn delete_system(&self, id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM cron_jobs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -102,7 +102,7 @@ impl ICronRepository for SqliteCronRepository {
         Ok(())
     }
 
-    async fn get_by_id(&self, id: &str) -> Result<Option<CronJobRow>, DbError> {
+    async fn get_by_id_system(&self, id: &str) -> Result<Option<CronJobRow>, DbError> {
         let row = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -119,7 +119,7 @@ impl ICronRepository for SqliteCronRepository {
         Ok(row)
     }
 
-    async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError> {
+    async fn list_all_system(&self) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs ORDER BY created_at ASC")
             .fetch_all(&self.pool)
             .await?;
@@ -134,14 +134,14 @@ impl ICronRepository for SqliteCronRepository {
         Ok(rows)
     }
 
-    async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError> {
+    async fn list_enabled_system(&self) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE enabled = 1 ORDER BY created_at ASC")
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
     }
 
-    async fn list_by_conversation(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError> {
+    async fn list_by_conversation_system(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>(
             "SELECT * FROM cron_jobs WHERE conversation_id = ? ORDER BY created_at ASC",
         )
@@ -168,7 +168,7 @@ impl ICronRepository for SqliteCronRepository {
         Ok(rows)
     }
 
-    async fn delete_by_conversation(&self, conversation_id: &str) -> Result<u64, DbError> {
+    async fn delete_by_conversation_system(&self, conversation_id: &str) -> Result<u64, DbError> {
         let result = sqlx::query("DELETE FROM cron_jobs WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&self.pool)
@@ -603,7 +603,7 @@ mod tests {
         let row = make_row("cron_1");
         repo.insert(&row).await.unwrap();
 
-        let found = repo.get_by_id("cron_1").await.unwrap().expect("found");
+        let found = repo.get_by_id_system("cron_1").await.unwrap().expect("found");
         assert_eq!(found.id, "cron_1");
         assert_eq!(found.name, "Test Job");
         assert!(found.enabled);
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn get_by_id_returns_none_for_missing() {
         let (repo, _db) = setup().await;
-        let result = repo.get_by_id("cron_missing").await.unwrap();
+        let result = repo.get_by_id_system("cron_missing").await.unwrap();
         assert!(result.is_none());
     }
 
@@ -624,7 +624,7 @@ mod tests {
         repo.insert(&make_row("cron_a")).await.unwrap();
         repo.insert(&make_row("cron_b")).await.unwrap();
 
-        let all = repo.list_all().await.unwrap();
+        let all = repo.list_all_system().await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -637,7 +637,7 @@ mod tests {
         disabled.enabled = false;
         repo.insert(&disabled).await.unwrap();
 
-        let enabled = repo.list_enabled().await.unwrap();
+        let enabled = repo.list_enabled_system().await.unwrap();
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].id, "cron_e1");
     }
@@ -658,11 +658,11 @@ mod tests {
         other.conversation_id = "conv_2".into();
         repo.insert(&other).await.unwrap();
 
-        let conv1_jobs = repo.list_by_conversation("conv_1").await.unwrap();
+        let conv1_jobs = repo.list_by_conversation_system("conv_1").await.unwrap();
         assert_eq!(conv1_jobs.len(), 1);
         assert_eq!(conv1_jobs[0].id, "cron_c1");
 
-        let conv2_jobs = repo.list_by_conversation("conv_2").await.unwrap();
+        let conv2_jobs = repo.list_by_conversation_system("conv_2").await.unwrap();
         assert_eq!(conv2_jobs.len(), 1);
         assert_eq!(conv2_jobs[0].id, "cron_c2");
     }
@@ -678,9 +678,9 @@ mod tests {
             run_count: Some(42),
             ..Default::default()
         };
-        repo.update("cron_u1", &params).await.unwrap();
+        repo.update_system("cron_u1", &params).await.unwrap();
 
-        let updated = repo.get_by_id("cron_u1").await.unwrap().unwrap();
+        let updated = repo.get_by_id_system("cron_u1").await.unwrap().unwrap();
         assert_eq!(updated.name, "Renamed");
         assert!(!updated.enabled);
         assert_eq!(updated.run_count, 42);
@@ -692,7 +692,7 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.insert(&make_row("cron_queue")).await.unwrap();
 
-        repo.update(
+        repo.update_system(
             "cron_queue",
             &UpdateCronJobParams {
                 queue_enabled: Some(true),
@@ -702,7 +702,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(repo.get_by_id("cron_queue").await.unwrap().unwrap().queue_enabled);
+        assert!(
+            repo.get_by_id_system("cron_queue")
+                .await
+                .unwrap()
+                .unwrap()
+                .queue_enabled
+        );
     }
 
     #[tokio::test]
@@ -967,9 +973,9 @@ mod tests {
             skill_content: Some(Some("---\nname: skill\n---\nDo it".into())),
             ..Default::default()
         };
-        repo.update("cron_u2", &params).await.unwrap();
+        repo.update_system("cron_u2", &params).await.unwrap();
 
-        let updated = repo.get_by_id("cron_u2").await.unwrap().unwrap();
+        let updated = repo.get_by_id_system("cron_u2").await.unwrap().unwrap();
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
         assert_eq!(updated.last_error.as_deref(), Some("timeout"));
         assert!(updated.skill_content.is_some());
@@ -980,9 +986,9 @@ mod tests {
             skill_content: Some(None),
             ..Default::default()
         };
-        repo.update("cron_u2", &clear_params).await.unwrap();
+        repo.update_system("cron_u2", &clear_params).await.unwrap();
 
-        let cleared = repo.get_by_id("cron_u2").await.unwrap().unwrap();
+        let cleared = repo.get_by_id_system("cron_u2").await.unwrap().unwrap();
         assert!(cleared.last_status.is_none());
         assert!(cleared.last_error.is_none());
         assert!(cleared.skill_content.is_none());
@@ -995,7 +1001,7 @@ mod tests {
             name: Some("x".into()),
             ..Default::default()
         };
-        let err = repo.update("cron_nope", &params).await.unwrap_err();
+        let err = repo.update_system("cron_nope", &params).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -1004,9 +1010,11 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.insert(&make_row("cron_noop")).await.unwrap();
 
-        let before = repo.get_by_id("cron_noop").await.unwrap().unwrap();
-        repo.update("cron_noop", &UpdateCronJobParams::default()).await.unwrap();
-        let after = repo.get_by_id("cron_noop").await.unwrap().unwrap();
+        let before = repo.get_by_id_system("cron_noop").await.unwrap().unwrap();
+        repo.update_system("cron_noop", &UpdateCronJobParams::default())
+            .await
+            .unwrap();
+        let after = repo.get_by_id_system("cron_noop").await.unwrap().unwrap();
 
         assert_eq!(before.updated_at, after.updated_at);
     }
@@ -1016,15 +1024,15 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.insert(&make_row("cron_d1")).await.unwrap();
 
-        repo.delete("cron_d1").await.unwrap();
-        let result = repo.get_by_id("cron_d1").await.unwrap();
+        repo.delete_system("cron_d1").await.unwrap();
+        let result = repo.get_by_id_system("cron_d1").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete("cron_nope").await.unwrap_err();
+        let err = repo.delete_system("cron_nope").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -1034,17 +1042,17 @@ mod tests {
         repo.insert(&make_row("cron_dc1")).await.unwrap();
         repo.insert(&make_row("cron_dc2")).await.unwrap();
 
-        let deleted = repo.delete_by_conversation("conv_1").await.unwrap();
+        let deleted = repo.delete_by_conversation_system("conv_1").await.unwrap();
         assert_eq!(deleted, 2);
 
-        let remaining = repo.list_all().await.unwrap();
+        let remaining = repo.list_all_system().await.unwrap();
         assert!(remaining.is_empty());
     }
 
     #[tokio::test]
     async fn delete_by_conversation_returns_zero_for_no_match() {
         let (repo, _db) = setup().await;
-        let deleted = repo.delete_by_conversation("conv_none").await.unwrap();
+        let deleted = repo.delete_by_conversation_system("conv_none").await.unwrap();
         assert_eq!(deleted, 0);
     }
 
@@ -1061,9 +1069,9 @@ mod tests {
             next_run_at: Some(Some(9999999)),
             ..Default::default()
         };
-        repo.update("cron_s1", &params).await.unwrap();
+        repo.update_system("cron_s1", &params).await.unwrap();
 
-        let updated = repo.get_by_id("cron_s1").await.unwrap().unwrap();
+        let updated = repo.get_by_id_system("cron_s1").await.unwrap().unwrap();
         assert_eq!(updated.schedule_kind, "cron");
         assert_eq!(updated.schedule_value, "0 0 9 * * *");
         assert_eq!(updated.schedule_tz.as_deref(), Some("Asia/Shanghai"));
@@ -1085,7 +1093,7 @@ mod tests {
         cron_job.schedule_tz = Some("UTC".into());
         repo.insert(&cron_job).await.unwrap();
 
-        let all = repo.list_all().await.unwrap();
+        let all = repo.list_all_system().await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -1096,7 +1104,7 @@ mod tests {
         row.skill_content = Some("---\nname: My Skill\ndescription: A test\n---\nDo X".into());
         repo.insert(&row).await.unwrap();
 
-        let found = repo.get_by_id("cron_sk").await.unwrap().unwrap();
+        let found = repo.get_by_id_system("cron_sk").await.unwrap().unwrap();
         assert!(found.skill_content.unwrap().contains("My Skill"));
     }
 
@@ -1107,7 +1115,7 @@ mod tests {
         row.agent_config = Some(r#"{"name":"GPT","model_id":"gpt-4"}"#.into());
         repo.insert(&row).await.unwrap();
 
-        let found = repo.get_by_id("cron_ac").await.unwrap().unwrap();
+        let found = repo.get_by_id_system("cron_ac").await.unwrap().unwrap();
         let config = found.agent_config.unwrap();
         assert!(config.contains("gpt-4"));
     }

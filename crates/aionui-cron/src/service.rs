@@ -496,7 +496,7 @@ impl CronService {
             warn!(error = %error, "Failed to clean up old cron run records");
         }
 
-        let rows = match self.repo.list_enabled().await {
+        let rows = match self.repo.list_enabled_system().await {
             Ok(rows) => rows,
             Err(e) => {
                 error!(error = %e, "Failed to load enabled cron jobs");
@@ -538,7 +538,7 @@ impl CronService {
     }
 
     pub async fn tick(&self, job_id: &str, scheduled_at: i64) {
-        let row = match self.repo.get_by_id(job_id).await {
+        let row = match self.repo.get_by_id_system(job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
                 warn!(job_id, "Tick: job not found, cancelling timer");
@@ -652,7 +652,7 @@ impl CronService {
     }
 
     pub async fn handle_system_resume(&self) {
-        let rows = match self.repo.list_enabled().await {
+        let rows = match self.repo.list_enabled_system().await {
             Ok(r) => r,
             Err(e) => {
                 error!(error = %e, "Resume: failed to load enabled jobs");

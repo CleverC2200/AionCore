@@ -102,7 +102,7 @@ async fn cj1_insert_returns_all_fields() {
     let job = make_job("cron_cj1");
     r.insert(&job).await.unwrap();
 
-    let found = r.get_by_id("cron_cj1").await.unwrap().expect("found");
+    let found = r.get_by_id_system("cron_cj1").await.unwrap().expect("found");
     assert_eq!(found.id, "cron_cj1");
     assert_eq!(found.name, "Test Job");
     assert!(found.enabled);
@@ -137,13 +137,13 @@ async fn cj2_three_schedule_kinds() {
     cron_job.schedule_tz = Some("Asia/Shanghai".into());
     r.insert(&cron_job).await.unwrap();
 
-    let at = r.get_by_id("cron_at").await.unwrap().unwrap();
+    let at = r.get_by_id_system("cron_at").await.unwrap().unwrap();
     assert_eq!(at.schedule_kind, "at");
 
-    let every = r.get_by_id("cron_every").await.unwrap().unwrap();
+    let every = r.get_by_id_system("cron_every").await.unwrap().unwrap();
     assert_eq!(every.schedule_kind, "every");
 
-    let cron = r.get_by_id("cron_cron").await.unwrap().unwrap();
+    let cron = r.get_by_id_system("cron_cron").await.unwrap().unwrap();
     assert_eq!(cron.schedule_kind, "cron");
     assert_eq!(cron.schedule_tz.as_deref(), Some("Asia/Shanghai"));
 }
@@ -152,14 +152,14 @@ async fn cj2_three_schedule_kinds() {
 async fn cj4_get_by_id_existing() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_g1")).await.unwrap();
-    let found = r.get_by_id("cron_g1").await.unwrap();
+    let found = r.get_by_id_system("cron_g1").await.unwrap();
     assert!(found.is_some());
 }
 
 #[tokio::test]
 async fn cj5_get_by_id_nonexistent() {
     let (r, _db) = repo().await;
-    let found = r.get_by_id("cron_nonexistent").await.unwrap();
+    let found = r.get_by_id_system("cron_nonexistent").await.unwrap();
     assert!(found.is_none());
 }
 
@@ -170,7 +170,7 @@ async fn cj6_list_all() {
     r.insert(&make_job("cron_l2")).await.unwrap();
     r.insert(&make_job("cron_l3")).await.unwrap();
 
-    let all = r.list_all().await.unwrap();
+    let all = r.list_all_system().await.unwrap();
     assert!(all.len() >= 3);
 }
 
@@ -193,10 +193,10 @@ async fn cj7_list_by_conversation() {
     other.conversation_id = "conv_2".into();
     r.insert(&other).await.unwrap();
 
-    let conv1 = r.list_by_conversation("conv_1").await.unwrap();
+    let conv1 = r.list_by_conversation_system("conv_1").await.unwrap();
     assert_eq!(conv1.len(), 2);
 
-    let conv2 = r.list_by_conversation("conv_2").await.unwrap();
+    let conv2 = r.list_by_conversation_system("conv_2").await.unwrap();
     assert_eq!(conv2.len(), 1);
 }
 
@@ -271,7 +271,7 @@ async fn scheduler_enabled_scan_uses_job_user_id() {
     new_conversation.execution_mode = "new_conversation".into();
     r.insert(&new_conversation).await.unwrap();
 
-    let enabled = r.list_enabled().await.unwrap();
+    let enabled = r.list_enabled_system().await.unwrap();
 
     assert!(enabled.iter().any(|job| job.id == "cron_owned"));
     assert!(enabled.iter().any(|job| job.id == "cron_new_conversation"));
@@ -287,9 +287,9 @@ async fn cj8_update_name_and_enabled() {
         enabled: Some(false),
         ..Default::default()
     };
-    r.update("cron_u1", &params).await.unwrap();
+    r.update_system("cron_u1", &params).await.unwrap();
 
-    let updated = r.get_by_id("cron_u1").await.unwrap().unwrap();
+    let updated = r.get_by_id_system("cron_u1").await.unwrap().unwrap();
     assert_eq!(updated.name, "Renamed");
     assert!(!updated.enabled);
     assert!(updated.updated_at >= updated.created_at);
@@ -307,9 +307,9 @@ async fn cj9_update_schedule_type() {
         next_run_at: Some(Some(9999999)),
         ..Default::default()
     };
-    r.update("cron_s1", &params).await.unwrap();
+    r.update_system("cron_s1", &params).await.unwrap();
 
-    let updated = r.get_by_id("cron_s1").await.unwrap().unwrap();
+    let updated = r.get_by_id_system("cron_s1").await.unwrap().unwrap();
     assert_eq!(updated.schedule_kind, "cron");
     assert_eq!(updated.schedule_value, "0 0 9 * * *");
     assert_eq!(updated.schedule_tz.as_deref(), Some("UTC"));
@@ -323,7 +323,7 @@ async fn cj10_update_nonexistent() {
         name: Some("x".into()),
         ..Default::default()
     };
-    let err = r.update("cron_nope", &params).await.unwrap_err();
+    let err = r.update_system("cron_nope", &params).await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -331,16 +331,16 @@ async fn cj10_update_nonexistent() {
 async fn cj11_delete() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_d1")).await.unwrap();
-    r.delete("cron_d1").await.unwrap();
+    r.delete_system("cron_d1").await.unwrap();
 
-    let found = r.get_by_id("cron_d1").await.unwrap();
+    let found = r.get_by_id_system("cron_d1").await.unwrap();
     assert!(found.is_none());
 }
 
 #[tokio::test]
 async fn cj12_delete_nonexistent() {
     let (r, _db) = repo().await;
-    let err = r.delete("cron_nope").await.unwrap_err();
+    let err = r.delete_system("cron_nope").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -405,7 +405,7 @@ async fn list_enabled_filters_disabled_jobs() {
     disabled.enabled = false;
     r.insert(&disabled).await.unwrap();
 
-    let enabled = r.list_enabled().await.unwrap();
+    let enabled = r.list_enabled_system().await.unwrap();
     assert_eq!(enabled.len(), 1);
     assert_eq!(enabled[0].id, "cron_en1");
 }
@@ -421,9 +421,9 @@ async fn sk1_save_skill_content() {
         skill_content: Some(Some("---\nname: test\n---\nDo something".into())),
         ..Default::default()
     };
-    r.update("cron_sk1", &params).await.unwrap();
+    r.update_system("cron_sk1", &params).await.unwrap();
 
-    let updated = r.get_by_id("cron_sk1").await.unwrap().unwrap();
+    let updated = r.get_by_id_system("cron_sk1").await.unwrap().unwrap();
     assert!(updated.skill_content.is_some());
     assert!(updated.skill_content.unwrap().contains("Do something"));
 }
@@ -435,7 +435,7 @@ async fn sk2_has_skill_after_save() {
     job.skill_content = Some("---\nname: s\n---\ncontent".into());
     r.insert(&job).await.unwrap();
 
-    let found = r.get_by_id("cron_sk2").await.unwrap().unwrap();
+    let found = r.get_by_id_system("cron_sk2").await.unwrap().unwrap();
     assert!(found.skill_content.is_some());
 }
 
@@ -444,7 +444,7 @@ async fn sk3_no_skill_by_default() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_sk3")).await.unwrap();
 
-    let found = r.get_by_id("cron_sk3").await.unwrap().unwrap();
+    let found = r.get_by_id_system("cron_sk3").await.unwrap().unwrap();
     assert!(found.skill_content.is_none());
 }
 
@@ -455,8 +455,8 @@ async fn sk7_delete_clears_skill() {
     job.skill_content = Some("content".into());
     r.insert(&job).await.unwrap();
 
-    r.delete("cron_sk7").await.unwrap();
-    let found = r.get_by_id("cron_sk7").await.unwrap();
+    r.delete_system("cron_sk7").await.unwrap();
+    let found = r.get_by_id_system("cron_sk7").await.unwrap();
     assert!(found.is_none());
 }
 
@@ -468,17 +468,17 @@ async fn cd1_delete_by_conversation_removes_all() {
     r.insert(&make_job("cron_cd1")).await.unwrap();
     r.insert(&make_job("cron_cd2")).await.unwrap();
 
-    let deleted = r.delete_by_conversation("conv_1").await.unwrap();
+    let deleted = r.delete_by_conversation_system("conv_1").await.unwrap();
     assert_eq!(deleted, 2);
 
-    let remaining = r.list_all().await.unwrap();
+    let remaining = r.list_all_system().await.unwrap();
     assert!(remaining.is_empty());
 }
 
 #[tokio::test]
 async fn delete_by_conversation_no_match_returns_zero() {
     let (r, _db) = repo().await;
-    let deleted = r.delete_by_conversation("conv_none").await.unwrap();
+    let deleted = r.delete_by_conversation_system("conv_none").await.unwrap();
     assert_eq!(deleted, 0);
 }
 
@@ -498,9 +498,9 @@ async fn update_execution_state() {
         next_run_at: Some(Some(now + 60_000)),
         ..Default::default()
     };
-    r.update("cron_ex1", &params).await.unwrap();
+    r.update_system("cron_ex1", &params).await.unwrap();
 
-    let updated = r.get_by_id("cron_ex1").await.unwrap().unwrap();
+    let updated = r.get_by_id_system("cron_ex1").await.unwrap().unwrap();
     assert_eq!(updated.last_run_at, Some(now));
     assert_eq!(updated.last_status.as_deref(), Some("ok"));
     assert_eq!(updated.run_count, 1);
@@ -518,9 +518,9 @@ async fn update_error_state() {
         retry_count: Some(1),
         ..Default::default()
     };
-    r.update("cron_err1", &params).await.unwrap();
+    r.update_system("cron_err1", &params).await.unwrap();
 
-    let updated = r.get_by_id("cron_err1").await.unwrap().unwrap();
+    let updated = r.get_by_id_system("cron_err1").await.unwrap().unwrap();
     assert_eq!(updated.last_status.as_deref(), Some("error"));
     assert_eq!(updated.last_error.as_deref(), Some("timeout after 30s"));
     assert_eq!(updated.retry_count, 1);
@@ -535,7 +535,7 @@ async fn insert_and_retrieve_agent_config() {
     job.agent_config = Some(r#"{"backend":"openai","name":"GPT-4","modelId":"gpt-4","workspace":"/home/user"}"#.into());
     r.insert(&job).await.unwrap();
 
-    let found = r.get_by_id("cron_ag1").await.unwrap().unwrap();
+    let found = r.get_by_id_system("cron_ag1").await.unwrap().unwrap();
     let config = found.agent_config.unwrap();
     assert!(config.contains("openai"));
     assert!(config.contains("gpt-4"));
@@ -550,6 +550,6 @@ async fn insert_new_conversation_mode() {
     job.execution_mode = "new_conversation".into();
     r.insert(&job).await.unwrap();
 
-    let found = r.get_by_id("cron_nc1").await.unwrap().unwrap();
+    let found = r.get_by_id_system("cron_nc1").await.unwrap().unwrap();
     assert_eq!(found.execution_mode, "new_conversation");
 }

@@ -1262,7 +1262,7 @@ async fn create_job_allows_missing_task_description() {
     let job = svc.add_job("u1", req).await.unwrap();
 
     assert_eq!(job.description, None);
-    let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     assert_eq!(row.description, None);
 }
 
@@ -1750,7 +1750,7 @@ async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
         .unwrap();
     assert_eq!(updated.execution_mode.as_str(), "new_conversation");
 
-    let row = cron_repo.get_by_id(&created.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&created.id).await.unwrap().unwrap();
     assert_eq!(row.execution_mode, "new_conversation");
     assert_eq!(row.conversation_id, "conv_mode_switch");
     assert!(row.conversation_title.is_none());
@@ -1810,7 +1810,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
     .await
     .unwrap();
 
-    let row = cron_repo.get_by_id(&created.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&created.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert!(
         config.workspace.is_none(),
@@ -1855,7 +1855,7 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
     .await
     .unwrap();
 
-    let row = cron_repo.get_by_id(&created.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&created.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.workspace.as_deref(), Some(custom_workspace.as_str()));
 }
@@ -2441,7 +2441,7 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
         tokio::task::yield_now().await;
     }
 
-    let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     assert_eq!(row.run_count, 0);
     assert!(row.last_status.is_none());
     assert!(
@@ -2502,7 +2502,7 @@ async fn create_for_conversation_helper_creates_claimed_conversation_job_with_mu
     assert!(response.job_id.starts_with("cron_"));
     assert!(response.message.contains("Agent Helper Job"));
 
-    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     assert_eq!(row.payload_message, "first\nsecond\nthird");
     assert_eq!(row.conversation_id, "conv_1");
     assert_eq!(row.created_by, "agent");
@@ -2534,7 +2534,7 @@ async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged(
         .await
         .unwrap();
 
-    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.mode.as_deref(), Some("yolo"));
 
@@ -2563,7 +2563,7 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
         .await
         .unwrap();
 
-    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
 }
@@ -2620,7 +2620,7 @@ async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from
         .await
         .unwrap();
 
-    let row = cron_repo.get_by_id(&response.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
 }
@@ -2641,7 +2641,7 @@ async fn create_for_conversation_helper_fails_when_conversation_binding_fails() 
 
     assert!(matches!(err, aionui_cron::error::CronError::Database(_)));
 
-    let rows = cron_repo.list_by_conversation("conv_1").await.unwrap();
+    let rows = cron_repo.list_by_conversation_system("conv_1").await.unwrap();
     assert!(rows.is_empty());
 }
 
@@ -2681,7 +2681,7 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
     let envelope: ApiResponse<CreateConversationCronResponse> = serde_json::from_slice(&body).unwrap();
     let payload = envelope.data.expect("response should contain created job id");
 
-    let row = cron_repo.get_by_id(&payload.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&payload.job_id).await.unwrap().unwrap();
     assert_eq!(row.payload_message, "first\nsecond\nthird");
     assert_eq!(row.conversation_id, "conv_1");
     assert_eq!(row.created_by, "agent");
@@ -2729,7 +2729,7 @@ async fn conversation_cron_routes_create_list_and_update_claimed_job() {
         .unwrap();
     assert_eq!(update_response.status(), StatusCode::OK);
 
-    let row = cron_repo.get_by_id(&payload.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&payload.job_id).await.unwrap().unwrap();
     assert_eq!(row.name, "Updated Route Job");
     assert_eq!(row.payload_message, "updated\nsecond\nthird");
     assert_eq!(row.schedule_value, "0 */20 * * * *");
@@ -2888,7 +2888,7 @@ async fn update_for_conversation_helper_updates_claimed_conversation_job() {
         .unwrap();
 
     assert_eq!(updated.name, "Updated Helper Job");
-    let row = cron_repo.get_by_id(&created.job_id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&created.job_id).await.unwrap().unwrap();
     assert_eq!(row.payload_message, "new message\nsecond line");
     assert_eq!(row.schedule_value, "0 */20 * * * *");
 
@@ -3116,7 +3116,7 @@ async fn sr1_system_resume_missed_job() {
         next_run_at: Some(Some(past_ms)),
         ..Default::default()
     };
-    repo.update(&job.id, &params).await.unwrap();
+    repo.update_system(&job.id, &params).await.unwrap();
 
     svc.handle_system_resume().await;
 
@@ -3264,7 +3264,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
             .is_some(),
         "test setup should use a workspace ConversationService will delete"
     );
-    let row_before = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    let row_before = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     let config_before: CronAgentConfig = serde_json::from_str(row_before.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(
         config_before.workspace.as_deref(),
@@ -3274,7 +3274,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
     svc.on_conversation_deleted("u1", &conversation_id).await;
 
     assert!(svc.get_job("u1", &job.id).await.is_ok());
-    let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert!(
         config.workspace.is_none(),
@@ -3332,14 +3332,22 @@ async fn cd3b_on_conversation_delete_only_clears_current_user_jobs() {
 
     svc.on_conversation_deleted("u1", &conversation_id).await;
 
-    let u1_row = cron_repo.get_by_id("cron_workspace_scope_u1").await.unwrap().unwrap();
+    let u1_row = cron_repo
+        .get_by_id_system("cron_workspace_scope_u1")
+        .await
+        .unwrap()
+        .unwrap();
     let u1_config: CronAgentConfig = serde_json::from_str(u1_row.agent_config.as_deref().unwrap()).unwrap();
     assert!(
         u1_config.workspace.is_none(),
         "deleted conversation owner job should drop cached workspace"
     );
 
-    let u2_row = cron_repo.get_by_id("cron_workspace_scope_u2").await.unwrap().unwrap();
+    let u2_row = cron_repo
+        .get_by_id_system("cron_workspace_scope_u2")
+        .await
+        .unwrap()
+        .unwrap();
     let u2_config: CronAgentConfig = serde_json::from_str(u2_row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(
         u2_config.workspace.as_deref(),
@@ -3370,7 +3378,7 @@ async fn cd3c_on_conversation_delete_preserves_custom_workspace_on_jobs() {
 
     svc.on_conversation_deleted("u1", &conversation_id).await;
 
-    let row = cron_repo.get_by_id(&job.id).await.unwrap().unwrap();
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.workspace.as_deref(), Some(custom_workspace.as_str()));
 
