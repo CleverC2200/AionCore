@@ -72,6 +72,91 @@ SELECT CASE
     ELSE 0
 END;
 
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM messages m
+        LEFT JOIN conversations c ON c.id = m.conversation_id
+        WHERE c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM conversation_artifacts a
+        LEFT JOIN conversations c ON c.id = a.conversation_id
+        WHERE c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM conversation_assistant_snapshots s
+        LEFT JOIN conversations c ON c.id = s.conversation_id
+        WHERE c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM acp_session s
+        LEFT JOIN conversations c ON c.id = s.conversation_id
+        WHERE c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM cron_jobs j
+        LEFT JOIN conversations c ON c.id = j.conversation_id
+        WHERE COALESCE(j.conversation_id, '') <> ''
+          AND c.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM mailbox m
+        LEFT JOIN teams t ON t.id = m.team_id
+        WHERE t.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_migration_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM team_tasks tt
+        LEFT JOIN teams t ON t.id = tt.team_id
+        WHERE t.id IS NULL
+    )
+    THEN 1
+    ELSE 0
+END;
+
 DROP TABLE user_scope_migration_checks;
 
 DROP TABLE users;

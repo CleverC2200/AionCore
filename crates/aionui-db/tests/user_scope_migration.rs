@@ -386,6 +386,204 @@ async fn migration_028_keeps_new_conversation_cron_jobs_unanchored_until_run() {
     assert_eq!(row.get::<String, _>("conversation_id"), "");
 }
 
+async fn insert_valid_aggregate_parents(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv_parent', 'system_default_user', 'Parent Conversation', 'acp', '{}', 'pending', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO teams (id, user_id, name, workspace, agents, created_at, updated_at)
+         VALUES ('team_parent', 'system_default_user', 'Parent Team', '', '[]', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn migration_028_preserves_valid_aggregate_child_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 27).await;
+    insert_valid_aggregate_parents(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, type, content, created_at)
+         VALUES ('msg_parent', 'conv_parent', 'user', '{}', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_artifacts (
+            id, conversation_id, cron_job_id, kind, status, payload, created_at, updated_at
+         ) VALUES (
+            'artifact_parent', 'conv_parent', 'cron_parent', 'skill_suggest', 'active', '{}', 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_assistant_snapshots (
+            conversation_id, assistant_definition_id, assistant_id, assistant_source,
+            agent_id, rules_content, default_model_mode, default_permission_mode,
+            default_thought_level_mode, default_skills_mode, resolved_skill_ids,
+            resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids,
+            created_at, updated_at
+         ) VALUES (
+            'conv_parent', 'definition_parent', 'assistant_parent', 'user',
+            'agent_parent', '', 'auto', 'auto', 'auto', 'auto', '[]', '[]',
+            'auto', '[]', 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO acp_session (
+            conversation_id, agent_source, agent_id, session_status, session_config
+         ) VALUES (
+            'conv_parent', 'builtin', 'agent_parent', 'idle', '{}'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cron_jobs (
+            id, name, enabled, schedule_kind, schedule_value, payload_message,
+            execution_mode, conversation_id, created_by, created_at,
+            updated_at, run_count, retry_count, max_retries, queue_enabled
+         ) VALUES (
+            'cron_parent', 'Parent Cron', 1, 'every', '60000', 'message',
+            'existing', 'conv_parent', 'user', 1, 1, 0, 0, 3, 0
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, created_at)
+         VALUES ('mail_parent', 'team_parent', 'a1', 'a2', 'message', 'hello', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks (id, team_id, subject, status, created_at, updated_at)
+         VALUES ('task_parent', 'team_parent', 'Task', 'pending', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 28).await;
+
+    for (table, id_column, id_value) in [
+        ("messages", "id", "msg_parent"),
+        ("conversation_artifacts", "id", "artifact_parent"),
+        ("conversation_assistant_snapshots", "conversation_id", "conv_parent"),
+        ("acp_session", "conversation_id", "conv_parent"),
+        ("cron_jobs", "id", "cron_parent"),
+        ("mailbox", "id", "mail_parent"),
+        ("team_tasks", "id", "task_parent"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {id_column} = ?");
+        let count: i64 = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "{table} row was not preserved");
+    }
+
+    let cron_owner: String = sqlx::query_scalar("SELECT user_id FROM cron_jobs WHERE id = 'cron_parent'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cron_owner, "system_default_user");
+}
+
+#[tokio::test]
+async fn migration_028_rejects_aggregate_child_orphans() {
+    for (name, setup_sql) in [
+        (
+            "messages",
+            "INSERT INTO messages (id, conversation_id, type, content, created_at)
+             VALUES ('orphan_msg', 'missing_conv', 'user', '{}', 1)",
+        ),
+        (
+            "conversation_artifacts",
+            "INSERT INTO conversation_artifacts (
+                id, conversation_id, cron_job_id, kind, status, payload, created_at, updated_at
+             ) VALUES (
+                'orphan_artifact', 'missing_conv', NULL, 'skill_suggest', 'active', '{}', 1, 1
+             )",
+        ),
+        (
+            "conversation_assistant_snapshots",
+            "INSERT INTO conversation_assistant_snapshots (
+                conversation_id, assistant_definition_id, assistant_id, assistant_source,
+                agent_id, rules_content, default_model_mode, default_permission_mode,
+                default_thought_level_mode, default_skills_mode, resolved_skill_ids,
+                resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids,
+                created_at, updated_at
+             ) VALUES (
+                'missing_conv', 'definition_parent', 'assistant_parent', 'user',
+                'agent_parent', '', 'auto', 'auto', 'auto', 'auto', '[]', '[]',
+                'auto', '[]', 1, 1
+             )",
+        ),
+        (
+            "acp_session",
+            "INSERT INTO acp_session (
+                conversation_id, agent_source, agent_id, session_status, session_config
+             ) VALUES (
+                'missing_conv', 'builtin', 'agent_parent', 'idle', '{}'
+             )",
+        ),
+        (
+            "cron_jobs",
+            "INSERT INTO cron_jobs (
+                id, name, enabled, schedule_kind, schedule_value, payload_message,
+                execution_mode, conversation_id, created_by, created_at,
+                updated_at, run_count, retry_count, max_retries, queue_enabled
+             ) VALUES (
+                'orphan_cron', 'Orphan Cron', 1, 'every', '60000', 'message',
+                'existing', 'missing_conv', 'user', 1, 1, 0, 0, 3, 0
+             )",
+        ),
+        (
+            "mailbox",
+            "INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, created_at)
+             VALUES ('orphan_mail', 'missing_team', 'a1', 'a2', 'message', 'hello', 1)",
+        ),
+        (
+            "team_tasks",
+            "INSERT INTO team_tasks (id, team_id, subject, status, created_at, updated_at)
+             VALUES ('orphan_task', 'missing_team', 'Task', 'pending', 1, 1)",
+        ),
+    ] {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations_through(&pool, 27).await;
+        sqlx::query(setup_sql).execute(&pool).await.unwrap();
+
+        let err = run_migration_result(&pool, 28).await.unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "unexpected migration error for {name}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn migration_028_rejects_channel_session_without_channel_user() {
     let pool = SqlitePoolOptions::new()
