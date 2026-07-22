@@ -52,10 +52,18 @@ pub fn resolve_agent_binding_from_rows(rows: &[AgentMetadataRow], value: &str) -
         .map(binding_resolution_for_agent)
 }
 
-pub async fn resolve_agent_binding(pool: &SqlitePool, value: &str) -> Result<Option<AgentBindingResolution>, DbError> {
+pub async fn resolve_agent_binding_for_user(
+    pool: &SqlitePool,
+    user_id: &str,
+    value: &str,
+) -> Result<Option<AgentBindingResolution>, DbError> {
     let repo = SqliteAgentMetadataRepository::new(pool.clone());
-    let rows = repo.list_all().await?;
+    let rows = repo.list_all_for_user(user_id).await?;
     Ok(resolve_agent_binding_from_rows(&rows, value))
+}
+
+pub async fn resolve_agent_binding(pool: &SqlitePool, value: &str) -> Result<Option<AgentBindingResolution>, DbError> {
+    resolve_agent_binding_for_user(pool, "system_default_user", value).await
 }
 
 fn agent_match_rank(row: &AgentMetadataRow) -> (i32, i64, &str) {

@@ -19,7 +19,7 @@ use aionui_db::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding_for_user,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -244,7 +244,9 @@ impl AssistantService {
                 .get_by_id(&definition_id)
                 .await
                 .map_err(|e| AssistantError::Internal(format!("get builtin definition: {e}")))?;
-            let agent_id = self.resolve_agent_id_for_agent_ref(&builtin.agent_ref).await?;
+            let agent_id = self
+                .resolve_agent_id_for_agent_ref(DEFAULT_USER_ID, &builtin.agent_ref)
+                .await?;
             let default_model_mode = existing_definition
                 .as_ref()
                 .filter(|definition| definition.source == "builtin")
@@ -714,7 +716,7 @@ impl AssistantService {
                 None => self.resolve_default_agent_id_for_user(user_id).await?,
             },
         };
-        self.resolve_runtime_backend_for_agent_id(&agent_id).await?;
+        self.resolve_runtime_backend_for_agent_id(user_id, &agent_id).await?;
 
         self.definition_repo
             .upsert_for_user(
@@ -850,7 +852,7 @@ impl AssistantService {
                 continue;
             }
             let projection = self
-                .project_definition(definition, state_map.get(&definition.id), &projections)
+                .project_definition(user_id, definition, state_map.get(&definition.id), &projections)
                 .await?;
             result.push(self.definition_to_response(definition, state_map.get(&definition.id), &projection)?);
         }
@@ -884,7 +886,7 @@ impl AssistantService {
             }
             let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
             let projection = self
-                .project_definition(&definition, state.as_ref(), &projections)
+                .project_definition(user_id, &definition, state.as_ref(), &projections)
                 .await?;
             return self.definition_to_response(&definition, state.as_ref(), &projection);
         }
@@ -911,7 +913,7 @@ impl AssistantService {
             let preference = self.preference_repo.get_for_user(user_id, &definition.id).await?;
             let rules_content = self.read_rule_for_user(user_id, id, locale).await?;
             let projection = self
-                .project_definition(&definition, state.as_ref(), &projections)
+                .project_definition(user_id, &definition, state.as_ref(), &projections)
                 .await?;
             return self.definition_to_detail_response(
                 &definition,
@@ -957,7 +959,7 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("failed to list providers: {e}")))?;
 
         if providers.iter().any(|p| p.enabled) {
-            self.resolve_agent_id_for_agent_ref("aionrs").await
+            self.resolve_agent_id_for_agent_ref(user_id, "aionrs").await
         } else {
             Err(AssistantError::BadRequest(
                 "Cannot create assistant: no providers configured. Add a provider before creating an assistant, \
@@ -967,12 +969,16 @@ impl AssistantService {
         }
     }
 
-    async fn resolve_runtime_backend_for_agent_id(&self, agent_id: &str) -> Result<String, AssistantError> {
+    async fn resolve_runtime_backend_for_agent_id(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+    ) -> Result<String, AssistantError> {
         let trimmed = agent_id.trim();
         if trimmed.is_empty() {
             return Err(AssistantError::BadRequest("agent_id is required".into()));
         }
-        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+        let Some(binding) = resolve_agent_binding_for_user(&self.pool, user_id, trimmed)
             .await
             .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
         else {
@@ -981,9 +987,9 @@ impl AssistantService {
         Ok(binding.runtime_backend)
     }
 
-    async fn resolve_agent_id_for_agent_ref(&self, agent_ref: &str) -> Result<String, AssistantError> {
+    async fn resolve_agent_id_for_agent_ref(&self, user_id: &str, agent_ref: &str) -> Result<String, AssistantError> {
         let trimmed = agent_ref.trim();
-        let Some(binding) = resolve_agent_binding(&self.pool, trimmed)
+        let Some(binding) = resolve_agent_binding_for_user(&self.pool, user_id, trimmed)
             .await
             .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
         else {
@@ -994,12 +1000,13 @@ impl AssistantService {
 
     async fn project_definition(
         &self,
+        user_id: &str,
         definition: &AssistantDefinitionRow,
         state: Option<&AssistantOverlayRow>,
         agent_rows: &[AgentManagementRow],
     ) -> Result<AssistantRuntimeProjection, AssistantError> {
         let effective_agent_id = effective_agent_id_for_definition(definition, state);
-        let runtime_backend = resolve_agent_binding(&self.pool, effective_agent_id)
+        let runtime_backend = resolve_agent_binding_for_user(&self.pool, user_id, effective_agent_id)
             .await
             .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
             .map(|binding| binding.runtime_backend);
@@ -1051,7 +1058,8 @@ impl AssistantService {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
             _ => self.resolve_default_agent_id_for_user(user_id).await?,
         };
-        self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await?;
+        self.resolve_runtime_backend_for_agent_id(user_id, &resolved_agent_id)
+            .await?;
         let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
         let params = CreateAssistantParams {
             id: &id,
@@ -1149,7 +1157,8 @@ impl AssistantService {
                     .as_deref()
                     .is_some_and(|agent_id| agent_id != current_agent_id);
                 if let Some(requested_agent_id) = requested_agent_id.as_deref() {
-                    self.resolve_runtime_backend_for_agent_id(requested_agent_id).await?;
+                    self.resolve_runtime_backend_for_agent_id(user_id, requested_agent_id)
+                        .await?;
                 }
                 self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
                     .await?;
@@ -1259,7 +1268,7 @@ impl AssistantService {
             None => None,
         };
         if let Some(agent_id) = requested_agent_id.as_deref() {
-            self.resolve_runtime_backend_for_agent_id(agent_id).await?;
+            self.resolve_runtime_backend_for_agent_id(user_id, agent_id).await?;
         }
         let reset_model_and_permission = requested_agent_id
             .as_deref()
@@ -1689,7 +1698,10 @@ impl AssistantService {
                     },
                 },
             };
-            if let Err(e) = self.resolve_runtime_backend_for_agent_id(&resolved_agent_id).await {
+            if let Err(e) = self
+                .resolve_runtime_backend_for_agent_id(user_id, &resolved_agent_id)
+                .await
+            {
                 result.failed += 1;
                 result.errors.push(ImportError {
                     id,
