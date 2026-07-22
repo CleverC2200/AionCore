@@ -29,12 +29,27 @@ pub struct ChannelManager {
     broadcaster: Arc<dyn EventBroadcaster>,
     encryption_key: [u8; 32],
     /// Active plugin instances keyed by owner user ID + plugin ID.
-    plugins: DashMap<String, Box<dyn ChannelPlugin>>,
+    plugins: DashMap<ChannelRuntimeKey, Box<dyn ChannelPlugin>>,
     /// Sender for incoming messages from all plugins.
     /// The `ActionExecutor` holds the receiving end.
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     /// Sender for tool confirmation callbacks from all plugins.
     confirm_tx: mpsc::Sender<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ChannelRuntimeKey {
+    owner_user_id: String,
+    plugin_id: String,
+}
+
+impl ChannelRuntimeKey {
+    fn new(owner_user_id: &str, plugin_id: &str) -> Self {
+        Self {
+            owner_user_id: owner_user_id.to_owned(),
+            plugin_id: plugin_id.to_owned(),
+        }
+    }
 }
 
 /// Factory function type for creating plugin instances.
@@ -322,7 +337,7 @@ impl ChannelManager {
     ///
     /// Called during application shutdown.
     pub async fn shutdown(&self) {
-        let keys: Vec<String> = self.plugins.iter().map(|entry| entry.key().clone()).collect();
+        let keys: Vec<ChannelRuntimeKey> = self.plugins.iter().map(|entry| entry.key().clone()).collect();
 
         for key in keys {
             self.stop_plugin_by_key(&key).await;
@@ -335,11 +350,10 @@ impl ChannelManager {
     /// Called when an external Core session is revoked so no channel runtime
     /// continues handling messages for the old account.
     pub async fn shutdown_for_user(&self, owner_user_id: &str) -> usize {
-        let prefix = format!("{owner_user_id}:");
-        let keys: Vec<String> = self
+        let keys: Vec<ChannelRuntimeKey> = self
             .plugins
             .iter()
-            .filter(|entry| entry.key().starts_with(&prefix))
+            .filter(|entry| entry.key().owner_user_id == owner_user_id)
             .map(|entry| entry.key().clone())
             .collect();
         let stopped = keys.len();
@@ -451,8 +465,8 @@ impl ChannelManager {
     }
 
     /// Stops and removes an active plugin instance.
-    fn runtime_key(owner_user_id: &str, plugin_id: &str) -> String {
-        format!("{owner_user_id}:{plugin_id}")
+    fn runtime_key(owner_user_id: &str, plugin_id: &str) -> ChannelRuntimeKey {
+        ChannelRuntimeKey::new(owner_user_id, plugin_id)
     }
 
     fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
@@ -480,7 +494,7 @@ impl ChannelManager {
     }
 
     /// Stops and removes an active plugin instance by runtime key.
-    async fn stop_plugin_by_key(&self, key: &str) {
+    async fn stop_plugin_by_key(&self, key: &ChannelRuntimeKey) {
         if let Some((_, mut plugin)) = self.plugins.remove(key) {
             let plugin_id = plugin.plugin_type().to_string();
             if let Err(e) = plugin.stop().await {
@@ -1553,6 +1567,14 @@ mod tests {
     }
 
     // ── helper methods ─────────────────────────────────────────────────
+
+    #[test]
+    fn runtime_key_keeps_owner_and_plugin_boundaries() {
+        let first = ChannelRuntimeKey::new("owner:a", "plugin");
+        let second = ChannelRuntimeKey::new("owner", "a:plugin");
+
+        assert_ne!(first, second);
+    }
 
     #[tokio::test]
     async fn active_plugin_count_tracks_correctly() {
