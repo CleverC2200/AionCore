@@ -228,6 +228,25 @@ async fn t1_3_create_with_optional_fields() {
     assert_eq!(resp.channel_chat_id.as_deref(), Some("user:123"));
 }
 
+#[tokio::test]
+async fn create_ignores_extra_user_id() {
+    let (svc, _, _task_mgr) = setup().await;
+    let workspace = ensure_test_workspace_path();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "user_id": "forged-other-user" }
+    }))
+    .unwrap();
+    let resp = svc.create(USER_ID, req).await.unwrap();
+
+    assert!(
+        !resp.extra.as_object().unwrap().contains_key("user_id"),
+        "create must not persist client-supplied extra.user_id; got {:?}",
+        resp.extra
+    );
+}
+
 // ── T2: List conversations ─────────────────────────────────────────
 
 #[tokio::test]
@@ -439,6 +458,25 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 
     assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
+}
+
+#[tokio::test]
+async fn update_ignores_extra_user_id() {
+    let (svc, _, task_mgr) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "user_id": "forged-other-user", "display_density": "compact" }
+    }))
+    .unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req, &task_mgr).await.unwrap();
+
+    assert!(
+        !updated.extra.as_object().unwrap().contains_key("user_id"),
+        "update must not persist client-supplied extra.user_id; got {:?}",
+        updated.extra
+    );
+    assert_eq!(updated.extra["display_density"], "compact");
 }
 
 #[tokio::test]

@@ -762,6 +762,7 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
+        strip_request_owner_user_id(&mut extra);
 
         let assistant_id = req
             .assistant
@@ -1971,6 +1972,7 @@ impl ConversationService {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
             merge_json(&mut existing_extra, new_extra);
+            strip_request_owner_user_id(&mut existing_extra);
             if existing_type == AgentType::Aionrs
                 && let Some(obj) = existing_extra.as_object_mut()
                 && obj.remove("model").is_some()
@@ -3638,6 +3640,12 @@ fn normalize_workspace_extra(extra: &mut serde_json::Value) -> Result<(), Conver
         obj.insert("workspace".to_owned(), serde_json::Value::String(normalized));
     }
     Ok(())
+}
+
+fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut() {
+        obj.remove("user_id");
+    }
 }
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
