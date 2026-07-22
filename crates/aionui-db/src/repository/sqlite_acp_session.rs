@@ -19,6 +19,90 @@ impl SqliteAcpSessionRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    async fn get_unscoped(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+        let row = sqlx::query_as::<_, AcpSessionRow>("SELECT * FROM acp_session WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    #[cfg(test)]
+    async fn update_session_id_unscoped(&self, conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
+        let now = now_ms();
+        let result = sqlx::query("UPDATE acp_session SET session_id = ?, last_active_at = ? WHERE conversation_id = ?")
+            .bind(session_id)
+            .bind(now)
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[cfg(test)]
+    async fn delete_unscoped(&self, conversation_id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM acp_session WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[cfg(test)]
+    async fn load_runtime_state_unscoped(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<PersistedSessionState>, DbError> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+
+        Ok(Some(decode_runtime_state(&raw)?))
+    }
+
+    #[cfg(test)]
+    async fn save_runtime_state_unscoped(
+        &self,
+        conversation_id: &str,
+        params: &SaveRuntimeStateParams<'_>,
+    ) -> Result<bool, DbError> {
+        if params.is_empty() {
+            return Ok(true);
+        }
+
+        // Read-modify-write. The service layer serialises writes per
+        // conversation_id through a single consumer task, so a naive
+        // RMW is race-free for our callers.
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+
+        let new_config = merge_runtime_state(&raw, params)?;
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE acp_session SET session_config = ?, last_active_at = ? \
+             WHERE conversation_id = ?",
+        )
+        .bind(new_config)
+        .bind(now)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
@@ -104,14 +188,6 @@ fn merge_runtime_state(raw: &str, params: &SaveRuntimeStateParams<'_>) -> Result
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for SqliteAcpSessionRepository {
-    async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
-        let row = sqlx::query_as::<_, AcpSessionRow>("SELECT * FROM acp_session WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row)
-    }
-
     async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         let row = sqlx::query_as::<_, AcpSessionRow>(
             "SELECT a.* FROM acp_session a \
@@ -147,23 +223,12 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
             _ => DbError::Query(e),
         })?;
 
-        self.get(params.conversation_id).await?.ok_or_else(|| {
+        self.get_unscoped(params.conversation_id).await?.ok_or_else(|| {
             DbError::Init(format!(
                 "create did not produce acp_session row for '{}'",
                 params.conversation_id
             ))
         })
-    }
-
-    async fn update_session_id(&self, conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
-        let now = now_ms();
-        let result = sqlx::query("UPDATE acp_session SET session_id = ?, last_active_at = ? WHERE conversation_id = ?")
-            .bind(session_id)
-            .bind(now)
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     async fn update_session_id_for_user(
@@ -187,14 +252,6 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn delete(&self, conversation_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM acp_session WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query(
             "DELETE FROM acp_session \
@@ -206,20 +263,6 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    async fn load_runtime_state(&self, conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
-        let raw: Option<String> =
-            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
-                .bind(conversation_id)
-                .fetch_optional(&self.pool)
-                .await?;
-
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-
-        Ok(Some(decode_runtime_state(&raw)?))
     }
 
     async fn load_runtime_state_for_user(
@@ -242,42 +285,6 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         };
 
         Ok(Some(decode_runtime_state(&raw)?))
-    }
-
-    async fn save_runtime_state(
-        &self,
-        conversation_id: &str,
-        params: &SaveRuntimeStateParams<'_>,
-    ) -> Result<bool, DbError> {
-        if params.is_empty() {
-            return Ok(true);
-        }
-
-        // Read-modify-write. The service layer serialises writes per
-        // conversation_id through a single consumer task, so a naive
-        // RMW is race-free for our callers.
-        let raw: Option<String> =
-            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
-                .bind(conversation_id)
-                .fetch_optional(&self.pool)
-                .await?;
-
-        let Some(raw) = raw else {
-            return Ok(false);
-        };
-
-        let new_config = merge_runtime_state(&raw, params)?;
-        let now = now_ms();
-        let result = sqlx::query(
-            "UPDATE acp_session SET session_config = ?, last_active_at = ? \
-             WHERE conversation_id = ?",
-        )
-        .bind(new_config)
-        .bind(now)
-        .bind(conversation_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     async fn save_runtime_state_for_user(
@@ -379,7 +386,7 @@ mod tests {
         assert_eq!(row.session_status, "idle");
         assert_eq!(row.session_config, "{}");
 
-        let fetched = repo.get("conv-1").await.unwrap().unwrap();
+        let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(fetched.conversation_id, "conv-1");
     }
 
@@ -395,9 +402,9 @@ mod tests {
     async fn update_session_id_flips_field() {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
-        assert!(repo.update_session_id("conv-1", "sess-abc").await.unwrap());
+        assert!(repo.update_session_id_unscoped("conv-1", "sess-abc").await.unwrap());
 
-        let fetched = repo.get("conv-1").await.unwrap().unwrap();
+        let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(fetched.session_id.as_deref(), Some("sess-abc"));
         assert!(fetched.last_active_at.is_some());
     }
@@ -405,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn update_session_id_missing_row_returns_false() {
         let (repo, _db) = setup().await;
-        assert!(!repo.update_session_id("nope", "sid").await.unwrap());
+        assert!(!repo.update_session_id_unscoped("nope", "sid").await.unwrap());
     }
 
     #[tokio::test]
@@ -426,7 +433,7 @@ mod tests {
                 .unwrap()
         );
 
-        let fetched = repo.get("conv-1").await.unwrap().unwrap();
+        let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(fetched.session_id.as_deref(), Some("sess-owner"));
     }
 
@@ -434,9 +441,9 @@ mod tests {
     async fn delete_removes_row() {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
-        assert!(repo.delete("conv-1").await.unwrap());
-        assert!(repo.get("conv-1").await.unwrap().is_none());
-        assert!(!repo.delete("conv-1").await.unwrap());
+        assert!(repo.delete_unscoped("conv-1").await.unwrap());
+        assert!(repo.get_unscoped("conv-1").await.unwrap().is_none());
+        assert!(!repo.delete_unscoped("conv-1").await.unwrap());
     }
 
     #[tokio::test]
@@ -448,22 +455,22 @@ mod tests {
         assert!(repo.get_for_user("user-2", "conv-1").await.unwrap().is_none());
         assert!(repo.get_for_user("user-1", "conv-1").await.unwrap().is_some());
         assert!(!repo.delete_for_user("user-2", "conv-1").await.unwrap());
-        assert!(repo.get("conv-1").await.unwrap().is_some());
+        assert!(repo.get_unscoped("conv-1").await.unwrap().is_some());
         assert!(repo.delete_for_user("user-1", "conv-1").await.unwrap());
-        assert!(repo.get("conv-1").await.unwrap().is_none());
+        assert!(repo.get_unscoped("conv-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn load_runtime_state_missing_row() {
         let (repo, _db) = setup().await;
-        assert!(repo.load_runtime_state("nope").await.unwrap().is_none());
+        assert!(repo.load_runtime_state_unscoped("nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn load_runtime_state_empty_config_returns_defaults() {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(state, PersistedSessionState::default());
     }
 
@@ -473,7 +480,7 @@ mod tests {
         repo.create(&create_params("conv-1")).await.unwrap();
 
         assert!(
-            repo.save_runtime_state(
+            repo.save_runtime_state_unscoped(
                 "conv-1",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("code")),
@@ -486,7 +493,7 @@ mod tests {
             .unwrap()
         );
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("code"));
         assert_eq!(state.current_model_id.as_deref(), Some("claude-sonnet-4"));
         // The stored JSON should parse back to the same payload
@@ -550,7 +557,7 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
 
-        repo.save_runtime_state(
+        repo.save_runtime_state_unscoped(
             "conv-1",
             &SaveRuntimeStateParams {
                 current_mode_id: Some(Some("code")),
@@ -562,7 +569,7 @@ mod tests {
         .unwrap();
 
         // Later write only touches current_model_id.
-        repo.save_runtime_state(
+        repo.save_runtime_state_unscoped(
             "conv-1",
             &SaveRuntimeStateParams {
                 current_model_id: Some(Some("opus-4")),
@@ -572,7 +579,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(
             state.current_mode_id.as_deref(),
             Some("code"),
@@ -586,7 +593,7 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
 
-        repo.save_runtime_state(
+        repo.save_runtime_state_unscoped(
             "conv-1",
             &SaveRuntimeStateParams {
                 current_mode_id: Some(Some("code")),
@@ -595,7 +602,7 @@ mod tests {
         )
         .await
         .unwrap();
-        repo.save_runtime_state(
+        repo.save_runtime_state_unscoped(
             "conv-1",
             &SaveRuntimeStateParams {
                 current_mode_id: Some(None),
@@ -605,7 +612,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert!(state.current_mode_id.is_none());
     }
 
@@ -614,11 +621,11 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.create(&create_params("conv-1")).await.unwrap();
         assert!(
-            repo.save_runtime_state("conv-1", &SaveRuntimeStateParams::default())
+            repo.save_runtime_state_unscoped("conv-1", &SaveRuntimeStateParams::default())
                 .await
                 .unwrap()
         );
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(state, PersistedSessionState::default());
     }
 
@@ -626,7 +633,7 @@ mod tests {
     async fn save_runtime_state_missing_row_returns_false() {
         let (repo, _db) = setup().await;
         let ok = repo
-            .save_runtime_state(
+            .save_runtime_state_unscoped(
                 "nope",
                 &SaveRuntimeStateParams {
                     current_mode_id: Some(Some("x")),

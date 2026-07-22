@@ -3411,8 +3411,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl aionui_db::IAcpSessionRepository for StubAcpSessionRepo {
-        async fn get(
+        async fn get_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
         ) -> Result<Option<aionui_db::models::AcpSessionRow>, aionui_db::DbError> {
             Ok(None)
@@ -3423,24 +3424,27 @@ mod tests {
         ) -> Result<aionui_db::models::AcpSessionRow, aionui_db::DbError> {
             Err(aionui_db::DbError::Init("stub".into()))
         }
-        async fn update_session_id(
+        async fn update_session_id_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
             _session_id: &str,
         ) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
-        async fn delete(&self, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
+        async fn delete_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
-        async fn load_runtime_state(
+        async fn load_runtime_state_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
         ) -> Result<Option<aionui_db::PersistedSessionState>, aionui_db::DbError> {
             Ok(None)
         }
-        async fn save_runtime_state(
+        async fn save_runtime_state_for_user(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
             _params: &aionui_db::SaveRuntimeStateParams<'_>,
         ) -> Result<bool, aionui_db::DbError> {

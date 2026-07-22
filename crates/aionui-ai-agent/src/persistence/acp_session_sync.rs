@@ -330,7 +330,8 @@ mod tests {
     #[tokio::test]
     async fn load_persisted_round_trips() {
         let (svc, repo) = setup().await;
-        repo.save_runtime_state(
+        repo.save_runtime_state_for_user(
+            "user-1",
             "conv-1",
             &SaveRuntimeStateParams {
                 current_mode_id: Some(Some("plan")),
@@ -358,11 +359,19 @@ mod tests {
             .unwrap();
 
         sleep(Duration::from_millis(200)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(state.current_mode_id.is_none(), "debounce not yet elapsed");
 
         sleep(Duration::from_millis(400)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("plan"));
     }
 
@@ -383,7 +392,11 @@ mod tests {
         }
         sleep(Duration::from_millis(600)).await;
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("ask"));
     }
 
@@ -399,7 +412,11 @@ mod tests {
         tx.send(AcpSessionEvent::SessionOpened).await.unwrap();
         sleep(Duration::from_millis(600)).await;
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(state.current_mode_id.is_none());
     }
 
@@ -418,7 +435,11 @@ mod tests {
         drop(tx);
         sleep(Duration::from_millis(50)).await;
 
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             state.current_mode_id.as_deref(),
             Some("plan"),
@@ -446,7 +467,11 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(state.current_model_id.as_deref(), Some("claude-opus-4"));
     }
 
@@ -465,7 +490,11 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             state.current_model_id.is_none(),
             "DesiredModelChanged is reconcile/UI-only; persistence only follows Observed*",
@@ -485,7 +514,11 @@ mod tests {
             .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             state.current_mode_id.is_none(),
             "DesiredModeChanged is reconcile/UI-only; persistence only follows Observed*",
@@ -510,7 +543,11 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state("conv-1").await.unwrap().unwrap();
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
         let raw = state.context_usage_json.expect("usage must be persisted");
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["used"], 12345);
@@ -536,7 +573,7 @@ mod tests {
         // Well under the debounce window — the event must have already
         // been written.
         sleep(Duration::from_millis(100)).await;
-        let row = repo.get("conv-1").await.unwrap().unwrap();
+        let row = repo.get_for_user("user-1", "conv-1").await.unwrap().unwrap();
         assert_eq!(row.session_id.as_deref(), Some("sess-42"));
         drop(tx);
         sleep(Duration::from_millis(50)).await;

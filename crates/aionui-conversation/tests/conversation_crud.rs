@@ -881,7 +881,7 @@ async fn create_acp_seeds_acp_session_runtime_from_extra() {
     let conv = svc.create(USER_ID, req).await.unwrap();
 
     let runtime = acp_session_repo
-        .load_runtime_state(&conv.id)
+        .load_runtime_state_for_user(USER_ID, &conv.id)
         .await
         .unwrap()
         .expect("acp_session runtime state should exist after create");
@@ -927,7 +927,10 @@ async fn create_acp_skips_seed_when_extra_has_empty_runtime_fields() {
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
 
-    let runtime = acp_session_repo.load_runtime_state(&conv.id).await.unwrap();
+    let runtime = acp_session_repo
+        .load_runtime_state_for_user(USER_ID, &conv.id)
+        .await
+        .unwrap();
     // Either `None` (no runtime key yet) or Some(default) — both mean "nothing seeded".
     assert!(
         runtime
