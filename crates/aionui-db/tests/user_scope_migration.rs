@@ -130,6 +130,232 @@ async fn migration_028_migrates_cron_skills_as_global_rows() {
 }
 
 #[tokio::test]
+async fn migration_028_backfills_existing_independent_roots_to_default_user() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 27).await;
+    let now = 1_000_i64;
+
+    sqlx::query(
+        "INSERT INTO providers (
+            id, platform, name, base_url, api_key_encrypted, models, enabled,
+            capabilities, model_settings, created_at, updated_at
+         ) VALUES (
+            'provider_legacy', 'openai', 'OpenAI', 'https://api.example.com',
+            'encrypted', '[]', 1, '[]', '{}', ?, ?
+         )",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO remote_agents (
+            id, name, protocol, url, auth_type, status, created_at, updated_at
+         ) VALUES (
+            'remote_legacy', 'Remote', 'http', 'http://127.0.0.1:1', 'none', 'unknown', ?, ?
+         )",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO mcp_servers (
+            id, name, enabled, transport_type, transport_config, last_test_status,
+            builtin, created_at, updated_at
+         ) VALUES (
+            'mcp_legacy', 'legacy-mcp', 1, 'stdio', '{}', 'disconnected', 0, ?, ?
+         )",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO oauth_tokens (
+            server_url, access_token, token_type, created_at, updated_at
+         ) VALUES (
+            'https://mcp.example.com', 'encrypted-token', 'bearer', ?, ?
+         )",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("INSERT INTO client_preferences (key, value, updated_at) VALUES ('theme', 'dark', ?)")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO cron_jobs (
+            id, name, enabled, schedule_kind, schedule_value, payload_message,
+            execution_mode, conversation_id, created_by, created_at,
+            updated_at, run_count, retry_count, max_retries, queue_enabled
+         ) VALUES (
+            'cron_legacy', 'Legacy Cron', 1, 'every', '60000', 'message',
+            'new_conversation', '', 'user', ?, ?, 0, 0, 3, 0
+         )",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 28).await;
+
+    for (table, id_column, id_value, scope_column) in [
+        ("providers", "id", "provider_legacy", "user_id"),
+        ("remote_agents", "id", "remote_legacy", "user_id"),
+        ("mcp_servers", "id", "mcp_legacy", "user_id"),
+        ("client_preferences", "key", "theme", "user_id"),
+        ("cron_jobs", "id", "cron_legacy", "user_id"),
+    ] {
+        let sql = format!("SELECT {scope_column} FROM {table} WHERE {id_column} = ?");
+        let owner: String = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            owner, "system_default_user",
+            "{table}.{scope_column} was not backfilled"
+        );
+    }
+
+    let oauth_owner: String =
+        sqlx::query_scalar("SELECT user_id FROM oauth_tokens WHERE server_url = 'https://mcp.example.com'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(oauth_owner, "system_default_user");
+}
+
+#[tokio::test]
+async fn migration_028_classifies_global_and_user_catalog_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 27).await;
+    let now = 2_000_i64;
+
+    sqlx::query(
+        "INSERT INTO agent_metadata (
+            id, name, agent_type, agent_source, enabled, created_at, updated_at
+         ) VALUES
+            ('agent_builtin_legacy', 'Builtin Agent', 'acp', 'builtin', 1, ?, ?),
+            ('agent_user_legacy', 'User Agent', 'acp', 'custom', 1, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_definitions (
+            id, assistant_id, source, owner_type, source_ref, name, name_i18n,
+            description_i18n, avatar_type, agent_id, rule_resource_type,
+            recommended_prompts, recommended_prompts_i18n, default_model_mode,
+            default_permission_mode, default_skills_mode, default_skill_ids,
+            custom_skill_names, default_disabled_builtin_skill_ids,
+            default_mcps_mode, default_mcp_ids, created_at, updated_at
+         ) VALUES
+            (
+                'def_builtin_legacy', 'assistant_builtin', 'builtin', 'system',
+                'builtin-ref', 'Builtin Assistant', '{}', '{}', 'none',
+                'agent_builtin_legacy', 'none', '[]', '{}', 'auto', 'auto',
+                'auto', '[]', '[]', '[]', 'auto', '[]', ?, ?
+            ),
+            (
+                'def_user_legacy', 'assistant_user', 'user', 'user',
+                'user-ref', 'User Assistant', '{}', '{}', 'none',
+                'agent_user_legacy', 'user_file', '[]', '{}', 'auto', 'auto',
+                'auto', '[]', '[]', '[]', 'auto', '[]', ?, ?
+            )",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO skills (id, name, description, path, source, enabled, created_at, updated_at)
+         VALUES
+            ('skill_builtin_legacy', 'builtin-skill', NULL, '/tmp/builtin', 'builtin', 1, ?, ?),
+            ('skill_extension_legacy', 'extension-skill', NULL, '/tmp/extension', 'extension', 1, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO skill_import_records (
+            id, operation_id, source_label, source_name, status, error_code, created_at
+         ) VALUES (
+            'import_failed_legacy', 'op_legacy', 'archive.zip', 'broken-skill',
+            'failed', 'INVALID_MANIFEST', ?
+         )",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 28).await;
+
+    for (table, id_column, id_value, expected_owner) in [
+        ("agent_metadata", "id", "agent_builtin_legacy", None),
+        ("agent_metadata", "id", "agent_user_legacy", Some("system_default_user")),
+        ("assistant_definitions", "id", "def_builtin_legacy", None),
+        (
+            "assistant_definitions",
+            "id",
+            "def_user_legacy",
+            Some("system_default_user"),
+        ),
+        ("skills", "id", "skill_builtin_legacy", None),
+        ("skills", "id", "skill_extension_legacy", Some("system_default_user")),
+    ] {
+        let sql = format!("SELECT user_id FROM {table} WHERE {id_column} = ?");
+        let owner: Option<String> = sqlx::query_scalar(&sql).bind(id_value).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            owner.as_deref(),
+            expected_owner,
+            "{table}.{id_column}={id_value} had wrong user_id"
+        );
+    }
+
+    let import_owner: String =
+        sqlx::query_scalar("SELECT user_id FROM skill_import_records WHERE id = 'import_failed_legacy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(import_owner, "system_default_user");
+}
+
+#[tokio::test]
 async fn migration_028_keeps_new_conversation_cron_jobs_unanchored_until_run() {
     let db = init_database_memory().await.unwrap();
     let now = aionui_common::now_ms();
@@ -158,6 +384,33 @@ async fn migration_028_keeps_new_conversation_cron_jobs_unanchored_until_run() {
         .unwrap();
     assert_eq!(row.get::<String, _>("user_id"), "system_default_user");
     assert_eq!(row.get::<String, _>("conversation_id"), "");
+}
+
+#[tokio::test]
+async fn migration_028_rejects_channel_session_without_channel_user() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 27).await;
+
+    sqlx::query(
+        "INSERT INTO assistant_sessions (
+             id, user_id, agent_type, conversation_id, workspace, chat_id, created_at, last_activity
+         ) VALUES (
+             'session_orphan_channel_user', 'missing_channel_user', 'acp', NULL, NULL, 'chat-1', 1, 1
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = run_migration_result(&pool, 28).await.unwrap_err();
+    assert!(
+        err.to_string().contains("CHECK constraint failed"),
+        "unexpected migration error: {err}"
+    );
 }
 
 #[tokio::test]
