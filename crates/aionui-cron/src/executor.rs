@@ -3459,8 +3459,21 @@ mod tests {
         async fn list_all(&self) -> Result<Vec<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(Vec::new())
         }
+        async fn list_all_for_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.list_all().await
+        }
         async fn get(&self, _id: &str) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
+        }
+        async fn get_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.get(id).await
         }
         async fn find_by_source_and_name(
             &self,
@@ -3469,17 +3482,39 @@ mod tests {
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn find_by_source_and_name_for_user(
+            &self,
+            _user_id: &str,
+            agent_source: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.find_by_source_and_name(agent_source, name).await
+        }
         async fn find_builtin_by_backend(
             &self,
             _backend: &str,
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn find_builtin_by_backend_for_user(
+            &self,
+            _user_id: &str,
+            backend: &str,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.find_builtin_by_backend(backend).await
+        }
         async fn upsert(
             &self,
             _params: &aionui_db::models::UpsertAgentMetadataParams<'_>,
         ) -> Result<aionui_db::models::AgentMetadataRow, aionui_db::DbError> {
             Err(aionui_db::DbError::Init("stub".into()))
+        }
+        async fn upsert_for_user(
+            &self,
+            _user_id: &str,
+            params: &aionui_db::models::UpsertAgentMetadataParams<'_>,
+        ) -> Result<aionui_db::models::AgentMetadataRow, aionui_db::DbError> {
+            self.upsert(params).await
         }
         async fn apply_handshake(
             &self,
@@ -3488,12 +3523,28 @@ mod tests {
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
         }
+        async fn apply_handshake_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &aionui_db::models::UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.apply_handshake(id, params).await
+        }
         async fn update_availability_snapshot(
             &self,
             _id: &str,
             _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
         ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
             Ok(None)
+        }
+        async fn update_availability_snapshot_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<aionui_db::models::AgentMetadataRow>, aionui_db::DbError> {
+            self.update_availability_snapshot(id, params).await
         }
         async fn update_agent_overrides(
             &self,
@@ -3503,11 +3554,31 @@ mod tests {
         ) -> Result<(), aionui_db::DbError> {
             Ok(())
         }
+        async fn update_agent_overrides_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            command_override: Option<&str>,
+            env_override: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            self.update_agent_overrides(id, command_override, env_override).await
+        }
         async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
+        async fn set_enabled_for_user(
+            &self,
+            _user_id: &str,
+            id: &str,
+            enabled: bool,
+        ) -> Result<bool, aionui_db::DbError> {
+            self.set_enabled(id, enabled).await
+        }
         async fn delete(&self, _id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
+        }
+        async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, aionui_db::DbError> {
+            self.delete(id).await
         }
     }
 }

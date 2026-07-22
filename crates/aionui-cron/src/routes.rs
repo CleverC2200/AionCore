@@ -41,6 +41,9 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::CrossAccountReference(msg) => {
+                ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
+            }
             CronError::Scheduler(msg) => ApiError::Internal(msg),
             CronError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             CronError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
@@ -367,6 +370,13 @@ mod tests {
     fn invalid_agent_config_maps_to_bad_request() {
         let err: ApiError = CronError::InvalidAgentConfig("missing backend".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn cross_account_reference_maps_to_stable_conflict_code() {
+        let err: ApiError = CronError::CrossAccountReference("cross account".into()).into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "CROSS_ACCOUNT_REFERENCE");
     }
 
     #[test]

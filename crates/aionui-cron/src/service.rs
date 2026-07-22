@@ -267,19 +267,9 @@ impl CronService {
         let created_by = CreatedBy::from_str(&req.created_by)?;
         let message = req.message.or(req.prompt).unwrap_or_default();
         let conversation_id = req.conversation_id.trim();
-        if matches!(execution_mode, ExecutionMode::Existing)
-            && (conversation_id.is_empty()
-                || self
-                    .executor
-                    .get_conversation_row_for_user(user_id, conversation_id)
-                    .await?
-                    .is_none())
-        {
-            return Err(CronError::Conversation(
-                aionui_conversation::ConversationError::NotFound {
-                    id: req.conversation_id,
-                },
-            ));
+        if matches!(execution_mode, ExecutionMode::Existing) {
+            self.require_existing_conversation_scope(user_id, conversation_id)
+                .await?;
         }
 
         let agent_config = match req.agent_config {
@@ -888,6 +878,32 @@ impl CronService {
                 None
             }
         }
+    }
+
+    async fn require_existing_conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<(), CronError> {
+        if conversation_id.is_empty() {
+            return Err(CronError::Conversation(
+                aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                },
+            ));
+        }
+
+        let Some(row) = self.executor.get_conversation_row(conversation_id).await? else {
+            return Err(CronError::Conversation(
+                aionui_conversation::ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                },
+            ));
+        };
+
+        if row.user_id != user_id {
+            return Err(CronError::CrossAccountReference(
+                "Referenced conversation belongs to another user.".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {

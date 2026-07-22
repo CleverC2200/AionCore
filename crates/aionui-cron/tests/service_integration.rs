@@ -2369,6 +2369,46 @@ async fn oc2_rejects_existing_jobs_with_missing_conversation() {
 }
 
 #[tokio::test]
+async fn oc2b_rejects_existing_jobs_with_cross_user_conversation_code() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('u2', 'u2', 'hash', 0, 0)",
+    )
+    .execute(&conv_repo.sqlite_pool)
+    .await
+    .unwrap();
+    conv_repo
+        .create(&aionui_db::models::ConversationRow {
+            id: "conv_user_b".to_owned(),
+            user_id: "u2".to_owned(),
+            name: "User B Conversation".to_owned(),
+            r#type: "normal".to_owned(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: None,
+            channel_chat_id: None,
+            extra: "{}".to_owned(),
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .await
+        .unwrap();
+
+    let mut req = make_create_req("Cross User Conversation", every_60s());
+    req.conversation_id = "conv_user_b".into();
+
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(
+        err,
+        aionui_cron::error::CronError::CrossAccountReference(message)
+            if message == "Referenced conversation belongs to another user."
+    ));
+}
+
+#[tokio::test]
 async fn existing_job_with_missing_conversation_is_rejected() {
     let (svc, _repo, _bc, _conv_repo) = setup_with_conv_repo().await;
 
