@@ -62,10 +62,27 @@ struct WatchSession {
 // ---------------------------------------------------------------------------
 
 pub struct OfficecliWatchManager {
-    sessions: DashMap<String, WatchSession>,
+    sessions: DashMap<WatchSessionKey, WatchSession>,
     spawner: Arc<dyn ProcessSpawner>,
     broadcaster: Arc<dyn EventBroadcaster>,
     last_version_check: Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WatchSessionKey {
+    user_id: String,
+    doc_type: DocType,
+    resolved_path: String,
+}
+
+impl WatchSessionKey {
+    fn new(user_id: &str, resolved_path: &str, doc_type: DocType) -> Self {
+        Self {
+            user_id: user_id.to_owned(),
+            doc_type,
+            resolved_path: resolved_path.to_owned(),
+        }
+    }
 }
 
 impl OfficecliWatchManager {
@@ -462,8 +479,8 @@ fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
     Ok(resolved.to_string_lossy().into_owned())
 }
 
-fn session_key(user_id: &str, resolved_path: &str, doc_type: DocType) -> String {
-    format!("{user_id}:{doc_type}:{resolved_path}")
+fn session_key(user_id: &str, resolved_path: &str, doc_type: DocType) -> WatchSessionKey {
+    WatchSessionKey::new(user_id, resolved_path, doc_type)
 }
 
 fn is_port_in_use_start_failure(error: &OfficeError) -> bool {
@@ -642,9 +659,11 @@ mod tests {
     }
 
     #[test]
-    fn session_key_format() {
+    fn session_key_preserves_fields() {
         let key = session_key("user-1", "/path/to/doc.docx", DocType::Word);
-        assert_eq!(key, "user-1:word:/path/to/doc.docx");
+        assert_eq!(key.user_id, "user-1");
+        assert_eq!(key.doc_type, DocType::Word);
+        assert_eq!(key.resolved_path, "/path/to/doc.docx");
     }
 
     #[test]
@@ -659,6 +678,13 @@ mod tests {
         let k1 = session_key("user-1", "/a.docx", DocType::Word);
         let k2 = session_key("user-2", "/a.docx", DocType::Word);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_keeps_user_type_and_path_boundaries() {
+        let first = session_key("user:word", "/a.docx", DocType::Excel);
+        let second = session_key("user", "word:/a.docx", DocType::Excel);
+        assert_ne!(first, second);
     }
 
     #[test]
