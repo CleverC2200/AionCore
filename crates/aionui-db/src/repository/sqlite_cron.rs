@@ -22,6 +22,9 @@ impl SqliteCronRepository {
 #[async_trait::async_trait]
 impl ICronRepository for SqliteCronRepository {
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError> {
+        self.validate_conversation_owner(&row.user_id, &row.conversation_id)
+            .await?;
+
         sqlx::query(
             "INSERT INTO cron_jobs (\
                 id, user_id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
@@ -386,6 +389,23 @@ impl ICronRepository for SqliteCronRepository {
 }
 
 impl SqliteCronRepository {
+    async fn validate_conversation_owner(&self, user_id: &str, conversation_id: &str) -> Result<(), DbError> {
+        if conversation_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let owns_conversation: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                .bind(user_id)
+                .bind(conversation_id)
+                .fetch_one(&self.pool)
+                .await?;
+        if !owns_conversation {
+            return Err(DbError::NotFound(format!("conversation '{conversation_id}'")));
+        }
+        Ok(())
+    }
+
     async fn update_inner(&self, user_id: Option<&str>, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
@@ -464,15 +484,7 @@ impl SqliteCronRepository {
         if let (Some(user_id), Some(conversation_id)) = (user_id, params.conversation_id.as_deref())
             && !conversation_id.trim().is_empty()
         {
-            let owns_new_conversation: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
-                    .bind(user_id)
-                    .bind(conversation_id)
-                    .fetch_one(&self.pool)
-                    .await?;
-            if !owns_new_conversation {
-                return Err(DbError::NotFound(format!("conversation '{conversation_id}'")));
-            }
+            self.validate_conversation_owner(user_id, conversation_id).await?;
         }
 
         let sql = if user_id.is_some() {
@@ -557,7 +569,7 @@ mod tests {
         let now = now_ms();
         CronJobRow {
             id: id.into(),
-            user_id: "user1".into(),
+            user_id: "user_1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule_kind: "every".into(),

@@ -244,17 +244,37 @@ async fn scoped_crud_filters_by_job_user_id() {
 }
 
 #[tokio::test]
+async fn insert_rejects_conversation_owned_by_another_user() {
+    let (r, db) = repo().await;
+    insert_user_and_conversation(&db, "user_2", "conv_2").await;
+
+    let mut cross_user = make_job("cron_cross_user_conversation");
+    cross_user.user_id = "user_2".into();
+    cross_user.conversation_id = "conv_1".into();
+
+    let result = r.insert(&cross_user).await;
+    assert!(matches!(result, Err(DbError::NotFound(_))));
+    assert!(
+        r.get_by_id_for_user("user_2", "cron_cross_user_conversation")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn scheduler_enabled_scan_uses_job_user_id() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_owned")).await.unwrap();
-    let mut orphan = make_job("cron_orphan");
-    orphan.conversation_id = "missing_conversation".into();
-    r.insert(&orphan).await.unwrap();
+    let mut new_conversation = make_job("cron_new_conversation");
+    new_conversation.conversation_id = String::new();
+    new_conversation.execution_mode = "new_conversation".into();
+    r.insert(&new_conversation).await.unwrap();
 
     let enabled = r.list_enabled().await.unwrap();
 
     assert!(enabled.iter().any(|job| job.id == "cron_owned"));
-    assert!(enabled.iter().any(|job| job.id == "cron_orphan"));
+    assert!(enabled.iter().any(|job| job.id == "cron_new_conversation"));
 }
 
 #[tokio::test]
