@@ -17,18 +17,12 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Return every row, in insertion order.
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError>;
 
-    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.list_all().await
-    }
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError>;
 
     /// Look up by primary key.
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
 
-    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.get(id).await
-    }
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Look up by the unique `(agent_source, name)` pair.
     async fn find_by_source_and_name(
@@ -42,10 +36,7 @@ pub trait IAgentMetadataRepository: Send + Sync {
         user_id: &str,
         agent_source: &str,
         name: &str,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.find_by_source_and_name(agent_source, name).await
-    }
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Look up the first `builtin` row whose vendor label matches.
     /// Useful when the caller only has the legacy `backend` string and
@@ -56,10 +47,7 @@ pub trait IAgentMetadataRepository: Send + Sync {
         &self,
         user_id: &str,
         backend: &str,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.find_builtin_by_backend(backend).await
-    }
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Insert or replace a row. Returns the row as stored.
     async fn upsert(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError>;
@@ -68,10 +56,7 @@ pub trait IAgentMetadataRepository: Send + Sync {
         &self,
         user_id: &str,
         params: &UpsertAgentMetadataParams<'_>,
-    ) -> Result<AgentMetadataRow, DbError> {
-        let _ = user_id;
-        self.upsert(params).await
-    }
+    ) -> Result<AgentMetadataRow, DbError>;
 
     async fn upsert_global(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         self.upsert(params).await
@@ -90,10 +75,7 @@ pub trait IAgentMetadataRepository: Send + Sync {
         user_id: &str,
         id: &str,
         params: &UpdateAgentHandshakeParams<'_>,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.apply_handshake(id, params).await
-    }
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Persist the latest availability snapshot for an existing row.
     /// Returns `Ok(None)` if no row matches `id`.
@@ -108,10 +90,7 @@ pub trait IAgentMetadataRepository: Send + Sync {
         user_id: &str,
         id: &str,
         params: &UpdateAgentAvailabilitySnapshotParams<'_>,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let _ = user_id;
-        self.update_availability_snapshot(id, params).await
-    }
+    ) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Write only the self-repair override columns for an agent, leaving all
     /// other columns (seed truth + availability snapshot) untouched. Kept
@@ -130,24 +109,15 @@ pub trait IAgentMetadataRepository: Send + Sync {
         id: &str,
         command_override: Option<&str>,
         env_override: Option<&str>,
-    ) -> Result<(), DbError> {
-        let _ = user_id;
-        self.update_agent_overrides(id, command_override, env_override).await
-    }
+    ) -> Result<(), DbError>;
 
     /// Toggle the `enabled` flag. Returns `true` if a row was updated.
     async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError>;
 
-    async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
-        let _ = user_id;
-        self.set_enabled(id, enabled).await
-    }
+    async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError>;
 
     /// Delete a row. Returns `true` if a row was removed.
     async fn delete(&self, id: &str) -> Result<bool, DbError>;
 
-    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
-        let _ = user_id;
-        self.delete(id).await
-    }
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError>;
 }
