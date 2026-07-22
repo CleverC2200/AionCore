@@ -173,6 +173,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             let channel_manager = states.channel.manager.clone();
             let channel_session_manager = states.channel.session_manager.clone();
             let file_watch_service = states.file.watch_service.clone();
+            let office_watch_manager = states.office.watch_manager.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
                 let stopped_team_sessions = team_service.stop_sessions_for_user(user_id);
@@ -188,8 +189,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 let channel_manager = channel_manager.clone();
                 let channel_session_manager = channel_session_manager.clone();
                 let file_watch_service = file_watch_service.clone();
+                let office_watch_manager = office_watch_manager.clone();
                 tokio::spawn(async move {
                     channel_manager.shutdown_for_user(&user_id).await;
+                    office_watch_manager.stop_all_for_user(&user_id);
                     if let Err(err) = channel_session_manager.clear_all_sessions(&user_id).await {
                         tracing::warn!(
                             user_id = %user_id,

@@ -245,6 +245,27 @@ impl OfficecliWatchManager {
         self.sessions.clear();
     }
 
+    pub fn stop_all_for_user(&self, user_id: &str) -> usize {
+        let keys: Vec<WatchSessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.key().user_id == user_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let stopped = keys.len();
+
+        for key in keys {
+            if let Some((_, session)) = self.sessions.remove(&key) {
+                session.process.kill();
+            }
+        }
+
+        if stopped > 0 {
+            tracing::info!(user_id = %user_id, stopped, "stopped office preview sessions for user");
+        }
+        stopped
+    }
+
     pub fn is_active_port(&self, port: u16, doc_type: DocType) -> bool {
         self.sessions
             .iter()
@@ -865,6 +886,28 @@ mod tests {
 
         mgr.stop_all();
         assert_eq!(mgr.active_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_all_for_user_keeps_other_user_sessions() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shared.docx");
+        std::fs::write(&file, b"test").unwrap();
+        let path = file.to_str().unwrap();
+
+        let user_a_port = mgr.start_for_user("user-a", path, DocType::Word).await.unwrap();
+        let user_b_port = mgr.start_for_user("user-b", path, DocType::Word).await.unwrap();
+        assert_eq!(mgr.active_session_count(), 2);
+
+        assert_eq!(mgr.stop_all_for_user("user-a"), 1);
+
+        assert_eq!(mgr.active_session_count(), 1);
+        assert!(!mgr.is_active_port_for_user("user-a", user_a_port, DocType::Word));
+        assert!(mgr.is_active_port_for_user("user-b", user_b_port, DocType::Word));
     }
 
     #[tokio::test]
