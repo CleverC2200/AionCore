@@ -6,17 +6,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const TEST_USER_ID: &str = "system_default_user";
+const OTHER_USERNAME: &str = "user-2";
 
 use aionui_api_types::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, ImportMcpServerRequest, McpTransport, UpdateMcpServerRequest,
 };
-use aionui_db::SqliteMcpServerRepository;
+use aionui_db::{IUserRepository, SqliteMcpServerRepository, SqliteUserRepository};
 use aionui_mcp::{McpConfigService, McpError};
 
 async fn make_service() -> McpConfigService {
+    make_service_with_other_user().await.0
+}
+
+async fn make_service_with_other_user() -> (McpConfigService, String) {
     let db = aionui_db::init_database_memory().await.unwrap();
+    let user_repo = SqliteUserRepository::new(db.pool().clone());
+    let other_user = user_repo.create_user(OTHER_USERNAME, "hash").await.unwrap();
     let repo = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
-    McpConfigService::new(repo)
+    (McpConfigService::new(repo), other_user.id)
 }
 
 fn stdio_req(name: &str) -> CreateMcpServerRequest {
@@ -143,6 +150,48 @@ async fn get_not_found() {
     let svc = make_service().await;
     let err = svc.get_server(TEST_USER_ID, "nonexistent").await.unwrap_err();
     assert!(matches!(err, McpError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn servers_are_scoped_by_current_user() {
+    let (svc, other_user_id) = make_service_with_other_user().await;
+    let owner_server = svc.add_server(TEST_USER_ID, stdio_req("shared")).await.unwrap();
+    let other_server = svc.add_server(&other_user_id, http_req("shared")).await.unwrap();
+
+    assert_ne!(owner_server.id, other_server.id);
+    assert_eq!(svc.list_servers(TEST_USER_ID).await.unwrap().len(), 1);
+    assert_eq!(svc.list_servers(&other_user_id).await.unwrap().len(), 1);
+
+    assert!(matches!(
+        svc.get_server(TEST_USER_ID, &other_server.id).await.unwrap_err(),
+        McpError::NotFound(_)
+    ));
+    assert!(matches!(
+        svc.edit_server(
+            TEST_USER_ID,
+            &other_server.id,
+            UpdateMcpServerRequest {
+                name: None,
+                description: Some(Some("forged".into())),
+                transport: None,
+                original_json: None,
+                builtin: None,
+            },
+        )
+        .await
+        .unwrap_err(),
+        McpError::NotFound(_)
+    ));
+    assert!(matches!(
+        svc.delete_server(TEST_USER_ID, &other_server.id).await.unwrap_err(),
+        McpError::NotFound(_)
+    ));
+
+    svc.delete_server(&other_user_id, &other_server.id).await.unwrap();
+    assert_eq!(
+        svc.get_server(TEST_USER_ID, &owner_server.id).await.unwrap().id,
+        owner_server.id
+    );
 }
 
 // ---------------------------------------------------------------------------
