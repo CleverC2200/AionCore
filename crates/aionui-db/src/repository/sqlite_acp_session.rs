@@ -228,6 +228,21 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         })?;
 
         if result.rows_affected() == 0 {
+            let conversation_owner = sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
+                .bind(params.conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+            if conversation_owner
+                .as_deref()
+                .is_some_and(|user_id| user_id != params.user_id)
+            {
+                return Err(DbError::Conflict(format!(
+                    "CROSS_ACCOUNT_REFERENCE: acp_session conversation '{}' belongs to another user",
+                    params.conversation_id
+                )));
+            }
+
             return Err(DbError::NotFound(format!(
                 "conversation '{}' for user '{}'",
                 params.conversation_id, params.user_id
@@ -426,7 +441,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, DbError::NotFound(_)));
+        assert!(matches!(
+            err,
+            DbError::Conflict(msg) if msg.starts_with("CROSS_ACCOUNT_REFERENCE:")
+        ));
         assert!(repo.get_for_user("user-1", "conv-1").await.unwrap().is_none());
     }
 
