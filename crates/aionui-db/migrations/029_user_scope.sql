@@ -844,6 +844,141 @@ ALTER TABLE assistant_pairing_codes_new RENAME TO assistant_pairing_codes;
 CREATE INDEX IF NOT EXISTS idx_pairing_codes_owner_status
     ON assistant_pairing_codes(owner_user_id, status);
 
+-- ---------------------------------------------------------------------------
+-- Project-bind tables (created by 028_project_bind, which precedes this
+-- migration). `projects` holds user data (user-named projects, user-selected
+-- workspace roots; temp projects follow user-owned conversations), so it is
+-- an independent user-scoped root. `folders` stays global by design: a
+-- canonical filesystem path is a machine fact, deduped across users.
+-- `project_explorer` inherits its user through the project parent chain but
+-- carries a denormalized owner so the one-workspace-per-folder uniqueness
+-- can be expressed per user (SQLite cannot index across tables) — same
+-- pattern as the temporary Channel owner fields.
+--
+-- Both tables are guaranteed empty here (the feature is un-wired in 028's
+-- phase 1), so the rebuilds carry no data. The DEFAULT keeps phase-1 store
+-- code (which does not write owner columns) working unchanged; phase 2 must
+-- write owners explicitly and resolve workspace entries per user.
+-- ---------------------------------------------------------------------------
+
+CREATE TEMP TABLE user_scope_project_checks (
+    ok INTEGER NOT NULL CHECK (ok = 1)
+);
+
+CREATE TABLE projects_new (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT    NOT NULL,
+    user_id    TEXT    NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    name       TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+INSERT INTO projects_new (id, project_id, user_id, name, kind, created_at, updated_at)
+SELECT id, project_id, 'system_default_user', name, kind, created_at, updated_at
+FROM projects;
+
+INSERT INTO user_scope_project_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM projects_new) = (SELECT COUNT(*) FROM projects)
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE projects;
+ALTER TABLE projects_new RENAME TO projects;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_project_id_unique ON projects(project_id);
+CREATE INDEX IF NOT EXISTS idx_projects_user_updated ON projects(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_projects_user_kind_updated ON projects(user_id, kind, updated_at DESC);
+
+CREATE TABLE project_explorer_new (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    pe_id         TEXT    NOT NULL,
+    project_id    TEXT    NOT NULL,
+    owner_user_id TEXT    NOT NULL DEFAULT 'system_default_user' REFERENCES users(id),
+    folder_id     TEXT    NOT NULL,
+    role          TEXT    NOT NULL,
+    display_name  TEXT,
+    order_index   INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
+INSERT INTO project_explorer_new (
+    id, pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at
+)
+SELECT
+    id, pe_id, project_id, 'system_default_user', folder_id, role, display_name, order_index, created_at, updated_at
+FROM project_explorer;
+
+INSERT INTO user_scope_project_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM project_explorer_new) = (SELECT COUNT(*) FROM project_explorer)
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE project_explorer;
+ALTER TABLE project_explorer_new RENAME TO project_explorer;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_explorer_pe_id_unique ON project_explorer(pe_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_explorer_project_folder_unique
+    ON project_explorer(project_id, folder_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_explorer_one_workspace
+    ON project_explorer(project_id) WHERE role = 'workspace';
+-- Per user: a folder can be the workspace root of at most one project PER
+-- OWNER. Replaces 028's global (folder_id) uniqueness, which would let one
+-- user permanently reserve a directory against every other user.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_explorer_one_workspace_folder
+    ON project_explorer(owner_user_id, folder_id) WHERE role = 'workspace';
+CREATE INDEX IF NOT EXISTS idx_project_explorer_project_order ON project_explorer(project_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_project_explorer_folder_id ON project_explorer(folder_id);
+
+-- Cross-scope integrity: explorer owner must match its project's owner, and
+-- user-scoped roots referencing a project must share its owner. All tables
+-- involved are empty at migration time; these guard future upgrade paths.
+INSERT INTO user_scope_project_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM project_explorer pe
+        JOIN projects p ON p.project_id = pe.project_id
+        WHERE pe.owner_user_id != p.user_id
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_project_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM conversations c
+        JOIN projects p ON p.project_id = c.project_id
+        WHERE c.project_id IS NOT NULL
+          AND p.user_id != c.user_id
+    )
+    THEN 1
+    ELSE 0
+END;
+
+INSERT INTO user_scope_project_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM teams t
+        JOIN projects p ON p.project_id = t.project_id
+        WHERE t.project_id IS NOT NULL
+          AND p.user_id != t.user_id
+    )
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE user_scope_project_checks;
+
 DROP TABLE user_scope_rebuild_checks;
 
 PRAGMA foreign_keys = ON;

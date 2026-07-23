@@ -202,11 +202,10 @@ impl IUserRepository for SqliteUserRepository {
         if external_count != 1 {
             return Ok(0);
         }
-        let (is_owner,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
-                .bind(owner_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let (is_owner,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
+            .bind(owner_id)
+            .fetch_one(&mut *tx)
+            .await?;
         if is_owner != 1 {
             return Ok(0);
         }
@@ -851,7 +850,10 @@ mod tests {
             "system_settings",
             "client_preferences",
         ] {
-            assert!(names.contains(&expected), "expected user-scoped table '{expected}' to be discovered");
+            assert!(
+                names.contains(&expected),
+                "expected user-scoped table '{expected}' to be discovered"
+            );
         }
     }
 
@@ -867,11 +869,13 @@ mod tests {
         // Both the legacy user and the new owner have a system_settings row
         // (PRIMARY KEY user_id) — the owner's row must win, the legacy row
         // must be left behind rather than erroring the whole adoption.
-        sqlx::query("INSERT INTO system_settings (user_id, language, updated_at) VALUES ('system_default_user', 'zh-CN', ?)")
-            .bind(now)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_settings (user_id, language, updated_at) VALUES ('system_default_user', 'zh-CN', ?)",
+        )
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO system_settings (user_id, language, updated_at) VALUES (?, 'en-US', ?)")
             .bind(&user.id)
             .bind(now)

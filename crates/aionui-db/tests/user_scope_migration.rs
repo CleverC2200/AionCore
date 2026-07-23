@@ -62,7 +62,7 @@ async fn run_migration_result(pool: &sqlx::SqlitePool, version: i64) -> Result<(
 }
 
 #[tokio::test]
-async fn migration_028_adds_core_user_projection_columns() {
+async fn migration_029_adds_core_user_projection_columns() {
     let db = init_database_memory().await.unwrap();
     let columns = table_columns(db.pool(), "users").await;
     for column in ["user_type", "external_user_id", "status", "session_generation"] {
@@ -80,7 +80,7 @@ async fn migration_028_adds_core_user_projection_columns() {
 }
 
 #[tokio::test]
-async fn migration_028_adds_user_scope_to_independent_roots() {
+async fn migration_029_adds_user_scope_to_independent_roots() {
     let db = init_database_memory().await.unwrap();
     for (table, column) in [
         ("cron_jobs", "user_id"),
@@ -103,13 +103,13 @@ async fn migration_028_adds_user_scope_to_independent_roots() {
 }
 
 #[tokio::test]
-async fn migration_028_migrates_cron_skills_to_default_user() {
+async fn migration_029_migrates_cron_skills_to_default_user() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 26).await;
+    run_migrations_through(&pool, 28).await;
 
     sqlx::query(
         "INSERT INTO skills (id, name, description, path, source, enabled, created_at, updated_at)
@@ -119,7 +119,7 @@ async fn migration_028_migrates_cron_skills_to_default_user() {
     .await
     .unwrap();
 
-    run_migration(&pool, 28).await;
+    run_migration(&pool, 29).await;
 
     let row = sqlx::query("SELECT user_id, source FROM skills WHERE id = 'legacy-cron-skill'")
         .fetch_one(&pool)
@@ -135,13 +135,13 @@ async fn migration_028_migrates_cron_skills_to_default_user() {
 }
 
 #[tokio::test]
-async fn migration_028_backfills_existing_independent_roots_to_default_user() {
+async fn migration_029_backfills_existing_independent_roots_to_default_user() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 27).await;
+    run_migrations_through(&pool, 28).await;
     let now = 1_000_i64;
 
     sqlx::query(
@@ -221,7 +221,7 @@ async fn migration_028_backfills_existing_independent_roots_to_default_user() {
     .await
     .unwrap();
 
-    run_migration(&pool, 28).await;
+    run_migration(&pool, 29).await;
 
     for (table, id_column, id_value, scope_column) in [
         ("providers", "id", "provider_legacy", "user_id"),
@@ -247,13 +247,13 @@ async fn migration_028_backfills_existing_independent_roots_to_default_user() {
 }
 
 #[tokio::test]
-async fn migration_028_classifies_global_and_user_catalog_rows() {
+async fn migration_029_classifies_global_and_user_catalog_rows() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 27).await;
+    run_migrations_through(&pool, 28).await;
     let now = 2_000_i64;
 
     sqlx::query(
@@ -328,7 +328,7 @@ async fn migration_028_classifies_global_and_user_catalog_rows() {
     .await
     .unwrap();
 
-    run_migration(&pool, 28).await;
+    run_migration(&pool, 29).await;
 
     for (table, id_column, id_value, expected_owner) in [
         ("agent_metadata", "id", "agent_builtin_legacy", None),
@@ -361,7 +361,7 @@ async fn migration_028_classifies_global_and_user_catalog_rows() {
 }
 
 #[tokio::test]
-async fn migration_028_keeps_new_conversation_cron_jobs_unanchored_until_run() {
+async fn migration_029_keeps_new_conversation_cron_jobs_unanchored_until_run() {
     let db = init_database_memory().await.unwrap();
     let now = aionui_common::now_ms();
 
@@ -410,13 +410,13 @@ async fn insert_valid_aggregate_parents(pool: &sqlx::SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_028_preserves_valid_aggregate_child_rows() {
+async fn migration_029_preserves_valid_aggregate_child_rows() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 27).await;
+    run_migrations_through(&pool, 28).await;
     insert_valid_aggregate_parents(&pool).await;
 
     sqlx::query(
@@ -490,7 +490,7 @@ async fn migration_028_preserves_valid_aggregate_child_rows() {
     .await
     .unwrap();
 
-    run_migration(&pool, 28).await;
+    run_migration(&pool, 29).await;
 
     for (table, id_column, id_value) in [
         ("messages", "id", "msg_parent"),
@@ -514,7 +514,7 @@ async fn migration_028_preserves_valid_aggregate_child_rows() {
 }
 
 #[tokio::test]
-async fn migration_028_rejects_aggregate_child_orphans() {
+async fn migration_029_rejects_aggregate_child_orphans() {
     for (name, setup_sql) in [
         (
             "messages",
@@ -578,10 +578,10 @@ async fn migration_028_rejects_aggregate_child_orphans() {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        run_migrations_through(&pool, 27).await;
+        run_migrations_through(&pool, 28).await;
         sqlx::query(setup_sql).execute(&pool).await.unwrap();
 
-        let err = run_migration_result(&pool, 28).await.unwrap_err();
+        let err = run_migration_result(&pool, 29).await.unwrap_err();
         assert!(
             err.to_string().contains("CHECK constraint failed"),
             "unexpected migration error for {name}: {err}"
@@ -590,13 +590,13 @@ async fn migration_028_rejects_aggregate_child_orphans() {
 }
 
 #[tokio::test]
-async fn migration_028_rejects_channel_session_without_channel_user() {
+async fn migration_029_rejects_channel_session_without_channel_user() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 27).await;
+    run_migrations_through(&pool, 28).await;
 
     sqlx::query(
         "INSERT INTO assistant_sessions (
@@ -609,7 +609,7 @@ async fn migration_028_rejects_channel_session_without_channel_user() {
     .await
     .unwrap();
 
-    let err = run_migration_result(&pool, 28).await.unwrap_err();
+    let err = run_migration_result(&pool, 29).await.unwrap_err();
     assert!(
         err.to_string().contains("CHECK constraint failed"),
         "unexpected migration error: {err}"
@@ -617,13 +617,13 @@ async fn migration_028_rejects_channel_session_without_channel_user() {
 }
 
 #[tokio::test]
-async fn migration_028_rejects_channel_session_cross_user_conversation() {
+async fn migration_029_rejects_channel_session_cross_user_conversation() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 26).await;
+    run_migrations_through(&pool, 28).await;
 
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at)
@@ -663,9 +663,119 @@ async fn migration_028_rejects_channel_session_cross_user_conversation() {
     .await
     .unwrap();
 
-    let err = run_migration_result(&pool, 28).await.unwrap_err();
+    let err = run_migration_result(&pool, 29).await.unwrap_err();
     assert!(
         err.to_string().contains("CHECK constraint failed"),
         "unexpected migration error: {err}"
     );
+}
+
+#[tokio::test]
+async fn migration_029_scopes_project_bind_tables_by_user() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 28).await;
+    run_migration(&pool, 29).await;
+
+    // projects gains a NOT NULL user_id defaulting to the local user so
+    // phase-1 store code (which never writes the column) keeps working.
+    sqlx::query(
+        "INSERT INTO projects (project_id, name, kind, created_at, updated_at)
+         VALUES ('proj_default', 'Default Owner', 'standard', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let row = sqlx::query("SELECT user_id FROM projects WHERE project_id = 'proj_default'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("user_id"), "system_default_user");
+
+    // The one-workspace-per-folder uniqueness is per owner now: two users may
+    // use the same folder as their workspace root; the same user may not.
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at)
+         VALUES ('user_b', 'user_b', 'hash', 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO folders (folder_id, resource_uri, resource_canonical, created_at, updated_at)
+         VALUES ('folder_shared', 'file:///shared', 'file:///shared', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_explorer
+             (pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at)
+         VALUES ('pe_a', 'proj_default', 'system_default_user', 'folder_shared', 'workspace', NULL, 0, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_explorer
+             (pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at)
+         VALUES ('pe_b', 'proj_b', 'user_b', 'folder_shared', 'workspace', NULL, 0, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let same_owner_conflict = sqlx::query(
+        "INSERT INTO project_explorer
+             (pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at)
+         VALUES ('pe_a2', 'proj_other', 'system_default_user', 'folder_shared', 'workspace', NULL, 0, 1, 1)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        same_owner_conflict.is_err(),
+        "same owner must not claim the same folder as workspace twice"
+    );
+}
+
+#[tokio::test]
+async fn migration_029_backfills_legacy_project_rows_to_default_user() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 28).await;
+
+    // Rows created by phase-1 store code (no owner columns exist in 028)
+    // must land on system_default_user after the 029 rebuild, mirroring
+    // every other legacy backfill in this migration. Cross-owner divergence
+    // cannot exist pre-029 (no owner columns), so the preflight consistency
+    // checks are trivially green here; their forward-going enforcement is
+    // covered by migration_029_scopes_project_bind_tables_by_user.
+    sqlx::query(
+        "INSERT INTO projects (project_id, name, kind, created_at, updated_at)
+         VALUES ('proj_legacy', 'Legacy', 'standard', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_explorer
+             (pe_id, project_id, folder_id, role, display_name, order_index, created_at, updated_at)
+         VALUES ('pe_legacy', 'proj_legacy', 'folder_x', 'workspace', NULL, 0, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Clean legacy data: both rows backfill to system_default_user → passes.
+    run_migration(&pool, 29).await;
+    let row = sqlx::query("SELECT owner_user_id FROM project_explorer WHERE pe_id = 'pe_legacy'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("owner_user_id"), "system_default_user");
 }
