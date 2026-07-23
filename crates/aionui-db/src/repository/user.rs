@@ -50,6 +50,19 @@ pub trait IUserRepository: Send + Sync {
         external_user_id: &str,
     ) -> Result<Option<User>, DbError>;
 
+    /// One-time adoption of the machine's pre-multi-account data: while
+    /// `owner_id` is the ONLY external (aionpro) user in this database,
+    /// re-own every user-scoped row currently held by `system_default_user`
+    /// to `owner_id`. Returns the number of rows moved.
+    ///
+    /// Self-idempotent: after the first successful adoption the source set is
+    /// empty, so repeated calls move nothing. Once a second external user is
+    /// provisioned the adoption window closes permanently. Rows that would
+    /// collide with an existing row of the new owner (per-user PK/UNIQUE
+    /// tables such as `system_settings`) are skipped, keeping the owner's own
+    /// data authoritative.
+    async fn adopt_system_default_data(&self, owner_id: &str) -> Result<u64, DbError>;
+
     /// Finds a user by ID.
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
 

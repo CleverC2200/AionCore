@@ -190,6 +190,60 @@ impl IUserRepository for SqliteUserRepository {
         Ok(user)
     }
 
+    async fn adopt_system_default_data(&self, owner_id: &str) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Adoption window: exactly one external user, and it is the caller.
+        // A second provisioned account closes the window forever — later
+        // accounts must never inherit another machine user's data.
+        let (external_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE user_type != 'local'")
+            .fetch_one(&mut *tx)
+            .await?;
+        if external_count != 1 {
+            return Ok(0);
+        }
+        let (is_owner,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
+                .bind(owner_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if is_owner != 1 {
+            return Ok(0);
+        }
+
+        // Discover ownership tables from the live schema rather than a
+        // hand-maintained list, so user-scoped tables added by future
+        // migrations are adopted automatically. Convention (root-scope
+        // design): a `user_id` column IS the ownership column.
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT m.name FROM sqlite_master m \
+             WHERE m.type = 'table' \
+               AND m.name NOT LIKE 'sqlite_%' \
+               AND m.name != 'users' \
+               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'user_id')",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Global template rows (`user_id IS NULL`) are shared and stay put;
+        // only rows owned by the local default user move. `UPDATE OR IGNORE`
+        // skips rows that would collide with the new owner's existing rows on
+        // per-user PK/UNIQUE tables (e.g. `system_settings.user_id`).
+        let mut moved: u64 = 0;
+        for (table,) in &tables {
+            let result = sqlx::query(&format!(
+                "UPDATE OR IGNORE \"{table}\" SET user_id = ? WHERE user_id = 'system_default_user'"
+            ))
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?;
+            moved += result.rows_affected();
+        }
+
+        tx.commit().await?;
+        Ok(moved)
+    }
+
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(id)
@@ -690,5 +744,150 @@ mod tests {
         assert_eq!(generation, 1);
         let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
         assert_eq!(updated.session_generation, 1);
+    }
+
+    async fn seed_legacy_conversation(db: &crate::Database, id: &str) {
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES (?, 'system_default_user', 'legacy', 'aionrs', ?, ?)",
+        )
+        .bind(id)
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn conversation_owner(db: &crate::Database, id: &str) -> String {
+        let (owner,): (String,) = sqlx::query_as("SELECT user_id FROM conversations WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        owner
+    }
+
+    #[tokio::test]
+    async fn adopt_moves_legacy_data_to_sole_external_user_once() {
+        let (repo, db) = setup().await;
+        seed_legacy_conversation(&db, "conv-legacy").await;
+        let user = repo
+            .ensure_external_user(UserType::Aionpro, "ext-1", ExternalUserProjection::default())
+            .await
+            .unwrap();
+
+        let moved = repo.adopt_system_default_data(&user.id).await.unwrap();
+        assert!(moved >= 1);
+        assert_eq!(conversation_owner(&db, "conv-legacy").await, user.id);
+
+        // Self-idempotent: the source set is now empty.
+        let moved_again = repo.adopt_system_default_data(&user.id).await.unwrap();
+        assert_eq!(moved_again, 0);
+    }
+
+    #[tokio::test]
+    async fn adopt_is_refused_once_a_second_external_user_exists() {
+        let (repo, db) = setup().await;
+        seed_legacy_conversation(&db, "conv-legacy-2").await;
+        let first = repo
+            .ensure_external_user(UserType::Aionpro, "ext-a", ExternalUserProjection::default())
+            .await
+            .unwrap();
+        let second = repo
+            .ensure_external_user(UserType::Aionpro, "ext-b", ExternalUserProjection::default())
+            .await
+            .unwrap();
+
+        assert_eq!(repo.adopt_system_default_data(&first.id).await.unwrap(), 0);
+        assert_eq!(repo.adopt_system_default_data(&second.id).await.unwrap(), 0);
+        assert_eq!(conversation_owner(&db, "conv-legacy-2").await, "system_default_user");
+    }
+
+    #[tokio::test]
+    async fn adopt_is_refused_for_local_or_unknown_owner() {
+        let (repo, db) = setup().await;
+        seed_legacy_conversation(&db, "conv-legacy-3").await;
+
+        // No external user at all.
+        assert_eq!(repo.adopt_system_default_data("system_default_user").await.unwrap(), 0);
+
+        // Owner id that is not the external user.
+        repo.ensure_external_user(UserType::Aionpro, "ext-c", ExternalUserProjection::default())
+            .await
+            .unwrap();
+        assert_eq!(repo.adopt_system_default_data("someone-else").await.unwrap(), 0);
+        assert_eq!(conversation_owner(&db, "conv-legacy-3").await, "system_default_user");
+    }
+
+    #[tokio::test]
+    async fn adopt_discovers_all_known_user_scoped_tables() {
+        let (_repo, db) = setup().await;
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT m.name FROM sqlite_master m \
+             WHERE m.type = 'table' \
+               AND m.name NOT LIKE 'sqlite_%' \
+               AND m.name != 'users' \
+               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'user_id')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
+
+        // Sentinel: the discovery convention (`user_id` column == ownership)
+        // must keep matching the core scope tables. If this fails, either a
+        // migration renamed an ownership column or the convention broke —
+        // both must be looked at before shipping.
+        for expected in [
+            "conversations",
+            "teams",
+            "cron_jobs",
+            "skills",
+            "mcp_servers",
+            "providers",
+            "assistants",
+            "system_settings",
+            "client_preferences",
+        ] {
+            assert!(names.contains(&expected), "expected user-scoped table '{expected}' to be discovered");
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_skips_rows_colliding_with_the_new_owner() {
+        let (repo, db) = setup().await;
+        let now = aionui_common::now_ms();
+        let user = repo
+            .ensure_external_user(UserType::Aionpro, "ext-d", ExternalUserProjection::default())
+            .await
+            .unwrap();
+
+        // Both the legacy user and the new owner have a system_settings row
+        // (PRIMARY KEY user_id) — the owner's row must win, the legacy row
+        // must be left behind rather than erroring the whole adoption.
+        sqlx::query("INSERT INTO system_settings (user_id, language, updated_at) VALUES ('system_default_user', 'zh-CN', ?)")
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO system_settings (user_id, language, updated_at) VALUES (?, 'en-US', ?)")
+            .bind(&user.id)
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        seed_legacy_conversation(&db, "conv-legacy-4").await;
+
+        repo.adopt_system_default_data(&user.id).await.unwrap();
+
+        let (language,): (String,) = sqlx::query_as("SELECT language FROM system_settings WHERE user_id = ?")
+            .bind(&user.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(language, "en-US");
+        assert_eq!(conversation_owner(&db, "conv-legacy-4").await, user.id);
     }
 }

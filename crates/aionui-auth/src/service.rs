@@ -61,6 +61,15 @@ impl AuthProvisionService {
             return Err(ProvisionError::UserDisabled);
         }
 
+        // Upgrade path (AionUi -> AionPro over the same database): while this
+        // is the machine's only external user, re-own the local default
+        // user's pre-multi-account data to it. Self-idempotent — moves
+        // nothing once the source set is empty or a second account exists.
+        let adopted = self.user_repo.adopt_system_default_data(&user.id).await?;
+        if adopted > 0 {
+            tracing::info!(user_id = %user.id, rows = adopted, "adopted system_default_user data into first external user");
+        }
+
         Ok(external_user_response(user, request.user_type))
     }
 

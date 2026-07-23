@@ -6,12 +6,12 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderName, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
 use aionui_api_types::ErrorResponse;
@@ -393,7 +393,29 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             .allow_headers(Any);
         router.layer(cors)
     } else {
-        router
+        // Non-local (external identity) mode: the desktop renderer is a
+        // cross-origin browser context (localhost:5173 in dev, file:// when
+        // packaged) authenticating with the session cookie, so responses must
+        // opt in to credentialed CORS. Credentialed mode forbids wildcards:
+        // reflect the request origin and enumerate headers explicitly
+        // (x-csrf-token is required by the CSRF double-submit middleware).
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_credentials(true)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                HeaderName::from_static("x-csrf-token"),
+            ]);
+        router.layer(cors)
     }
 }
 
