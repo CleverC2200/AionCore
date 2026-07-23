@@ -12,6 +12,14 @@ use crate::repository::conversation::{
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 
+/// Bump `conversations.updated_at` so the conversation-list sort
+/// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
+/// activity to the top. Persisting a message never used to touch this column,
+/// so a conversation receiving new messages stayed frozen at its last
+/// create/rename/reset time. `MAX(updated_at, ?)` keeps recency monotonic: an
+/// out-of-order streaming upsert (older event time) can never move a
+/// conversation backward in the list. Runs inside the caller's transaction so
+/// the message write and the bump commit atomically.
 /// SQLite-backed implementation of [`IConversationRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteConversationRepository {
@@ -42,34 +50,78 @@ impl SqliteConversationRepository {
     }
 
     async fn insert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
-        self.ensure_conversation_for_user(user_id, &message.conversation_id)
-            .await?;
-        sqlx::query(
-            "INSERT INTO messages \
-                (id, conversation_id, msg_id, type, content, position, \
-                 status, hidden, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&message.id)
-        .bind(&message.conversation_id)
-        .bind(&message.msg_id)
-        .bind(&message.r#type)
-        .bind(&message.content)
-        .bind(&message.position)
-        .bind(&message.status)
-        .bind(message.hidden)
-        .bind(message.created_at)
-        .execute(&self.pool)
-        .await?;
+        // BEGIN IMMEDIATE claims the writer lock up front (same pattern as
+        // `claim_run`) so concurrent inserters queue on SQLite's busy handler
+        // instead of a read-then-write transaction failing with "database is
+        // locked" when it tries to upgrade to the write lock.
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
 
-        Ok(())
+        let result: Result<(), DbError> = async {
+            // Ownership check inside the same transaction as the insert +
+            // bump, so parent-chain authorization and the write are atomic.
+            let exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+                    .bind(user_id)
+                    .bind(&message.conversation_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if exists == 0 {
+                return Err(DbError::NotFound(format!(
+                    "Conversation '{}' not found",
+                    message.conversation_id
+                )));
+            }
+            sqlx::query(
+                "INSERT INTO messages \
+                    (id, conversation_id, msg_id, type, content, position, \
+                     status, hidden, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&message.id)
+            .bind(&message.conversation_id)
+            .bind(&message.msg_id)
+            .bind(&message.r#type)
+            .bind(&message.content)
+            .bind(&message.position)
+            .bind(&message.status)
+            .bind(message.hidden)
+            .bind(message.created_at)
+            .execute(&mut *connection)
+            .await?;
+
+            // Persisting a message bumps the parent conversation's recency so
+            // the conversation-list sort floats fresh activity to the top;
+            // MAX() keeps recency monotonic under out-of-order upserts.
+            sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+                .bind(message.created_at)
+                .bind(&message.conversation_id)
+                .execute(&mut *connection)
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
-        self.ensure_conversation_for_user(user_id, &message.conversation_id)
-            .await?;
-        let result = sqlx::query(
-            "INSERT INTO messages \
+        // Writer-lock-first transaction; see `insert_message_once` for why.
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+
+        let result: Result<(), DbError> = async {
+            let result = sqlx::query(
+                "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
                  status, hidden, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -102,28 +154,49 @@ impl SqliteConversationRepository {
                     SELECT 1 FROM conversations c \
                     WHERE c.id = messages.conversation_id AND c.user_id = ? \
                )",
-        )
-        .bind(&message.id)
-        .bind(&message.conversation_id)
-        .bind(&message.msg_id)
-        .bind(&message.r#type)
-        .bind(&message.content)
-        .bind(&message.position)
-        .bind(&message.status)
-        .bind(message.hidden)
-        .bind(message.created_at)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+            )
+            .bind(&message.id)
+            .bind(&message.conversation_id)
+            .bind(&message.msg_id)
+            .bind(&message.r#type)
+            .bind(&message.content)
+            .bind(&message.position)
+            .bind(&message.status)
+            .bind(message.hidden)
+            .bind(message.created_at)
+            .bind(user_id)
+            .execute(&mut *connection)
+            .await?;
 
-        if result.rows_affected() == 0 {
-            return Err(DbError::Conflict(format!(
-                "Message with id '{}' already exists outside the requested conversation",
-                message.id
-            )));
+            // 0 rows: either the id exists under another conversation, or the
+            // user-scope EXISTS guard rejected a foreign owner. The rollback
+            // below means the timestamp bump never applies either way.
+            if result.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "Message with id '{}' already exists outside the requested conversation",
+                    message.id
+                )));
+            }
+
+            sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+                .bind(message.created_at)
+                .bind(&message.conversation_id)
+                .execute(&mut *connection)
+                .await?;
+            Ok(())
         }
+        .await;
 
-        Ok(())
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn visible_message_exists_before(
@@ -1307,6 +1380,50 @@ mod tests {
     async fn get_nonexistent_returns_none() {
         let (repo, _db) = setup().await;
         assert!(repo.get("user_1", "no_such_id").await.unwrap().is_none());
+    }
+
+    /// Persisting a message must bump the parent conversation's updated_at so the
+    /// conversation-list sort (ORDER BY conversations.updated_at DESC) floats a
+    /// conversation with fresh activity to the top. Recency is monotonic — an
+    /// out-of-order (older) upsert must not move it backward.
+    #[tokio::test]
+    async fn insert_message_bumps_conversation_updated_at() {
+        let (repo, _db) = setup().await;
+        let mut conv = sample_conversation(SYSTEM_USER_ID);
+        conv.updated_at = 1; // force a known-stale baseline
+        repo.create(&conv).await.unwrap();
+
+        // insert_message with a newer event time bumps updated_at forward.
+        let mut msg = sample_message(&conv.id);
+        msg.created_at = 5_000;
+        repo.insert_message(SYSTEM_USER_ID, &msg).await.unwrap();
+        assert_eq!(
+            repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap().updated_at,
+            5_000,
+            "insert must bump updated_at to the message time"
+        );
+
+        // A newer upsert (streaming tool-call update) advances recency.
+        let mut newer = sample_message(&conv.id);
+        newer.id = "tool-1".to_string();
+        newer.created_at = 9_000;
+        repo.upsert_message(SYSTEM_USER_ID, &newer).await.unwrap();
+        assert_eq!(
+            repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap().updated_at,
+            9_000,
+            "newer upsert must advance updated_at"
+        );
+
+        // An out-of-order (older) upsert must NOT move recency backward (MAX guard).
+        let mut older = sample_message(&conv.id);
+        older.id = "tool-2".to_string();
+        older.created_at = 3_000;
+        repo.upsert_message(SYSTEM_USER_ID, &older).await.unwrap();
+        assert_eq!(
+            repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().unwrap().updated_at,
+            9_000,
+            "older upsert must not move updated_at backward"
+        );
     }
 
     #[tokio::test]

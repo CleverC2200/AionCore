@@ -280,6 +280,21 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE acp_session SET session_id = NULL, last_active_at = ? \
+             WHERE conversation_id = ? \
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query(
             "DELETE FROM acp_session \
@@ -485,6 +500,44 @@ mod tests {
 
         let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(fetched.session_id.as_deref(), Some("sess-owner"));
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_nulls_field_but_keeps_row() {
+        let (repo, _db) = setup().await;
+        insert_conversation(&repo, "user-1", "conv-1").await;
+        repo.create(&create_params("conv-1")).await.unwrap();
+        repo.update_session_id_unscoped("conv-1", "sess-abc").await.unwrap();
+
+        assert!(repo.clear_session_id_for_user("user-1", "conv-1").await.unwrap());
+        let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
+        assert_eq!(fetched.session_id, None, "the resume anchor must be nulled");
+        assert_eq!(
+            fetched.session_status, "idle",
+            "the row (and its config) survives the clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_rejects_other_owner() {
+        let (repo, _db) = setup().await;
+        insert_conversation(&repo, "user-1", "conv-1").await;
+        repo.create(&create_params("conv-1")).await.unwrap();
+        repo.update_session_id_unscoped("conv-1", "sess-abc").await.unwrap();
+
+        assert!(!repo.clear_session_id_for_user("intruder", "conv-1").await.unwrap());
+        let fetched = repo.get_unscoped("conv-1").await.unwrap().unwrap();
+        assert_eq!(
+            fetched.session_id.as_deref(),
+            Some("sess-abc"),
+            "a foreign user must not clear another owner's resume anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_missing_row_returns_false() {
+        let (repo, _db) = setup().await;
+        assert!(!repo.clear_session_id_for_user("user-1", "nope").await.unwrap());
     }
 
     #[tokio::test]

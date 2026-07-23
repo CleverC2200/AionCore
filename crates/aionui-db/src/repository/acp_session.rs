@@ -85,6 +85,17 @@ pub trait IAcpSessionRepository: Send + Sync {
         session_id: &str,
     ) -> Result<bool, DbError>;
 
+    /// Null the stored `session_id`, dropping the resume anchor while keeping the
+    /// row (config/runtime state) intact. Called on an unrecoverable resume error
+    /// ("No conversation found" / `error_during_execution`) so the NEXT turn opens
+    /// Fresh instead of re-resuming a dead backend session forever. Distinct from
+    /// [`delete_for_user`](Self::delete_for_user), which drops the whole row.
+    /// Returns `true` when the row existed under `user_id`'s conversation. This
+    /// is the direct-CLI equivalent of the clean-slate `Orchestrator` emitting
+    /// `BackendBound{None}` and the legacy ACP
+    /// `rebuild_after_session_not_found` → `clear_session_id` self-heal.
+    async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
+
     /// Delete the row when the owning conversation belongs to `user_id`.
     /// Called by the conversation delete hook — no DB foreign key, so this
     /// must be invoked explicitly.
