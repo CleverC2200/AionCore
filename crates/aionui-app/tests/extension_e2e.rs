@@ -1,6 +1,7 @@
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -819,6 +820,108 @@ async fn em4_disable_nonexistent_returns_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn extension_enablement_and_contributions_are_isolated_by_user() {
+    let tmp = TempDir::new().unwrap();
+    let ext_root = write_legacy_extension_fixture(&tmp);
+    let (mut app, services) = build_app_with_extension_root(&ext_root).await;
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "extension-user-a", "pass-a").await;
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "extension-user-b", "pass-b").await;
+
+    let missing_csrf = Request::builder()
+        .method("POST")
+        .uri("/api/extensions/disable")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token_a}"))
+        .body(Body::from(r#"{"name":"legacy-suite"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(missing_csrf).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "CSRF_INVALID");
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/extensions/disable",
+            json!({"name": "legacy-suite"}),
+            &token_a,
+            &csrf_a,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let extensions_a = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions", &token_a))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let extensions_b = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions", &token_b))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(extensions_a["data"][0]["enabled"], false);
+    assert_eq!(extensions_b["data"][0]["enabled"], true);
+
+    let skills_a = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions/skills", &token_a))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let skills_b = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/extensions/skills", &token_b))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(skills_a["data"], json!([]));
+    assert_eq!(skills_b["data"].as_array().unwrap().len(), 1);
+
+    let asset_a = app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/extensions/legacy-suite/assets/assets/channel.png",
+            &token_a,
+        ))
+        .await
+        .unwrap();
+    let asset_b = app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/extensions/legacy-suite/assets/assets/channel.png",
+            &token_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_a.status(), StatusCode::NOT_FOUND);
+    assert_eq!(asset_b.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/extensions/enable",
+            json!({"name": "legacy-suite"}),
+            &token_b,
+            &csrf_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let extensions_a = body_json(app.oneshot(get_with_token("/api/extensions", &token_a)).await.unwrap()).await;
+    assert_eq!(extensions_a["data"][0]["enabled"], false);
 }
 
 // ---------------------------------------------------------------------------

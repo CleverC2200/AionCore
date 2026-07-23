@@ -400,7 +400,7 @@ fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentit
 fn is_global_websocket_event(event_name: &str) -> bool {
     matches!(
         event_name,
-        "runtime.statusChanged" | "extensions.state-changed" | "extensions.lifecycle" | "hub.state-changed"
+        "runtime.statusChanged" | "extensions.lifecycle" | "hub.state-changed"
     )
 }
 
@@ -461,7 +461,7 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{boundary_error_for_status, create_router_with_runtime};
+    use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
     use crate::config::AppConfig;
     use crate::services::AppServices;
 
@@ -488,6 +488,12 @@ mod tests {
             let (_, actual_code) = boundary_error_for_status(status).expect("status should be normalized");
             assert_eq!(actual_code, code);
         }
+    }
+
+    #[test]
+    fn extension_enablement_events_are_user_scoped() {
+        assert!(!is_global_websocket_event("extensions.state-changed"));
+        assert!(is_global_websocket_event("extensions.lifecycle"));
     }
 
     #[tokio::test]

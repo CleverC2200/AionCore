@@ -1491,14 +1491,6 @@ async fn resolve_skill_source_path_with_repo_for_user(
     user_id: &str,
     name: &str,
 ) -> Result<Option<PathBuf>, ExtensionError> {
-    let top = paths.builtin_skills_dir.join(name);
-    if top.is_dir() {
-        return Ok(Some(top));
-    }
-    let auto = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
-    if auto.is_dir() {
-        return Ok(Some(auto));
-    }
     if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
@@ -1510,7 +1502,17 @@ async fn resolve_skill_source_path_with_repo_for_user(
             deleted = row.deleted_at.is_some(),
             "skill row points at a missing directory"
         );
-        return Ok(None);
+        if row.user_id.is_some() {
+            return Ok(None);
+        }
+    }
+    let top = paths.builtin_skills_dir.join(name);
+    if top.is_dir() {
+        return Ok(Some(top));
+    }
+    let auto = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
+    if auto.is_dir() {
+        return Ok(Some(auto));
     }
     let cron = paths.cron_skills_dir.join(name);
     if cron.is_dir() {

@@ -140,7 +140,7 @@ async fn get_plugin_status(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ChannelPluginStatusView>>>, ApiError> {
     let statuses = state.manager.get_plugin_status(&user.id).await?;
-    let extension_plugins = state.extension_registry.get_channel_plugins().await;
+    let extension_plugins = state.extension_registry.get_channel_plugins_for_user(&user.id).await;
 
     let extension_map: HashMap<String, ResolvedChannelPlugin> = extension_plugins
         .into_iter()
@@ -318,7 +318,7 @@ async fn enable_plugin(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
+    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id).await {
         let config = build_extension_config(&extension_plugin, &req.config)?;
         match state
             .manager
@@ -372,7 +372,9 @@ async fn disable_plugin(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if resolve_extension_channel_plugin(&state, &req.plugin_id).await.is_some()
+    if resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id)
+        .await
+        .is_some()
         && state
             .repo
             .get_plugin(&user.id, &req.plugin_id)
@@ -407,11 +409,12 @@ async fn disable_plugin(
 /// `POST /api/channel/plugins/test` — test plugin credentials.
 async fn test_plugin(
     State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<TestPluginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TestPluginResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &req.plugin_id).await {
+    if let Some(extension_plugin) = resolve_extension_channel_plugin(&state, &user.id, &req.plugin_id).await {
         let _config = build_extension_test_config(&extension_plugin, &req)?;
         return Ok(Json(ApiResponse::ok(TestPluginResponse {
             success: true,
@@ -762,11 +765,12 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
 
 async fn resolve_extension_channel_plugin(
     state: &ChannelRouterState,
+    user_id: &str,
     plugin_id: &str,
 ) -> Option<ResolvedChannelPlugin> {
     state
         .extension_registry
-        .get_channel_plugins()
+        .get_channel_plugins_for_user(user_id)
         .await
         .into_iter()
         .find(|plugin| plugin.id == plugin_id)

@@ -1530,7 +1530,7 @@ impl AssistantService {
         }
 
         // Best-effort filesystem cleanup.
-        self.cleanup_user_assets(id);
+        self.cleanup_user_assets_for_user(user_id, id);
 
         Ok(())
     }
@@ -2004,20 +2004,12 @@ impl AssistantService {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn user_rules_dir(&self) -> PathBuf {
-        self.user_rules_dir_for_user(DEFAULT_USER_ID)
-    }
-
     fn user_rules_root_dir(&self) -> PathBuf {
         self.user_data_dir.join("assistant-rules")
     }
 
     fn user_rules_dir_for_user(&self, user_id: &str) -> PathBuf {
         self.user_rules_root_dir().join(encode_filename_component(user_id))
-    }
-
-    fn user_skills_dir(&self) -> PathBuf {
-        self.user_skills_dir_for_user(DEFAULT_USER_ID)
     }
 
     fn user_skills_root_dir(&self) -> PathBuf {
@@ -2329,9 +2321,13 @@ impl AssistantService {
         Ok((generate_prefixed_id("asstdef"), assistant_id.to_string()))
     }
 
-    fn cleanup_user_assets(&self, id: &str) {
-        remove_assistant_md_files(&self.user_rules_dir(), id);
-        remove_assistant_md_files(&self.user_skills_dir(), id);
+    fn cleanup_user_assets_for_user(&self, user_id: &str, id: &str) {
+        remove_assistant_md_files(&self.user_rules_dir_for_user(user_id), id);
+        remove_assistant_md_files(&self.user_skills_dir_for_user(user_id), id);
+        if user_id == DEFAULT_USER_ID {
+            remove_assistant_md_files(&self.user_rules_root_dir(), id);
+            remove_assistant_md_files(&self.user_skills_root_dir(), id);
+        }
         remove_assistant_avatar_files(&self.user_avatars_dir(), id);
     }
 }
