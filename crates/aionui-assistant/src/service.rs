@@ -1844,6 +1844,16 @@ impl AssistantService {
         if !content.is_empty() {
             return content;
         }
+
+        // Mirror the scoped-dir fallback: a requested locale falls back to
+        // the locale-less file (migrating any legacy-named copy) before the
+        // glob-any last resort, which has no migration side effect.
+        if locale.is_some_and(|value| !value.is_empty()) {
+            let locale_less = read_assistant_md_with_legacy(&legacy_rules_dir, id, None);
+            if !locale_less.is_empty() {
+                return locale_less;
+            }
+        }
         read_first_assistant_md(&legacy_rules_dir, id)
     }
 
