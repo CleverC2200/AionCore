@@ -22,8 +22,15 @@ impl SqliteCronRepository {
 #[async_trait::async_trait]
 impl ICronRepository for SqliteCronRepository {
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError> {
-        self.validate_conversation_owner(&row.user_id, &row.conversation_id)
-            .await?;
+        // Existing-mode jobs bind to a live conversation, so the referenced
+        // conversation must belong to the job owner. New-conversation jobs
+        // keep a stale anchor id that is re-resolved at run time and stays
+        // unanchored until then; the executor re-validates ownership before
+        // dispatch.
+        if row.execution_mode == "existing" {
+            self.validate_conversation_owner(&row.user_id, &row.conversation_id)
+                .await?;
+        }
 
         sqlx::query(
             "INSERT INTO cron_jobs (\

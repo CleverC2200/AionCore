@@ -1282,7 +1282,9 @@ pub struct ResolvedAgentSkill {
 /// 1. `{builtin_skills_dir}/{name}/` — top-level opt-in builtin.
 /// 2. `{builtin_skills_dir}/auto-inject/{name}/` — auto-inject builtin.
 /// 3. `{user_skills_dir}/{name}/` — user-created custom skill.
-/// 4. `{cron_skills_dir}/{name}/` — per-job cron skill.
+///
+/// Per-job cron skill dirs hold user content and are never probed by
+/// name; they resolve only through the owning user's repo row.
 ///
 /// No files are copied and no per-conversation directory is created —
 /// the backend just hands the absolute source paths back to the caller,
@@ -1478,10 +1480,8 @@ async fn resolve_skill_source_path(paths: &SkillPaths, name: &str) -> Result<Opt
     if user.is_dir() {
         return Ok(Some(user));
     }
-    let cron = paths.cron_skills_dir.join(name);
-    if cron.is_dir() {
-        return Ok(Some(cron));
-    }
+    // Per-job cron skill dirs are intentionally NOT probed: they hold
+    // user content and resolve only through an owned repo row.
     Ok(None)
 }
 
@@ -1514,10 +1514,9 @@ async fn resolve_skill_source_path_with_repo_for_user(
     if auto.is_dir() {
         return Ok(Some(auto));
     }
-    let cron = paths.cron_skills_dir.join(name);
-    if cron.is_dir() {
-        return Ok(Some(cron));
-    }
+    // Per-job cron skill dirs are intentionally NOT probed as a fallback:
+    // they hold user content (job prompts) and must resolve only through
+    // a repo row owned by the requesting user.
     Ok(None)
 }
 
@@ -1710,36 +1709,10 @@ async fn sync_builtin_skills_into_repo(paths: &SkillPaths, repo: &dyn ISkillRepo
         }
     }
 
-    if let Ok(skills) = scan_skill_dirs(&paths.cron_skills_dir).await {
-        for skill in skills {
-            sync_managed_skill_into_repo(repo, &skill, "cron").await?;
-        }
-    }
+    // Per-job cron skills are user content (job prompts); their rows are
+    // owned by the job owner and maintained by aionui-cron, never synced
+    // here as global rows.
 
-    Ok(())
-}
-
-async fn sync_managed_skill_into_repo(
-    repo: &dyn ISkillRepository,
-    skill: &ScannedSkill,
-    source: &str,
-) -> Result<(), ExtensionError> {
-    if let Some(existing) = repo.find_by_name_any_for_user(DEFAULT_USER_ID, &skill.name).await?
-        && existing.source == "user"
-        && existing.deleted_at.is_none()
-        && existing.enabled
-    {
-        return Ok(());
-    }
-
-    repo.upsert_global(UpsertSkillParams {
-        name: &skill.name,
-        description: Some(&skill.description),
-        path: &skill.path,
-        source,
-        enabled: true,
-    })
-    .await?;
     Ok(())
 }
 
@@ -3015,7 +2988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_available_skills_with_repo_syncs_builtin_auto_inject_and_cron_sources_into_repo() {
+    async fn list_available_skills_with_repo_syncs_builtin_sources_but_never_cron_dirs() {
         let tmp = TempDir::new().unwrap();
         let paths = make_disk_builtin_paths(tmp.path());
         let repo = make_test_skill_repo().await;
@@ -3044,12 +3017,10 @@ mod tests {
         let auto_cron_row = repo.find_by_name("cron").await.unwrap().unwrap();
         assert_eq!(auto_cron_row.source, "builtin");
 
-        let scheduled = skills.iter().find(|skill| skill.name == "scheduled-task").unwrap();
-        assert_eq!(scheduled.source, SkillSource::Cron);
-        assert_eq!(scheduled.relative_location, None);
-        let scheduled_row = repo.find_by_name("scheduled-task").await.unwrap().unwrap();
-        assert_eq!(scheduled_row.source, "cron");
-        assert_eq!(scheduled_row.user_id, None);
+        // Per-job cron skills hold user content; the machine-level catalog
+        // sync must not ingest them as global rows or list them.
+        assert!(skills.iter().all(|skill| skill.name != "scheduled-task"));
+        assert!(repo.find_by_name_any("scheduled-task").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -1416,8 +1416,33 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
             "limit_bytes": 50 * 1024 * 1024
         }])
     );
-    assert!(paths.user_skills_dir.join("sample-alpha").join("SKILL.md").exists());
+    // Imported skills for a real (non-default) user land in that user's
+    // scoped storage under `.users/`, never in the legacy shared root.
+    let user = services
+        .user_repo
+        .find_by_username("user1")
+        .await
+        .unwrap()
+        .expect("test user should exist");
+    let skill_repo = aionui_db::SqliteSkillRepository::new(services.database.pool().clone());
+    let alpha_row = aionui_db::ISkillRepository::find_by_name_for_user(&skill_repo, &user.id, "sample-alpha")
+        .await
+        .unwrap()
+        .expect("imported skill row should exist for the importing user");
+    assert!(
+        alpha_row.path.contains(".users"),
+        "import must use user-scoped storage: {}",
+        alpha_row.path
+    );
+    assert!(std::path::Path::new(&alpha_row.path).join("SKILL.md").exists());
+    assert!(!paths.user_skills_dir.join("sample-alpha").exists());
     assert!(!paths.user_skills_dir.join("sample-beta").exists());
+    assert!(
+        aionui_db::ISkillRepository::find_by_name_for_user(&skill_repo, &user.id, "sample-beta")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let resp = app
         .oneshot(get_with_token("/api/skills/import-history", &token))
@@ -1454,12 +1479,28 @@ fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
 async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review skill");
-    write_skill(&paths.user_skills_dir, "my-skill", "A user-imported skill");
     sync_skill_catalog_for_test(&services, &paths, "user1").await;
+
+    // Real users get custom skills through the import API, which stores
+    // files under the user's scoped storage (never the legacy shared root).
+    let source_dir = tmp.path().join("import-src");
+    write_skill(&source_dir, "my-skill", "A user-imported skill");
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": source_dir.join("my-skill").to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1493,12 +1534,35 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 async fn sl2_list_skills_user_custom_overrides_builtin() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review");
-    write_skill(&paths.user_skills_dir, "review", "Custom review override");
     sync_skill_catalog_for_test(&services, &paths, "user1").await;
+
+    // A user-imported skill with the same name shadows the builtin row in
+    // the user's listing. The source dir name differs; the skill NAME in
+    // the frontmatter is what collides.
+    let source_dir = tmp.path().join("import-src");
+    let override_dir = source_dir.join("review-override");
+    std::fs::create_dir_all(&override_dir).unwrap();
+    std::fs::write(
+        override_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: Custom review override\n---\nBody",
+    )
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/import",
+            json!({ "skill_path": override_dir.to_str().unwrap() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app.oneshot(get_with_token("/api/skills", &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

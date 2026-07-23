@@ -675,7 +675,7 @@ INSERT INTO skills_new (
 )
 SELECT
     id,
-    CASE WHEN source IN ('builtin', 'cron') THEN NULL ELSE 'system_default_user' END,
+    CASE WHEN source = 'builtin' THEN NULL ELSE 'system_default_user' END,
     name, description, path, source, enabled, deleted_at, created_at, updated_at
 FROM skills;
 

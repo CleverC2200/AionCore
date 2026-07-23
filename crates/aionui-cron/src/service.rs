@@ -12,9 +12,10 @@ use aionui_common::{
     validate_workspace_path_availability,
 };
 use aionui_db::{
-    ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, IAgentMetadataRepository,
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, UpdateCronJobParams,
-    models::AgentMetadataRow, resolve_agent_binding_from_rows, runtime_backend_for_agent,
+    ClaimCronRunParams, CronRunClaimResult, DbError, FinishCronRunParams, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, ISkillRepository,
+    UpdateCronJobParams, UpsertSkillParams, models::AgentMetadataRow, resolve_agent_binding_from_rows,
+    runtime_backend_for_agent,
 };
 use tracing::{debug, error, info, warn};
 
@@ -23,7 +24,10 @@ use crate::events::CronEventEmitter;
 use crate::error::CronError;
 use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
 use crate::scheduler::{CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule};
-use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
+use crate::skill_file::{
+    cron_skill_dir, cron_skill_name, delete_skill_file, has_skill_file, parse_skill_content, read_skill_content,
+    write_raw_skill_file, write_skill_file,
+};
 use crate::types::{
     CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
     cron_job_to_row, schedule_from_dto,
@@ -50,6 +54,7 @@ pub struct CronService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    skill_repo: Arc<dyn ISkillRepository>,
     scheduler: Arc<CronScheduler>,
     executor: Arc<JobExecutor>,
     emitter: CronEventEmitter,
@@ -62,6 +67,7 @@ pub struct CronServiceDeps {
     pub agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     pub assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     pub assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub skill_repo: Arc<dyn ISkillRepository>,
     pub scheduler: Arc<CronScheduler>,
     pub executor: Arc<JobExecutor>,
     pub emitter: CronEventEmitter,
@@ -75,6 +81,7 @@ impl CronService {
             agent_metadata_repo: deps.agent_metadata_repo,
             assistant_definition_repo: deps.assistant_definition_repo,
             assistant_overlay_repo: deps.assistant_overlay_repo,
+            skill_repo: deps.skill_repo,
             scheduler: deps.scheduler,
             executor: deps.executor,
             emitter: deps.emitter,
@@ -453,6 +460,7 @@ impl CronService {
         if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
             warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");
         }
+        self.delete_skill_row_for_job(user_id, job_id).await;
         self.repo.delete_for_user(user_id, job_id).await?;
         self.emitter.emit_job_removed(user_id, job_id);
         info!(job_id, "Cron job removed");
@@ -496,6 +504,8 @@ impl CronService {
             warn!(error = %error, "Failed to clean up old cron run records");
         }
 
+        self.reconcile_skill_rows().await;
+
         let rows = match self.repo.list_enabled_system().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -535,6 +545,76 @@ impl CronService {
         }
 
         info!(scheduled, "Cron service initialized");
+    }
+
+    /// Reconcile owner-scoped skill rows for saved cron skills at startup.
+    ///
+    /// For each job whose skill file exists on disk, ensure an owner-scoped
+    /// row named `cron-{job_id}` exists. Legacy rows produced by the old
+    /// machine-level catalog scan were named after the SKILL.md frontmatter
+    /// name instead; those duplicates are soft-deleted so listings do not
+    /// double up while historical conversations can still materialize them.
+    async fn reconcile_skill_rows(&self) {
+        let rows = match self.repo.list_all_system().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to list cron jobs for skill row reconciliation");
+                return;
+            }
+        };
+
+        let mut reconciled = 0u32;
+        let mut cleaned = 0u32;
+        for row in rows {
+            let owner_user_id = row.user_id.clone();
+            let job = match cron_job_from_row(row) {
+                Ok(job) => job,
+                Err(_) => continue,
+            };
+            match has_skill_file(&self.data_dir, &job.id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(job_id = %job.id, error = %e, "Failed to check cron skill file during reconciliation");
+                    continue;
+                }
+            }
+
+            if let Ok(Some(content)) = read_skill_content(&self.data_dir, &job.id).await
+                && let Ok(parsed) = parse_skill_content(&content)
+                && let Ok(dir_name) = cron_skill_name(&job.id)
+                && parsed.name != dir_name
+                && let Ok(Some(legacy)) = self
+                    .skill_repo
+                    .find_by_name_for_user(&owner_user_id, &parsed.name)
+                    .await
+                && legacy.source == "cron"
+                && legacy.user_id.is_some()
+            {
+                match self
+                    .skill_repo
+                    .delete_by_name_for_user(&owner_user_id, &parsed.name)
+                    .await
+                {
+                    Ok(_) => cleaned += 1,
+                    Err(DbError::NotFound(_)) => {}
+                    Err(e) => {
+                        warn!(job_id = %job.id, error = %e, "Failed to clean legacy cron skill row");
+                    }
+                }
+            }
+
+            match self.upsert_skill_row_for_job(&owner_user_id, &job).await {
+                Ok(()) => reconciled += 1,
+                Err(e) => {
+                    warn!(job_id = %job.id, error = %e, "Failed to reconcile cron skill row");
+                }
+            }
+        }
+
+        if reconciled > 0 || cleaned > 0 {
+            info!(reconciled, cleaned, "Cron skill rows reconciled");
+        }
     }
 
     pub async fn tick(&self, job_id: &str, scheduled_at: i64) {
@@ -758,12 +838,62 @@ impl CronService {
             ..Default::default()
         };
         self.repo.update_for_user(user_id, job_id, &params).await?;
+        self.upsert_skill_row_for_job(user_id, &job).await?;
         self.executor
             .mark_skill_suggest_artifacts_saved(user_id, job_id)
             .await?;
 
         info!(job_id, "Skill content saved");
         Ok(())
+    }
+
+    /// Upsert the owner-scoped skill row for a job's saved cron skill.
+    ///
+    /// Cron skill content is user data (the job prompt), so the catalog row
+    /// is owned by the job owner and named after the on-disk skill dir
+    /// (`cron-{job_id}`) — the stable name the executor materializes by.
+    async fn upsert_skill_row_for_job(&self, user_id: &str, job: &CronJob) -> Result<(), CronError> {
+        let name = cron_skill_name(&job.id)?;
+        let path = cron_skill_dir(&self.data_dir, &job.id)?;
+        let description = match read_skill_content(&self.data_dir, &job.id).await? {
+            Some(content) => parse_skill_content(&content)
+                .map(|parsed| parsed.description)
+                .ok()
+                .filter(|desc| !desc.trim().is_empty()),
+            None => None,
+        };
+        let description = description
+            .or_else(|| job.description.clone())
+            .unwrap_or_else(|| format!("Saved cron skill for {}", job.name));
+
+        self.skill_repo
+            .upsert_for_user(
+                user_id,
+                UpsertSkillParams {
+                    name: &name,
+                    description: Some(&description),
+                    path: &path.to_string_lossy(),
+                    source: "cron",
+                    enabled: true,
+                },
+            )
+            .await
+            .map_err(|e| CronError::Scheduler(format!("Failed to upsert cron skill row: {e}")))?;
+        Ok(())
+    }
+
+    /// Soft-delete the owner-scoped skill row for a job. Missing rows are
+    /// fine — jobs without a saved skill never had one.
+    async fn delete_skill_row_for_job(&self, user_id: &str, job_id: &str) {
+        let Ok(name) = cron_skill_name(job_id) else {
+            return;
+        };
+        match self.skill_repo.delete_by_name_for_user(user_id, &name).await {
+            Ok(_) | Err(DbError::NotFound(_)) => {}
+            Err(e) => {
+                warn!(job_id, error = %e, "Failed to delete cron skill row");
+            }
+        }
     }
 
     pub async fn has_skill(&self, user_id: &str, job_id: &str) -> Result<HasSkillResponse, CronError> {
@@ -792,6 +922,7 @@ impl CronService {
             ..Default::default()
         };
         self.repo.update_for_user(user_id, job_id, &params).await?;
+        self.delete_skill_row_for_job(user_id, job_id).await;
 
         info!(job_id, "Skill content deleted");
         Ok(())

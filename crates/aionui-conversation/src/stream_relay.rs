@@ -849,6 +849,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSkillResolverForRelay {
         requested: Mutex<Vec<String>>,
+        requested_user_ids: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -861,7 +862,8 @@ mod tests {
             Vec::new()
         }
 
-        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+        async fn load_skill_bodies_for_user(&self, user_id: &str, names: &[String]) -> Vec<LoadedAgentSkill> {
+            self.requested_user_ids.lock().unwrap().push(user_id.to_owned());
             self.requested.lock().unwrap().extend(names.iter().cloned());
             names
                 .iter()
@@ -897,6 +899,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "cron");
         assert_eq!(concrete.requested.lock().unwrap().as_slice(), ["cron"]);
+        assert_eq!(
+            concrete.requested_user_ids.lock().unwrap().as_slice(),
+            ["system_default_user"]
+        );
     }
 
     #[tokio::test]

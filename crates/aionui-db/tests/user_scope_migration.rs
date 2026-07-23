@@ -103,7 +103,7 @@ async fn migration_028_adds_user_scope_to_independent_roots() {
 }
 
 #[tokio::test]
-async fn migration_028_migrates_cron_skills_as_global_rows() {
+async fn migration_028_migrates_cron_skills_to_default_user() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -126,7 +126,12 @@ async fn migration_028_migrates_cron_skills_as_global_rows() {
         .await
         .unwrap();
     assert_eq!(row.get::<String, _>("source"), "cron");
-    assert_eq!(row.get::<Option<String>, _>("user_id"), None);
+    // Cron-derived skills carry user content (job prompts); legacy rows are
+    // owned by the pre-migration single user, never exposed as global rows.
+    assert_eq!(
+        row.get::<Option<String>, _>("user_id").as_deref(),
+        Some("system_default_user")
+    );
 }
 
 #[tokio::test]

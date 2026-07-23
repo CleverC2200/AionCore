@@ -28,8 +28,8 @@ use aionui_db::{
     IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
-    SqliteCronRepository, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertConversationAssistantSnapshotParams, init_database_memory,
+    SqliteCronRepository, SqliteSkillRepository, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
@@ -840,7 +840,7 @@ async fn setup_with_conv_runtime() -> (
     Arc<StubConvRepo>,
     Arc<ConversationService>,
 ) {
-    let (svc, cron_repo, bc, stub_conv_repo, conv_service, _) = setup_with_conv_runtime_and_agent_metadata().await;
+    let (svc, cron_repo, bc, stub_conv_repo, conv_service, _, _) = setup_with_conv_runtime_and_agent_metadata().await;
     (svc, cron_repo, bc, stub_conv_repo, conv_service)
 }
 
@@ -851,6 +851,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
     Arc<StubConvRepo>,
     Arc<ConversationService>,
     Arc<dyn IAgentMetadataRepository>,
+    Arc<dyn aionui_db::ISkillRepository>,
 ) {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
@@ -923,11 +924,13 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
     let scheduler = Arc::new(CronScheduler::new(Arc::new(|_| {})));
 
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn EventBroadcaster>);
+    let skill_repo: Arc<dyn aionui_db::ISkillRepository> = Arc::new(SqliteSkillRepository::new(pool.clone()));
     let svc = CronService::new(CronServiceDeps {
         repo: cron_repo.clone(),
         agent_metadata_repo: agent_metadata_repo.clone(),
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        skill_repo: skill_repo.clone(),
         scheduler,
         executor,
         emitter,
@@ -944,7 +947,20 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
     seed_bare_assistant_definitions(&assistant_definition_repo).await;
 
     std::mem::forget(db);
-    (svc, cron_repo, bc, stub_conv_repo, conv_service, agent_metadata_repo)
+    (
+        svc,
+        cron_repo,
+        bc,
+        stub_conv_repo,
+        conv_service,
+        agent_metadata_repo,
+        skill_repo,
+    )
+}
+
+async fn setup_with_skill_repo() -> (CronService, Arc<dyn aionui_db::ISkillRepository>) {
+    let (svc, _, _, _, _, _, skill_repo) = setup_with_conv_runtime_and_agent_metadata().await;
+    (svc, skill_repo)
 }
 
 async fn setup_with_assistant_repos() -> (
@@ -1030,6 +1046,7 @@ async fn setup_with_assistant_repos() -> (
         agent_metadata_repo,
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
+        skill_repo: Arc::new(SqliteSkillRepository::new(pool.clone())),
         scheduler,
         executor,
         emitter,
@@ -2243,6 +2260,156 @@ async fn sk7_delete_cleans_skill() {
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
 }
 
+// ── SK-8..11: Owner-scoped cron skill rows ────────────────────────
+
+#[tokio::test]
+async fn sk8_save_skill_upserts_owner_scoped_row() {
+    let (svc, skill_repo) = setup_with_skill_repo().await;
+    let job = svc
+        .add_job("u1", make_create_req("Skill Row Job", every_60s()))
+        .await
+        .unwrap();
+
+    svc.save_skill(
+        "u1",
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: analyze\ndescription: Analyze numbers\n---\nDo the analysis".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let row_name = format!("cron-{}", job.id);
+    let row = skill_repo
+        .find_by_name_for_user("u1", &row_name)
+        .await
+        .unwrap()
+        .expect("owner-scoped cron skill row must exist after save");
+    assert_eq!(row.user_id.as_deref(), Some("u1"));
+    assert_eq!(row.source, "cron");
+    assert_eq!(row.description.as_deref(), Some("Analyze numbers"));
+    assert!(
+        row.path.ends_with(&row_name),
+        "row path should be the cron skill dir: {}",
+        row.path
+    );
+}
+
+#[tokio::test]
+async fn sk9_delete_skill_removes_owner_row() {
+    let (svc, skill_repo) = setup_with_skill_repo().await;
+    let job = svc
+        .add_job("u1", make_create_req("Skill Row Delete", every_60s()))
+        .await
+        .unwrap();
+    svc.save_skill(
+        "u1",
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: x\ndescription: d\n---\nContent".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.delete_skill("u1", &job.id).await.unwrap();
+
+    let row_name = format!("cron-{}", job.id);
+    assert!(
+        skill_repo
+            .find_by_name_for_user("u1", &row_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "active row must be gone after delete_skill"
+    );
+}
+
+#[tokio::test]
+async fn sk10_remove_job_removes_owner_row() {
+    let (svc, skill_repo) = setup_with_skill_repo().await;
+    let job = svc
+        .add_job("u1", make_create_req("Skill Row Remove Job", every_60s()))
+        .await
+        .unwrap();
+    svc.save_skill(
+        "u1",
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: x\ndescription: d\n---\nContent".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.remove_job("u1", &job.id).await.unwrap();
+
+    let row_name = format!("cron-{}", job.id);
+    assert!(
+        skill_repo
+            .find_by_name_for_user("u1", &row_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "active row must be gone after remove_job"
+    );
+}
+
+#[tokio::test]
+async fn sk11_init_reconciles_owner_rows_and_cleans_legacy_names() {
+    let (svc, skill_repo) = setup_with_skill_repo().await;
+    let job = svc
+        .add_job("u1", make_create_req("Skill Row Reconcile", every_60s()))
+        .await
+        .unwrap();
+    svc.save_skill(
+        "u1",
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: analyze\ndescription: Analyze numbers\n---\nDo the analysis".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let row_name = format!("cron-{}", job.id);
+    // Simulate a fresh database: the file exists but the row is missing.
+    skill_repo.delete_by_name_for_user("u1", &row_name).await.unwrap();
+    // Simulate a legacy machine-level scan row named by SKILL.md frontmatter.
+    skill_repo
+        .upsert_for_user(
+            "u1",
+            aionui_db::UpsertSkillParams {
+                name: "analyze",
+                description: Some("Analyze numbers"),
+                path: "/legacy/path",
+                source: "cron",
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.init().await;
+
+    let row = skill_repo
+        .find_by_name_for_user("u1", &row_name)
+        .await
+        .unwrap()
+        .expect("reconcile must restore the owner-scoped row");
+    assert_eq!(row.user_id.as_deref(), Some("u1"));
+    assert_eq!(row.source, "cron");
+    assert!(
+        skill_repo
+            .find_by_name_for_user("u1", "analyze")
+            .await
+            .unwrap()
+            .is_none(),
+        "legacy frontmatter-named cron row must be soft-deleted by reconcile"
+    );
+}
+
 // ── SC-3: Every type next_run ─────────────────────────────────────
 
 #[tokio::test]
@@ -2570,7 +2737,8 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 
 #[tokio::test]
 async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
-    let (svc, cron_repo, _, _, conv_service, agent_metadata_repo) = setup_with_conv_runtime_and_agent_metadata().await;
+    let (svc, cron_repo, _, _, conv_service, agent_metadata_repo, _) =
+        setup_with_conv_runtime_and_agent_metadata().await;
     let codex = agent_metadata_repo
         .find_builtin_by_backend("codex")
         .await
@@ -3311,24 +3479,18 @@ async fn cd3b_on_conversation_delete_only_clears_current_user_jobs() {
         "test setup should use a workspace ConversationService will delete"
     );
 
-    cron_repo
-        .insert(&make_cron_row_with_workspace(
-            "cron_workspace_scope_u1",
-            "u1",
-            &conversation_id,
-            &deleted_workspace,
-        ))
-        .await
-        .unwrap();
-    cron_repo
-        .insert(&make_cron_row_with_workspace(
-            "cron_workspace_scope_u2",
-            "u2",
-            &conversation_id,
-            &deleted_workspace,
-        ))
-        .await
-        .unwrap();
+    // New-conversation jobs may keep a stale conversation anchor (unanchored
+    // until run), so rows for both users can reference the same conversation
+    // id; existing-mode rows would be rejected at insert for a conversation
+    // the owner does not hold.
+    let mut u1_row =
+        make_cron_row_with_workspace("cron_workspace_scope_u1", "u1", &conversation_id, &deleted_workspace);
+    u1_row.execution_mode = "new_conversation".into();
+    cron_repo.insert(&u1_row).await.unwrap();
+    let mut u2_row =
+        make_cron_row_with_workspace("cron_workspace_scope_u2", "u2", &conversation_id, &deleted_workspace);
+    u2_row.execution_mode = "new_conversation".into();
+    cron_repo.insert(&u2_row).await.unwrap();
 
     svc.on_conversation_deleted("u1", &conversation_id).await;
 
