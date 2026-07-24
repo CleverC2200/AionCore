@@ -81,6 +81,8 @@ async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &
             pinned_at: None,
             created_at: 0,
             updated_at: 0,
+            project_id: None,
+            folder_id: None,
         })
         .await
         .unwrap();
@@ -2586,6 +2588,8 @@ async fn oc2b_rejects_existing_jobs_with_cross_user_conversation_code() {
             pinned_at: None,
             created_at: 0,
             updated_at: 0,
+            project_id: None,
+            folder_id: None,
         })
         .await
         .unwrap();
