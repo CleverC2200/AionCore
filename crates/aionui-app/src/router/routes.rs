@@ -13,12 +13,14 @@ use axum::routing::get;
 use axum::{Router, middleware};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use aionui_ai_agent::{agent_routes, remote_agent_routes};
+use aionui_ai_agent::{
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
+};
 use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, auth_middleware, auth_routes, csrf_middleware,
     security_headers_middleware,
 };
 use aionui_channel::channel_routes;
@@ -240,6 +242,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
+        runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
+            runtime_token_service: services.runtime_token_service.clone(),
+        })),
     };
 
     // System routes protected by auth middleware
@@ -416,6 +421,27 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 HeaderName::from_static("x-csrf-token"),
             ]);
         router.layer(cors)
+    }
+}
+
+/// Adapter exposing the agent runtime's token service to the auth middleware
+/// as the conversation-helper credential channel (aionui-auth cannot depend on
+/// aionui-ai-agent, so the binding happens here in the composition layer).
+struct ConversationHelperTokenVerifier {
+    runtime_token_service: Arc<RuntimeTokenService>,
+}
+
+impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
+    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
+        self.runtime_token_service
+            .validate(
+                Some(token),
+                user_id,
+                conversation_id,
+                RuntimeTokenScope::ConversationHelper,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .is_ok()
     }
 }
 

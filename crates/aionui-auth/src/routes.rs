@@ -252,6 +252,9 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         } else {
             AuthIdentityMode::UserSession
         },
+        // Auth endpoints manage sessions themselves; the helper CLI never
+        // calls them, so the runtime-token channel stays disabled here.
+        runtime_token_verifier: None,
     };
 
     // Auth rate limited routes (login, qr-login)

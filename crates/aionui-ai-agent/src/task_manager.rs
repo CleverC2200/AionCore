@@ -135,17 +135,19 @@ impl WorkerTaskManagerImpl {
     }
 
     fn refresh_runtime_token_for_new_task(&self, options: &mut BuildTaskOptions) {
-        if options.context.team.is_none() {
-            return;
-        }
         let Some(service) = &self.runtime_token_service else {
             return;
         };
+        // Helper scope for every conversation; team scopes only when team-bound.
+        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        if options.context.team.is_some() {
+            scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
+        }
         let issue = service.issue(
             options.context.conversation.user_id.clone(),
             options.context.conversation.conversation_id.clone(),
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+            scopes,
         );
         options
             .context

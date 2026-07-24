@@ -3483,14 +3483,15 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Option<String> {
-        build_opts.context.team.as_ref()?;
         let service = self.runtime_token_service.as_ref()?;
-        let issue = service.issue(
-            user_id,
-            conversation_id,
-            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
-        );
+        // Every conversation gets a helper-scoped token so the in-conversation
+        // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
+        // mode; team-bound conversations additionally get the team-tools scopes.
+        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        if build_opts.context.team.is_some() {
+            scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
+        }
+        let issue = service.issue(user_id, conversation_id, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, scopes);
         Some(issue.token)
     }
 

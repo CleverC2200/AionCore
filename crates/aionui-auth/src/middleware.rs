@@ -20,6 +20,24 @@ pub enum AuthIdentityMode {
     AionPro,
 }
 
+/// Header carrying the conversation-runtime helper token minted by the backend
+/// and injected into agent subprocess environments as `AIONUI_RUNTIME_TOKEN`.
+pub const RUNTIME_TOKEN_HEADER: &str = "x-aionui-runtime-token";
+/// Header carrying the acting user id asserted by the helper CLI.
+pub const RUNTIME_USER_ID_HEADER: &str = "x-aionui-user-id";
+/// Header carrying the conversation id the helper CLI runs inside.
+pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
+
+/// Port for validating conversation-runtime helper tokens.
+///
+/// Implemented in the composition layer over the agent runtime's token
+/// service; `aionui-auth` must not depend on `aionui-ai-agent` directly.
+/// A verifier must confirm the token is a live, conversation-helper-scoped
+/// token bound to exactly this (user_id, conversation_id) pair.
+pub trait IRuntimeTokenVerifier: Send + Sync {
+    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+}
+
 /// Authenticated user injected into request extensions by the auth middleware.
 ///
 /// Route handlers extract this from `request.extensions()` to identify
@@ -53,6 +71,10 @@ pub struct AuthState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
     pub identity_mode: AuthIdentityMode,
+    /// Optional second credential channel for agent-subprocess helper CLIs
+    /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
+    /// `None` disables the channel (requests without a JWT are rejected).
+    pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -77,8 +99,11 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let token = extract_token_from_headers(request.headers())
-        .ok_or_else(|| ApiError::Unauthorized("Authentication required".into()))?;
+    let Some(token) = extract_token_from_headers(request.headers()) else {
+        // No JWT/cookie: fall back to the conversation-helper runtime-token
+        // channel used by agent subprocess CLIs.
+        return runtime_token_channel(&state, request, next).await;
+    };
 
     let payload = state.jwt_service.verify(&token).map_err(|e| {
         tracing::debug!("Token verification failed: {e}");
@@ -106,6 +131,65 @@ pub async fn auth_middleware(
 
     if payload.session_generation != user.session_generation {
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
+    request.extensions_mut().insert(CurrentUser {
+        id: user.id,
+        username: user.username.unwrap_or_else(|| "external_user".to_string()),
+        user_type: user.user_type,
+        status: user.status,
+    });
+
+    Ok(next.run(request).await)
+}
+
+/// Authenticate a JWT-less request via the conversation-helper runtime token.
+///
+/// The helper CLI sends the token the backend minted for its conversation
+/// runtime plus the (user, conversation) pair the token was bound to. The
+/// verifier enforces that binding, so a forged user or conversation header
+/// fails closed. On success the token's user is loaded and injected as
+/// [`CurrentUser`], making ordinary user-scoped handlers work unchanged.
+async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Next) -> Result<Response, ApiError> {
+    let headers = request.headers();
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(verifier), Some(token), Some(user_id), Some(conversation_id)) = (
+        state.runtime_token_verifier.as_ref(),
+        header(RUNTIME_TOKEN_HEADER),
+        header(RUNTIME_USER_ID_HEADER),
+        header(RUNTIME_CONVERSATION_ID_HEADER),
+    ) else {
+        return Err(ApiError::Unauthorized("Authentication required".into()));
+    };
+
+    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id) {
+        return Err(ApiError::Unauthorized("Invalid runtime token".into()));
+    }
+
+    let user = state
+        .user_repo
+        .find_active_by_id(&user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "runtime token channel user lookup failed");
+            ApiError::Internal("Authentication service unavailable".into())
+        })?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+
+    if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        ));
     }
 
     request.extensions_mut().insert(CurrentUser {

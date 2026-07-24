@@ -35,10 +35,17 @@ pub async fn csrf_middleware(
 
     // Validate CSRF for state-changing requests
     let needs_validation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
+    // Requests on the runtime-token channel are exempt: CSRF defends against
+    // cookie-bearing cross-site requests, while the helper CLI authenticates
+    // via an explicit custom header (never ambient cookies) that browsers
+    // cannot attach cross-site without a CORS preflight. The token itself is
+    // still fully validated by the auth middleware behind this layer.
+    let is_runtime_token_request = request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER);
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
-        || path.starts_with("/api/auth/internal/external-sessions");
+        || path.starts_with("/api/auth/internal/external-sessions")
+        || is_runtime_token_request;
 
     if needs_validation && !is_exempt {
         let header_token = request
