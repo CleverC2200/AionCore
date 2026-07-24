@@ -2038,7 +2038,8 @@ impl AssistantService {
     }
 
     fn user_rules_dir_for_user(&self, user_id: &str) -> PathBuf {
-        self.user_rules_root_dir().join(encode_filename_component(user_id))
+        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+        self.user_rules_root_dir().join("users").join(dir)
     }
 
     fn user_skills_root_dir(&self) -> PathBuf {
@@ -2046,7 +2047,8 @@ impl AssistantService {
     }
 
     fn user_skills_dir_for_user(&self, user_id: &str) -> PathBuf {
-        self.user_skills_root_dir().join(encode_filename_component(user_id))
+        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+        self.user_skills_root_dir().join("users").join(dir)
     }
 
     fn user_avatars_dir(&self) -> PathBuf {
@@ -3378,6 +3380,39 @@ mod tests {
     // T-B2 — bounded concurrent-startup retry policy (Sentry 135525166 Option B).
     fn busy_error() -> AssistantError {
         AssistantError::Internal("Database query failed: database is locked".to_string())
+    }
+
+    /// Build an `AssistantService` pinned to `data_dir` without touching disk
+    /// (no bootstrap, no builtin manifest) — for path-helper assertions only.
+    async fn test_service_with_data_dir(data_dir: &Path) -> AssistantService {
+        let db = init_database_memory().await.unwrap();
+        AssistantService::new(
+            db.pool().clone(),
+            AssistantServiceDeps {
+                definition_repo: Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone())),
+                state_repo: Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone())),
+                preference_repo: Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone())),
+                repo: Arc::new(SqliteAssistantRepository::new(db.pool().clone())),
+                override_repo: Arc::new(SqliteAssistantOverrideRepository::new(db.pool().clone())),
+                provider_repo: Arc::new(SqliteProviderRepository::new(db.pool().clone())),
+                builtin: Arc::new(BuiltinAssistantRegistry::empty()),
+                agent_catalog: None,
+            },
+            data_dir.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn assistant_user_dirs_are_type_first() {
+        let svc = test_service_with_data_dir(std::path::Path::new("/data")).await;
+        assert_eq!(
+            svc.user_rules_dir_for_user("user_019f8de8-3537-7c73-8d92-3bfde17eb1ee"),
+            std::path::Path::new("/data/assistant-rules/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee")
+        );
+        assert_eq!(
+            svc.user_skills_dir_for_user("system_default_user"),
+            std::path::Path::new("/data/assistant-skills/users/system_default_user")
+        );
     }
 
     #[tokio::test]
@@ -6320,7 +6355,7 @@ mod tests {
         assert!(
             fx._tmp
                 .path()
-                .join("assistant-rules/system_default_user/bare%3Aagent-claude.en-US.md")
+                .join("assistant-rules/users/system_default_user/bare%3Aagent-claude.en-US.md")
                 .is_file()
         );
         assert!(
