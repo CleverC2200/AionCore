@@ -178,6 +178,16 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
     .unwrap();
     let (project_id, pe_id) = seed_default_user_project(pool).await;
 
+    // Channel binding owned by the pre-upgrade local user (`owner_user_id`
+    // table with a coexisting platform identity column).
+    sqlx::query(
+        "INSERT INTO assistant_users (id, platform_user_id, platform_type, display_name, authorized_at, owner_user_id)
+         VALUES ('au-legacy', 'tg-123', 'telegram', 'TG User', 1, 'system_default_user')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
     let user = repo
         .ensure_external_user(
             UserType::Aionpro,
@@ -192,9 +202,15 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
         .unwrap();
     let moved = repo.adopt_system_default_data(&user.id).await.unwrap();
     assert!(
-        moved >= 3,
-        "conversation + project + explorer entry must move, moved={moved}"
+        moved >= 4,
+        "conversation + project + explorer entry + channel binding must move, moved={moved}"
     );
+
+    let binding_owner: String = sqlx::query_scalar("SELECT owner_user_id FROM assistant_users WHERE id = 'au-legacy'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(binding_owner, user.id, "channel platform binding must be adopted");
 
     let conv_owner: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = 'conv-legacy'")
         .fetch_one(pool)
