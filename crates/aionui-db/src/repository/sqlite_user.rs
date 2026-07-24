@@ -213,30 +213,38 @@ impl IUserRepository for SqliteUserRepository {
         // Discover ownership tables from the live schema rather than a
         // hand-maintained list, so user-scoped tables added by future
         // migrations are adopted automatically. Convention (root-scope
-        // design): a `user_id` column IS the ownership column.
-        let tables: Vec<(String,)> = sqlx::query_as(
-            "SELECT m.name FROM sqlite_master m \
-             WHERE m.type = 'table' \
-               AND m.name NOT LIKE 'sqlite_%' \
-               AND m.name != 'users' \
-               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'user_id')",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-
-        // Global template rows (`user_id IS NULL`) are shared and stay put;
-        // only rows owned by the local default user move. `UPDATE OR IGNORE`
-        // skips rows that would collide with the new owner's existing rows on
-        // per-user PK/UNIQUE tables (e.g. `system_settings.user_id`).
+        // design): the ownership column is `user_id`, or `owner_user_id` on
+        // tables that also carry an external platform user id (channel
+        // bindings) or reference another root's `user_id` (project explorer).
+        // The exhaustiveness of this convention is enforced by the
+        // adoption-coverage classification test in aionui-db/tests.
         let mut moved: u64 = 0;
-        for (table,) in &tables {
-            let result = sqlx::query(&format!(
-                "UPDATE OR IGNORE \"{table}\" SET user_id = ? WHERE user_id = 'system_default_user'"
-            ))
-            .bind(owner_id)
-            .execute(&mut *tx)
+        for owner_column in ["user_id", "owner_user_id"] {
+            let tables: Vec<(String,)> = sqlx::query_as(
+                "SELECT m.name FROM sqlite_master m \
+                 WHERE m.type = 'table' \
+                   AND m.name NOT LIKE 'sqlite_%' \
+                   AND m.name != 'users' \
+                   AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = ?)",
+            )
+            .bind(owner_column)
+            .fetch_all(&mut *tx)
             .await?;
-            moved += result.rows_affected();
+
+            // Global template rows (`user_id IS NULL`) are shared and stay put;
+            // only rows owned by the local default user move. `UPDATE OR IGNORE`
+            // skips rows that would collide with the new owner's existing rows on
+            // per-user PK/UNIQUE tables (e.g. `system_settings.user_id`).
+            for (table,) in &tables {
+                let result = sqlx::query(&format!(
+                    "UPDATE OR IGNORE \"{table}\" SET \"{owner_column}\" = ? \
+                     WHERE \"{owner_column}\" = 'system_default_user'"
+                ))
+                .bind(owner_id)
+                .execute(&mut *tx)
+                .await?;
+                moved += result.rows_affected();
+            }
         }
 
         tx.commit().await?;
