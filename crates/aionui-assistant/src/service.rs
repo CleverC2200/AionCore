@@ -430,11 +430,11 @@ impl AssistantService {
                 continue;
             }
 
-            if self.user_asset_avatar_value_is_renderable(&definition) {
+            if self.user_asset_avatar_value_is_renderable(DEFAULT_USER_ID, &definition) {
                 continue;
             }
 
-            if let Some(path) = self.find_existing_user_avatar_file(&definition.assistant_id) {
+            if let Some(path) = self.find_existing_user_avatar_file(DEFAULT_USER_ID, &definition.assistant_id) {
                 definition.avatar_type = "user_asset".to_string();
                 definition.avatar_value = Some(managed_user_avatar_value_from_path(&path)?);
             } else {
@@ -729,7 +729,7 @@ impl AssistantService {
             .resolve_definition_identity_for_user(user_id, "user", Some(&row.id), &row.id)
             .await?;
         let (avatar_type, avatar_value) =
-            self.normalize_legacy_user_avatar_input(&assistant_id, row.avatar.as_deref())?;
+            self.normalize_legacy_user_avatar_input(user_id, &assistant_id, row.avatar.as_deref())?;
         let existing_definition = self
             .definition_repo
             .get_by_assistant_id_for_user(user_id, &assistant_id)
@@ -879,7 +879,12 @@ impl AssistantService {
             let projection = self
                 .project_definition(user_id, definition, state_map.get(&definition.id), &projections)
                 .await?;
-            result.push(self.definition_to_response(definition, state_map.get(&definition.id), &projection)?);
+            result.push(self.definition_to_response(
+                user_id,
+                definition,
+                state_map.get(&definition.id),
+                &projection,
+            )?);
         }
 
         // Sort by sort_order asc, then last_used_at desc (newer first).
@@ -913,7 +918,7 @@ impl AssistantService {
             let projection = self
                 .project_definition(user_id, &definition, state.as_ref(), &projections)
                 .await?;
-            return self.definition_to_response(&definition, state.as_ref(), &projection);
+            return self.definition_to_response(user_id, &definition, state.as_ref(), &projection);
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -941,6 +946,7 @@ impl AssistantService {
                 .project_definition(user_id, &definition, state.as_ref(), &projections)
                 .await?;
             return self.definition_to_detail_response(
+                user_id,
                 &definition,
                 state.as_ref(),
                 preference.as_ref(),
@@ -1085,7 +1091,7 @@ impl AssistantService {
         };
         self.resolve_runtime_backend_for_agent_id(user_id, &resolved_agent_id)
             .await?;
-        let avatar = self.normalize_user_avatar_input(&id, req.avatar.as_deref())?;
+        let avatar = self.normalize_user_avatar_input(user_id, &id, req.avatar.as_deref())?;
         let params = CreateAssistantParams {
             id: &id,
             name: &name,
@@ -1299,7 +1305,7 @@ impl AssistantService {
             .as_deref()
             .is_some_and(|agent_id| agent_id != current_definition.agent_id);
         let normalized_avatar = if req.avatar.is_some() {
-            Some(self.normalize_user_avatar_input(id, req.avatar.as_deref())?)
+            Some(self.normalize_user_avatar_input(user_id, id, req.avatar.as_deref())?)
         } else {
             None
         };
@@ -1735,7 +1741,7 @@ impl AssistantService {
                 continue;
             }
 
-            let avatar = match self.normalize_user_avatar_input(&id, entry.avatar.as_deref()) {
+            let avatar = match self.normalize_user_avatar_input(user_id, &id, entry.avatar.as_deref()) {
                 Ok(value) => value,
                 Err(e) => {
                     result.failed += 1;
@@ -2019,7 +2025,7 @@ impl AssistantService {
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        && let Some(asset) = self.read_user_avatar_asset_by_filename(value)
+                        && let Some(asset) = self.read_user_avatar_asset_by_filename(user_id, value)
                     {
                         return Some(asset);
                     }
@@ -2055,8 +2061,14 @@ impl AssistantService {
         self.user_data_dir.join("assistant-avatars")
     }
 
+    fn user_avatars_dir_for_user(&self, user_id: &str) -> PathBuf {
+        let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+        self.user_avatars_dir().join("users").join(dir)
+    }
+
     fn normalize_legacy_user_avatar_input(
         &self,
+        user_id: &str,
         id: &str,
         avatar: Option<&str>,
     ) -> Result<(String, Option<String>), AssistantError> {
@@ -2065,7 +2077,7 @@ impl AssistantService {
         };
 
         if is_local_avatar_value(value) && parse_local_avatar_path(value).is_none() {
-            if let Some(path) = self.find_existing_user_avatar_file(id) {
+            if let Some(path) = self.find_existing_user_avatar_file(user_id, id) {
                 return Ok((
                     "user_asset".to_string(),
                     Some(managed_user_avatar_value_from_path(&path)?),
@@ -2087,7 +2099,7 @@ impl AssistantService {
         }
 
         if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
-            if let Some(path) = self.find_existing_user_avatar_file(id) {
+            if let Some(path) = self.find_existing_user_avatar_file(user_id, id) {
                 return Ok((
                     "user_asset".to_string(),
                     Some(managed_user_avatar_value_from_path(&path)?),
@@ -2100,13 +2112,17 @@ impl AssistantService {
                 );
                 return Ok(("none".to_string(), None));
             }
-            if let Some(source_avatar_path) = self.find_existing_user_avatar_file(&source_assistant_id) {
-                let avatar_value = self.persist_user_avatar_file(id, &source_avatar_path)?;
+            if let Some(source_avatar_path) = self.find_existing_user_avatar_file(user_id, &source_assistant_id) {
+                let avatar_value = self.persist_user_avatar_file(user_id, id, &source_avatar_path)?;
                 return Ok(("user_asset".to_string(), Some(avatar_value)));
             }
             if let Some(builtin_avatar) = self.builtin.avatar_asset(&source_assistant_id) {
-                let avatar_value =
-                    self.persist_user_avatar_bytes(id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())?;
+                let avatar_value = self.persist_user_avatar_bytes(
+                    user_id,
+                    id,
+                    &builtin_avatar.bytes,
+                    builtin_avatar.extension.as_deref(),
+                )?;
                 return Ok(("user_asset".to_string(), Some(avatar_value)));
             }
             warn!(
@@ -2118,18 +2134,18 @@ impl AssistantService {
         }
 
         if let Some(source_path) = parse_local_avatar_path(value) {
-            if let Some(path) = self.find_existing_user_avatar_file(id) {
+            if let Some(path) = self.find_existing_user_avatar_file(user_id, id) {
                 return Ok((
                     "user_asset".to_string(),
                     Some(managed_user_avatar_value_from_path(&path)?),
                 ));
             }
-            let avatar_value = self.persist_user_avatar_file(id, &source_path)?;
+            let avatar_value = self.persist_user_avatar_file(user_id, id, &source_path)?;
             return Ok(("user_asset".to_string(), Some(avatar_value)));
         }
 
         if looks_like_avatar_asset(value) {
-            if let Some(path) = self.find_existing_user_avatar_file(id) {
+            if let Some(path) = self.find_existing_user_avatar_file(user_id, id) {
                 return Ok((
                     "user_asset".to_string(),
                     Some(managed_user_avatar_value_from_path(&path)?),
@@ -2145,48 +2161,55 @@ impl AssistantService {
         Ok(("emoji".to_string(), Some(value.to_string())))
     }
 
-    fn normalize_user_avatar_input(&self, id: &str, avatar: Option<&str>) -> Result<Option<String>, AssistantError> {
+    fn normalize_user_avatar_input(
+        &self,
+        user_id: &str,
+        id: &str,
+        avatar: Option<&str>,
+    ) -> Result<Option<String>, AssistantError> {
         let Some(value) = avatar.map(str::trim).filter(|value| !value.is_empty()) else {
-            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
             return Ok(None);
         };
 
         if !looks_like_avatar_asset(value) {
-            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
             return Ok(Some(value.to_string()));
         }
 
         if let Some(source_assistant_id) = parse_assistant_avatar_route(value) {
-            if let Some(existing_avatar_path) = self.find_existing_user_avatar_file(&source_assistant_id) {
+            if let Some(existing_avatar_path) = self.find_existing_user_avatar_file(user_id, &source_assistant_id) {
                 if source_assistant_id == id {
                     return managed_user_avatar_value_from_path(&existing_avatar_path).map(Some);
                 }
-                return self.persist_user_avatar_file(id, &existing_avatar_path).map(Some);
+                return self
+                    .persist_user_avatar_file(user_id, id, &existing_avatar_path)
+                    .map(Some);
             }
             if let Some(builtin_avatar) = self.builtin.avatar_asset(&source_assistant_id) {
                 return self
-                    .persist_user_avatar_bytes(id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())
+                    .persist_user_avatar_bytes(user_id, id, &builtin_avatar.bytes, builtin_avatar.extension.as_deref())
                     .map(Some);
             }
             return Ok(Some(value.to_string()));
         }
 
         if is_unsupported_direct_avatar_reference(value) {
-            remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+            remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
             return Err(AssistantError::BadRequest(
                 "assistant avatar must be an emoji or a local image file".into(),
             ));
         }
 
         if let Some(source_path) = parse_local_avatar_path(value) {
-            return self.persist_user_avatar_file(id, &source_path).map(Some);
+            return self.persist_user_avatar_file(user_id, id, &source_path).map(Some);
         }
 
-        remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+        remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
         Ok(Some(value.to_string()))
     }
 
-    fn persist_user_avatar_file(&self, id: &str, source_path: &Path) -> Result<String, AssistantError> {
+    fn persist_user_avatar_file(&self, user_id: &str, id: &str, source_path: &Path) -> Result<String, AssistantError> {
         let extension = source_path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -2199,7 +2222,7 @@ impl AssistantService {
             )));
         }
 
-        let destination_dir = self.user_avatars_dir();
+        let destination_dir = self.user_avatars_dir_for_user(user_id);
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
         let destination = destination_dir.join(format!("{id}.{extension}"));
@@ -2221,6 +2244,7 @@ impl AssistantService {
 
     fn persist_user_avatar_bytes(
         &self,
+        user_id: &str,
         id: &str,
         bytes: &[u8],
         extension: Option<&str>,
@@ -2235,7 +2259,7 @@ impl AssistantService {
             )));
         }
 
-        let destination_dir = self.user_avatars_dir();
+        let destination_dir = self.user_avatars_dir_for_user(user_id);
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
         remove_assistant_avatar_files(&destination_dir, id);
@@ -2248,8 +2272,8 @@ impl AssistantService {
         managed_user_avatar_value_from_path(&destination)
     }
 
-    fn find_existing_user_avatar_file(&self, id: &str) -> Option<PathBuf> {
-        let entries = std::fs::read_dir(self.user_avatars_dir()).ok()?;
+    fn find_existing_user_avatar_file(&self, user_id: &str, id: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(self.user_avatars_dir_for_user(user_id)).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
             let file_stem = path.file_stem().and_then(|stem| stem.to_str());
@@ -2260,15 +2284,15 @@ impl AssistantService {
         None
     }
 
-    fn read_user_avatar_asset_by_filename(&self, value: &str) -> Option<AvatarAsset> {
+    fn read_user_avatar_asset_by_filename(&self, user_id: &str, value: &str) -> Option<AvatarAsset> {
         let value = value.trim();
         if value.is_empty() || value.contains('/') || value.contains('\\') {
             return None;
         }
-        read_user_avatar_asset_from_path(&self.user_avatars_dir().join(value))
+        read_user_avatar_asset_from_path(&self.user_avatars_dir_for_user(user_id).join(value))
     }
 
-    fn user_asset_avatar_value_is_renderable(&self, definition: &AssistantDefinitionRow) -> bool {
+    fn user_asset_avatar_value_is_renderable(&self, user_id: &str, definition: &AssistantDefinitionRow) -> bool {
         let Some(value) = definition
             .avatar_value
             .as_deref()
@@ -2284,7 +2308,7 @@ impl AssistantService {
         if path.file_stem().and_then(|stem| stem.to_str()) != Some(definition.assistant_id.as_str()) {
             return false;
         }
-        self.read_user_avatar_asset_by_filename(value).is_some()
+        self.read_user_avatar_asset_by_filename(user_id, value).is_some()
     }
 
     fn user_rule_path_for_user(&self, user_id: &str, id: &str, locale: Option<&str>) -> PathBuf {
@@ -2359,7 +2383,7 @@ impl AssistantService {
             remove_assistant_md_files(&self.user_rules_root_dir(), id);
             remove_assistant_md_files(&self.user_skills_root_dir(), id);
         }
-        remove_assistant_avatar_files(&self.user_avatars_dir(), id);
+        remove_assistant_avatar_files(&self.user_avatars_dir_for_user(user_id), id);
     }
 }
 
@@ -2435,8 +2459,8 @@ fn assistant_error_to_extension_error(error: AssistantError) -> ExtensionError {
 // ---------------------------------------------------------------------------
 
 impl AssistantService {
-    fn avatar_display_value(&self, definition: &AssistantDefinitionRow) -> Option<String> {
-        if definition.avatar_type == "user_asset" && !self.user_asset_avatar_value_is_renderable(definition) {
+    fn avatar_display_value(&self, user_id: &str, definition: &AssistantDefinitionRow) -> Option<String> {
+        if definition.avatar_type == "user_asset" && !self.user_asset_avatar_value_is_renderable(user_id, definition) {
             return None;
         }
 
@@ -2468,6 +2492,7 @@ impl AssistantService {
 
     fn definition_to_response(
         &self,
+        user_id: &str,
         definition: &AssistantDefinitionRow,
         state: Option<&AssistantOverlayRow>,
         projection: &AssistantRuntimeProjection,
@@ -2493,7 +2518,7 @@ impl AssistantService {
             name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
             description: definition.description.clone(),
             description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
-            avatar: self.avatar_display_value(definition),
+            avatar: self.avatar_display_value(user_id, definition),
             // For builtins: enabled = overlay if the user has one, else the
             // manifest default (butler on, others off). sort_order = always the
             // manifest value (users can't reorder official assistants).
@@ -2525,6 +2550,7 @@ impl AssistantService {
 
     fn definition_to_detail_response(
         &self,
+        user_id: &str,
         definition: &AssistantDefinitionRow,
         state: Option<&AssistantOverlayRow>,
         preference: Option<&aionui_db::AssistantPreferenceRow>,
@@ -2567,7 +2593,7 @@ impl AssistantService {
                 name_i18n: decode_str_map(Some(definition.name_i18n.as_str()))?,
                 description: definition.description.clone(),
                 description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
-                avatar: self.avatar_display_value(definition),
+                avatar: self.avatar_display_value(user_id, definition),
             },
             state: AssistantStateResponse {
                 enabled: match state {
@@ -3412,6 +3438,19 @@ mod tests {
         assert_eq!(
             svc.user_skills_dir_for_user("system_default_user"),
             std::path::Path::new("/data/assistant-skills/users/system_default_user")
+        );
+    }
+
+    #[tokio::test]
+    async fn avatar_dir_is_per_user() {
+        let svc = test_service_with_data_dir(std::path::Path::new("/data")).await;
+        assert_eq!(
+            svc.user_avatars_dir_for_user("user_019f8de8-3537-7c73-8d92-3bfde17eb1ee"),
+            std::path::Path::new("/data/assistant-avatars/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee")
+        );
+        assert_eq!(
+            svc.user_avatars_dir_for_user("system_default_user"),
+            std::path::Path::new("/data/assistant-avatars/users/system_default_user")
         );
     }
 
@@ -4332,7 +4371,13 @@ mod tests {
 
         fx.service.sync_legacy_user_assistants_to_new_tables().await.unwrap();
 
-        let managed_avatar = fx._tmp.path().join("assistant-avatars").join("custom-local-avatar.png");
+        let managed_avatar = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user")
+            .join("custom-local-avatar.png");
         assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"avatar-bytes");
 
         let definition = fx
@@ -4363,7 +4408,12 @@ mod tests {
     #[tokio::test]
     async fn legacy_user_avatar_path_already_managed_is_preserved() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-managed-avatar.jpg");
         std::fs::write(&managed_avatar, b"managed-avatar-bytes").unwrap();
@@ -4485,7 +4535,12 @@ mod tests {
     #[tokio::test]
     async fn legacy_sync_does_not_delete_existing_avatar_file_for_bad_legacy_avatar() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-bad-legacy-avatar.jpg");
         std::fs::write(&managed_avatar, b"do-not-delete").unwrap();
@@ -4524,7 +4579,12 @@ mod tests {
     #[tokio::test]
     async fn legacy_missing_local_avatar_path_recovers_existing_managed_avatar() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-recovered-avatar.png");
         std::fs::write(&managed_avatar, b"recovered-avatar-bytes").unwrap();
@@ -4563,7 +4623,12 @@ mod tests {
     #[tokio::test]
     async fn reconcile_repairs_user_asset_local_path_to_managed_filename_when_managed_avatar_exists() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-definition-recovered.jpg");
 
@@ -4695,7 +4760,12 @@ mod tests {
     #[tokio::test]
     async fn reconcile_leaves_non_user_asset_local_path_value_unchanged() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-non-user-asset.jpg");
         std::fs::write(&managed_avatar, b"non-user-asset-avatar").unwrap();
@@ -4740,7 +4810,12 @@ mod tests {
     #[tokio::test]
     async fn reconcile_repairs_empty_user_asset_value_to_managed_filename() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-empty-user-asset.png");
 
@@ -4783,7 +4858,12 @@ mod tests {
     #[tokio::test]
     async fn avatar_asset_does_not_fallback_to_id_scanned_file_without_managed_value() {
         let fx = fixture().await;
-        let managed_avatar_dir = fx._tmp.path().join("assistant-avatars");
+        let managed_avatar_dir = fx
+            ._tmp
+            .path()
+            .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user");
         std::fs::create_dir_all(&managed_avatar_dir).unwrap();
         let managed_avatar = managed_avatar_dir.join("custom-no-avatar-value.png");
         std::fs::write(&managed_avatar, b"must-not-be-used-without-db-value").unwrap();
@@ -5254,7 +5334,7 @@ mod tests {
         assert!(
             fx._tmp
                 .path()
-                .join("assistant-avatars/custom-absolute-builtin-avatar.png")
+                .join("assistant-avatars/users/system_default_user/custom-absolute-builtin-avatar.png")
                 .is_file()
         );
     }
@@ -5279,6 +5359,8 @@ mod tests {
             ._tmp
             .path()
             .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user")
             .join("custom-uploaded-avatar.png");
         assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"uploaded-avatar-bytes");
         let definition = fx
@@ -5321,6 +5403,8 @@ mod tests {
             ._tmp
             .path()
             .join("assistant-avatars")
+            .join("users")
+            .join("system_default_user")
             .join("custom-updated-avatar.jpg");
         assert_eq!(std::fs::read(&managed_avatar).unwrap(), b"updated-avatar-bytes");
         let definition = fx
