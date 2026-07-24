@@ -53,6 +53,7 @@ async fn test_app_with_options_and_hook(
     let state = AuthRouterState {
         jwt_service: jwt_service.clone(),
         user_repo: user_repo.clone(),
+        fs_adopter: None,
         cookie_config,
         qr_token_store: qr_token_store.clone(),
         identity_mode: if local {

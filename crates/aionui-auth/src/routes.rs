@@ -69,6 +69,8 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
 pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
+    pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub identity_mode: AuthIdentityMode,
@@ -365,7 +367,10 @@ async fn ensure_external_user_handler(
 ) -> Result<Json<ApiResponse<EnsureExternalUserResponse>>, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let mut service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    if let Some(fs_adopter) = state.fs_adopter {
+        service = service.with_filesystem_adopter(fs_adopter);
+    }
     let response = service
         .ensure_external_user(&external_user_id, req)
         .await

@@ -62,4 +62,4 @@ pub use qr_token::QrTokenStore;
 // Routes
 pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
 
-pub use service::{AuthProvisionService, ProvisionError};
+pub use service::{AuthProvisionService, ProvisionError, SystemDefaultFilesystemAdopter};

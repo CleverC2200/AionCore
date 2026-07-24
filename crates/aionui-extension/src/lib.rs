@@ -8,6 +8,7 @@ pub mod constants;
 pub mod dependency;
 pub mod error;
 pub mod external_paths;
+pub mod fs_adopt;
 pub mod hub;
 pub mod hub_routes;
 pub mod lifecycle;

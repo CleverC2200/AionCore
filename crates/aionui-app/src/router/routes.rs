@@ -20,8 +20,8 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, auth_middleware, auth_routes, csrf_middleware,
-    security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, SystemDefaultFilesystemAdopter,
+    auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -172,6 +172,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
+            skill_paths: services.skill_paths.clone(),
+            skill_repo: services.skill_repo.clone(),
+        })),
         cookie_config: services.cookie_config.clone(),
         qr_token_store: services.qr_token_store.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
@@ -421,6 +425,25 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 HeaderName::from_static("x-csrf-token"),
             ]);
         router.layer(cors)
+    }
+}
+
+/// Adapter running the on-disk side of AionUi → AionPro adoption over the
+/// skill filesystem (auth crate cannot depend on the extension/filesystem).
+struct SkillFilesystemAdopter {
+    skill_paths: Arc<aionui_extension::SkillPaths>,
+    skill_repo: Arc<dyn aionui_db::ISkillRepository>,
+}
+
+#[async_trait::async_trait]
+impl SystemDefaultFilesystemAdopter for SkillFilesystemAdopter {
+    async fn adopt_filesystem(&self, adopter_user_id: &str) {
+        aionui_extension::fs_adopt::adopt_user_filesystem(
+            self.skill_paths.as_ref(),
+            self.skill_repo.as_ref(),
+            adopter_user_id,
+        )
+        .await;
     }
 }
 

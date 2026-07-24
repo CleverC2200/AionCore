@@ -22,10 +22,22 @@ pub enum ProvisionError {
     Token(#[from] crate::AuthError),
 }
 
+/// Port for the on-disk side of AionUi → AionPro adoption. When DB adoption
+/// re-owns `system_default_user`'s rows to the first external user, this moves
+/// the corresponding per-user files (and rewrites stored paths). Implemented
+/// in the composition layer over the skill filesystem so `aionui-auth` stays
+/// free of filesystem/extension dependencies. Best-effort: never fails
+/// provisioning.
+#[async_trait::async_trait]
+pub trait SystemDefaultFilesystemAdopter: Send + Sync {
+    async fn adopt_filesystem(&self, adopter_user_id: &str);
+}
+
 #[derive(Clone)]
 pub struct AuthProvisionService {
     user_repo: Arc<dyn IUserRepository>,
     jwt_service: Arc<JwtService>,
+    fs_adopter: Option<Arc<dyn SystemDefaultFilesystemAdopter>>,
 }
 
 pub struct ExternalSessionExchange {
@@ -35,7 +47,16 @@ pub struct ExternalSessionExchange {
 
 impl AuthProvisionService {
     pub fn new(user_repo: Arc<dyn IUserRepository>, jwt_service: Arc<JwtService>) -> Self {
-        Self { user_repo, jwt_service }
+        Self {
+            user_repo,
+            jwt_service,
+            fs_adopter: None,
+        }
+    }
+
+    pub fn with_filesystem_adopter(mut self, fs_adopter: Arc<dyn SystemDefaultFilesystemAdopter>) -> Self {
+        self.fs_adopter = Some(fs_adopter);
+        self
     }
 
     pub async fn ensure_external_user(
@@ -68,6 +89,12 @@ impl AuthProvisionService {
         let adopted = self.user_repo.adopt_system_default_data(&user.id).await?;
         if adopted > 0 {
             tracing::info!(user_id = %user.id, rows = adopted, "adopted system_default_user data into first external user");
+            // Move the corresponding on-disk files to the adopter's per-user
+            // roots so the upgraded account can see its files (DB rows already
+            // point at it). Best-effort; never fails provisioning.
+            if let Some(fs_adopter) = &self.fs_adopter {
+                fs_adopter.adopt_filesystem(&user.id).await;
+            }
         }
 
         Ok(external_user_response(user, request.user_type))
