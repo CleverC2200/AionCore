@@ -25,6 +25,9 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 const SKILL_MD: &str = "SKILL.md";
+/// Mirrors the private `skill_service::DEFAULT_USER_ID` constant; kept in
+/// sync manually since it isn't part of the crate's public API.
+const DEFAULT_USER_ID: &str = "system_default_user";
 
 fn make_paths(base: &Path) -> SkillPaths {
     SkillPaths {
@@ -157,8 +160,13 @@ async fn sm3_import_skill_copy() {
     let name = import_skill(&paths, &source).await.unwrap();
     assert_eq!(name, "ext-tool");
 
-    // Verify files were copied
-    let imported = paths.user_skills_dir.join("ext-tool");
+    // Verify files were copied under the default user's type-first root
+    // (skills/users/{user_dir}/), not the flat legacy root.
+    let imported = paths
+        .user_skills_dir
+        .join("users")
+        .join(DEFAULT_USER_ID)
+        .join("ext-tool");
     assert!(imported.join(SKILL_MD).exists());
     assert!(imported.join("helper.py").exists());
 }
@@ -189,7 +197,7 @@ async fn sm4_import_skill_replaces_existing_copy() {
     let name = import_skill(&paths, &source).await.unwrap();
     assert_eq!(name, "linked");
 
-    let imported = paths.user_skills_dir.join("linked");
+    let imported = paths.user_skills_dir.join("users").join(DEFAULT_USER_ID).join("linked");
     assert!(!imported.is_symlink());
     let content = std::fs::read_to_string(imported.join(SKILL_MD)).unwrap();
     assert!(content.contains("Updated body"));

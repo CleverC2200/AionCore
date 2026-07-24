@@ -1060,14 +1060,10 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
 }
 
 fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
-    if user_id == DEFAULT_USER_ID {
-        return paths.user_skills_dir.clone();
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(user_id.as_bytes());
-    let digest = hasher.finalize();
-    paths.user_skills_dir.join(".users").join(hex::encode(&digest[..12]))
+    // Type-first per-user root: skills/users/{user_dir}/ for every user,
+    // including the default user (no more flat-root special case).
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    paths.user_skills_dir.join("users").join(dir)
 }
 
 fn import_staging_dir(user_skill_root: &Path, skill_name: &str) -> PathBuf {
@@ -1802,7 +1798,7 @@ fn is_user_scoped_skill_storage_path(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
             component,
-            Component::Normal(name) if name == std::ffi::OsStr::new(".users")
+            Component::Normal(name) if name == std::ffi::OsStr::new("users")
         )
     })
 }
@@ -2765,8 +2761,8 @@ mod tests {
         let name = import_skill(&paths, &source_dir).await.unwrap();
         assert_eq!(name, "imported");
 
-        // Verify the skill was copied
-        let imported_dir = paths.user_skills_dir.join("imported");
+        // Verify the skill was copied under the default user's type-first root.
+        let imported_dir = default_user_skill_root(&paths).join("imported");
         assert!(imported_dir.join(SKILL_MANIFEST_FILE).exists());
         assert!(imported_dir.join("extra.txt").exists());
     }
@@ -2790,7 +2786,7 @@ mod tests {
         assert_eq!(outcome.imported, vec!["selected-manifest"]);
         assert!(outcome.failed.is_empty());
 
-        let imported_path = paths.user_skills_dir.join("selected-manifest");
+        let imported_path = default_user_skill_root(&paths).join("selected-manifest");
         assert!(!imported_path.is_symlink());
         assert!(imported_path.join(SKILL_MANIFEST_FILE).exists());
 
@@ -2810,10 +2806,11 @@ mod tests {
         let outcome = import_skills(&paths, &source_dir).await.unwrap();
         assert_eq!(outcome.imported, vec!["alpha", "beta"]);
         assert!(outcome.failed.is_empty());
-        assert!(!paths.user_skills_dir.join("alpha").is_symlink());
-        assert!(!paths.user_skills_dir.join("beta").is_symlink());
-        assert!(paths.user_skills_dir.join("alpha").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("beta").join(SKILL_MANIFEST_FILE).exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("alpha").is_symlink());
+        assert!(!user_root.join("beta").is_symlink());
+        assert!(user_root.join("alpha").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("beta").join(SKILL_MANIFEST_FILE).exists());
     }
 
     #[tokio::test]
@@ -2833,12 +2830,13 @@ mod tests {
 
         assert_eq!(outcome.imported, vec!["alpha", "beta"]);
         assert!(outcome.failed.is_empty());
-        assert!(!paths.user_skills_dir.join("mixed-import-root").exists());
-        assert!(!paths.user_skills_dir.join("README.md").exists());
-        assert!(!paths.user_skills_dir.join(".DS_Store").exists());
-        assert!(!paths.user_skills_dir.join("skills.zip").exists());
-        assert!(paths.user_skills_dir.join("alpha").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("beta").join(SKILL_MANIFEST_FILE).exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("mixed-import-root").exists());
+        assert!(!user_root.join("README.md").exists());
+        assert!(!user_root.join(".DS_Store").exists());
+        assert!(!user_root.join("skills.zip").exists());
+        assert!(user_root.join("alpha").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("beta").join(SKILL_MANIFEST_FILE).exists());
     }
 
     #[tokio::test]
@@ -2860,7 +2858,7 @@ mod tests {
         let name = import_skill(&paths, &source_dir).await.unwrap();
 
         assert_eq!(name, "small-files");
-        let imported = paths.user_skills_dir.join("small-files");
+        let imported = default_user_skill_root(&paths).join("small-files");
         assert!(imported.join(SKILL_MANIFEST_FILE).exists());
         assert!(imported.join(".DS_Store").exists());
         assert!(imported.join(".git/config").exists());
@@ -2884,8 +2882,9 @@ mod tests {
         let result = import_skill(&paths, &source_dir).await;
 
         assert!(matches!(result, Err(ExtensionError::SkillImportFileTooLarge { .. })));
-        assert!(!paths.user_skills_dir.join("too-large").exists());
-        assert!(!has_import_staging_dirs(&paths.user_skills_dir));
+        let user_root = default_user_skill_root(&paths);
+        assert!(!user_root.join("too-large").exists());
+        assert!(!has_import_staging_dirs(&user_root));
     }
 
     #[tokio::test]
@@ -2896,8 +2895,9 @@ mod tests {
         let stale_source = tmp.path().join("stale-source");
         create_skill_in_dir(&stale_source, "dangling", "Stale source");
         let stale_skill_dir = stale_source.join("dangling");
-        let target = paths.user_skills_dir.join("dangling");
-        tokio::fs::create_dir_all(&paths.user_skills_dir).await.unwrap();
+        let user_root = default_user_skill_root(&paths);
+        let target = user_root.join("dangling");
+        tokio::fs::create_dir_all(&user_root).await.unwrap();
         create_symlink(&stale_skill_dir, &target).await.unwrap();
         std::fs::remove_dir_all(&stale_source).unwrap();
 
@@ -3061,10 +3061,11 @@ mod tests {
         let outcome = import_skills(&paths, &zip_path).await.unwrap();
         assert_eq!(outcome.imported, vec!["zip-one", "zip-two"]);
         assert!(outcome.failed.is_empty());
-        assert!(paths.user_skills_dir.join("zip-one").join(SKILL_MANIFEST_FILE).exists());
-        assert!(paths.user_skills_dir.join("zip-one").join("data.txt").exists());
-        assert!(!paths.user_skills_dir.join("zip-one").is_symlink());
-        assert!(!paths.user_skills_dir.join(".import-tmp").join("skills.zip").exists());
+        let user_root = default_user_skill_root(&paths);
+        assert!(user_root.join("zip-one").join(SKILL_MANIFEST_FILE).exists());
+        assert!(user_root.join("zip-one").join("data.txt").exists());
+        assert!(!user_root.join("zip-one").is_symlink());
+        assert!(!user_root.join(".import-tmp").join("skills.zip").exists());
     }
 
     #[tokio::test]
@@ -3130,7 +3131,7 @@ mod tests {
 
         let result = import_skills(&paths, &source_dir).await;
         assert!(matches!(result, Err(ExtensionError::SkillInvalidFrontmatter(_))));
-        assert!(!paths.user_skills_dir.join("invalid-frontmatter").exists());
+        assert!(!default_user_skill_root(&paths).join("invalid-frontmatter").exists());
     }
 
     #[tokio::test]
@@ -3158,8 +3159,7 @@ mod tests {
         delete_skill_with_repo(&paths, &repo, "historical").await.unwrap();
 
         assert!(
-            paths
-                .user_skills_dir
+            default_user_skill_root(&paths)
                 .join("historical")
                 .join(SKILL_MANIFEST_FILE)
                 .exists()
@@ -3173,7 +3173,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].source_path, paths.user_skills_dir.join("historical"));
+        assert_eq!(
+            resolved[0].source_path,
+            default_user_skill_root(&paths).join("historical")
+        );
     }
 
     #[tokio::test]
@@ -3261,8 +3264,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Per-user skill storage root
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn user_skill_root_is_type_first_for_all_users() {
+        let paths = make_test_paths(std::path::Path::new("/data"));
+        assert_eq!(
+            user_skill_root_for_user(&paths, "system_default_user"),
+            std::path::Path::new("/data/skills/users/system_default_user")
+        );
+        assert_eq!(
+            user_skill_root_for_user(&paths, "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee"),
+            std::path::Path::new("/data/skills/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// The on-disk root where the default user's skills now live:
+    /// `{user_skills_dir}/users/{DEFAULT_USER_ID}/`.
+    fn default_user_skill_root(paths: &SkillPaths) -> PathBuf {
+        user_skill_root_for_user(paths, DEFAULT_USER_ID)
+    }
 
     fn make_test_paths(base: &Path) -> SkillPaths {
         // Hand out an empty on-disk builtin-skills dir. Tests that need
