@@ -1417,7 +1417,7 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
         }])
     );
     // Imported skills for a real (non-default) user land in that user's
-    // scoped storage under `.users/`, never in the legacy shared root.
+    // scoped storage under `users/{dir}/`, never in the legacy shared root.
     let user = services
         .user_repo
         .find_by_username("user1")
@@ -1430,7 +1430,7 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
         .unwrap()
         .expect("imported skill row should exist for the importing user");
     assert!(
-        alpha_row.path.contains(".users"),
+        alpha_row.path.contains("/skills/users/"),
         "import must use user-scoped storage: {}",
         alpha_row.path
     );

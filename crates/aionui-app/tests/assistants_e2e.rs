@@ -699,7 +699,9 @@ async fn create_user_avatar_from_local_file_is_served_via_assistant_avatar_route
     let body = body_json(resp).await;
     assert_versioned_avatar_route(&body, "/api/assistants/u-avatar/avatar");
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -746,7 +748,9 @@ async fn create_user_avatar_from_builtin_avatar_route_copies_builtin_asset() {
     let body = body_json(resp).await;
     assert_versioned_avatar_route(&body, "/api/assistants/u-avatar-from-builtin/avatar");
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-from-builtin.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar-from-builtin.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -798,7 +802,7 @@ async fn create_user_avatar_from_absolute_builtin_avatar_route_copies_builtin_as
 
     let persisted_avatar = fx
         .user_data_dir
-        .join("assistant-avatars/u-avatar-from-builtin-absolute.png");
+        .join("assistant-avatars/users/system_default_user/u-avatar-from-builtin-absolute.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -840,7 +844,9 @@ async fn update_user_avatar_with_existing_route_preserves_served_file() {
     let update_resp = fx.app.clone().oneshot(update_req).await.unwrap();
     assert_eq!(update_resp.status(), StatusCode::OK);
 
-    let persisted_avatar = fx.user_data_dir.join("assistant-avatars/u-avatar-stable.png");
+    let persisted_avatar = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/u-avatar-stable.png");
     assert!(
         persisted_avatar.exists(),
         "persisted avatar missing: {}",
@@ -993,9 +999,21 @@ async fn delete_happy_path_removes_row_and_user_assets() {
     create_user(&fx, "u1", "A").await;
     // Drop a rule, skill, and avatar on disk so the fs-cleanup branch has
     // something to remove.
-    let rules_dir = fx.user_data_dir.join("assistant-rules").join(DEFAULT_USER_ID);
-    let skills_dir = fx.user_data_dir.join("assistant-skills").join(DEFAULT_USER_ID);
-    let avatars_dir = fx.user_data_dir.join("assistant-avatars");
+    let rules_dir = fx
+        .user_data_dir
+        .join("assistant-rules")
+        .join("users")
+        .join(DEFAULT_USER_ID);
+    let skills_dir = fx
+        .user_data_dir
+        .join("assistant-skills")
+        .join("users")
+        .join(DEFAULT_USER_ID);
+    let avatars_dir = fx
+        .user_data_dir
+        .join("assistant-avatars")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::create_dir_all(&skills_dir).unwrap();
     std::fs::create_dir_all(&avatars_dir).unwrap();
@@ -1273,7 +1291,11 @@ async fn avatar_builtin_returns_bytes_with_content_type() {
 async fn avatar_user_ignores_planted_file_without_managed_value() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let avatars_dir = fx.user_data_dir.join("assistant-avatars");
+    let avatars_dir = fx
+        .user_data_dir
+        .join("assistant-avatars")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&avatars_dir).unwrap();
     std::fs::write(avatars_dir.join("u1.svg"), b"<svg></svg>").unwrap();
 
@@ -1431,19 +1453,43 @@ async fn rule_and_skill_files_are_isolated_by_current_user() {
     let rule_root = fx.user_data_dir.join("assistant-rules");
     let skill_root = fx.user_data_dir.join("assistant-skills");
     assert_eq!(
-        std::fs::read_to_string(rule_root.join(DEFAULT_USER_ID).join("shared-assistant.md")).unwrap(),
+        std::fs::read_to_string(
+            rule_root
+                .join("users")
+                .join(DEFAULT_USER_ID)
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
         "rule-a"
     );
     assert_eq!(
-        std::fs::read_to_string(rule_root.join(&user_b.id).join("shared-assistant.md")).unwrap(),
+        std::fs::read_to_string(
+            rule_root
+                .join("users")
+                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
         "rule-b"
     );
     assert_eq!(
-        std::fs::read_to_string(skill_root.join(DEFAULT_USER_ID).join("shared-assistant.md")).unwrap(),
+        std::fs::read_to_string(
+            skill_root
+                .join("users")
+                .join(DEFAULT_USER_ID)
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
         "skill-a"
     );
     assert_eq!(
-        std::fs::read_to_string(skill_root.join(&user_b.id).join("shared-assistant.md")).unwrap(),
+        std::fs::read_to_string(
+            skill_root
+                .join("users")
+                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
+                .join("shared-assistant.md")
+        )
+        .unwrap(),
         "skill-b"
     );
 }
@@ -1469,6 +1515,7 @@ async fn write_rule_user_happy_path() {
     let file = fx
         .user_data_dir
         .join("assistant-rules")
+        .join("users")
         .join(DEFAULT_USER_ID)
         .join("u1.md");
     assert_eq!(std::fs::read_to_string(file).unwrap(), "rule body");
@@ -1510,7 +1557,11 @@ async fn write_rule_extension_registry_id_behaves_like_user_id() {
 async fn delete_rule_user_removes_file() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let rules_dir = fx.user_data_dir.join("assistant-rules").join(DEFAULT_USER_ID);
+    let rules_dir = fx
+        .user_data_dir
+        .join("assistant-rules")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&rules_dir).unwrap();
     std::fs::write(rules_dir.join("u1.md"), "body").unwrap();
 
@@ -1639,6 +1690,7 @@ async fn write_skill_user_happy_path() {
     let file = fx
         .user_data_dir
         .join("assistant-skills")
+        .join("users")
         .join(DEFAULT_USER_ID)
         .join("u1.md");
     assert_eq!(std::fs::read_to_string(file).unwrap(), "skill body");
@@ -1680,7 +1732,11 @@ async fn write_skill_extension_registry_id_behaves_like_user_id() {
 async fn delete_skill_user_removes_file() {
     let fx = fixture().await;
     create_user(&fx, "u1", "A").await;
-    let skills_dir = fx.user_data_dir.join("assistant-skills").join(DEFAULT_USER_ID);
+    let skills_dir = fx
+        .user_data_dir
+        .join("assistant-skills")
+        .join("users")
+        .join(DEFAULT_USER_ID);
     std::fs::create_dir_all(&skills_dir).unwrap();
     std::fs::write(skills_dir.join("u1.md"), "body").unwrap();
 
