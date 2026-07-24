@@ -1443,6 +1443,7 @@ fn unique_test_workspace_path(label: &str) -> PathBuf {
 }
 
 fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected_file_name: &str) {
+    // Per-user, type-first layout: conversations/users/{user_dir}/{Y}/{M}/{D}/{leaf}
     let relative = workspace
         .strip_prefix(workspace_root.join("conversations"))
         .expect("workspace should be under the conversations root");
@@ -1451,14 +1452,20 @@ fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected
         .map(|part| part.to_str().expect("workspace path should be utf-8"))
         .collect::<Vec<_>>();
 
-    assert_eq!(parts.len(), 4);
-    assert_eq!(parts[0].len(), 4);
-    assert_eq!(parts[1].len(), 2);
-    assert_eq!(parts[2].len(), 2);
-    assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
-    assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(
+        parts.len(),
+        6,
+        "expected conversations/users/{{dir}}/Y/M/D/leaf, got {parts:?}"
+    );
+    assert_eq!(parts[0], "users");
+    assert!(!parts[1].is_empty(), "user dir segment must be present");
+    assert_eq!(parts[2].len(), 4);
+    assert_eq!(parts[3].len(), 2);
+    assert_eq!(parts[4].len(), 2);
     assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
-    assert_eq!(parts[3], expected_file_name);
+    assert!(parts[3].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[4].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(parts[5], expected_file_name);
 }
 
 async fn upsert_test_assistant_definition(
@@ -1771,7 +1778,7 @@ fn create_team_temp_workspace_uses_date_partition() {
     let workspace_root = temp.path().join("aionui-data");
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
 
-    let workspace = svc.create_team_temp_workspace("team_1").unwrap();
+    let workspace = svc.create_team_temp_workspace("user_1", "team_1").unwrap();
 
     let workspace = Path::new(&workspace);
     assert_dated_workspace_path(&workspace_root, workspace, "team-temp-team_1");

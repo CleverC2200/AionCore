@@ -724,7 +724,7 @@ pub(crate) mod workspace_harness {
             }))
         }
 
-        async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+        async fn create_team_temp_workspace(&self, _user_id: &str, team_id: &str) -> Result<String, TeamError> {
             let path = self
                 .workspace_root
                 .join("conversations")

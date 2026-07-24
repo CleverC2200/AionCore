@@ -423,8 +423,8 @@ impl ConversationService {
         self
     }
 
-    pub fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, ConversationError> {
-        let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("team-temp-{team_id}"));
+    pub fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, ConversationError> {
+        let ws_path = auto_workspace_parent(&self.workspace_root, user_id).join(format!("team-temp-{team_id}"));
         std::fs::create_dir_all(&ws_path)
             .map_err(|e| ConversationError::internal(format!("Failed to create Team temporary workspace: {e}")))?;
         Ok(ws_path.to_string_lossy().into_owned())
@@ -915,7 +915,7 @@ impl ConversationService {
                     .map(|backend| serde_json::Value::String(backend.clone()))
                     .as_ref(),
             );
-            let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("{label}-temp-{id}"));
+            let ws_path = auto_workspace_parent(&self.workspace_root, user_id).join(format!("{label}-temp-{id}"));
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
@@ -3522,6 +3522,7 @@ impl ConversationService {
         if !context.workspace.is_custom {
             let expected_workspace = expected_auto_workspace_path(
                 &self.workspace_root,
+                &row.user_id,
                 &row.id,
                 &context.conversation.agent_type,
                 backend.as_ref(),
@@ -3778,20 +3779,24 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
 
 fn expected_auto_workspace_path(
     workspace_root: &std::path::Path,
+    user_id: &str,
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    auto_workspace_parent(workspace_root).join(format!(
+    auto_workspace_parent(workspace_root, user_id).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
 }
 
-fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")
+        .join("users")
+        .join(dir)
         .join(format!("{:04}", now.year()))
         .join(format!("{:02}", now.month()))
         .join(format!("{:02}", now.day()))
@@ -3836,16 +3841,21 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
         return false;
     };
 
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
+
     match parts.as_slice() {
+        // legacy: bare leaf, or {Y}/{M}/{D}/leaf
         [_file_name] => true,
-        [year, month, day, _file_name] => {
-            year.len() == 4
-                && month.len() == 2
-                && day.len() == 2
-                && year.chars().all(|ch| ch.is_ascii_digit())
-                && month.chars().all(|ch| ch.is_ascii_digit())
-                && day.chars().all(|ch| ch.is_ascii_digit())
-        }
+        [year, month, day, _file_name] => dated(year, month, day),
+        // per-user, type-first: users/{user_dir}/{Y}/{M}/{D}/leaf
+        ["users", _user_dir, year, month, day, _file_name] => dated(year, month, day),
         _ => false,
     }
 }
@@ -3897,15 +3907,23 @@ fn is_dated_auto_workspace_relative_path(relative: &Path) -> bool {
         return false;
     };
 
+    // Per-user, type-first layout: users/{user_dir}/{Y}/{M}/{D}/{file}. The
+    // legacy userless {Y}/{M}/{D}/{file} form is still accepted so old
+    // conversations' empty date dirs are pruned on delete.
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
     matches!(
         parts.as_slice(),
-        [year, month, day, _file_name]
-            if year.len() == 4
-                && month.len() == 2
-                && day.len() == 2
-                && year.chars().all(|ch| ch.is_ascii_digit())
-                && month.chars().all(|ch| ch.is_ascii_digit())
-                && day.chars().all(|ch| ch.is_ascii_digit())
+        [year, month, day, _file_name] if dated(year, month, day)
+    ) || matches!(
+        parts.as_slice(),
+        ["users", _user_dir, year, month, day, _file_name] if dated(year, month, day)
     )
 }
 

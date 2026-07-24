@@ -111,8 +111,13 @@ impl<'a> SessionContextBuilder<'a> {
         extra: &serde_json::Value,
         workspace_override: Option<&str>,
     ) -> Result<WorkspaceContext, ConversationError> {
-        let expected_auto_workspace =
-            expected_auto_workspace_path(self.workspace_root, &row.id, agent_type, extra.get("backend"));
+        let expected_auto_workspace = expected_auto_workspace_path(
+            self.workspace_root,
+            &row.user_id,
+            &row.id,
+            agent_type,
+            extra.get("backend"),
+        );
         let existing_stored_path = extra
             .get("workspace")
             .and_then(serde_json::Value::as_str)
@@ -152,7 +157,14 @@ impl<'a> SessionContextBuilder<'a> {
         let normalized = match validate_workspace_path_availability(stored_path) {
             Ok(normalized) => normalized,
             Err(WorkspacePathValidationError::DoesNotExist(path))
-                if expected_auto_workspace.as_path() == Path::new(stored_path) =>
+                if is_auto_workspace(
+                    self.workspace_root,
+                    &row.user_id,
+                    &row.id,
+                    agent_type,
+                    extra.get("backend"),
+                    Path::new(stored_path),
+                ) =>
             {
                 path
             }
@@ -163,7 +175,14 @@ impl<'a> SessionContextBuilder<'a> {
         };
 
         Ok(WorkspaceContext {
-            is_custom: Path::new(&normalized) != expected_auto_workspace.as_path(),
+            is_custom: !is_auto_workspace(
+                self.workspace_root,
+                &row.user_id,
+                &row.id,
+                agent_type,
+                extra.get("backend"),
+                Path::new(&normalized),
+            ),
             stored_path: stored_path.to_owned(),
             path: normalized,
         })
@@ -566,23 +585,55 @@ fn decode_persisted_session_state(state: aionui_db::PersistedSessionState) -> Pe
 
 fn expected_auto_workspace_path(
     workspace_root: &Path,
+    user_id: &str,
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
 ) -> PathBuf {
-    auto_workspace_parent(workspace_root).join(format!(
+    auto_workspace_parent(workspace_root, user_id).join(format!(
         "{}-temp-{conversation_id}",
         conversation_label(agent_type, backend)
     ))
 }
 
-fn auto_workspace_parent(workspace_root: &Path) -> PathBuf {
+fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
+    let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
+    let now = chrono::Local::now();
+    workspace_root
+        .join("conversations")
+        .join("users")
+        .join(dir)
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month()))
+        .join(format!("{:02}", now.day()))
+}
+
+/// Legacy (pre-per-user) auto-workspace parent: `conversations/{Y}/{M}/{D}`
+/// with no `users/{dir}` segment. Retained so conversations created before the
+/// per-user layout are still recognized as auto workspaces (not misclassified
+/// as custom) — see [`is_auto_workspace`].
+fn legacy_auto_workspace_parent(workspace_root: &Path) -> PathBuf {
     let now = chrono::Local::now();
     workspace_root
         .join("conversations")
         .join(format!("{:04}", now.year()))
         .join(format!("{:02}", now.month()))
         .join(format!("{:02}", now.day()))
+}
+
+/// Whether `candidate` is an auto-provisioned workspace for this conversation,
+/// accepting BOTH the current per-user layout and the legacy userless layout.
+fn is_auto_workspace(
+    workspace_root: &Path,
+    user_id: &str,
+    conversation_id: &str,
+    agent_type: &AgentType,
+    backend: Option<&serde_json::Value>,
+    candidate: &Path,
+) -> bool {
+    let leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
+    candidate == auto_workspace_parent(workspace_root, user_id).join(&leaf)
+        || candidate == legacy_auto_workspace_parent(workspace_root).join(&leaf)
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -1174,6 +1225,44 @@ mod tests {
         let context = repos.builder().build(&row).await.unwrap();
         assert!(context.workspace.is_custom);
         assert_eq!(context.workspace.path, custom.to_string_lossy());
+    }
+
+    #[test]
+    fn new_workspace_is_user_scoped_and_legacy_still_recognized() {
+        let root = std::path::Path::new("/w");
+        let user = "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee";
+        let new_path = expected_auto_workspace_path(root, user, "conv-1", &AgentType::Acp, None);
+        assert!(
+            new_path
+                .to_string_lossy()
+                .contains("/conversations/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee/"),
+            "new workspace must be under conversations/users/{{dir}}/: {}",
+            new_path.display()
+        );
+        assert!(new_path.to_string_lossy().ends_with("-temp-conv-1"));
+
+        // Both the new per-user path and the legacy userless path must count as
+        // auto workspaces (so old conversations are not misclassified custom).
+        assert!(is_auto_workspace(
+            root,
+            user,
+            "conv-1",
+            &AgentType::Acp,
+            None,
+            &new_path
+        ));
+        let now = chrono::Local::now();
+        let legacy = root
+            .join("conversations")
+            .join(format!("{:04}", now.year()))
+            .join(format!("{:02}", now.month()))
+            .join(format!("{:02}", now.day()))
+            .join("acp-temp-conv-1");
+        assert!(is_auto_workspace(root, user, "conv-1", &AgentType::Acp, None, &legacy));
+
+        // A genuinely custom path is neither.
+        let custom = root.join("somewhere-else");
+        assert!(!is_auto_workspace(root, user, "conv-1", &AgentType::Acp, None, &custom));
     }
 
     #[test]

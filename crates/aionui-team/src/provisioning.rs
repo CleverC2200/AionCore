@@ -87,7 +87,7 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError>;
+    async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
@@ -199,6 +199,7 @@ impl TeamAgentProvisioner {
             Some(workspace) => workspace.to_owned(),
             None => {
                 self.resolve_initial_leader_workspace(
+                    user_id,
                     team_id,
                     &leader_conversation.conversation_id,
                     leader_conversation.workspace,
@@ -620,6 +621,7 @@ impl TeamAgentProvisioner {
 
     async fn resolve_initial_leader_workspace(
         &self,
+        user_id: &str,
         team_id: &str,
         leader_conversation_id: &str,
         created_workspace: Option<String>,
@@ -642,7 +644,10 @@ impl TeamAgentProvisioner {
             return Ok(workspace);
         }
 
-        let workspace = self.conversation_port.create_team_temp_workspace(team_id).await?;
+        let workspace = self
+            .conversation_port
+            .create_team_temp_workspace(user_id, team_id)
+            .await?;
         if let Err(e) = self
             .conversation_port
             .patch_runtime_config(leader_conversation_id, serde_json::json!({ "workspace": workspace }))
@@ -766,7 +771,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn create_team_temp_workspace(&self, _team_id: &str) -> Result<String, TeamError> {
+        async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
         }
 

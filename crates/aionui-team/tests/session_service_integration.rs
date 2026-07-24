@@ -443,7 +443,11 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
+    async fn create_team_temp_workspace(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+    ) -> Result<String, aionui_team::TeamError> {
         if self
             .fail_team_temp_create
             .swap(false, std::sync::atomic::Ordering::SeqCst)

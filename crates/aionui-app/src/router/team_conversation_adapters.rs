@@ -263,9 +263,9 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, TeamError> {
+    async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
-            .create_team_temp_workspace(team_id)
+            .create_team_temp_workspace(user_id, team_id)
             .map_err(map_conversation_update_error)
     }
 

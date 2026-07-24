@@ -62,7 +62,10 @@ impl TeamWorkspaceResolver {
             return Ok(leader_workspace);
         }
 
-        let workspace = self.conversation_port.create_team_temp_workspace(&row.id).await?;
+        let workspace = self
+            .conversation_port
+            .create_team_temp_workspace(&row.user_id, &row.id)
+            .await?;
         let workspace = validate_runtime_workspace_path(&workspace)?;
         self.write_team_workspace(&row.id, &workspace).await?;
         self.patch_leader_workspace_best_effort(&row.id, team, &workspace).await;
