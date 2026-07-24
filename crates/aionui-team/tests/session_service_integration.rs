@@ -2625,6 +2625,15 @@ async fn create_team_side_branch_backfills_project_binding_when_injected() {
 
     // Real store on an in-memory DB; leaked so the shared pool outlives the test.
     let db = aionui_db::init_database_memory().await.unwrap();
+    // The project tables carry a users(id) FK; seed the acting owner as in
+    // production, where the owner row always exists.
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user1', 'local', 'user1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
     std::mem::forget(db);
     svc.with_project_service(Arc::new(aionui_project::ProjectService::new(

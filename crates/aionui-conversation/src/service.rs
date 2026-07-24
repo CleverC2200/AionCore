@@ -462,7 +462,7 @@ impl ConversationService {
                 return;
             }
         };
-        match project_service.resolve_existing(uri).await {
+        match project_service.resolve_existing(user_id, uri).await {
             Ok(out) => {
                 let update = ConversationRowUpdate {
                     project_id: Some(out.project.project_id),

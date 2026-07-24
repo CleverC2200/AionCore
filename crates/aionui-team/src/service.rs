@@ -216,7 +216,7 @@ impl TeamSessionService {
     /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
     /// missing service / empty workspace / bad URI / resolve error → `(None, None)`,
     /// logged at `warn`. Never affects team create/read.
-    async fn resolve_binding_best_effort(&self, workspace: &str) -> (Option<String>, Option<String>) {
+    async fn resolve_binding_best_effort(&self, user_id: &str, workspace: &str) -> (Option<String>, Option<String>) {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
             return (None, None);
@@ -231,7 +231,7 @@ impl TeamSessionService {
                 return (None, None);
             }
         };
-        match project_service.resolve_existing(uri).await {
+        match project_service.resolve_existing(user_id, uri).await {
             Ok(out) => (Some(out.project.project_id), Some(out.folder.folder_id)),
             Err(err) => {
                 warn!(error = err.code(), "team project bind skipped");
@@ -246,7 +246,8 @@ impl TeamSessionService {
         if row.project_id.is_some() || row.workspace.trim().is_empty() {
             return;
         }
-        let (Some(project_id), Some(folder_id)) = self.resolve_binding_best_effort(&row.workspace).await else {
+        let (Some(project_id), Some(folder_id)) = self.resolve_binding_best_effort(&row.user_id, &row.workspace).await
+        else {
             return;
         };
         let params = UpdateTeamParams {
@@ -383,7 +384,7 @@ impl TeamSessionService {
         let agents_json = serde_json::to_string(&agents)?;
 
         // Project-bind side branch (best-effort; never affects team creation).
-        let (project_id, folder_id) = self.resolve_binding_best_effort(&team_workspace).await;
+        let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &team_workspace).await;
 
         let row = TeamRow {
             id: team_id.clone(),

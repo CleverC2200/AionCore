@@ -1625,6 +1625,15 @@ async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync
     // (`work_dir/conversations`) so classification matches production. The
     // Database handle is leaked so the shared in-memory pool outlives the test.
     let db = aionui_db::init_database_memory().await.unwrap();
+    // The project tables carry a users(id) FK; seed the owner these tests act
+    // as, mirroring production where the owner always exists.
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user_1', 'local', 'user_1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
         std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
     std::mem::forget(db);
