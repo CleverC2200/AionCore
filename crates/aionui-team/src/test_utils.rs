@@ -52,6 +52,8 @@ impl ITeamRepository for MockTeamRepo {
             agents_version: "1.0.1".to_owned(),
             created_at: now_ms(),
             updated_at: now_ms(),
+            project_id: None,
+            folder_id: None,
         }))
     }
     async fn update_team(&self, _user_id: &str, _id: &str, _p: &UpdateTeamParams) -> Result<(), DbError> {
@@ -691,6 +693,8 @@ pub(crate) mod workspace_harness {
                     status: Some("pending".into()),
                     created_at: now_ms(),
                     updated_at: now_ms(),
+                    project_id: None,
+                    folder_id: None,
                 })
                 .await?;
             Ok(TeamConversationCreateResult {
@@ -756,6 +760,8 @@ pub(crate) mod workspace_harness {
                         extra: Some(serde_json::to_string(&extra).unwrap()),
                         status: None,
                         updated_at: Some(now_ms()),
+                        project_id: None,
+                        folder_id: None,
                     },
                 )
                 .await?;

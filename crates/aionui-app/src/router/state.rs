@@ -696,6 +696,7 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -739,6 +740,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_project_service(Arc::new(services.project_service.clone()));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),

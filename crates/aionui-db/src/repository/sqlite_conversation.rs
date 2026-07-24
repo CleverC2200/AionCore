@@ -313,8 +313,8 @@ impl IConversationRepository for SqliteConversationRepository {
         sqlx::query(
             "INSERT INTO conversations \
                 (id, user_id, name, type, extra, model, status, source, \
-                 channel_chat_id, pinned, pinned_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 channel_chat_id, pinned, pinned_at, created_at, updated_at, project_id, folder_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -329,6 +329,8 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(row.pinned_at)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(&row.project_id)
+        .bind(&row.folder_id)
         .execute(&self.pool)
         .await?;
 
@@ -367,6 +369,14 @@ impl IConversationRepository for SqliteConversationRepository {
         if let Some(updated_at) = updates.updated_at {
             set_parts.push("updated_at = ?".to_string());
             binds.push(BindValue::I64(updated_at));
+        }
+        if let Some(ref project_id) = updates.project_id {
+            set_parts.push("project_id = ?".to_string());
+            binds.push(BindValue::Str(project_id.clone()));
+        }
+        if let Some(ref folder_id) = updates.folder_id {
+            set_parts.push("folder_id = ?".to_string());
+            binds.push(BindValue::Str(folder_id.clone()));
         }
 
         if set_parts.is_empty() {
@@ -1339,6 +1349,8 @@ mod tests {
             pinned_at: None,
             created_at: now,
             updated_at: now,
+            project_id: None,
+            folder_id: None,
         }
     }
 
