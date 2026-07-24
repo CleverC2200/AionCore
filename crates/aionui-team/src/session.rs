@@ -837,6 +837,27 @@ impl TeamSession {
         Ok(commit.team_run_id)
     }
 
+    /// Enqueue a system/lifecycle wake so the woken agent's turn always runs
+    /// inside a team run (attaching to the caller's or team's active run, or
+    /// opening a `SystemLifecycle` run when idle). This upholds the invariant
+    /// that every agent turn is run-scoped, so run-scoped tools like
+    /// `team_send_message` are never rejected for a run-less system wake.
+    async fn enqueue_system_work(
+        &self,
+        slot_id: &str,
+        source: WorkSource,
+        mailbox_message_id: Option<String>,
+        inherit_from: Option<String>,
+    ) -> Result<Option<String>, TeamError> {
+        self.enqueue_existing_work(
+            slot_id,
+            source,
+            mailbox_message_id,
+            CausalBinding::SystemInitiated { inherit_from },
+        )
+        .await
+    }
+
     async fn commit_persisted_enqueue(
         &self,
         lease: &EnqueueLease,
@@ -873,8 +894,7 @@ impl TeamSession {
         slot_id: &str,
         source: WorkSource,
     ) -> Result<(), TeamError> {
-        self.enqueue_existing_work(slot_id, source, None, CausalBinding::ActiveRunOrBackground)
-            .await?;
+        self.enqueue_system_work(slot_id, source, None, None).await?;
         Ok(())
     }
 
@@ -909,13 +929,8 @@ impl TeamSession {
                 continue;
             }
             for message_id in unread {
-                self.enqueue_existing_work(
-                    &agent.slot_id,
-                    WorkSource::RecoveryDrain,
-                    Some(message_id),
-                    CausalBinding::Background,
-                )
-                .await?;
+                self.enqueue_system_work(&agent.slot_id, WorkSource::RecoveryDrain, Some(message_id), None)
+                    .await?;
             }
             recovered_slots.push(agent.slot_id);
         }
@@ -1196,15 +1211,8 @@ impl TeamSession {
         let Some(message_id) = message_id else {
             return Ok(());
         };
-        self.enqueue_existing_work(
-            &lead_slot_id,
-            source,
-            Some(message_id),
-            CausalBinding::InheritRunningBatch {
-                caller_slot_id: source_slot_id.to_owned(),
-            },
-        )
-        .await?;
+        self.enqueue_system_work(&lead_slot_id, source, Some(message_id), Some(source_slot_id.to_owned()))
+            .await?;
         Ok(())
     }
 
@@ -1264,18 +1272,13 @@ impl TeamSession {
         )
         .await;
 
-        self.enqueue_existing_work(
-            &agent.slot_id,
-            WorkSource::SpawnWelcome,
-            Some(welcome.id),
-            CausalBinding::ActiveRunOrBackground,
-        )
-        .await?;
-        self.enqueue_existing_work(
+        self.enqueue_system_work(&agent.slot_id, WorkSource::SpawnWelcome, Some(welcome.id), None)
+            .await?;
+        self.enqueue_system_work(
             &lead_slot_id,
             WorkSource::TeamMembershipChanged,
             Some(leader_notice.id),
-            CausalBinding::ActiveRunOrBackground,
+            None,
         )
         .await?;
         Ok(())
@@ -1308,13 +1311,8 @@ impl TeamSession {
         self.project_team_system_message(&lead_slot_id, &lead_agent.conversation_id, &notice.id, &notice.content)
             .await;
 
-        self.enqueue_existing_work(
-            &lead_slot_id,
-            WorkSource::TeamMembershipChanged,
-            Some(notice.id),
-            CausalBinding::ActiveRunOrBackground,
-        )
-        .await?;
+        self.enqueue_system_work(&lead_slot_id, WorkSource::TeamMembershipChanged, Some(notice.id), None)
+            .await?;
 
         Ok(())
     }
@@ -1507,13 +1505,11 @@ impl TeamSession {
             }
         };
 
-        self.enqueue_existing_work(
+        self.enqueue_system_work(
             &new_agent.slot_id,
             WorkSource::SpawnWelcome,
             Some(welcome_message.id),
-            CausalBinding::InheritRunningBatch {
-                caller_slot_id: caller_slot_id.to_owned(),
-            },
+            Some(caller_slot_id.to_owned()),
         )
         .await?;
 
@@ -1676,6 +1672,22 @@ pub(crate) async fn attach_member_runtime(
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
             .await;
         let failure = sanitize_member_runtime_failure(&error);
+        // Log the RAW error before it is sanitized away: the broadcast/public
+        // reason is intentionally generic ("Agent runtime failed to start"),
+        // and without this line production logs carry no trace of the actual
+        // cause (Sentry ELECTRON-3PP was only diagnosable by timing forensics).
+        // TeamError texts here are runtime/spawn diagnostics (never prompts,
+        // tool payloads, or secrets), so info-level visibility is safe.
+        warn!(
+            team_id = session.team_id(),
+            slot_id = agent.slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            generation,
+            error_classification = failure.classification,
+            error = %error,
+            "team member runtime attach failed"
+        );
         if session.member_runtimes.commit_failed(&lease, failure.clone()) {
             service.broadcast_agent_runtime_status(
                 session.user_id(),
@@ -2534,7 +2546,21 @@ mod tests {
             .expect("scan should not fail");
 
         assert_eq!(result, vec![lead.clone()]);
-        assert!(session.team_run_manager().current_active_run_id().is_none());
+        // Recovery drain now runs the recovered work inside a SystemLifecycle
+        // run instead of run-less background, upholding the invariant that every
+        // recovered turn is run-scoped. The lead's non-self unread drains into
+        // exactly one such run (not one per message).
+        let run_id = session
+            .team_run_manager()
+            .current_active_run_id()
+            .expect("recovery drain must open a system run");
+        let payload = session
+            .team_run_manager()
+            .current_payload(&session.work_coordinator().snapshot())
+            .expect("the recovery system run must be observable");
+        assert_eq!(payload.team_run_id, run_id);
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert!(!payload.has_user_intervention);
     }
 
     #[tokio::test]
