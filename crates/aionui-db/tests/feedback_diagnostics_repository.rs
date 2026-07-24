@@ -424,12 +424,13 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO agent_metadata \
-            (id, name, backend, agent_type, agent_source, enabled, command, args, env, \
+            (id, agent_id, name, backend, agent_type, agent_source, enabled, command, args, env, \
              native_skills_dirs, behavior_policy, available_modes, available_models, sort_order, \
              last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
              created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind("opencode")
     .bind("opencode")
     .bind("OpenCode")
     .bind("opencode")
@@ -658,12 +659,13 @@ async fn insert_foreign_agent_metadata(db: &aionui_db::Database) {
 
     sqlx::query(
         "INSERT INTO agent_metadata \
-            (id, user_id, name, backend, agent_type, agent_source, enabled, command, args, env, \
+            (id, agent_id, user_id, name, backend, agent_type, agent_source, enabled, command, args, env, \
              native_skills_dirs, behavior_policy, available_modes, available_models, sort_order, \
              last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
              created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind("foreign-agent")
     .bind("foreign-agent")
     .bind("user-b")
     .bind("Foreign Agent")

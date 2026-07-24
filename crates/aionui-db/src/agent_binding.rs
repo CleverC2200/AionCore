@@ -83,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_agent_binding_uses_safe_agent_metadata_reads() {
         let db = init_database_memory().await.unwrap();
-        sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE id = ?")
+        sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
             .bind("2d23ff1c")
             .execute(db.pool())
             .await

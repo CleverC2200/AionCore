@@ -350,7 +350,11 @@ DROP TABLE client_preferences;
 ALTER TABLE client_preferences_new RENAME TO client_preferences;
 
 CREATE TABLE agent_metadata_new (
-    id                       TEXT NOT NULL,
+    -- Surrogate row key. The logical agent identity lives in agent_id, which
+    -- repeats across scope rows (one global template row + per-user override
+    -- rows), mirroring skills(id, name) and assistant_definitions(id, assistant_id).
+    id                       TEXT PRIMARY KEY NOT NULL,
+    agent_id                 TEXT NOT NULL,
     user_id                  TEXT REFERENCES users(id),
     icon                     TEXT,
     name                     TEXT NOT NULL,
@@ -391,7 +395,7 @@ CREATE TABLE agent_metadata_new (
 );
 
 INSERT INTO agent_metadata_new (
-    id, user_id, icon, name, name_i18n, description, description_i18n,
+    id, agent_id, user_id, icon, name, name_i18n, description, description_i18n,
     backend, agent_type, agent_source, agent_source_info,
     enabled, command, args, env, native_skills_dirs,
     behavior_policy, yolo_id,
@@ -403,6 +407,9 @@ INSERT INTO agent_metadata_new (
     command_override, env_override, created_at, updated_at
 )
 SELECT
+    -- Pre-migration ids are unique (old primary key), so they can seed both
+    -- the surrogate row key and the logical agent id.
+    id,
     id,
     CASE WHEN agent_source IN ('builtin', 'internal') THEN NULL ELSE 'system_default_user' END,
     icon, name, name_i18n, description, description_i18n,
@@ -426,11 +433,11 @@ END;
 
 DROP TABLE agent_metadata;
 ALTER TABLE agent_metadata_new RENAME TO agent_metadata;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_global_id
-    ON agent_metadata(id)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_global_agent_id
+    ON agent_metadata(agent_id)
     WHERE user_id IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_user_id
-    ON agent_metadata(user_id, id)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_metadata_user_agent_id
+    ON agent_metadata(user_id, agent_id)
     WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_backend ON agent_metadata(backend);
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent_type ON agent_metadata(agent_type);

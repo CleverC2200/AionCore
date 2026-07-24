@@ -445,13 +445,13 @@ impl SqliteFeedbackDiagnosticsRepository {
 
         let row = sqlx::query(
             "SELECT \
-                id, name, backend, agent_type, agent_source, enabled, sort_order, \
+                agent_id AS id, name, backend, agent_type, agent_source, enabled, sort_order, \
                 length(command) AS command_bytes, length(args) AS args_bytes, length(env) AS env_bytes, \
                 available_modes, available_models, available_commands, config_options, \
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at \
              FROM agent_metadata \
-             WHERE id = ? AND (user_id IS NULL OR user_id = ?)",
+             WHERE agent_id = ? AND (user_id IS NULL OR user_id = ?)",
         )
         .bind(agent_id)
         .bind(user_id)
@@ -1443,7 +1443,7 @@ impl SqliteFeedbackDiagnosticsRepository {
     async fn collect_global_agent_health(&self, user_id: &str) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT \
-                id, name, backend, agent_type, agent_source, enabled, sort_order, \
+                agent_id AS id, name, backend, agent_type, agent_source, enabled, sort_order, \
                 length(command) AS command_bytes, length(args) AS args_bytes, length(env) AS env_bytes, \
                 last_check_status, last_check_kind, last_check_error_code, last_check_latency_ms, \
                 last_check_at, last_success_at, last_failure_at, updated_at \

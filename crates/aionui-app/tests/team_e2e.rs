@@ -46,7 +46,7 @@ async fn ensure_default_team_agent_installed(services: &aionui_app::AppServices)
         "UPDATE agent_metadata \
          SET agent_source = 'custom', agent_source_info = ?, command = ?, args = '[]', env = '[]', \
              updated_at = unixepoch('now','subsec') * 1000 \
-         WHERE id = ?",
+         WHERE agent_id = ?",
     )
     .bind(&source_info)
     .bind(&command)

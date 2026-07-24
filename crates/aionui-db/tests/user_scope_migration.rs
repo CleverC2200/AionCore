@@ -358,6 +358,18 @@ async fn migration_029_classifies_global_and_user_catalog_rows() {
             .await
             .unwrap();
     assert_eq!(import_owner, "system_default_user");
+
+    // agent_metadata gains a surrogate row key; the legacy id must be carried
+    // into agent_id so external references (conversation bindings, assistant
+    // definitions) keep resolving.
+    for legacy_id in ["agent_builtin_legacy", "agent_user_legacy"] {
+        let agent_id: String = sqlx::query_scalar("SELECT agent_id FROM agent_metadata WHERE id = ?")
+            .bind(legacy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(agent_id, legacy_id, "legacy id must seed agent_id");
+    }
 }
 
 #[tokio::test]
