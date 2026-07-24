@@ -1678,6 +1678,20 @@ pub async fn sync_skill_catalog_into_repo(
     sync_skill_catalog_into_repo_for_user(paths, repo, DEFAULT_USER_ID).await
 }
 
+/// Startup sync for AionPro machines: built-in skills only.
+///
+/// The legacy shared-directory backfill cannot attribute on-disk files to a
+/// real account (that information never existed on disk), so ingesting them
+/// would only mint rows for the never-logged-in local default user. Real
+/// users' skills live in per-user storage and enter the catalog through the
+/// import APIs.
+pub async fn sync_builtin_skill_catalog_into_repo(
+    paths: &SkillPaths,
+    repo: &dyn ISkillRepository,
+) -> Result<(), ExtensionError> {
+    sync_builtin_skills_into_repo(paths, repo).await
+}
+
 /// Synchronize filesystem-backed skill catalogs for a specific user.
 ///
 /// Built-in skills are global. Disk-backed custom skills are attributed to

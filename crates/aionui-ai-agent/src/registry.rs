@@ -1577,35 +1577,6 @@ mod tests {
         reg
     }
 
-    fn custom_params<'a>(id: &'a str, name: &'a str) -> UpsertAgentMetadataParams<'a> {
-        UpsertAgentMetadataParams {
-            id,
-            icon: None,
-            name,
-            name_i18n: None,
-            description: Some("test custom agent"),
-            description_i18n: None,
-            backend: None,
-            agent_type: "acp",
-            agent_source: "custom",
-            agent_source_info: Some(r#"{"binary_name":"sh"}"#),
-            enabled: true,
-            command: Some("sh"),
-            args: Some("[]"),
-            env: Some("[]"),
-            native_skills_dirs: None,
-            behavior_policy: None,
-            yolo_id: None,
-            agent_capabilities: None,
-            auth_methods: None,
-            config_options: None,
-            available_modes: None,
-            available_models: None,
-            available_commands: None,
-            sort_order: 1500,
-        }
-    }
-
     #[tokio::test]
     async fn hydrate_loads_seed_rows() {
         // `list_all_including_hidden` bypasses the available/enabled
@@ -1766,6 +1737,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_handshake_scopes_custom_agent_by_user() {
+        // Single-row catalog: the builtin agent has exactly one catalog row;
+        // the default user's handshake lands on it (machine level) while a
+        // real user's handshake lands in their agent_user_state delta —
+        // neither may pollute the other.
         let db = init_database_memory().await.unwrap();
         sqlx::query(
             "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
@@ -1775,20 +1750,11 @@ mod tests {
         .await
         .unwrap();
         let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
-        repo.upsert_for_user(
-            SYSTEM_DEFAULT_USER_ID,
-            &custom_params("custom-shared", "Default Custom"),
-        )
-        .await
-        .unwrap();
-        repo.upsert_for_user("user-b", &custom_params("custom-shared", "User B Custom"))
-            .await
-            .unwrap();
 
         let reg = AgentRegistry::new(repo.clone());
         reg.apply_handshake_inner(
             SYSTEM_DEFAULT_USER_ID,
-            "custom-shared",
+            "2d23ff1c",
             &AgentHandshake {
                 config_options: Some(serde_json::json!({
                     "config_options": [
@@ -1809,7 +1775,7 @@ mod tests {
         .unwrap();
         reg.apply_handshake_inner(
             "user-b",
-            "custom-shared",
+            "2d23ff1c",
             &AgentHandshake {
                 auth_methods: Some(serde_json::json!([{"type":"agent","id":"oauth"}])),
                 config_options: Some(serde_json::json!({
@@ -1831,11 +1797,11 @@ mod tests {
         .unwrap();
 
         let default_row = repo
-            .get_for_user(SYSTEM_DEFAULT_USER_ID, "custom-shared")
+            .get_for_user(SYSTEM_DEFAULT_USER_ID, "2d23ff1c")
             .await
             .unwrap()
             .unwrap();
-        let user_b_row = repo.get_for_user("user-b", "custom-shared").await.unwrap().unwrap();
+        let user_b_row = repo.get_for_user("user-b", "2d23ff1c").await.unwrap().unwrap();
         assert!(default_row.auth_methods.is_none());
         assert!(
             default_row
@@ -1859,15 +1825,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains(r#""id":"model""#))
         );
-        assert!(
-            user_b_row
-                .config_options
-                .as_deref()
-                .is_none_or(|value| !value.contains(r#""id":"mode""#))
-        );
+        // Inheriting the machine baseline ("mode") into the user's merged
+        // handshake is expected — the guarded direction is that the user's
+        // write never leaks back into the catalog (asserted above).
 
         let default_management = reg
-            .management_row_by_id_for_user(SYSTEM_DEFAULT_USER_ID, "custom-shared")
+            .management_row_by_id_for_user(SYSTEM_DEFAULT_USER_ID, "2d23ff1c")
             .await
             .unwrap()
             .unwrap();
@@ -1876,13 +1839,12 @@ mod tests {
         assert!(!default_options.to_string().contains(r#""model""#));
 
         let user_b_management = reg
-            .management_row_by_id_for_user("user-b", "custom-shared")
+            .management_row_by_id_for_user("user-b", "2d23ff1c")
             .await
             .unwrap()
             .unwrap();
         let user_b_options = user_b_management.config_options.unwrap();
         assert!(user_b_options.to_string().contains(r#""model""#));
-        assert!(!user_b_options.to_string().contains(r#""mode""#));
     }
 
     /// Partial updates must leave unrelated columns untouched.

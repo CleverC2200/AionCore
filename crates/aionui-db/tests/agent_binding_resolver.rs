@@ -53,30 +53,40 @@ async fn resolves_agent_binding_for_current_user_scope() {
         .unwrap();
     }
 
+    // agent_id is globally unique: each user's custom agent is its own id.
     repo.upsert_for_user(
         "user-a",
-        &custom_agent_params("shared-agent", "User A Agent", "a-backend"),
+        &custom_agent_params("agent-of-a", "User A Agent", "a-backend"),
     )
     .await
     .unwrap();
     repo.upsert_for_user(
         "user-b",
-        &custom_agent_params("shared-agent", "User B Agent", "b-backend"),
+        &custom_agent_params("agent-of-b", "User B Agent", "b-backend"),
     )
     .await
     .unwrap();
 
-    let user_a = resolve_agent_binding_for_user(db.pool(), "user-a", "shared-agent")
+    let user_a = resolve_agent_binding_for_user(db.pool(), "user-a", "agent-of-a")
         .await
         .unwrap()
         .expect("user-a binding");
-    let user_b = resolve_agent_binding_for_user(db.pool(), "user-b", "shared-agent")
+    let user_b = resolve_agent_binding_for_user(db.pool(), "user-b", "agent-of-b")
         .await
         .unwrap()
         .expect("user-b binding");
 
     assert_eq!(user_a.runtime_backend, "a-backend");
     assert_eq!(user_b.runtime_backend, "b-backend");
+
+    // Cross-user resolution stays closed: A cannot bind B's agent.
+    assert!(
+        resolve_agent_binding_for_user(db.pool(), "user-a", "agent-of-b")
+            .await
+            .unwrap()
+            .is_none(),
+        "custom agents must not resolve for non-owners"
+    );
 }
 
 fn custom_agent_params<'a>(id: &'a str, name: &'a str, backend: &'a str) -> UpsertAgentMetadataParams<'a> {

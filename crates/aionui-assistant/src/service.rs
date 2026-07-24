@@ -186,6 +186,13 @@ impl AssistantService {
     /// Bootstrap unified assistant storage from builtin assets and the
     /// legacy mirror tables.
     pub async fn bootstrap_assistant_storage(&self) -> Result<(), AssistantError> {
+        self.bootstrap_assistant_storage_inner(true).await
+    }
+
+    async fn bootstrap_assistant_storage_inner(
+        &self,
+        reconcile_default_user_generated: bool,
+    ) -> Result<(), AssistantError> {
         // Each step already re-runs idempotently on every startup. Wrap each in
         // bounded concurrent-startup retry so a transient SQLITE_BUSY is retried
         // and a UNIQUE conflict (another startup already inserted the row) is
@@ -211,11 +218,23 @@ impl AssistantService {
             Box::pin(self.sync_legacy_overrides_to_new_states())
         })
         .await?;
-        retry_bootstrap_step("reconcile_generated_assistants", || {
-            Box::pin(async { self.reconcile_generated_assistants().await.map(|_| ()) })
-        })
-        .await?;
+        if reconcile_default_user_generated {
+            retry_bootstrap_step("reconcile_generated_assistants", || {
+                Box::pin(async { self.reconcile_generated_assistants().await.map(|_| ()) })
+            })
+            .await?;
+        }
         Ok(())
+    }
+
+    /// Bootstrap for AionPro machines: identical to
+    /// [`Self::bootstrap_assistant_storage`] except the trailing generated
+    /// reconcile is skipped — generated definitions are per-user and each
+    /// real account materializes its own lazily on first catalog read, so a
+    /// startup pass would only mint rows for the never-logged-in local
+    /// default user.
+    pub async fn bootstrap_assistant_storage_external(&self) -> Result<(), AssistantError> {
+        self.bootstrap_assistant_storage_inner(false).await
     }
 
     /// Materialize builtin assistants into `assistant_definitions`.

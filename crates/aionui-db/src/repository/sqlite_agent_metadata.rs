@@ -17,21 +17,43 @@ pub struct SqliteAgentMetadataRepository {
 
 const DEFAULT_USER_ID: &str = "system_default_user";
 
+/// Merged projection: the single catalog row (`am`) overlaid with the acting
+/// user's delta row (`us`, LEFT JOIN on agent_user_state). Identity fields
+/// come from the catalog only; user-overridable fields COALESCE user-first;
+/// the availability snapshot is taken as a WHOLE from whichever side has one
+/// (user session state wins over the machine's startup probe) so its fields
+/// never mix across two different snapshots.
 const AGENT_METADATA_SAFE_COLUMNS: &str = "\
-    agent_id AS id, user_id, icon, name, name_i18n, description, description_i18n, \
-    backend, agent_type, agent_source, agent_source_info, \
-    enabled, command, args, env, native_skills_dirs, \
-    behavior_policy, yolo_id, \
-    CAST(agent_capabilities AS BLOB) AS agent_capabilities, \
-    CAST(auth_methods AS BLOB) AS auth_methods, \
-    CAST(config_options AS BLOB) AS config_options, \
-    CAST(available_modes AS BLOB) AS available_modes, \
-    CAST(available_models AS BLOB) AS available_models, \
-    CAST(available_commands AS BLOB) AS available_commands, \
-    sort_order, \
-    last_check_status, last_check_kind, last_check_error_code, last_check_error_message, \
-    last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at, \
-    command_override, env_override, created_at, updated_at";
+    am.agent_id AS id, am.user_id, am.icon, am.name, am.name_i18n, am.description, am.description_i18n, \
+    am.backend, am.agent_type, am.agent_source, am.agent_source_info, \
+    COALESCE(us.enabled, am.enabled) AS enabled, am.command, am.args, am.env, am.native_skills_dirs, \
+    am.behavior_policy, am.yolo_id, \
+    CAST(COALESCE(us.agent_capabilities, am.agent_capabilities) AS BLOB) AS agent_capabilities, \
+    CAST(COALESCE(us.auth_methods, am.auth_methods) AS BLOB) AS auth_methods, \
+    CAST(COALESCE(us.config_options, am.config_options) AS BLOB) AS config_options, \
+    CAST(COALESCE(us.available_modes, am.available_modes) AS BLOB) AS available_modes, \
+    CAST(COALESCE(us.available_models, am.available_models) AS BLOB) AS available_models, \
+    CAST(COALESCE(us.available_commands, am.available_commands) AS BLOB) AS available_commands, \
+    am.sort_order, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_status ELSE am.last_check_status END AS last_check_status, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_kind ELSE am.last_check_kind END AS last_check_kind, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_error_code ELSE am.last_check_error_code END AS last_check_error_code, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_error_message ELSE am.last_check_error_message END AS last_check_error_message, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_guidance ELSE am.last_check_guidance END AS last_check_guidance, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_latency_ms ELSE am.last_check_latency_ms END AS last_check_latency_ms, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_check_at ELSE am.last_check_at END AS last_check_at, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_success_at ELSE am.last_success_at END AS last_success_at, \
+    CASE WHEN us.last_check_status IS NOT NULL THEN us.last_failure_at ELSE am.last_failure_at END AS last_failure_at, \
+    COALESCE(us.command_override, am.command_override) AS command_override, \
+    COALESCE(us.env_override, am.env_override) AS env_override, \
+    am.created_at, am.updated_at";
+
+/// FROM clause pairing the catalog with the acting user's delta row. Queries
+/// using this must bind the user id for the join BEFORE their own binds, and
+/// filter custom rows with `visible_filter` semantics (owner-only).
+const AGENT_METADATA_MERGED_FROM: &str = "\
+    FROM agent_metadata am \
+    LEFT JOIN agent_user_state us ON us.agent_id = am.agent_id AND us.user_id = ?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentMetadataCacheField {
@@ -241,31 +263,6 @@ impl SqliteAgentMetadataRepository {
         Self { pool }
     }
 
-    async fn fetch_optional_safe(&self, sql: &str, bind: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query(sql).bind(bind).fetch_optional(&self.pool).await?;
-        match row {
-            Some(row) => Ok(Some(self.decode_and_repair(row).await?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn fetch_optional_safe_two_binds(
-        &self,
-        sql: &str,
-        first: &str,
-        second: &str,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        let row = sqlx::query(sql)
-            .bind(first)
-            .bind(second)
-            .fetch_optional(&self.pool)
-            .await?;
-        match row {
-            Some(row) => Ok(Some(self.decode_and_repair(row).await?)),
-            None => Ok(None),
-        }
-    }
-
     async fn fetch_optional_safe_three_binds(
         &self,
         sql: &str,
@@ -285,56 +282,25 @@ impl SqliteAgentMetadataRepository {
         }
     }
 
-    async fn ensure_user_row_for_write(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "INSERT INTO agent_metadata (
-                id, agent_id, user_id, icon, name, name_i18n, description, description_i18n,
-                backend, agent_type, agent_source, agent_source_info,
-                enabled, command, args, env, native_skills_dirs,
-                behavior_policy, yolo_id,
-                agent_capabilities, auth_methods, config_options,
-                available_modes, available_models, available_commands,
-                sort_order,
-                last_check_status, last_check_kind, last_check_error_code, last_check_error_message,
-                last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at,
-                command_override, env_override, created_at, updated_at
-            )
-            SELECT
-                lower(hex(randomblob(16))), agent_id, ?, icon, name, name_i18n, description, description_i18n,
-                backend, agent_type, agent_source, agent_source_info,
-                enabled, command, args, env, native_skills_dirs,
-                behavior_policy, yolo_id,
-                agent_capabilities, auth_methods, config_options,
-                available_modes, available_models, available_commands,
-                sort_order,
-                last_check_status, last_check_kind, last_check_error_code, last_check_error_message,
-                last_check_guidance, last_check_latency_ms, last_check_at, last_success_at, last_failure_at,
-                command_override, env_override, created_at, ?
-            FROM agent_metadata
-            WHERE agent_id = ? AND (user_id = ? OR user_id IS NULL)
-            ORDER BY user_id IS NULL ASC
-            LIMIT 1
-            ON CONFLICT(user_id, agent_id) WHERE user_id IS NOT NULL DO NOTHING",
-        )
-        .bind(user_id)
-        .bind(now_ms())
-        .bind(id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0 || self.user_row_exists(user_id, id).await?)
-    }
-
-    async fn user_row_exists(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM agent_metadata WHERE user_id = ? AND agent_id = ?)",
-        )
-        .bind(user_id)
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(exists != 0)
+    async fn fetch_optional_safe_four_binds(
+        &self,
+        sql: &str,
+        first: &str,
+        second: &str,
+        third: &str,
+        fourth: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        let row = sqlx::query(sql)
+            .bind(first)
+            .bind(second)
+            .bind(third)
+            .bind(fourth)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(self.decode_and_repair(row).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn decode_and_repair(&self, row: SqliteRow) -> Result<AgentMetadataRow, DbError> {
@@ -366,18 +332,29 @@ impl SqliteAgentMetadataRepository {
         }
 
         for field in fields {
-            let sql = format!(
-                "UPDATE agent_metadata SET {} = NULL, updated_at = ? WHERE agent_id = ? AND user_id IS ?",
+            // Rebuildable cache data: clear it wherever it lives (catalog row
+            // and every user's delta row) — the next handshake repopulates.
+            let _ = user_id;
+            let catalog_sql = format!(
+                "UPDATE agent_metadata SET {} = NULL, updated_at = ? WHERE agent_id = ?",
                 field.column_name()
             );
-
-            if let Err(err) = sqlx::query(&sql)
+            let state_sql = format!(
+                "UPDATE agent_user_state SET {} = NULL, updated_at = ? WHERE agent_id = ?",
+                field.column_name()
+            );
+            let catalog = sqlx::query(&catalog_sql)
                 .bind(now_ms())
                 .bind(id)
-                .bind(user_id)
                 .execute(&self.pool)
-                .await
-            {
+                .await;
+            let state = sqlx::query(&state_sql)
+                .bind(now_ms())
+                .bind(id)
+                .execute(&self.pool)
+                .await;
+
+            if let Err(err) = catalog.and(state) {
                 warn!(
                     table = "agent_metadata",
                     row_id = %id,
@@ -400,18 +377,9 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
 
     async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
         let sql = format!(
-            "SELECT {AGENT_METADATA_SAFE_COLUMNS}
-             FROM agent_metadata am
-             WHERE am.user_id = ?
-             UNION ALL
-             SELECT {AGENT_METADATA_SAFE_COLUMNS}
-             FROM agent_metadata am
-             WHERE am.user_id IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM agent_metadata u
-                   WHERE u.user_id = ? AND u.agent_id = am.agent_id
-               )
-             ORDER BY sort_order ASC, name ASC"
+            "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_MERGED_FROM}
+             WHERE am.user_id IS NULL OR am.user_id = ?
+             ORDER BY am.sort_order ASC, am.name ASC"
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)
@@ -430,14 +398,12 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     }
 
     async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
-        self.fetch_optional_safe_two_binds(
+        self.fetch_optional_safe_three_binds(
             &format!(
-                "SELECT {AGENT_METADATA_SAFE_COLUMNS}
-                 FROM agent_metadata
-                 WHERE agent_id = ? AND (user_id = ? OR user_id IS NULL)
-                 ORDER BY user_id IS NULL ASC
-                 LIMIT 1"
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_MERGED_FROM}
+                 WHERE am.agent_id = ? AND (am.user_id IS NULL OR am.user_id = ?)"
             ),
+            user_id,
             id,
             user_id,
         )
@@ -459,14 +425,14 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         agent_source: &str,
         name: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        self.fetch_optional_safe_three_binds(
+        self.fetch_optional_safe_four_binds(
             &format!(
-                "SELECT {AGENT_METADATA_SAFE_COLUMNS}
-                 FROM agent_metadata
-                 WHERE agent_source = ? AND name = ? AND (user_id = ? OR user_id IS NULL)
-                 ORDER BY user_id IS NULL ASC, sort_order ASC, name ASC
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_MERGED_FROM}
+                 WHERE am.agent_source = ? AND am.name = ? AND (am.user_id IS NULL OR am.user_id = ?)
+                 ORDER BY am.sort_order ASC, am.name ASC
                  LIMIT 1"
             ),
+            user_id,
             agent_source,
             name,
             user_id,
@@ -483,16 +449,16 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         user_id: &str,
         backend: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        self.fetch_optional_safe_two_binds(
+        self.fetch_optional_safe_three_binds(
             &format!(
-                "SELECT {AGENT_METADATA_SAFE_COLUMNS}
-                 FROM agent_metadata
-                 WHERE agent_source = 'builtin'
-                   AND backend = ?
-                   AND (user_id = ? OR user_id IS NULL)
-                 ORDER BY user_id IS NULL ASC, sort_order ASC, name ASC
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} {AGENT_METADATA_MERGED_FROM}
+                 WHERE am.agent_source = 'builtin'
+                   AND am.backend = ?
+                   AND (am.user_id IS NULL OR am.user_id = ?)
+                 ORDER BY am.sort_order ASC, am.name ASC
                  LIMIT 1"
             ),
+            user_id,
             backend,
             user_id,
         )
@@ -524,19 +490,9 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         id: &str,
         params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        if self.user_row_exists(DEFAULT_USER_ID, id).await? {
-            return self.apply_handshake_for_user(DEFAULT_USER_ID, id, params).await;
-        }
-
-        let Some(existing) = self
-            .fetch_optional_safe(
-                &format!(
-                    "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE user_id IS NULL AND agent_id = ?"
-                ),
-                id,
-            )
-            .await?
-        else {
+        // Machine-level handshake (no acting user): update the single catalog
+        // row in place. Never creates rows.
+        let Some(existing) = self.get_for_user(DEFAULT_USER_ID, id).await? else {
             return Ok(None);
         };
 
@@ -569,7 +525,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
                 available_models = ?, \
                 available_commands = ?, \
                 updated_at = ? \
-             WHERE user_id IS NULL AND agent_id = ?",
+             WHERE agent_id = ?",
         )
         .bind(&agent_capabilities)
         .bind(&auth_methods)
@@ -582,11 +538,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .execute(&self.pool)
         .await?;
 
-        self.fetch_optional_safe(
-            &format!("SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE user_id IS NULL AND agent_id = ?"),
-            id,
-        )
-        .await
+        self.get_for_user(DEFAULT_USER_ID, id).await
     }
 
     async fn apply_handshake_for_user(
@@ -595,10 +547,6 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         id: &str,
         params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        if !self.ensure_user_row_for_write(user_id, id).await? {
-            return Ok(None);
-        }
-
         let Some(existing) = self.get_for_user(user_id, id).await? else {
             return Ok(None);
         };
@@ -624,16 +572,20 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
             .map_or(existing.available_commands, |v| v.map(String::from));
 
         sqlx::query(
-            "UPDATE agent_metadata SET \
-                agent_capabilities = ?, \
-                auth_methods = ?, \
-                config_options = ?, \
-                available_modes = ?, \
-                available_models = ?, \
-                available_commands = ?, \
-                updated_at = ? \
-             WHERE user_id = ? AND agent_id = ?",
+            "INSERT INTO agent_user_state (user_id, agent_id, agent_capabilities, auth_methods, config_options, \
+                 available_modes, available_models, available_commands, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, agent_id) DO UPDATE SET \
+                agent_capabilities = excluded.agent_capabilities, \
+                auth_methods = excluded.auth_methods, \
+                config_options = excluded.config_options, \
+                available_modes = excluded.available_modes, \
+                available_models = excluded.available_models, \
+                available_commands = excluded.available_commands, \
+                updated_at = excluded.updated_at",
         )
+        .bind(user_id)
+        .bind(id)
         .bind(&agent_capabilities)
         .bind(&auth_methods)
         .bind(&config_options)
@@ -641,8 +593,7 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .bind(&available_models)
         .bind(&available_commands)
         .bind(now)
-        .bind(user_id)
-        .bind(id)
+        .bind(now)
         .execute(&self.pool)
         .await?;
 
@@ -654,20 +605,8 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         id: &str,
         params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
-        self.update_availability_snapshot_for_user(DEFAULT_USER_ID, id, params)
-            .await
-    }
-
-    async fn update_availability_snapshot_for_user(
-        &self,
-        user_id: &str,
-        id: &str,
-        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
-    ) -> Result<Option<AgentMetadataRow>, DbError> {
-        if !self.ensure_user_row_for_write(user_id, id).await? {
-            return Ok(None);
-        }
-
+        // Machine-level probe result (startup `--version` / PATH checks):
+        // update the single catalog row in place. Never creates rows.
         let now = now_ms();
         let result = sqlx::query(
             "UPDATE agent_metadata SET \
@@ -678,10 +617,10 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
                 last_check_guidance = ?, \
                 last_check_latency_ms = ?, \
                 last_check_at = ?, \
-                last_success_at = ?, \
-                last_failure_at = ?, \
+                last_success_at = COALESCE(?, last_success_at), \
+                last_failure_at = COALESCE(?, last_failure_at), \
                 updated_at = ? \
-             WHERE user_id = ? AND agent_id = ?",
+             WHERE agent_id = ?",
         )
         .bind(params.last_check_status)
         .bind(params.last_check_kind)
@@ -693,7 +632,6 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .bind(params.last_success_at)
         .bind(params.last_failure_at)
         .bind(now)
-        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -701,6 +639,54 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         if result.rows_affected() == 0 {
             return Ok(None);
         }
+        self.get_for_user(DEFAULT_USER_ID, id).await
+    }
+
+    async fn update_availability_snapshot_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        // User-level availability (session outcomes, manual checks with the
+        // user's own auth): upsert the user's delta row.
+        if self.get_for_user(user_id, id).await?.is_none() {
+            return Ok(None);
+        }
+
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO agent_user_state (user_id, agent_id, last_check_status, last_check_kind, \
+                 last_check_error_code, last_check_error_message, last_check_guidance, \
+                 last_check_latency_ms, last_check_at, last_success_at, last_failure_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, agent_id) DO UPDATE SET \
+                last_check_status = excluded.last_check_status, \
+                last_check_kind = excluded.last_check_kind, \
+                last_check_error_code = excluded.last_check_error_code, \
+                last_check_error_message = excluded.last_check_error_message, \
+                last_check_guidance = excluded.last_check_guidance, \
+                last_check_latency_ms = excluded.last_check_latency_ms, \
+                last_check_at = excluded.last_check_at, \
+                last_success_at = COALESCE(excluded.last_success_at, agent_user_state.last_success_at), \
+                last_failure_at = COALESCE(excluded.last_failure_at, agent_user_state.last_failure_at), \
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(params.last_check_status)
+        .bind(params.last_check_kind)
+        .bind(params.last_check_error_code)
+        .bind(params.last_check_error_message)
+        .bind(params.last_check_guidance)
+        .bind(params.last_check_latency_ms)
+        .bind(params.last_check_at)
+        .bind(params.last_success_at)
+        .bind(params.last_failure_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
 
         self.get_for_user(user_id, id).await
     }
@@ -722,19 +708,24 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         command_override: Option<&str>,
         env_override: Option<&str>,
     ) -> Result<(), DbError> {
-        if !self.ensure_user_row_for_write(user_id, id).await? {
+        if self.get_for_user(user_id, id).await?.is_none() {
             return Ok(());
         }
-
+        let now = now_ms();
         sqlx::query(
-            "UPDATE agent_metadata SET command_override = ?, env_override = ?, \
-             updated_at = ? WHERE user_id = ? AND agent_id = ?",
+            "INSERT INTO agent_user_state (user_id, agent_id, command_override, env_override, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, agent_id) DO UPDATE SET \
+                command_override = excluded.command_override, \
+                env_override = excluded.env_override, \
+                updated_at = excluded.updated_at",
         )
-        .bind(command_override)
-        .bind(env_override)
-        .bind(aionui_common::now_ms())
         .bind(user_id)
         .bind(id)
+        .bind(command_override)
+        .bind(env_override)
+        .bind(now)
+        .bind(now)
         .execute(&self.pool)
         .await
         .map_err(DbError::Query)?;
@@ -746,19 +737,24 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     }
 
     async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
-        if !self.ensure_user_row_for_write(user_id, id).await? {
+        if self.get_for_user(user_id, id).await?.is_none() {
             return Ok(false);
         }
-
         let now = now_ms();
-        let result =
-            sqlx::query("UPDATE agent_metadata SET enabled = ?, updated_at = ? WHERE user_id = ? AND agent_id = ?")
-                .bind(enabled)
-                .bind(now)
-                .bind(user_id)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "INSERT INTO agent_user_state (user_id, agent_id, enabled, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, agent_id) DO UPDATE SET \
+                enabled = excluded.enabled, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(enabled)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -767,12 +763,21 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     }
 
     async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query("DELETE FROM agent_metadata WHERE user_id = ? AND agent_id = ?")
+        // Only the owner may delete a catalog row (builtin rows have no owner
+        // and are never deletable through this path).
+        let result = sqlx::query("DELETE FROM agent_metadata WHERE agent_id = ? AND user_id = ?")
+            .bind(id)
             .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM agent_user_state WHERE agent_id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(true)
     }
 }
 
@@ -784,11 +789,10 @@ impl SqliteAgentMetadataRepository {
     ) -> Result<AgentMetadataRow, DbError> {
         let now = now_ms();
 
-        let conflict_target = if user_id.is_some() {
-            "ON CONFLICT(user_id, agent_id) WHERE user_id IS NOT NULL DO UPDATE SET"
-        } else {
-            "ON CONFLICT(agent_id) WHERE user_id IS NULL DO UPDATE SET"
-        };
+        // Single-row catalog: one row per agent_id, whoever owns it. The
+        // ownership guard on the conflict clause stops a different owner from
+        // hijacking an existing agent_id (`IS` treats two NULLs as equal).
+        let conflict_target = "ON CONFLICT(agent_id) DO UPDATE SET";
 
         let sql = format!(
             "INSERT INTO agent_metadata \
@@ -824,7 +828,8 @@ impl SqliteAgentMetadataRepository {
                 available_models = excluded.available_models, \
                 available_commands = excluded.available_commands, \
                 sort_order = excluded.sort_order, \
-                updated_at = excluded.updated_at"
+                updated_at = excluded.updated_at \
+             WHERE agent_metadata.user_id IS excluded.user_id"
         );
 
         sqlx::query(&sql)
@@ -858,19 +863,11 @@ impl SqliteAgentMetadataRepository {
             .execute(&self.pool)
             .await?;
 
-        let row = match user_id {
-            Some(user_id) => self.get_for_user(user_id, params.id).await?,
-            None => {
-                self.fetch_optional_safe(
-                    &format!(
-                        "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE user_id IS NULL AND agent_id = ?"
-                    ),
-                    params.id,
-                )
-                .await?
-            }
-        }
-        .ok_or_else(|| DbError::Init(format!("upsert did not produce row for id '{}'", params.id)))?;
+        let viewer = user_id.unwrap_or(DEFAULT_USER_ID);
+        let row = self
+            .get_for_user(viewer, params.id)
+            .await?
+            .ok_or_else(|| DbError::Init(format!("upsert did not produce row for id '{}'", params.id)))?;
         Ok(row)
     }
 }
@@ -1379,39 +1376,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_rows_with_same_id_are_isolated_by_user() {
+    async fn custom_agent_id_cannot_be_hijacked_by_another_user() {
         let (repo, _db) = setup().await;
 
         repo.upsert_for_user(USER_A, &custom_params("custom-shared", "User A Custom"))
             .await
             .unwrap();
-        repo.upsert_for_user(USER_B, &custom_params("custom-shared", "User B Custom"))
+
+        // agent_id is globally unique: another user upserting the same id must
+        // neither take over nor shadow it — the attempt fails outright.
+        let err = repo
+            .upsert_for_user(USER_B, &custom_params("custom-shared", "User B Custom"))
+            .await;
+        assert!(err.is_err(), "cross-user agent_id hijack must be rejected");
+
+        // Owner's row is untouched; the other user cannot see it at all.
+        let user_a = repo.get_for_user(USER_A, "custom-shared").await.unwrap().unwrap();
+        assert_eq!(user_a.name, "User A Custom");
+        assert!(repo.get_for_user(USER_B, "custom-shared").await.unwrap().is_none());
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = 'custom-shared'")
+            .fetch_one(_db.pool())
             .await
             .unwrap();
-
-        let user_a = repo.get_for_user(USER_A, "custom-shared").await.unwrap().unwrap();
-        let user_b = repo.get_for_user(USER_B, "custom-shared").await.unwrap().unwrap();
-        assert_eq!(user_a.name, "User A Custom");
-        assert_eq!(user_b.name, "User B Custom");
-
-        let user_a_names: Vec<String> = repo
-            .list_all_for_user(USER_A)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.id == "custom-shared")
-            .map(|row| row.name)
-            .collect();
-        let user_b_names: Vec<String> = repo
-            .list_all_for_user(USER_B)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.id == "custom-shared")
-            .map(|row| row.name)
-            .collect();
-        assert_eq!(user_a_names, vec!["User A Custom"]);
-        assert_eq!(user_b_names, vec!["User B Custom"]);
+        assert_eq!(count, 1, "the catalog holds exactly one row per agent_id");
     }
 
     #[tokio::test]
@@ -1452,23 +1440,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_on_write_user_row_gets_own_surrogate_key_and_shares_agent_id() {
+    async fn user_toggle_writes_delta_row_and_never_copies_the_catalog_row() {
         let (repo, db) = setup().await;
 
         assert!(repo.set_enabled_for_user(USER_B, "2d23ff1c", false).await.unwrap());
 
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, agent_id, user_id FROM agent_metadata WHERE agent_id = '2d23ff1c' ORDER BY user_id IS NULL",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 2, "global template + one user copy");
-        let (user_row_id, user_agent_id, user_owner) = &rows[0];
-        let (global_row_id, global_agent_id, global_owner) = &rows[1];
-        assert_eq!(user_owner.as_deref(), Some(USER_B));
-        assert!(global_owner.is_none());
-        assert_eq!(user_agent_id, global_agent_id, "logical agent identity is shared");
-        assert_ne!(user_row_id, global_row_id, "surrogate row keys must differ");
+        // The catalog still holds exactly one row for the agent…
+        let catalog_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = '2d23ff1c'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(catalog_rows, 1, "user actions must never copy catalog rows");
+
+        // …and the user's change landed as a delta row.
+        let delta_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT enabled FROM agent_user_state WHERE user_id = ? AND agent_id = '2d23ff1c'")
+                .bind(USER_B)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(delta_enabled, Some(false));
+
+        // Merged read reflects the delta for USER_B, catalog default for others.
+        assert!(!repo.get_for_user(USER_B, "2d23ff1c").await.unwrap().unwrap().enabled);
+        assert!(repo.get_for_user(USER_A, "2d23ff1c").await.unwrap().unwrap().enabled);
     }
 }

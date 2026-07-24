@@ -172,9 +172,18 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
-        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        if identity_mode.is_local() {
+            aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        } else {
+            // AionPro: never ingest the legacy shared skill directory — its
+            // files carry no account attribution and would only create rows
+            // for the never-logged-in local default user.
+            aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        }
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is

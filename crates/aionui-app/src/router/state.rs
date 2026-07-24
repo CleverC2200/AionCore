@@ -216,11 +216,19 @@ pub async fn build_module_states(
     );
 
     let assistant = build_assistant_state(services);
-    assistant
-        .service
-        .bootstrap_assistant_storage()
-        .await
-        .map_err(assistant_bootstrap_build_error)?;
+    if services.identity_mode.is_local() {
+        assistant
+            .service
+            .bootstrap_assistant_storage()
+            .await
+            .map_err(assistant_bootstrap_build_error)?;
+    } else {
+        assistant
+            .service
+            .bootstrap_assistant_storage_external()
+            .await
+            .map_err(assistant_bootstrap_build_error)?;
+    }
     let cron = build_cron_state(services);
     // Cron builds its own ConversationService (not a clone of the shared one),
     // so wire the assistant rule dispatcher here — otherwise scheduled runs
@@ -240,7 +248,17 @@ pub async fn build_module_states(
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = assistant.service.clone();
     skill_state.assistant_dispatcher = Some(dispatcher);
 
-    let (channel_state, channel_components) = build_channel_state(services, ext_state.registry.clone()).await;
+    let generated_assistant_materializer: Arc<
+        dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer,
+    > = Arc::new(GeneratedAssistantMaterializerAdapter {
+        assistant: assistant.service.clone(),
+    });
+    let (channel_state, channel_components) = build_channel_state(
+        services,
+        ext_state.registry.clone(),
+        Some(generated_assistant_materializer),
+    )
+    .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
     let backend_binary_path = Arc::new(
@@ -495,24 +513,46 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     }
 }
 
+/// Adapter exposing the assistant service's lazy generated-assistant
+/// materialization to the channel settings service (avoids a channel→assistant
+/// crate dependency; the binding happens here in the composition layer).
+struct GeneratedAssistantMaterializerAdapter {
+    assistant: Arc<aionui_assistant::AssistantService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer for GeneratedAssistantMaterializerAdapter {
+    async fn ensure_generated_assistants(&self, user_id: &str) {
+        // list_for_user runs the per-user generated reconcile as a side effect.
+        if let Err(error) = self.assistant.list_for_user(user_id).await {
+            tracing::warn!(user_id, error = %error, "channel default: generated assistant materialization failed");
+        }
+    }
+}
+
 fn build_channel_settings_service(
     services: &AppServices,
+    generated_assistant_materializer: Option<
+        Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
+    >,
 ) -> Arc<aionui_channel::channel_settings::ChannelSettingsService> {
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
 
-    Arc::new(
-        aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
-            .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+    let mut service = aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+        .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
+            services.database.pool().clone(),
+        )))
+        .with_assistant_repos(
+            Arc::new(SqliteAssistantDefinitionRepository::new(
                 services.database.pool().clone(),
-            )))
-            .with_assistant_repos(
-                Arc::new(SqliteAssistantDefinitionRepository::new(
-                    services.database.pool().clone(),
-                )),
-                Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
-            ),
-    )
+            )),
+            Arc::new(SqliteAssistantOverlayRepository::new(services.database.pool().clone())),
+        );
+    if let Some(materializer) = generated_assistant_materializer {
+        service = service.with_generated_assistant_materializer(materializer);
+    }
+    Arc::new(service)
 }
 
 async fn build_channel_message_service(
@@ -546,6 +586,9 @@ async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String>
 pub async fn build_channel_state(
     services: &AppServices,
     extension_registry: ExtensionRegistry,
+    generated_assistant_materializer: Option<
+        Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
+    >,
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
@@ -573,7 +616,7 @@ pub async fn build_channel_state(
         Arc::new(Box::new(aionui_channel::plugins::create_plugin));
 
     // Build channel settings service for per-plugin agent/model configuration.
-    let channel_settings = build_channel_settings_service(services);
+    let channel_settings = build_channel_settings_service(services, generated_assistant_materializer);
     let startup_owner_user_id = startup_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
@@ -1145,7 +1188,7 @@ mod tests {
             .await
             .unwrap();
 
-        let settings = build_channel_settings_service(&services);
+        let settings = build_channel_settings_service(&services, None);
         let message_service = build_channel_message_service(&services, settings).await;
         let session = AssistantSessionRow {
             id: "session-channel-state".to_owned(),

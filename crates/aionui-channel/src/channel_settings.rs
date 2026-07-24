@@ -26,6 +26,18 @@ pub struct ChannelSettingsService {
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
     assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
     assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
+    generated_assistant_materializer: Option<Arc<dyn ChannelGeneratedAssistantMaterializer>>,
+}
+
+/// Port for materializing a user's generated assistants before the channel
+/// default falls back to them. Generated definitions are created lazily per
+/// user by the assistant service; without this hook a channel-settings read
+/// that happens before the user's first assistant listing would miss them.
+/// Implemented over the assistant service in the composition layer.
+#[async_trait::async_trait]
+pub trait ChannelGeneratedAssistantMaterializer: Send + Sync {
+    /// Best-effort: failures must not break channel settings reads.
+    async fn ensure_generated_assistants(&self, user_id: &str);
 }
 
 /// Resolved agent configuration for a channel platform.
@@ -53,7 +65,16 @@ impl ChannelSettingsService {
             agent_metadata_repo: None,
             assistant_definition_repo: None,
             assistant_overlay_repo: None,
+            generated_assistant_materializer: None,
         }
+    }
+
+    pub fn with_generated_assistant_materializer(
+        mut self,
+        materializer: Arc<dyn ChannelGeneratedAssistantMaterializer>,
+    ) -> Self {
+        self.generated_assistant_materializer = Some(materializer);
+        self
     }
 
     pub fn with_agent_metadata_repo(mut self, agent_metadata_repo: Arc<dyn IAgentMetadataRepository>) -> Self {
@@ -387,6 +408,12 @@ impl ChannelSettingsService {
         else {
             return Ok(None);
         };
+
+        // Generated assistants materialize lazily per user; make sure this
+        // user's exist before we look for the bare fallback.
+        if let Some(materializer) = &self.generated_assistant_materializer {
+            materializer.ensure_generated_assistants(user_id).await;
+        }
 
         let definitions = definition_repo.list_for_user(user_id).await?;
         let overlays = overlay_repo.list_for_user(user_id).await?;
