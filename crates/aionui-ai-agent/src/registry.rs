@@ -1565,9 +1565,7 @@ fn probe_command_candidate(command: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::{
-        IAgentMetadataRepository, SqliteAgentMetadataRepository, UpsertAgentMetadataParams, init_database_memory,
-    };
+    use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_memory};
 
     async fn registry() -> Arc<AgentRegistry> {
         let db = init_database_memory().await.unwrap();
