@@ -345,7 +345,7 @@ impl PairingService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow};
+    use aionui_db::models::{ChannelConnectionRow, ChannelConversationBindingRow};
     use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::sync::Mutex;
 
@@ -567,20 +567,29 @@ mod tests {
 
         // -- Session CRUD (unused stubs) --
 
-        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_session(&self, _owner_user_id: &str, _id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+        ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
             Ok(None)
         }
         async fn get_or_create_session(
             &self,
-            _owner_user_id: &str,
+            owner_user_id: &str,
             _user_id: &str,
             _chat_id: &str,
-            new_row: &AssistantSessionRow,
-        ) -> Result<AssistantSessionRow, DbError> {
-            Ok(new_row.clone())
+            new_row: &ChannelConversationBindingRow,
+        ) -> Result<ChannelConversationBindingRow, DbError> {
+            // Mirror the real INSERT: identity comes from the channel user.
+            Ok(ChannelConversationBindingRow {
+                owner_user_id: owner_user_id.to_owned(),
+                connection_id: STUB_CONNECTION_ID.to_owned(),
+                ..new_row.clone()
+            })
         }
         async fn update_session_activity(
             &self,
@@ -595,14 +604,6 @@ mod tests {
             _owner_user_id: &str,
             _id: &str,
             _conversation_id: &str,
-        ) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn update_session_agent_type(
-            &self,
-            _owner_user_id: &str,
-            _id: &str,
-            _agent_type: &str,
         ) -> Result<(), DbError> {
             Ok(())
         }
@@ -712,6 +713,8 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────────────
     const OWNER_ID: &str = "owner-test";
+    /// Connection the stub binding CRUD derives its `connection_id` from.
+    const STUB_CONNECTION_ID: &str = "conn-test";
     /// Fixed key so tests can recompute the hash the service stored.
     const TEST_KEY: [u8; 32] = [0x42u8; 32];
 

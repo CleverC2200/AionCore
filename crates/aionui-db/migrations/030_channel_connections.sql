@@ -230,3 +230,109 @@ CREATE INDEX idx_channel_pairing_owner_status_expiry
 -- Shared foundation for composite cross-account FKs (07-16 §5.4).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_user_id_id
     ON conversations(user_id, id);
+
+-- ---------------------------------------------------------------------------
+-- Segment 3: assistant_sessions → channel_conversation_bindings (A3).
+--
+--   * The binding attaches to its connection and channel user directly
+--     (owner_user_id + connection_id + channel_user_id columns, composite FK
+--     into channel_users), instead of deriving the owner through a join.
+--   * `agent_type` and `workspace` are dropped: agent configuration is owned
+--     by channel settings + the conversation snapshot, and the workspace
+--     column never had a production reader.
+--   * `chat_id` becomes `external_chat_id` (nullable is preserved: legacy
+--     rows without a chat id keep their history; new sessions always carry
+--     one). `last_activity` becomes `last_active_at`.
+--   * Uniqueness: one binding per (owner, connection, channel user, external
+--     chat) — "same user, different chat, different context" stays.
+--   * Cross-account guard against conversations: enforced by triggers rather
+--     than a composite FK — a composite FK's ON DELETE SET NULL would null
+--     owner_user_id together with conversation_id, and NO ACTION would block
+--     conversation deletion. The single-column conversation FK keeps its
+--     ON DELETE SET NULL semantics; the triggers make a cross-account
+--     binding unrepresentable (07-16 §5.4 intent).
+-- ---------------------------------------------------------------------------
+
+-- Composite FK target for (owner, connection, channel user).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_users_owner_connection_id
+    ON channel_users(owner_user_id, connection_id, id);
+
+CREATE TABLE channel_conversation_bindings (
+    id               TEXT    PRIMARY KEY NOT NULL,
+    owner_user_id    TEXT    NOT NULL REFERENCES users(id),
+    connection_id    TEXT    NOT NULL,
+    channel_user_id  TEXT    NOT NULL,
+    external_chat_id TEXT,
+    conversation_id  TEXT    REFERENCES conversations(id) ON DELETE SET NULL,
+    created_at       INTEGER NOT NULL,
+    last_active_at   INTEGER NOT NULL,
+    FOREIGN KEY (owner_user_id, connection_id, channel_user_id)
+        REFERENCES channel_users(owner_user_id, connection_id, id) ON DELETE CASCADE,
+    UNIQUE (owner_user_id, connection_id, channel_user_id, external_chat_id)
+);
+
+INSERT INTO channel_conversation_bindings (
+    id, owner_user_id, connection_id, channel_user_id, external_chat_id,
+    conversation_id, created_at, last_active_at
+)
+SELECT
+    s.id, u.owner_user_id, u.connection_id, s.user_id, s.chat_id,
+    s.conversation_id, s.created_at, s.last_activity
+FROM assistant_sessions s
+JOIN channel_users u ON u.id = s.user_id;
+
+CREATE TEMPORARY TABLE channel_refactor_checks_3 (
+    ok INTEGER NOT NULL CHECK (ok = 1)
+);
+
+-- Row conservation: every session became exactly one binding.
+INSERT INTO channel_refactor_checks_3 (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM channel_conversation_bindings) = (SELECT COUNT(*) FROM assistant_sessions)
+    THEN 1
+    ELSE 0
+END;
+
+-- No binding may reference a conversation owned by another Core user.
+INSERT INTO channel_refactor_checks_3 (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1 FROM channel_conversation_bindings b
+        JOIN conversations c ON c.id = b.conversation_id
+        WHERE c.user_id != b.owner_user_id
+    )
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE assistant_sessions;
+DROP TABLE channel_refactor_checks_3;
+
+CREATE INDEX IF NOT EXISTS idx_channel_bindings_owner_last_active
+    ON channel_conversation_bindings(owner_user_id, last_active_at DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_bindings_conversation
+    ON channel_conversation_bindings(conversation_id);
+
+-- Cross-account guard (see segment header): binding a conversation owned by
+-- a different Core user is unrepresentable.
+CREATE TRIGGER trg_channel_binding_conversation_owner_insert
+BEFORE INSERT ON channel_conversation_bindings
+FOR EACH ROW
+WHEN NEW.conversation_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations c
+    WHERE c.id = NEW.conversation_id AND c.user_id = NEW.owner_user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'CROSS_ACCOUNT_REFERENCE: conversation belongs to another user');
+END;
+
+CREATE TRIGGER trg_channel_binding_conversation_owner_update
+BEFORE UPDATE OF conversation_id, owner_user_id ON channel_conversation_bindings
+FOR EACH ROW
+WHEN NEW.conversation_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations c
+    WHERE c.id = NEW.conversation_id AND c.user_id = NEW.owner_user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'CROSS_ACCOUNT_REFERENCE: conversation belongs to another user');
+END;

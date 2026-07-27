@@ -982,7 +982,7 @@ mod tests {
     use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
     use aionui_channel::types::PluginType;
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
-    use aionui_db::models::{AssistantSessionRow, UpsertAssistantDefinitionParams};
+    use aionui_db::models::{ChannelConversationBindingRow, UpsertAssistantDefinitionParams};
     use aionui_db::{
         IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository,
         SqliteAssistantDefinitionRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
@@ -1193,12 +1193,12 @@ mod tests {
 
         let settings = build_channel_settings_service(&services, None);
         let message_service = build_channel_message_service(&services, settings).await;
-        let session = AssistantSessionRow {
+        let session = ChannelConversationBindingRow {
             id: "session-channel-state".to_owned(),
+            owner_user_id: "system_default_user".to_owned(),
+            connection_id: "conn-weixin".to_owned(),
             user_id: "channel-user-state".to_owned(),
-            agent_type: "aionrs".to_owned(),
             conversation_id: None,
-            workspace: None,
             chat_id: Some("wx-chat-state".to_owned()),
             created_at: 1,
             last_activity: 1,
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
         assert_eq!(conversation.name, "Weixin Aionrs");
 
-        let second_session = AssistantSessionRow {
+        let second_session = ChannelConversationBindingRow {
             conversation_id: Some(first.conversation_id.clone()),
             ..session
         };

@@ -253,10 +253,17 @@ pub struct ChannelUserResponse {
 pub struct ChannelSessionResponse {
     pub id: String,
     pub user_id: String,
-    pub agent_type: String,
+    /// Deprecated — always `None` since the channel refactor moved agent
+    /// configuration out of the session onto channel settings + the
+    /// conversation snapshot. Kept (and omitted from the payload when
+    /// absent) so existing clients keep deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Deprecated — always `None`; the session workspace column never had a
+    /// production reader and was dropped with the same refactor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
@@ -696,7 +703,7 @@ mod tests {
         let resp = ChannelSessionResponse {
             id: "sess_1".into(),
             user_id: "usr_1".into(),
-            agent_type: "gemini".into(),
+            agent_type: Some("gemini".into()),
             conversation_id: Some("conv_abc".into()),
             workspace: Some("/workspace".into()),
             chat_id: Some("chat_123".into()),
@@ -719,7 +726,7 @@ mod tests {
         let resp = ChannelSessionResponse {
             id: "sess_2".into(),
             user_id: "usr_2".into(),
-            agent_type: "acp".into(),
+            agent_type: None,
             conversation_id: None,
             workspace: None,
             chat_id: None,
@@ -730,6 +737,26 @@ mod tests {
         assert!(json.get("conversation_id").is_none());
         assert!(json.get("workspace").is_none());
         assert!(json.get("chat_id").is_none());
+        // Deprecated fields drop out of the payload rather than serializing null.
+        assert!(json.get("agent_type").is_none());
+    }
+
+    /// A payload without the deprecated fields — what the server now emits —
+    /// must still deserialize for clients round-tripping the DTO.
+    #[test]
+    fn test_channel_session_response_deserializes_without_deprecated_fields() {
+        let resp: ChannelSessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "sess_3",
+            "user_id": "usr_3",
+            "chat_id": "chat_3",
+            "created_at": 1700000000000_i64,
+            "last_activity": 1700000000000_i64,
+        }))
+        .unwrap();
+        assert_eq!(resp.id, "sess_3");
+        assert_eq!(resp.chat_id.as_deref(), Some("chat_3"));
+        assert!(resp.agent_type.is_none());
+        assert!(resp.workspace.is_none());
     }
 
     // -- I. WebSocket event payloads ------------------------------------------
@@ -871,7 +898,7 @@ mod tests {
         let resp = ChannelSessionResponse {
             id: "s1".into(),
             user_id: "u1".into(),
-            agent_type: "acp".into(),
+            agent_type: None,
             conversation_id: Some("c1".into()),
             workspace: None,
             chat_id: Some("ch1".into()),

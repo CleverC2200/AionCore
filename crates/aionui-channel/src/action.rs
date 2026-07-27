@@ -102,16 +102,9 @@ impl ActionExecutor {
         }
 
         // 3. Text message → session resolution → AI dispatch
-        let agent_config = self.settings.get_agent_config(owner_user_id, msg.platform).await?;
         let session = self
             .session_mgr
-            .get_or_create_session(
-                owner_user_id,
-                &internal_user_id,
-                chat_id,
-                &agent_config.agent_type,
-                None,
-            )
+            .get_or_create_session(owner_user_id, &internal_user_id, chat_id)
             .await?;
 
         info!(
@@ -267,15 +260,12 @@ impl ActionExecutor {
                     .settings
                     .get_agent_config(owner_user_id, action.context.platform)
                     .await?;
-                let session = self
-                    .session_mgr
-                    .reset_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
-                    .await?;
+                let session = self.session_mgr.reset_session(owner_user_id, user_id, chat_id).await?;
 
                 Ok(ActionResponse {
                     text: Some(format!(
                         "New session created.\nAgent: {}\nSession: {}",
-                        session.agent_type,
+                        agent_config.agent_type,
                         &session.id[..8]
                     )),
                     parse_mode: None,
@@ -299,14 +289,14 @@ impl ActionExecutor {
                     .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .get_or_create_session(owner_user_id, user_id, chat_id)
                     .await?;
 
                 Ok(ActionResponse {
                     text: Some(format!(
                         "Session: {}\nAgent: {}\nCreated: {}\nLast active: {}",
                         &session.id[..8],
-                        session.agent_type,
+                        agent_config.agent_type,
                         session.created_at,
                         session.last_activity,
                     )),
@@ -542,7 +532,7 @@ mod tests {
     use aionui_api_types::WebSocketMessage;
     use aionui_common::{TimestampMs, now_ms};
     use aionui_db::models::{
-        AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow, ClientPreference,
+        ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow, ClientPreference,
     };
     use aionui_db::{DbError, IChannelRepository, IClientPreferenceRepository, UpdateConnectionStatusParams};
     use aionui_realtime::EventBroadcaster;
@@ -563,7 +553,7 @@ mod tests {
     struct MockRepo {
         connections: Mutex<Vec<ChannelConnectionRow>>,
         users: Mutex<Vec<ChannelUserRow>>,
-        sessions: Mutex<Vec<AssistantSessionRow>>,
+        sessions: Mutex<Vec<ChannelConversationBindingRow>>,
         pairings: Mutex<Vec<ChannelPairingRequestRow>>,
     }
 
@@ -742,20 +732,35 @@ mod tests {
             }
         }
 
-        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
             Ok(self.sessions.lock().unwrap().clone())
         }
-        async fn get_session(&self, _owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+        ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
             let sessions = self.sessions.lock().unwrap();
             Ok(sessions.iter().find(|s| s.id == id).cloned())
         }
         async fn get_or_create_session(
             &self,
-            _owner_user_id: &str,
+            owner_user_id: &str,
             user_id: &str,
             chat_id: &str,
-            new_row: &AssistantSessionRow,
-        ) -> Result<AssistantSessionRow, DbError> {
+            new_row: &ChannelConversationBindingRow,
+        ) -> Result<ChannelConversationBindingRow, DbError> {
+            // Mirror the SQL INSERT: owner/connection are derived from the
+            // ACTIVE channel user, so an unknown or revoked user gets nothing.
+            let connection_id = self
+                .users
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|u| u.id == user_id && u.owner_user_id == owner_user_id && u.status == "active")
+                .map(|u| u.connection_id.clone())
+                .ok_or_else(|| DbError::NotFound(format!("Channel user '{user_id}' not found")))?;
+
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(existing) = sessions
                 .iter_mut()
@@ -764,8 +769,13 @@ mod tests {
                 existing.last_activity = new_row.last_activity;
                 return Ok(existing.clone());
             }
-            sessions.push(new_row.clone());
-            Ok(new_row.clone())
+            let created = ChannelConversationBindingRow {
+                owner_user_id: owner_user_id.to_owned(),
+                connection_id,
+                ..new_row.clone()
+            };
+            sessions.push(created.clone());
+            Ok(created)
         }
         async fn update_session_activity(
             &self,
@@ -784,20 +794,6 @@ mod tests {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
                 s.conversation_id = Some(conversation_id.to_owned());
-                Ok(())
-            } else {
-                Err(DbError::NotFound(id.into()))
-            }
-        }
-        async fn update_session_agent_type(
-            &self,
-            _owner_user_id: &str,
-            id: &str,
-            agent_type: &str,
-        ) -> Result<(), DbError> {
-            let mut sessions = self.sessions.lock().unwrap();
-            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-                s.agent_type = agent_type.to_owned();
                 Ok(())
             } else {
                 Err(DbError::NotFound(id.into()))

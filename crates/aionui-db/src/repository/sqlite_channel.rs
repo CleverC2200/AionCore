@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
+use crate::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow};
 use crate::repository::channel::{IChannelRepository, UpdateConnectionStatusParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
@@ -285,8 +285,11 @@ impl IChannelRepository for SqliteChannelRepository {
             return Err(DbError::NotFound(format!("User '{id}' not found")));
         }
         // Soft delete keeps the audit row, so sessions no longer cascade —
-        // remove them explicitly to stop message routing for this user.
-        sqlx::query("DELETE FROM assistant_sessions WHERE user_id = ?")
+        // remove them explicitly to stop message routing for this user. The
+        // owner predicate is defense in depth: the UPDATE above already
+        // proved ownership within this transaction.
+        sqlx::query("DELETE FROM channel_conversation_bindings WHERE owner_user_id = ? AND channel_user_id = ?")
+            .bind(owner_user_id)
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -294,14 +297,13 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    // ── Session CRUD ─────────────────────────────────────────────────
+    // ── Conversation binding CRUD ────────────────────────────────────
 
-    async fn get_all_sessions(&self, owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
-        let rows = sqlx::query_as::<_, AssistantSessionRow>(
-            "SELECT s.* FROM assistant_sessions s \
-             JOIN channel_users u ON u.id = s.user_id \
-             WHERE u.owner_user_id = ? \
-             ORDER BY s.last_activity DESC",
+    async fn get_all_sessions(&self, owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
+        let rows = sqlx::query_as::<_, ChannelConversationBindingRow>(
+            "SELECT * FROM channel_conversation_bindings \
+             WHERE owner_user_id = ? \
+             ORDER BY last_active_at DESC",
         )
         .bind(owner_user_id)
         .fetch_all(&self.pool)
@@ -309,11 +311,13 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(rows)
     }
 
-    async fn get_session(&self, owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
-        let row = sqlx::query_as::<_, AssistantSessionRow>(
-            "SELECT s.* FROM assistant_sessions s \
-             JOIN channel_users u ON u.id = s.user_id \
-             WHERE u.owner_user_id = ? AND s.id = ?",
+    async fn get_session(
+        &self,
+        owner_user_id: &str,
+        id: &str,
+    ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelConversationBindingRow>(
+            "SELECT * FROM channel_conversation_bindings WHERE owner_user_id = ? AND id = ?",
         )
         .bind(owner_user_id)
         .bind(id)
@@ -327,13 +331,12 @@ impl IChannelRepository for SqliteChannelRepository {
         owner_user_id: &str,
         channel_user_id: &str,
         chat_id: &str,
-        new_row: &AssistantSessionRow,
-    ) -> Result<AssistantSessionRow, DbError> {
-        // Try to find an existing session first.
-        let existing = sqlx::query_as::<_, AssistantSessionRow>(
-            "SELECT s.* FROM assistant_sessions s \
-             JOIN channel_users u ON u.id = s.user_id \
-             WHERE u.owner_user_id = ? AND s.user_id = ? AND s.chat_id = ?",
+        new_row: &ChannelConversationBindingRow,
+    ) -> Result<ChannelConversationBindingRow, DbError> {
+        // Try to find an existing binding first.
+        let existing = sqlx::query_as::<_, ChannelConversationBindingRow>(
+            "SELECT * FROM channel_conversation_bindings \
+             WHERE owner_user_id = ? AND channel_user_id = ? AND external_chat_id = ?",
         )
         .bind(owner_user_id)
         .bind(channel_user_id)
@@ -342,50 +345,46 @@ impl IChannelRepository for SqliteChannelRepository {
         .await?;
 
         if let Some(row) = existing {
-            // Touch last_activity.
+            // Touch last_active_at.
             let now = aionui_common::now_ms();
-            sqlx::query("UPDATE assistant_sessions SET last_activity = ? WHERE id = ?")
+            sqlx::query("UPDATE channel_conversation_bindings SET last_active_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(&row.id)
                 .execute(&self.pool)
                 .await?;
 
-            return Ok(AssistantSessionRow {
+            return Ok(ChannelConversationBindingRow {
                 last_activity: now,
                 ..row
             });
         }
 
-        // Insert new session.
+        // Insert a new binding. The owner/connection columns derive from the
+        // ACTIVE channel user row, so a foreign or revoked channel user makes
+        // the INSERT match zero rows. A conversation owned by another Core
+        // user is rejected by the cross-account trigger; the INSERT-side
+        // EXISTS keeps that failure a clean zero-row no-op instead of an
+        // opaque trigger abort for the common caller path.
         sqlx::query(
-            "INSERT INTO assistant_sessions \
-                (id, user_id, agent_type, conversation_id, workspace, \
-                 chat_id, created_at, last_activity) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE EXISTS (
-                 SELECT 1 FROM channel_users
-                 WHERE owner_user_id = ? AND id = ?
-             )
-             AND (
-                 ? IS NULL OR EXISTS (
-                     SELECT 1 FROM conversations WHERE id = ? AND user_id = ?
-                 )
-             )",
+            "INSERT INTO channel_conversation_bindings \
+                (id, owner_user_id, connection_id, channel_user_id, external_chat_id, \
+                 conversation_id, created_at, last_active_at) \
+             SELECT ?, u.owner_user_id, u.connection_id, u.id, ?, ?, ?, ? \
+             FROM channel_users u \
+             WHERE u.owner_user_id = ? AND u.id = ? AND u.status = 'active' \
+               AND (
+                   ? IS NULL OR EXISTS (
+                       SELECT 1 FROM conversations WHERE id = ? AND user_id = ?
+                   )
+               )",
         )
         .bind(&new_row.id)
-        .bind(channel_user_id)
-        .bind(&new_row.agent_type)
-        .bind(&new_row.conversation_id)
-        .bind(&new_row.workspace)
         .bind(&new_row.chat_id)
+        .bind(&new_row.conversation_id)
         .bind(new_row.created_at)
         .bind(new_row.last_activity)
         .bind(owner_user_id)
         .bind(channel_user_id)
-        // Cross-account guard: a bound conversation must belong to the same
-        // Core owner. NULL conversation_id (the current caller contract) is
-        // allowed; a conversation owned by another user makes the INSERT match
-        // zero rows, so get_session below returns NotFound.
         .bind(&new_row.conversation_id)
         .bind(&new_row.conversation_id)
         .bind(owner_user_id)
@@ -404,15 +403,12 @@ impl IChannelRepository for SqliteChannelRepository {
         last_activity: aionui_common::TimestampMs,
     ) -> Result<(), DbError> {
         let result = sqlx::query(
-            "UPDATE assistant_sessions SET last_activity = ? \
-             WHERE id = ? AND EXISTS (
-                 SELECT 1 FROM channel_users u
-                 WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
-             )",
+            "UPDATE channel_conversation_bindings SET last_active_at = ? \
+             WHERE owner_user_id = ? AND id = ?",
         )
         .bind(last_activity)
-        .bind(id)
         .bind(owner_user_id)
+        .bind(id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
@@ -429,13 +425,9 @@ impl IChannelRepository for SqliteChannelRepository {
     ) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
-            "UPDATE assistant_sessions \
-             SET conversation_id = ?, last_activity = ? \
-             WHERE id = ? \
-               AND EXISTS (
-                   SELECT 1 FROM channel_users u
-                   WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
-               )
+            "UPDATE channel_conversation_bindings \
+             SET conversation_id = ?, last_active_at = ? \
+             WHERE owner_user_id = ? AND id = ? \
                AND EXISTS (
                    SELECT 1 FROM conversations c
                    WHERE c.id = ? AND c.user_id = ?
@@ -443,20 +435,19 @@ impl IChannelRepository for SqliteChannelRepository {
         )
         .bind(conversation_id)
         .bind(now)
-        .bind(id)
         .bind(owner_user_id)
+        .bind(id)
         .bind(conversation_id)
         .bind(owner_user_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
             let session_exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM assistant_sessions s \
-                 JOIN channel_users u ON u.id = s.user_id \
-                 WHERE s.id = ? AND u.owner_user_id = ?",
+                "SELECT COUNT(*) FROM channel_conversation_bindings \
+                 WHERE owner_user_id = ? AND id = ?",
             )
-            .bind(id)
             .bind(owner_user_id)
+            .bind(id)
             .fetch_one(&self.pool)
             .await?;
 
@@ -481,40 +472,12 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    async fn update_session_agent_type(&self, owner_user_id: &str, id: &str, agent_type: &str) -> Result<(), DbError> {
-        let now = aionui_common::now_ms();
-        let result = sqlx::query(
-            "UPDATE assistant_sessions \
-             SET agent_type = ?, last_activity = ? \
-             WHERE id = ? AND EXISTS (
-                 SELECT 1 FROM channel_users u
-                 WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
-             )",
-        )
-        .bind(agent_type)
-        .bind(now)
-        .bind(id)
-        .bind(owner_user_id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Session '{id}' not found")));
-        }
-        Ok(())
-    }
-
     async fn delete_sessions_by_user(&self, owner_user_id: &str, channel_user_id: &str) -> Result<(), DbError> {
-        sqlx::query(
-            "DELETE FROM assistant_sessions \
-             WHERE user_id = ? AND EXISTS (
-                 SELECT 1 FROM channel_users u
-                 WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
-             )",
-        )
-        .bind(channel_user_id)
-        .bind(owner_user_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM channel_conversation_bindings WHERE owner_user_id = ? AND channel_user_id = ?")
+            .bind(owner_user_id)
+            .bind(channel_user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -525,15 +488,12 @@ impl IChannelRepository for SqliteChannelRepository {
         chat_id: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "DELETE FROM assistant_sessions \
-             WHERE user_id = ? AND chat_id = ? AND EXISTS (
-                 SELECT 1 FROM channel_users u
-                 WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
-             )",
+            "DELETE FROM channel_conversation_bindings \
+             WHERE owner_user_id = ? AND channel_user_id = ? AND external_chat_id = ?",
         )
+        .bind(owner_user_id)
         .bind(channel_user_id)
         .bind(chat_id)
-        .bind(owner_user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -768,15 +728,18 @@ mod tests {
         repo.create_user(OWNER_A, &sample_user()).await.unwrap();
     }
 
-    fn sample_session(user_id: &str) -> AssistantSessionRow {
+    /// `owner_user_id`/`connection_id` are left empty on purpose: the INSERT
+    /// derives both from the active `channel_users` row, so a caller-supplied
+    /// value is never trusted.
+    fn sample_session(user_id: &str) -> ChannelConversationBindingRow {
         let now = aionui_common::now_ms();
-        AssistantSessionRow {
+        ChannelConversationBindingRow {
             id: "sess-1".into(),
+            owner_user_id: String::new(),
+            connection_id: String::new(),
             user_id: user_id.into(),
-            agent_type: "gemini".into(),
-            conversation_id: None,
-            workspace: None,
             chat_id: Some("chat-abc".into()),
+            conversation_id: None,
             created_at: now,
             last_activity: now,
         }
@@ -1215,11 +1178,12 @@ mod tests {
         // Soft delete keeps the user row, but message routing stops: the
         // sessions are removed outright, not merely hidden behind the join.
         assert!(repo.get_all_sessions(OWNER_A).await.unwrap().is_empty());
-        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_sessions WHERE user_id = ?")
-            .bind("usr-1")
-            .fetch_one(&repo.pool)
-            .await
-            .unwrap();
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channel_conversation_bindings WHERE channel_user_id = ?")
+                .bind("usr-1")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
         assert_eq!(session_count, 0);
     }
 
@@ -1258,7 +1222,7 @@ mod tests {
             .unwrap();
 
         // Second call with different new_row id should still return the first.
-        let another = AssistantSessionRow {
+        let another = ChannelConversationBindingRow {
             id: "sess-2".into(),
             ..new
         };
@@ -1281,7 +1245,7 @@ mod tests {
             .await
             .unwrap();
 
-        let s2 = AssistantSessionRow {
+        let s2 = ChannelConversationBindingRow {
             id: "sess-2".into(),
             chat_id: Some("chat-xyz".into()),
             ..sample_session("usr-1")
@@ -1304,7 +1268,12 @@ mod tests {
             .unwrap();
 
         let found = repo.get_session(OWNER_A, "sess-1").await.unwrap().unwrap();
-        assert_eq!(found.agent_type, "gemini");
+        assert_eq!(found.user_id, "usr-1");
+        assert_eq!(found.chat_id.as_deref(), Some("chat-abc"));
+        // Owner and connection are derived from the channel user, not taken
+        // from the caller-supplied row (which left both empty).
+        assert_eq!(found.owner_user_id, OWNER_A);
+        assert_eq!(found.connection_id, "tg-1");
     }
 
     #[tokio::test]
@@ -1347,7 +1316,7 @@ mod tests {
             .await
             .unwrap();
 
-        let s2 = AssistantSessionRow {
+        let s2 = ChannelConversationBindingRow {
             id: "sess-2".into(),
             chat_id: Some("chat-xyz".into()),
             ..sample_session("usr-1")
@@ -1444,35 +1413,51 @@ mod tests {
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
+    /// Replaces the pre-A3 `update_session_agent_type` coverage: agent
+    /// configuration is no longer a binding column, so what the binding must
+    /// now guarantee is that its owner/connection identity comes from the
+    /// channel user rather than from the caller.
     #[tokio::test]
-    async fn update_session_agent_type_persists() {
+    async fn get_or_create_session_derives_owner_and_connection_ignoring_caller_values() {
         let (repo, _db) = setup().await;
         seed_user(&repo).await;
 
-        let new = sample_session("usr-1");
-        repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
+        // A caller that lies about owner/connection must not be believed.
+        let new = ChannelConversationBindingRow {
+            owner_user_id: "attacker".into(),
+            connection_id: "forged-connection".into(),
+            ..sample_session("usr-1")
+        };
+        let created = repo
+            .get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
             .await
             .unwrap();
-
-        assert_eq!(
-            repo.get_session(OWNER_A, "sess-1").await.unwrap().unwrap().agent_type,
-            "gemini"
-        );
-
-        repo.update_session_agent_type(OWNER_A, "sess-1", "acp").await.unwrap();
+        assert_eq!(created.owner_user_id, OWNER_A);
+        assert_eq!(created.connection_id, "tg-1");
 
         let found = repo.get_session(OWNER_A, "sess-1").await.unwrap().unwrap();
-        assert_eq!(found.agent_type, "acp");
+        assert_eq!(found.owner_user_id, OWNER_A);
+        assert_eq!(found.connection_id, "tg-1");
     }
 
+    /// A revoked channel user is no longer routable: the derive-side INSERT
+    /// filters on `status = 'active'`, so no new binding can be created.
     #[tokio::test]
-    async fn update_session_agent_type_not_found() {
+    async fn get_or_create_session_rejects_revoked_channel_user() {
         let (repo, _db) = setup().await;
+        seed_user(&repo).await;
+
+        repo.revoke_user(OWNER_A, "usr-1").await.unwrap();
+
         let err = repo
-            .update_session_agent_type(OWNER_A, "nope", "acp")
+            .get_or_create_session(OWNER_A, "usr-1", "chat-abc", &sample_session("usr-1"))
             .await
             .unwrap_err();
-        assert!(matches!(err, DbError::NotFound(_)));
+        assert!(
+            matches!(err, DbError::NotFound(_)),
+            "revoked user must not get a binding, got: {err:?}"
+        );
+        assert!(repo.get_all_sessions(OWNER_A).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1485,7 +1470,7 @@ mod tests {
             .await
             .unwrap();
 
-        let s2 = AssistantSessionRow {
+        let s2 = ChannelConversationBindingRow {
             id: "sess-2".into(),
             chat_id: Some("chat-xyz".into()),
             ..sample_session("usr-1")

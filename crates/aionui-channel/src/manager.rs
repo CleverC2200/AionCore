@@ -763,7 +763,9 @@ mod tests {
         BotInfo, OutgoingMessageType, PluginCredentials, PluginStatus, PluginType, UnifiedOutgoingMessage,
     };
     use aionui_common::TimestampMs;
-    use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
+    use aionui_db::models::{
+        ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow,
+    };
     use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -795,6 +797,8 @@ mod tests {
 
     // ── Mock IChannelRepository ────────────────────────────────────────
     const OWNER_ID: &str = "owner-test";
+    /// Connection the stub binding CRUD derives its `connection_id` from.
+    const STUB_CONNECTION_ID: &str = "conn-test";
 
     struct MockRepo {
         plugins: Mutex<Vec<ChannelConnectionRow>>,
@@ -909,20 +913,29 @@ mod tests {
         }
 
         // -- Session CRUD (unused stubs) --
-        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_session(&self, _owner_user_id: &str, _id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+        ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
             Ok(None)
         }
         async fn get_or_create_session(
             &self,
-            _owner_user_id: &str,
+            owner_user_id: &str,
             _uid: &str,
             _cid: &str,
-            new_row: &AssistantSessionRow,
-        ) -> Result<AssistantSessionRow, DbError> {
-            Ok(new_row.clone())
+            new_row: &ChannelConversationBindingRow,
+        ) -> Result<ChannelConversationBindingRow, DbError> {
+            // Mirror the real INSERT: identity comes from the channel user.
+            Ok(ChannelConversationBindingRow {
+                owner_user_id: owner_user_id.to_owned(),
+                connection_id: STUB_CONNECTION_ID.to_owned(),
+                ..new_row.clone()
+            })
         }
         async fn update_session_activity(
             &self,
@@ -938,9 +951,6 @@ mod tests {
             _id: &str,
             _cid: &str,
         ) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn update_session_agent_type(&self, _owner_user_id: &str, _id: &str, _at: &str) -> Result<(), DbError> {
             Ok(())
         }
         async fn delete_sessions_by_user(&self, _owner_user_id: &str, _uid: &str) -> Result<(), DbError> {

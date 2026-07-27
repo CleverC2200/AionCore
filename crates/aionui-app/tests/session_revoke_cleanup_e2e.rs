@@ -6,7 +6,7 @@
 //! services — revokes an AionPro session over HTTP, and asserts observable
 //! cleanup actually happened:
 //!
-//!   - channel sessions: the user's `assistant_sessions` rows are deleted by
+//!   - channel sessions: the user's `channel_conversation_bindings` rows are deleted by
 //!     `ChannelSessionManager::clear_all_sessions` (async part of the hook,
 //!     polled with a timeout);
 //!   - session invalidation: the revoked cookie token stops working
@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelUserRow};
+use aionui_db::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 
 const BOOTSTRAP: &str = "bootstrap-secret";
@@ -98,7 +98,7 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
         .to_owned();
 
     // Seed observable channel state owned by that user: one channel user with
-    // one active channel session (assistant_sessions row).
+    // one active channel session (channel_conversation_bindings row).
     let channel_repo = SqliteChannelRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
     // Channel users hang off the connection that authorized them.
@@ -143,12 +143,13 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
             &user_id,
             "cu-revoke",
             "chat-revoke",
-            &AssistantSessionRow {
+            &ChannelConversationBindingRow {
                 id: "cs-revoke".into(),
+                // Derived by the repository from the active channel user.
+                owner_user_id: String::new(),
+                connection_id: String::new(),
                 user_id: "cu-revoke".into(),
-                agent_type: "gemini".into(),
                 conversation_id: None,
-                workspace: None,
                 chat_id: Some("chat-revoke".into()),
                 created_at: now,
                 last_activity: now,

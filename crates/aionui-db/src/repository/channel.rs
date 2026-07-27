@@ -1,12 +1,12 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
+use crate::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow};
 
 /// Data access abstraction for channel integration tables.
 ///
 /// Covers four tables: `channel_connections`, `channel_users`,
-/// `assistant_sessions`, and `channel_pairing_requests`.
+/// `channel_conversation_bindings`, and `channel_pairing_requests`.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
@@ -83,10 +83,14 @@ pub trait IChannelRepository: Send + Sync {
     // ── Session CRUD ─────────────────────────────────────────────────
 
     /// Returns all sessions for an owner.
-    async fn get_all_sessions(&self, owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError>;
+    async fn get_all_sessions(&self, owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError>;
 
     /// Returns a single session by id.
-    async fn get_session(&self, owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError>;
+    async fn get_session(
+        &self,
+        owner_user_id: &str,
+        id: &str,
+    ) -> Result<Option<ChannelConversationBindingRow>, DbError>;
 
     /// Finds an existing session by user + chat, or creates a new one.
     /// If found, updates `last_activity` and returns the existing row.
@@ -96,8 +100,8 @@ pub trait IChannelRepository: Send + Sync {
         owner_user_id: &str,
         channel_user_id: &str,
         chat_id: &str,
-        new_row: &AssistantSessionRow,
-    ) -> Result<AssistantSessionRow, DbError>;
+        new_row: &ChannelConversationBindingRow,
+    ) -> Result<ChannelConversationBindingRow, DbError>;
 
     /// Updates `last_activity` timestamp for a session.
     async fn update_session_activity(
@@ -114,9 +118,6 @@ pub trait IChannelRepository: Send + Sync {
         id: &str,
         conversation_id: &str,
     ) -> Result<(), DbError>;
-
-    /// Updates the `agent_type` of a session.
-    async fn update_session_agent_type(&self, owner_user_id: &str, id: &str, agent_type: &str) -> Result<(), DbError>;
 
     /// Deletes all sessions belonging to a user.
     async fn delete_sessions_by_user(&self, owner_user_id: &str, channel_user_id: &str) -> Result<(), DbError>;

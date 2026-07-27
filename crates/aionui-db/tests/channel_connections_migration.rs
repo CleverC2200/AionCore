@@ -1,8 +1,12 @@
-//! Migration 030: assistant_plugins → channel_connections (connection entity).
+//! Migration 030: assistant_plugins → channel_connections (connection entity)
+//! and assistant_sessions → channel_conversation_bindings.
 //!
 //! Verifies the segment-1 backfill: legacy platform-type ids become
 //! `plugin_key`, connection ids are freshly generated, config/state columns
-//! are preserved, and the phase-1 single-instance index holds.
+//! are preserved, and the phase-1 single-instance index holds. Segment 3 is
+//! covered below: bindings inherit owner/connection from their channel user,
+//! `chat_id` survives as `external_chat_id`, agent config columns are gone,
+//! and cross-account conversation bindings are unrepresentable.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -114,4 +118,154 @@ async fn migration_030_rebuilds_plugins_as_connections() {
     .await;
     let err = dup.unwrap_err().to_string();
     assert!(err.contains("UNIQUE"), "unexpected error: {err}");
+}
+
+/// Segment 3: `assistant_sessions` becomes `channel_conversation_bindings`.
+#[tokio::test]
+async fn migration_030_rebuilds_sessions_as_conversation_bindings() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 29).await;
+
+    for uid in ["system_default_user", "other_core_user"] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO users \
+                (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(uid)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) VALUES \
+            ('conv-own', 'system_default_user', 'c', 'gemini', '{}', 'pending', 1, 1), \
+            ('conv-other', 'other_core_user', 'c', 'gemini', '{}', 'pending', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Legacy pre-030 rows: plugin id IS the platform type, sessions carry
+    // agent_type/workspace and hang off the user by a bare FK.
+    sqlx::query(
+        "INSERT INTO assistant_plugins (
+            id, owner_user_id, type, name, enabled, config, status,
+            last_connected, created_at, updated_at
+         ) VALUES ('telegram', 'system_default_user', 'telegram', 'TG Bot', 1, 'enc-tg', NULL, NULL, 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_users (
+            id, owner_user_id, platform_user_id, platform_type, display_name,
+            authorized_at, last_active, session_id
+         ) VALUES ('usr-1', 'system_default_user', 'tg_1', 'telegram', 'Alice', 10, 11, NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_sessions (
+            id, user_id, agent_type, conversation_id, workspace, chat_id,
+            created_at, last_activity
+         ) VALUES ('sess-1', 'usr-1', 'gemini', 'conv-own', '/tmp/ws', 'chat-abc', 20, 21)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migration(&pool, 30).await;
+
+    // The legacy table is gone, replaced by the binding table.
+    let old_table: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(old_table, 0);
+
+    let connection_id: String = sqlx::query_scalar("SELECT id FROM channel_connections WHERE plugin_key = 'telegram'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT id, owner_user_id, connection_id, channel_user_id, external_chat_id, \
+                conversation_id, created_at, last_active_at \
+         FROM channel_conversation_bindings",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.len(), 1);
+    let binding = &row[0];
+    assert_eq!(binding.get::<String, _>("id"), "sess-1");
+    // Owner and connection are derived through the channel user, not stored
+    // on the legacy session row.
+    assert_eq!(binding.get::<String, _>("owner_user_id"), "system_default_user");
+    assert_eq!(binding.get::<String, _>("connection_id"), connection_id);
+    assert_eq!(binding.get::<String, _>("channel_user_id"), "usr-1");
+    // Renamed columns keep their legacy values.
+    assert_eq!(
+        binding.get::<Option<String>, _>("external_chat_id").as_deref(),
+        Some("chat-abc")
+    );
+    assert_eq!(
+        binding.get::<Option<String>, _>("conversation_id").as_deref(),
+        Some("conv-own")
+    );
+    assert_eq!(binding.get::<i64, _>("created_at"), 20);
+    assert_eq!(binding.get::<i64, _>("last_active_at"), 21);
+
+    // agent_type / workspace are gone from the schema, not merely unused.
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(channel_conversation_bindings)")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+    assert!(
+        !columns.iter().any(|c| c == "agent_type" || c == "workspace"),
+        "agent config columns must not survive the rebuild: {columns:?}"
+    );
+
+    // Cross-account guard: binding another Core user's conversation aborts.
+    let err = sqlx::query(
+        "INSERT INTO channel_conversation_bindings (
+            id, owner_user_id, connection_id, channel_user_id, external_chat_id,
+            conversation_id, created_at, last_active_at
+         ) VALUES ('sess-x', 'system_default_user', ?, 'usr-1', 'chat-x', 'conv-other', 30, 30)",
+    )
+    .bind(&connection_id)
+    .execute(&pool)
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("CROSS_ACCOUNT_REFERENCE"),
+        "expected cross-account trigger abort, got: {err}"
+    );
+
+    // Same guard on UPDATE.
+    let update_err =
+        sqlx::query("UPDATE channel_conversation_bindings SET conversation_id = 'conv-other' WHERE id = 'sess-1'")
+            .execute(&pool)
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        update_err.contains("CROSS_ACCOUNT_REFERENCE"),
+        "expected cross-account trigger abort on update, got: {update_err}"
+    );
 }

@@ -44,14 +44,14 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
 /// Without this, "has a `user_id` column" would classify the table as an
 /// ownership root by accident and the gate would pass without a conscious
 /// decision. Each entry: (table, the non-Core table its `user_id` points at).
-const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
-    // assistant_sessions.user_id -> channel_users.id (a channel/platform
-    // user). Core ownership flows through channel_users.owner_user_id, which
-    // adoption re-owns; adoption's UPDATE on this `user_id` never matches
-    // 'system_default_user' (it holds channel_users UUIDs), so it is a
-    // harmless no-op.
-    ("assistant_sessions", "channel_users"),
-];
+///
+/// Currently empty: the only entry was `assistant_sessions`, whose misleading
+/// `user_id` the channel refactor renamed to `channel_user_id` on
+/// `channel_conversation_bindings`. That table now carries its own
+/// `owner_user_id` and classifies as a plain ownership root. The mechanism is
+/// kept so a future table with the same shape needs a conscious declaration
+/// rather than silently passing the gate.
+const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[];
 
 /// Identity / infrastructure tables outside the ownership model.
 const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];

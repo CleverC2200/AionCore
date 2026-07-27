@@ -213,14 +213,8 @@ async fn gs2_multiple_sessions_returned() {
     let uid1 = create_user(&repo, "p1", "telegram").await;
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
-    session_mgr
-        .get_or_create_session(OWNER_ID, &uid1, "c1", "gemini", None)
-        .await
-        .unwrap();
-    session_mgr
-        .get_or_create_session(OWNER_ID, &uid2, "c2", "acp", None)
-        .await
-        .unwrap();
+    session_mgr.get_or_create_session(OWNER_ID, &uid1, "c1").await.unwrap();
+    session_mgr.get_or_create_session(OWNER_ID, &uid2, "c2").await.unwrap();
 
     let sessions = session_mgr.get_active_sessions(OWNER_ID).await.unwrap();
     assert_eq!(sessions.len(), 2);
@@ -228,7 +222,9 @@ async fn gs2_multiple_sessions_returned() {
     for s in &sessions {
         assert!(!s.id.is_empty());
         assert!(!s.user_id.is_empty());
-        assert!(!s.agent_type.is_empty());
+        // Identity is derived from the channel user both users were seeded on.
+        assert_eq!(s.owner_user_id, OWNER_ID);
+        assert_eq!(s.connection_id, connection_id_for("telegram"));
         assert!(s.chat_id.is_some());
         assert!(s.created_at > 0);
         assert!(s.last_activity > 0);
@@ -244,11 +240,11 @@ async fn pc1_same_user_different_chat() {
     let uid = create_user(&repo, "p1", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA")
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid, "chatB", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatB")
         .await
         .unwrap();
 
@@ -269,11 +265,11 @@ async fn pc2_different_users_same_chat() {
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid1, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid1, "chatA")
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid2, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid2, "chatA")
         .await
         .unwrap();
 
@@ -289,11 +285,11 @@ async fn pc3_same_user_same_chat_reuses() {
     let uid = create_user(&repo, "p1", "telegram").await;
 
     let s1 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA")
         .await
         .unwrap();
     let s2 = session_mgr
-        .get_or_create_session(OWNER_ID, &uid, "chatA", "gemini", None)
+        .get_or_create_session(OWNER_ID, &uid, "chatA")
         .await
         .unwrap();
 
@@ -309,18 +305,9 @@ async fn ru3_revoke_clears_sessions() {
     let uid1 = create_user(&repo, "p1", "telegram").await;
     let uid2 = create_user(&repo, "p2", "telegram").await;
 
-    session_mgr
-        .get_or_create_session(OWNER_ID, &uid1, "c1", "gemini", None)
-        .await
-        .unwrap();
-    session_mgr
-        .get_or_create_session(OWNER_ID, &uid1, "c2", "acp", None)
-        .await
-        .unwrap();
-    session_mgr
-        .get_or_create_session(OWNER_ID, &uid2, "c1", "gemini", None)
-        .await
-        .unwrap();
+    session_mgr.get_or_create_session(OWNER_ID, &uid1, "c1").await.unwrap();
+    session_mgr.get_or_create_session(OWNER_ID, &uid1, "c2").await.unwrap();
+    session_mgr.get_or_create_session(OWNER_ID, &uid2, "c1").await.unwrap();
 
     // Cleanup user1 sessions
     session_mgr.cleanup_user_sessions(OWNER_ID, &uid1).await.unwrap();

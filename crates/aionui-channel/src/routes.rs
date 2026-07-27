@@ -589,9 +589,10 @@ async fn get_active_sessions(
         .map(|r| ChannelSessionResponse {
             id: r.id,
             user_id: r.user_id,
-            agent_type: r.agent_type,
+            // Deprecated: agent config is no longer part of the binding.
+            agent_type: None,
             conversation_id: r.conversation_id,
-            workspace: r.workspace,
+            workspace: None,
             chat_id: r.chat_id,
             created_at: r.created_at,
             last_activity: r.last_activity,

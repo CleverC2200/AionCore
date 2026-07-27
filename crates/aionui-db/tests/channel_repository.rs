@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
+use aionui_db::models::{
+    ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow,
+};
 use aionui_db::{
     DbError, IChannelRepository, SqliteChannelRepository, UpdateConnectionStatusParams, init_database_memory,
 };
@@ -61,15 +63,17 @@ fn make_user(id: &str, platform_uid: &str, platform: &str) -> ChannelUserRow {
     }
 }
 
-fn make_session(id: &str, user_id: &str, chat_id: &str) -> AssistantSessionRow {
+/// `owner_user_id`/`connection_id` are left empty: the repository derives
+/// both from the active `channel_users` row rather than trusting the caller.
+fn make_session(id: &str, user_id: &str, chat_id: &str) -> ChannelConversationBindingRow {
     let now = aionui_common::now_ms();
-    AssistantSessionRow {
+    ChannelConversationBindingRow {
         id: id.into(),
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: user_id.into(),
-        agent_type: "gemini".into(),
-        conversation_id: None,
-        workspace: None,
         chat_id: Some(chat_id.into()),
+        conversation_id: None,
         created_at: now,
         last_activity: now,
     }
@@ -207,11 +211,23 @@ async fn dc1_revoke_user_removes_sessions() {
     repo.revoke_user(OWNER_ID, "u1").await.unwrap();
 
     assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_sessions WHERE user_id = 'u1'")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_conversation_bindings WHERE channel_user_id = 'u1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     assert_eq!(remaining, 0);
+
+    // Revocation is also forward-looking: a revoked user cannot open a new
+    // binding, so message routing cannot resurrect itself.
+    let err = repo
+        .get_or_create_session(OWNER_ID, "u1", "chat-c", &make_session("s3", "u1", "chat-c"))
+        .await;
+    assert!(
+        matches!(err, Err(DbError::NotFound(_))),
+        "revoked user must not create a binding, got {err:?}"
+    );
+    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
 
     // The user is gone from the active surface …
     assert!(repo.get_all_users(OWNER_ID).await.unwrap().is_empty());
@@ -320,6 +336,13 @@ async fn pc1_same_user_different_chat_ids() {
 
     assert_ne!(s1.id, s2.id);
     assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 2);
+
+    // Both bindings carry the identity derived from the channel user, not the
+    // empty owner/connection the caller passed in.
+    for s in [&s1, &s2] {
+        assert_eq!(s.owner_user_id, OWNER_ID);
+        assert_eq!(s.connection_id, TG_CONN);
+    }
 }
 
 // ── PC-2: Different users, same chatId → different sessions ──────────

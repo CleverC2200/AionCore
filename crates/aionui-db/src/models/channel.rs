@@ -51,20 +51,30 @@ pub struct ChannelUserRow {
     pub last_active: Option<TimestampMs>,
 }
 
-/// Row mapping for the `assistant_sessions` table.
+/// Row mapping for the `channel_conversation_bindings` table.
 ///
-/// Per-chat session linking an authorized user to a conversation.
-/// FK: user_id → assistant_users(id) ON DELETE CASCADE.
-/// FK: conversation_id → conversations(id) ON DELETE SET NULL.
+/// Per-chat binding linking an authorized channel user to a conversation.
+/// FK: (owner_user_id, connection_id, channel_user_id) → channel_users
+/// ON DELETE CASCADE; conversation_id → conversations(id) ON DELETE SET NULL,
+/// with triggers making cross-account conversation bindings unrepresentable.
+///
+/// Field-name bridge (channel refactor A3): `user_id` maps the
+/// `channel_user_id` column, `chat_id` maps `external_chat_id`, and
+/// `last_activity` maps `last_active_at` — names kept to limit caller churn.
+/// The legacy `agent_type`/`workspace` columns are gone: agent configuration
+/// is owned by channel settings + the conversation snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct AssistantSessionRow {
+pub struct ChannelConversationBindingRow {
     pub id: String,
+    pub owner_user_id: String,
+    pub connection_id: String,
+    #[sqlx(rename = "channel_user_id")]
     pub user_id: String,
-    pub agent_type: String,
-    pub conversation_id: Option<String>,
-    pub workspace: Option<String>,
+    #[sqlx(rename = "external_chat_id")]
     pub chat_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub created_at: TimestampMs,
+    #[sqlx(rename = "last_active_at")]
     pub last_activity: TimestampMs,
 }
 

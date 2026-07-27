@@ -6,7 +6,7 @@
 mod common;
 
 use aionui_common::now_ms;
-use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelUserRow};
+use aionui_db::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use axum::http::StatusCode;
 use serde_json::json;
@@ -339,6 +339,73 @@ async fn get_sessions_empty() {
     assert!(json["data"].as_array().unwrap().is_empty());
 }
 
+// GS-2: A populated session response carries the binding fields, and the
+// deprecated agent_type/workspace fields are omitted rather than serialized.
+#[tokio::test]
+async fn get_sessions_returns_binding_without_deprecated_agent_fields() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    let connection_id = seed_connection(&repo, "telegram").await;
+    repo.create_user(
+        OWNER_ID,
+        &ChannelUserRow {
+            id: "cu-sessions".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            connection_id,
+            platform_user_id: "tg-sessions".to_owned(),
+            platform_type: "telegram".to_owned(),
+            display_name: Some("Sessions User".to_owned()),
+            status: "active".to_owned(),
+            revoked_at: None,
+            authorized_at: now,
+            last_active: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.get_or_create_session(
+        OWNER_ID,
+        "cu-sessions",
+        "chat-sessions",
+        &ChannelConversationBindingRow {
+            id: "cs-sessions".to_owned(),
+            owner_user_id: String::new(),
+            connection_id: String::new(),
+            user_id: "cu-sessions".to_owned(),
+            conversation_id: None,
+            chat_id: Some("chat-sessions".to_owned()),
+            created_at: now,
+            last_activity: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let req = get_with_token("/api/channel/sessions", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let sessions = json["data"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["id"], "cs-sessions");
+    assert_eq!(session["user_id"], "cu-sessions");
+    assert_eq!(session["chat_id"], "chat-sessions");
+    assert!(
+        session.get("agent_type").is_none(),
+        "deprecated agent_type must be omitted, got: {session}"
+    );
+    assert!(
+        session.get("workspace").is_none(),
+        "deprecated workspace must be omitted, got: {session}"
+    );
+}
+
 // ===========================================================================
 // §5 Settings sync
 // ===========================================================================
@@ -460,12 +527,14 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
     )
     .await
     .unwrap();
-    let new_session = AssistantSessionRow {
+    let new_session = ChannelConversationBindingRow {
         id: "sess-channel-assistant".to_owned(),
+        // Owner and connection are derived by the repository from the
+        // active channel user; the caller leaves them empty.
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: "user-channel-assistant".to_owned(),
-        agent_type: "acp".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("chat-channel-assistant".to_owned()),
         created_at: now,
         last_activity: now,
@@ -521,12 +590,14 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
     )
     .await
     .unwrap();
-    let new_session = AssistantSessionRow {
+    let new_session = ChannelConversationBindingRow {
         id: "sess-channel-model".to_owned(),
+        // Owner and connection are derived by the repository from the
+        // active channel user; the caller leaves them empty.
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: "user-channel-model".to_owned(),
-        agent_type: "acp".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("chat-channel-model".to_owned()),
         created_at: now,
         last_activity: now,
