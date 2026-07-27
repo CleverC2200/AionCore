@@ -1,12 +1,12 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+use crate::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
 
 /// Data access abstraction for channel integration tables.
 ///
-/// Covers four tables: `channel_connections`, `assistant_users`,
-/// `assistant_sessions`, and `assistant_pairing_codes`.
+/// Covers four tables: `channel_connections`, `channel_users`,
+/// `assistant_sessions`, and `channel_pairing_requests`.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
@@ -45,21 +45,27 @@ pub trait IChannelRepository: Send + Sync {
     /// Deletes a connection by connection id. Returns `DbError::NotFound` if absent.
     async fn delete_connection(&self, owner_user_id: &str, id: &str) -> Result<(), DbError>;
 
-    // ── User CRUD ────────────────────────────────────────────────────
+    // ── Channel user CRUD ────────────────────────────────────────────
 
-    /// Returns all authorized users for an owner.
-    async fn get_all_users(&self, owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError>;
+    /// Returns all active (non-revoked) authorized users for an owner.
+    async fn get_all_users(&self, owner_user_id: &str) -> Result<Vec<ChannelUserRow>, DbError>;
 
-    /// Finds a user by platform identity. Returns `None` if not found.
+    /// Finds an active user by platform identity (bridged through the
+    /// connection's plugin_key). Returns `None` if not found or revoked.
     async fn get_user_by_platform(
         &self,
         owner_user_id: &str,
         platform_user_id: &str,
         platform_type: &str,
-    ) -> Result<Option<AssistantUserRow>, DbError>;
+    ) -> Result<Option<ChannelUserRow>, DbError>;
 
-    /// Creates a new authorized user record.
-    async fn create_user(&self, owner_user_id: &str, row: &AssistantUserRow) -> Result<(), DbError>;
+    /// Creates a new authorized user record, or reactivates a previously
+    /// revoked row for the same (owner, connection, external user).
+    /// An already-active row is a `DbError::Conflict`.
+    ///
+    /// `row.connection_id` must reference the owner's connection;
+    /// `row.platform_type` is derived state and ignored on write.
+    async fn create_user(&self, owner_user_id: &str, row: &ChannelUserRow) -> Result<(), DbError>;
 
     /// Updates `last_active` timestamp for a user.
     async fn update_user_last_active(
@@ -69,9 +75,10 @@ pub trait IChannelRepository: Send + Sync {
         last_active: TimestampMs,
     ) -> Result<(), DbError>;
 
-    /// Deletes a user by id. Returns `DbError::NotFound` if absent.
-    /// Associated sessions are cascade-deleted by the database.
-    async fn delete_user(&self, owner_user_id: &str, id: &str) -> Result<(), DbError>;
+    /// Revokes a user's authorization (soft delete: `status = 'revoked'`,
+    /// audit row retained) and deletes their sessions. Returns
+    /// `DbError::NotFound` if no active row exists.
+    async fn revoke_user(&self, owner_user_id: &str, id: &str) -> Result<(), DbError>;
 
     // ── Session CRUD ─────────────────────────────────────────────────
 
@@ -122,22 +129,46 @@ pub trait IChannelRepository: Send + Sync {
         chat_id: &str,
     ) -> Result<(), DbError>;
 
-    // ── Pairing Codes ────────────────────────────────────────────────
+    // ── Pairing requests ─────────────────────────────────────────────
 
-    /// Creates a new pairing code record.
-    async fn create_pairing(&self, owner_user_id: &str, row: &PairingCodeRow) -> Result<(), DbError>;
+    /// Creates a new pairing request. `row.code_hash` carries the HMAC of
+    /// the code; the plaintext code is never persisted.
+    async fn create_pairing(&self, owner_user_id: &str, row: &ChannelPairingRequestRow) -> Result<(), DbError>;
 
-    /// Returns all pairing codes with status = 'pending'.
-    async fn get_pending_pairings(&self, owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError>;
+    /// Returns all pairing requests with status = 'pending'.
+    async fn get_pending_pairings(&self, owner_user_id: &str) -> Result<Vec<ChannelPairingRequestRow>, DbError>;
 
-    /// Retrieves a single pairing code, or `None` if not found.
-    async fn get_pairing_by_code(&self, owner_user_id: &str, code: &str) -> Result<Option<PairingCodeRow>, DbError>;
+    /// Retrieves a pairing request by surrogate id, or `None` if not found.
+    async fn get_pairing(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelPairingRequestRow>, DbError>;
 
-    /// Updates the status of a pairing code.
-    /// Returns `DbError::NotFound` if the code doesn't exist.
-    async fn update_pairing_status(&self, owner_user_id: &str, code: &str, status: &str) -> Result<(), DbError>;
+    /// Retrieves the pending pairing request matching a code hash, or `None`.
+    async fn get_pending_pairing_by_code_hash(
+        &self,
+        owner_user_id: &str,
+        code_hash: &str,
+    ) -> Result<Option<ChannelPairingRequestRow>, DbError>;
 
-    /// Marks all expired-but-still-pending pairing codes as 'expired'.
+    /// Updates the status of a pairing request (by surrogate id), optionally
+    /// recording the channel user created by an approval.
+    /// Returns `DbError::NotFound` if the request doesn't exist.
+    async fn update_pairing_status(
+        &self,
+        owner_user_id: &str,
+        id: &str,
+        status: &str,
+        approved_channel_user_id: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// Expires any pending requests for one (connection, external user).
+    /// Used before issuing a fresh code for the same user.
+    async fn expire_pending_pairings_for_user(
+        &self,
+        owner_user_id: &str,
+        connection_id: &str,
+        external_user_id: &str,
+    ) -> Result<u64, DbError>;
+
+    /// Marks all expired-but-still-pending pairing requests as 'expired'.
     /// `now` is the current timestamp in milliseconds.
     async fn cleanup_expired_pairings(&self, owner_user_id: &str, now: TimestampMs) -> Result<u64, DbError>;
 }

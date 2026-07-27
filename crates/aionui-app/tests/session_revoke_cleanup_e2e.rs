@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow};
+use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 
 const BOOTSTRAP: &str = "bootstrap-secret";
@@ -101,18 +101,39 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
     // one active channel session (assistant_sessions row).
     let channel_repo = SqliteChannelRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
+    // Channel users hang off the connection that authorized them.
+    channel_repo
+        .upsert_connection(
+            &user_id,
+            &ChannelConnectionRow {
+                id: "conn-revoke".into(),
+                owner_user_id: user_id.clone(),
+                plugin_key: "telegram".into(),
+                name: "TG".into(),
+                enabled: true,
+                config: "{}".into(),
+                status: None,
+                last_connected: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
     channel_repo
         .create_user(
             &user_id,
-            &AssistantUserRow {
+            &ChannelUserRow {
                 id: "cu-revoke".into(),
                 owner_user_id: user_id.clone(),
+                connection_id: "conn-revoke".into(),
                 platform_user_id: "tg-revoke".into(),
                 platform_type: "telegram".into(),
                 display_name: Some("TG".into()),
+                status: "active".into(),
+                revoked_at: None,
                 authorized_at: now,
                 last_active: None,
-                session_id: None,
             },
         )
         .await

@@ -605,9 +605,12 @@ pub async fn build_channel_state(
         confirm_tx,
     ));
 
+    // The pairing-code HMAC shares the channel credential key: both protect
+    // channel secrets at rest and rotate together with the JWT secret.
     let pairing_service = Arc::new(aionui_channel::pairing::PairingService::new(
         repo.clone(),
         services.event_bus.clone(),
+        encryption_key,
     ));
 
     let session_manager = Arc::new(aionui_channel::session::SessionManager::new(repo.clone()));

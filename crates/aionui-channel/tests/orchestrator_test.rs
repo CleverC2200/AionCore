@@ -47,7 +47,26 @@ async fn unauthorized_user_gets_pairing_response() {
         Arc::new(aionui_db::SqliteClientPreferenceRepository::new(pool));
     let settings = Arc::new(ChannelSettingsService::new(pref_repo));
 
-    let pairing = Arc::new(PairingService::new(repo.clone(), bus));
+    // Pairing attaches the request to the platform's connection.
+    repo.upsert_connection(
+        OWNER_ID,
+        &aionui_db::models::ChannelConnectionRow {
+            id: "conn-telegram".into(),
+            owner_user_id: OWNER_ID.into(),
+            plugin_key: "telegram".into(),
+            name: "telegram bot".into(),
+            enabled: true,
+            config: "{}".into(),
+            status: None,
+            last_connected: None,
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let pairing = Arc::new(PairingService::new(repo.clone(), bus, [0x42u8; 32]));
     let session_mgr = Arc::new(SessionManager::new(repo));
     let executor = Arc::new(ActionExecutor::new(
         pairing,

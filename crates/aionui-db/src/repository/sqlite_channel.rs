@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+use crate::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
 use crate::repository::channel::{IChannelRepository, UpdateConnectionStatusParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
@@ -147,11 +147,15 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    // ── User CRUD ────────────────────────────────────────────────────
+    // ── Channel user CRUD ────────────────────────────────────────────
 
-    async fn get_all_users(&self, owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
-        let rows = sqlx::query_as::<_, AssistantUserRow>(
-            "SELECT * FROM assistant_users WHERE owner_user_id = ? ORDER BY authorized_at DESC",
+    async fn get_all_users(&self, owner_user_id: &str) -> Result<Vec<ChannelUserRow>, DbError> {
+        let rows = sqlx::query_as::<_, ChannelUserRow>(
+            "SELECT u.*, c.plugin_key AS platform_type \
+             FROM channel_users u \
+             JOIN channel_connections c ON c.owner_user_id = u.owner_user_id AND c.id = u.connection_id \
+             WHERE u.owner_user_id = ? AND u.status = 'active' \
+             ORDER BY u.authorized_at DESC",
         )
         .bind(owner_user_id)
         .fetch_all(&self.pool)
@@ -164,10 +168,13 @@ impl IChannelRepository for SqliteChannelRepository {
         owner_user_id: &str,
         platform_user_id: &str,
         platform_type: &str,
-    ) -> Result<Option<AssistantUserRow>, DbError> {
-        let row = sqlx::query_as::<_, AssistantUserRow>(
-            "SELECT * FROM assistant_users \
-             WHERE owner_user_id = ? AND platform_user_id = ? AND platform_type = ?",
+    ) -> Result<Option<ChannelUserRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelUserRow>(
+            "SELECT u.*, c.plugin_key AS platform_type \
+             FROM channel_users u \
+             JOIN channel_connections c ON c.owner_user_id = u.owner_user_id AND c.id = u.connection_id \
+             WHERE u.owner_user_id = ? AND u.external_user_id = ? AND c.plugin_key = ? \
+               AND u.status = 'active'",
         )
         .bind(owner_user_id)
         .bind(platform_user_id)
@@ -177,33 +184,71 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(row)
     }
 
-    async fn create_user(&self, owner_user_id: &str, row: &AssistantUserRow) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO assistant_users \
-                (id, owner_user_id, platform_user_id, platform_type, display_name, \
-                 authorized_at, last_active, session_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    async fn create_user(&self, owner_user_id: &str, row: &ChannelUserRow) -> Result<(), DbError> {
+        // Reactivate a previously revoked row for the same identity;
+        // an already-active row is a conflict.
+        let mut tx = self.pool.begin().await?;
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM channel_users \
+             WHERE owner_user_id = ? AND connection_id = ? AND external_user_id = ?",
         )
-        .bind(&row.id)
         .bind(owner_user_id)
+        .bind(&row.connection_id)
         .bind(&row.platform_user_id)
-        .bind(&row.platform_type)
-        .bind(&row.display_name)
-        .bind(row.authorized_at)
-        .bind(row.last_active)
-        .bind(&row.session_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                DbError::Conflict(format!(
-                    "User '{}' on platform '{}' already exists",
-                    row.platform_user_id, row.platform_type
-                ))
-            } else {
-                DbError::Query(e)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        match existing {
+            Some((_, status)) if status == "active" => {
+                return Err(DbError::Conflict(format!(
+                    "User '{}' on connection '{}' already exists",
+                    row.platform_user_id, row.connection_id
+                )));
             }
-        })?;
+            Some((existing_id, _)) => {
+                sqlx::query(
+                    "UPDATE channel_users \
+                     SET status = 'active', revoked_at = NULL, display_name = ?, \
+                         authorized_at = ?, last_active = ? \
+                     WHERE owner_user_id = ? AND id = ?",
+                )
+                .bind(&row.display_name)
+                .bind(row.authorized_at)
+                .bind(row.last_active)
+                .bind(owner_user_id)
+                .bind(&existing_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO channel_users \
+                        (id, owner_user_id, connection_id, external_user_id, display_name, \
+                         status, revoked_at, authorized_at, last_active) \
+                     VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, ?)",
+                )
+                .bind(&row.id)
+                .bind(owner_user_id)
+                .bind(&row.connection_id)
+                .bind(&row.platform_user_id)
+                .bind(&row.display_name)
+                .bind(row.authorized_at)
+                .bind(row.last_active)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    if is_unique_violation(&e) {
+                        DbError::Conflict(format!(
+                            "User '{}' on connection '{}' already exists",
+                            row.platform_user_id, row.connection_id
+                        ))
+                    } else {
+                        DbError::Query(e)
+                    }
+                })?;
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -213,7 +258,7 @@ impl IChannelRepository for SqliteChannelRepository {
         id: &str,
         last_active: aionui_common::TimestampMs,
     ) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE assistant_users SET last_active = ? WHERE owner_user_id = ? AND id = ?")
+        let result = sqlx::query("UPDATE channel_users SET last_active = ? WHERE owner_user_id = ? AND id = ?")
             .bind(last_active)
             .bind(owner_user_id)
             .bind(id)
@@ -225,15 +270,27 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    async fn delete_user(&self, owner_user_id: &str, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM assistant_users WHERE owner_user_id = ? AND id = ?")
-            .bind(owner_user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    async fn revoke_user(&self, owner_user_id: &str, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE channel_users SET status = 'revoked', revoked_at = ? \
+             WHERE owner_user_id = ? AND id = ? AND status = 'active'",
+        )
+        .bind(aionui_common::now_ms())
+        .bind(owner_user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("User '{id}' not found")));
         }
+        // Soft delete keeps the audit row, so sessions no longer cascade —
+        // remove them explicitly to stop message routing for this user.
+        sqlx::query("DELETE FROM assistant_sessions WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -242,7 +299,7 @@ impl IChannelRepository for SqliteChannelRepository {
     async fn get_all_sessions(&self, owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
         let rows = sqlx::query_as::<_, AssistantSessionRow>(
             "SELECT s.* FROM assistant_sessions s \
-             JOIN assistant_users u ON u.id = s.user_id \
+             JOIN channel_users u ON u.id = s.user_id \
              WHERE u.owner_user_id = ? \
              ORDER BY s.last_activity DESC",
         )
@@ -255,7 +312,7 @@ impl IChannelRepository for SqliteChannelRepository {
     async fn get_session(&self, owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
         let row = sqlx::query_as::<_, AssistantSessionRow>(
             "SELECT s.* FROM assistant_sessions s \
-             JOIN assistant_users u ON u.id = s.user_id \
+             JOIN channel_users u ON u.id = s.user_id \
              WHERE u.owner_user_id = ? AND s.id = ?",
         )
         .bind(owner_user_id)
@@ -275,7 +332,7 @@ impl IChannelRepository for SqliteChannelRepository {
         // Try to find an existing session first.
         let existing = sqlx::query_as::<_, AssistantSessionRow>(
             "SELECT s.* FROM assistant_sessions s \
-             JOIN assistant_users u ON u.id = s.user_id \
+             JOIN channel_users u ON u.id = s.user_id \
              WHERE u.owner_user_id = ? AND s.user_id = ? AND s.chat_id = ?",
         )
         .bind(owner_user_id)
@@ -306,7 +363,7 @@ impl IChannelRepository for SqliteChannelRepository {
                  chat_id, created_at, last_activity) \
              SELECT ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (
-                 SELECT 1 FROM assistant_users
+                 SELECT 1 FROM channel_users
                  WHERE owner_user_id = ? AND id = ?
              )
              AND (
@@ -349,7 +406,7 @@ impl IChannelRepository for SqliteChannelRepository {
         let result = sqlx::query(
             "UPDATE assistant_sessions SET last_activity = ? \
              WHERE id = ? AND EXISTS (
-                 SELECT 1 FROM assistant_users u
+                 SELECT 1 FROM channel_users u
                  WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
              )",
         )
@@ -376,7 +433,7 @@ impl IChannelRepository for SqliteChannelRepository {
              SET conversation_id = ?, last_activity = ? \
              WHERE id = ? \
                AND EXISTS (
-                   SELECT 1 FROM assistant_users u
+                   SELECT 1 FROM channel_users u
                    WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
                )
                AND EXISTS (
@@ -395,7 +452,7 @@ impl IChannelRepository for SqliteChannelRepository {
         if result.rows_affected() == 0 {
             let session_exists = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM assistant_sessions s \
-                 JOIN assistant_users u ON u.id = s.user_id \
+                 JOIN channel_users u ON u.id = s.user_id \
                  WHERE s.id = ? AND u.owner_user_id = ?",
             )
             .bind(id)
@@ -430,7 +487,7 @@ impl IChannelRepository for SqliteChannelRepository {
             "UPDATE assistant_sessions \
              SET agent_type = ?, last_activity = ? \
              WHERE id = ? AND EXISTS (
-                 SELECT 1 FROM assistant_users u
+                 SELECT 1 FROM channel_users u
                  WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
              )",
         )
@@ -450,7 +507,7 @@ impl IChannelRepository for SqliteChannelRepository {
         sqlx::query(
             "DELETE FROM assistant_sessions \
              WHERE user_id = ? AND EXISTS (
-                 SELECT 1 FROM assistant_users u
+                 SELECT 1 FROM channel_users u
                  WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
              )",
         )
@@ -470,7 +527,7 @@ impl IChannelRepository for SqliteChannelRepository {
         sqlx::query(
             "DELETE FROM assistant_sessions \
              WHERE user_id = ? AND chat_id = ? AND EXISTS (
-                 SELECT 1 FROM assistant_users u
+                 SELECT 1 FROM channel_users u
                  WHERE u.id = assistant_sessions.user_id AND u.owner_user_id = ?
              )",
         )
@@ -482,28 +539,30 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    // ── Pairing Codes ────────────────────────────────────────────────
+    // ── Pairing requests ─────────────────────────────────────────────
 
-    async fn create_pairing(&self, owner_user_id: &str, row: &PairingCodeRow) -> Result<(), DbError> {
+    async fn create_pairing(&self, owner_user_id: &str, row: &ChannelPairingRequestRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO assistant_pairing_codes \
-                (code, owner_user_id, platform_user_id, platform_type, display_name, \
-                 requested_at, expires_at, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO channel_pairing_requests \
+                (id, owner_user_id, connection_id, external_user_id, display_name, \
+                 code_hash, status, requested_at, expires_at, approved_channel_user_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&row.code)
+        .bind(&row.id)
         .bind(owner_user_id)
+        .bind(&row.connection_id)
         .bind(&row.platform_user_id)
-        .bind(&row.platform_type)
         .bind(&row.display_name)
+        .bind(&row.code_hash)
+        .bind(&row.status)
         .bind(row.requested_at)
         .bind(row.expires_at)
-        .bind(&row.status)
+        .bind(&row.approved_channel_user_id)
         .execute(&self.pool)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
-                DbError::Conflict(format!("Pairing code '{}' already exists", row.code))
+                DbError::Conflict("A pending pairing request already exists for this user or code".into())
             } else {
                 DbError::Query(e)
             }
@@ -511,11 +570,13 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    async fn get_pending_pairings(&self, owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
-        let rows = sqlx::query_as::<_, PairingCodeRow>(
-            "SELECT * FROM assistant_pairing_codes \
-             WHERE owner_user_id = ? AND status = 'pending' \
-             ORDER BY requested_at DESC",
+    async fn get_pending_pairings(&self, owner_user_id: &str) -> Result<Vec<ChannelPairingRequestRow>, DbError> {
+        let rows = sqlx::query_as::<_, ChannelPairingRequestRow>(
+            "SELECT p.*, c.plugin_key AS platform_type \
+             FROM channel_pairing_requests p \
+             JOIN channel_connections c ON c.owner_user_id = p.owner_user_id AND c.id = p.connection_id \
+             WHERE p.owner_user_id = ? AND p.status = 'pending' \
+             ORDER BY p.requested_at DESC",
         )
         .bind(owner_user_id)
         .fetch_all(&self.pool)
@@ -523,28 +584,80 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(rows)
     }
 
-    async fn get_pairing_by_code(&self, owner_user_id: &str, code: &str) -> Result<Option<PairingCodeRow>, DbError> {
-        let row = sqlx::query_as::<_, PairingCodeRow>(
-            "SELECT * FROM assistant_pairing_codes WHERE owner_user_id = ? AND code = ?",
+    async fn get_pairing(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelPairingRequestRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelPairingRequestRow>(
+            "SELECT p.*, c.plugin_key AS platform_type \
+             FROM channel_pairing_requests p \
+             JOIN channel_connections c ON c.owner_user_id = p.owner_user_id AND c.id = p.connection_id \
+             WHERE p.owner_user_id = ? AND p.id = ?",
         )
         .bind(owner_user_id)
-        .bind(code)
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    async fn update_pairing_status(&self, owner_user_id: &str, code: &str, status: &str) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE assistant_pairing_codes SET status = ? WHERE owner_user_id = ? AND code = ?")
-            .bind(status)
-            .bind(owner_user_id)
-            .bind(code)
-            .execute(&self.pool)
-            .await?;
+    async fn get_pending_pairing_by_code_hash(
+        &self,
+        owner_user_id: &str,
+        code_hash: &str,
+    ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelPairingRequestRow>(
+            "SELECT p.*, c.plugin_key AS platform_type \
+             FROM channel_pairing_requests p \
+             JOIN channel_connections c ON c.owner_user_id = p.owner_user_id AND c.id = p.connection_id \
+             WHERE p.owner_user_id = ? AND p.code_hash = ? AND p.status = 'pending'",
+        )
+        .bind(owner_user_id)
+        .bind(code_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn update_pairing_status(
+        &self,
+        owner_user_id: &str,
+        id: &str,
+        status: &str,
+        approved_channel_user_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE channel_pairing_requests \
+             SET status = ?, approved_channel_user_id = COALESCE(?, approved_channel_user_id) \
+             WHERE owner_user_id = ? AND id = ?",
+        )
+        .bind(status)
+        .bind(approved_channel_user_id)
+        .bind(owner_user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Pairing code '{code}' not found")));
+            return Err(DbError::NotFound(format!("Pairing request '{id}' not found")));
         }
         Ok(())
+    }
+
+    async fn expire_pending_pairings_for_user(
+        &self,
+        owner_user_id: &str,
+        connection_id: &str,
+        external_user_id: &str,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE channel_pairing_requests \
+             SET status = 'expired' \
+             WHERE owner_user_id = ? AND connection_id = ? AND external_user_id = ? \
+               AND status = 'pending'",
+        )
+        .bind(owner_user_id)
+        .bind(connection_id)
+        .bind(external_user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     async fn cleanup_expired_pairings(
@@ -553,7 +666,7 @@ impl IChannelRepository for SqliteChannelRepository {
         now: aionui_common::TimestampMs,
     ) -> Result<u64, DbError> {
         let result = sqlx::query(
-            "UPDATE assistant_pairing_codes \
+            "UPDATE channel_pairing_requests \
              SET status = 'expired' \
              WHERE owner_user_id = ? AND status = 'pending' AND expires_at <= ?",
         )
@@ -619,18 +732,40 @@ mod tests {
         }
     }
 
-    fn sample_user() -> AssistantUserRow {
+    /// Seeds the connection row users/pairings attach to (FK parent).
+    /// Connection identity is per-owner, so the same id is seeded per owner.
+    async fn seed_connection(repo: &SqliteChannelRepository, owner: &str) {
+        repo.upsert_connection(
+            owner,
+            &ChannelConnectionRow {
+                owner_user_id: owner.into(),
+                ..sample_connection()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn sample_user() -> ChannelUserRow {
         let now = aionui_common::now_ms();
-        AssistantUserRow {
+        ChannelUserRow {
             id: "usr-1".into(),
             owner_user_id: OWNER_A.into(),
+            connection_id: "tg-1".into(),
             platform_user_id: "tg_12345".into(),
             platform_type: "telegram".into(),
             display_name: Some("Alice".into()),
+            status: "active".into(),
+            revoked_at: None,
             authorized_at: now,
             last_active: None,
-            session_id: None,
         }
+    }
+
+    /// Seeds the FK-parent connection and authorizes the sample user on it.
+    async fn seed_user(repo: &SqliteChannelRepository) {
+        seed_connection(repo, OWNER_A).await;
+        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
     }
 
     fn sample_session(user_id: &str) -> AssistantSessionRow {
@@ -647,17 +782,20 @@ mod tests {
         }
     }
 
-    fn sample_pairing() -> PairingCodeRow {
+    fn sample_pairing() -> ChannelPairingRequestRow {
         let now = aionui_common::now_ms();
-        PairingCodeRow {
-            code: "123456".into(),
+        ChannelPairingRequestRow {
+            id: "pair-1".into(),
             owner_user_id: OWNER_A.into(),
+            connection_id: "tg-1".into(),
             platform_user_id: "tg_99".into(),
             platform_type: "telegram".into(),
             display_name: Some("Bob".into()),
+            code_hash: "hash-123456".into(),
+            status: "pending".into(),
             requested_at: now,
             expires_at: now + 600_000,
-            status: "pending".into(),
+            approved_channel_user_id: None,
         }
     }
 
@@ -856,6 +994,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_user_by_platform() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         let user = sample_user();
         repo.create_user(OWNER_A, &user).await.unwrap();
 
@@ -871,9 +1010,9 @@ mod tests {
     #[tokio::test]
     async fn create_duplicate_user_returns_conflict() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
-        let dup = AssistantUserRow {
+        let dup = ChannelUserRow {
             id: "usr-2".into(),
             ..sample_user()
         };
@@ -882,12 +1021,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_reactivates_revoked_row() {
+        let (repo, _db) = setup().await;
+        seed_user(&repo).await;
+        repo.revoke_user(OWNER_A, "usr-1").await.unwrap();
+
+        // Re-authorizing the same identity reuses the revoked audit row
+        // instead of inserting a second one.
+        let again = ChannelUserRow {
+            id: "usr-2".into(),
+            display_name: Some("Alice Again".into()),
+            ..sample_user()
+        };
+        repo.create_user(OWNER_A, &again).await.unwrap();
+
+        let found = repo
+            .get_user_by_platform(OWNER_A, "tg_12345", "telegram")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "usr-1");
+        assert_eq!(found.status, "active");
+        assert_eq!(found.revoked_at, None);
+        assert_eq!(found.display_name.as_deref(), Some("Alice Again"));
+
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channel_users WHERE owner_user_id = ? AND external_user_id = ?")
+                .bind(OWNER_A)
+                .bind("tg_12345")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
     async fn platform_users_are_filtered_by_owner() {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
 
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
-        let other = AssistantUserRow {
+        seed_user(&repo).await;
+        seed_connection(&repo, OWNER_B).await;
+        let other = ChannelUserRow {
             id: "usr-2".into(),
             owner_user_id: OWNER_B.into(),
             platform_user_id: "tg_other".into(),
@@ -921,8 +1096,9 @@ mod tests {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
 
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
-        let other_owner_user = AssistantUserRow {
+        seed_user(&repo).await;
+        seed_connection(&repo, OWNER_B).await;
+        let other_owner_user = ChannelUserRow {
             id: "usr-2".into(),
             owner_user_id: OWNER_B.into(),
             ..sample_user()
@@ -957,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn update_user_last_active_updates_timestamp() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new_ts = aionui_common::now_ms() + 5000;
         repo.update_user_last_active(OWNER_A, "usr-1", new_ts).await.unwrap();
@@ -978,42 +1154,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_user_removes_row() {
+    async fn revoke_user_hides_user_but_keeps_audit_row() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
-        repo.delete_user(OWNER_A, "usr-1").await.unwrap();
+        seed_user(&repo).await;
+        repo.revoke_user(OWNER_A, "usr-1").await.unwrap();
+
+        // Revoked users disappear from every read path.
         assert!(
             repo.get_user_by_platform(OWNER_A, "tg_12345", "telegram")
                 .await
                 .unwrap()
                 .is_none()
         );
+        assert!(repo.get_all_users(OWNER_A).await.unwrap().is_empty());
+
+        // The authorization history survives as an audit row.
+        let (status, revoked_at): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, revoked_at FROM channel_users WHERE id = ?")
+                .bind("usr-1")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "revoked");
+        assert!(revoked_at.is_some());
     }
 
     #[tokio::test]
-    async fn delete_user_not_found() {
+    async fn revoke_user_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete_user(OWNER_A, "nope").await.unwrap_err();
+        let err = repo.revoke_user(OWNER_A, "nope").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
-    async fn delete_user_cascades_sessions() {
+    async fn revoke_user_twice_is_not_found() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
+        repo.revoke_user(OWNER_A, "usr-1").await.unwrap();
+
+        // Only an ACTIVE row can be revoked.
+        let err = repo.revoke_user(OWNER_A, "usr-1").await.unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn revoke_user_deletes_sessions() {
+        let (repo, _db) = setup().await;
+        seed_user(&repo).await;
 
         let session = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &session)
             .await
             .unwrap();
 
-        // Sessions exist before delete.
+        // Sessions exist before revocation.
         assert_eq!(repo.get_all_sessions(OWNER_A).await.unwrap().len(), 1);
 
-        repo.delete_user(OWNER_A, "usr-1").await.unwrap();
+        repo.revoke_user(OWNER_A, "usr-1").await.unwrap();
 
-        // Sessions cascade-deleted.
+        // Soft delete keeps the user row, but message routing stops: the
+        // sessions are removed outright, not merely hidden behind the join.
         assert!(repo.get_all_sessions(OWNER_A).await.unwrap().is_empty());
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_sessions WHERE user_id = ?")
+            .bind("usr-1")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(session_count, 0);
     }
 
     // ── Session tests ────────────────────────────────────────────────
@@ -1027,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_session_creates_new() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         let result = repo
@@ -1042,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_session_reuses_existing() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         let first = repo
@@ -1067,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn per_chat_isolation_different_chats() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let s1 = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &s1)
@@ -1089,7 +1296,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_by_id() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
@@ -1109,7 +1316,7 @@ mod tests {
     #[tokio::test]
     async fn update_session_activity_updates_timestamp() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
@@ -1133,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn delete_sessions_by_user_removes_all() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let s1 = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &s1)
@@ -1179,7 +1386,7 @@ mod tests {
     #[tokio::test]
     async fn update_session_conversation_persists() {
         let (repo, db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
@@ -1200,7 +1407,7 @@ mod tests {
     async fn update_session_conversation_rejects_cross_owner_conversation() {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
@@ -1240,7 +1447,7 @@ mod tests {
     #[tokio::test]
     async fn update_session_agent_type_persists() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let new = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &new)
@@ -1271,7 +1478,7 @@ mod tests {
     #[tokio::test]
     async fn delete_session_by_user_chat_removes_only_target() {
         let (repo, _db) = setup().await;
-        repo.create_user(OWNER_A, &sample_user()).await.unwrap();
+        seed_user(&repo).await;
 
         let s1 = sample_session("usr-1");
         repo.get_or_create_session(OWNER_A, "usr-1", "chat-abc", &s1)
@@ -1310,19 +1517,63 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_pairing() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         let pairing = sample_pairing();
         repo.create_pairing(OWNER_A, &pairing).await.unwrap();
 
-        let found = repo.get_pairing_by_code(OWNER_A, "123456").await.unwrap().unwrap();
+        // Addressable by surrogate id …
+        let found = repo.get_pairing(OWNER_A, "pair-1").await.unwrap().unwrap();
         assert_eq!(found.platform_user_id, "tg_99");
         assert_eq!(found.status, "pending");
+        // … and platform_type is derived from the joined connection.
+        assert_eq!(found.platform_type, "telegram");
+
+        // … and by code hash, while pending.
+        let by_hash = repo
+            .get_pending_pairing_by_code_hash(OWNER_A, "hash-123456")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_hash.id, "pair-1");
+    }
+
+    /// The plaintext code must never reach the database: only `code_hash`
+    /// is stored, and the table has no column that could hold the code.
+    #[tokio::test]
+    async fn pairing_stores_only_the_code_hash() {
+        let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
+        repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('channel_pairing_requests')")
+            .fetch_all(&repo.pool)
+            .await
+            .unwrap();
+        assert!(
+            !columns.iter().any(|c| c == "code"),
+            "pairing table must not carry a plaintext code column: {columns:?}"
+        );
+
+        let stored: String = sqlx::query_scalar("SELECT code_hash FROM channel_pairing_requests WHERE id = ?")
+            .bind("pair-1")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "hash-123456");
+        assert_ne!(stored, "123456");
     }
 
     #[tokio::test]
     async fn create_duplicate_pairing_returns_conflict() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
-        let err = repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap_err();
+        let second = ChannelPairingRequestRow {
+            id: "pair-2".into(),
+            ..sample_pairing()
+        };
+        // One pending request per (owner, connection, external user).
+        let err = repo.create_pairing(OWNER_A, &second).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
     }
 
@@ -1330,28 +1581,46 @@ mod tests {
     async fn pairing_lookup_is_filtered_by_owner() {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
+        seed_connection(&repo, OWNER_A).await;
 
         repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
 
-        assert!(repo.get_pairing_by_code(OWNER_B, "123456").await.unwrap().is_none());
+        assert!(repo.get_pairing(OWNER_B, "pair-1").await.unwrap().is_none());
+        assert!(
+            repo.get_pending_pairing_by_code_hash(OWNER_B, "hash-123456")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(repo.get_pending_pairings(OWNER_B).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn same_pairing_code_can_exist_for_different_owners() {
+    async fn same_code_hash_can_exist_for_different_owners() {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
+        seed_connection(&repo, OWNER_A).await;
+        seed_connection(&repo, OWNER_B).await;
 
         repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
-        let owner_b_pairing = PairingCodeRow {
+        let owner_b_pairing = ChannelPairingRequestRow {
+            id: "pair-2".into(),
             owner_user_id: OWNER_B.into(),
             platform_user_id: "tg_owner_b".into(),
             ..sample_pairing()
         };
         repo.create_pairing(OWNER_B, &owner_b_pairing).await.unwrap();
 
-        let owner_a = repo.get_pairing_by_code(OWNER_A, "123456").await.unwrap().unwrap();
-        let owner_b = repo.get_pairing_by_code(OWNER_B, "123456").await.unwrap().unwrap();
+        let owner_a = repo
+            .get_pending_pairing_by_code_hash(OWNER_A, "hash-123456")
+            .await
+            .unwrap()
+            .unwrap();
+        let owner_b = repo
+            .get_pending_pairing_by_code_hash(OWNER_B, "hash-123456")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(owner_a.platform_user_id, "tg_99");
         assert_eq!(owner_b.platform_user_id, "tg_owner_b");
     }
@@ -1359,11 +1628,14 @@ mod tests {
     #[tokio::test]
     async fn get_pending_pairings_filters_by_status() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         let p1 = sample_pairing();
         repo.create_pairing(OWNER_A, &p1).await.unwrap();
 
-        let p2 = PairingCodeRow {
-            code: "654321".into(),
+        let p2 = ChannelPairingRequestRow {
+            id: "pair-2".into(),
+            platform_user_id: "tg_100".into(),
+            code_hash: "hash-654321".into(),
             status: "approved".into(),
             ..sample_pairing()
         };
@@ -1371,52 +1643,122 @@ mod tests {
 
         let pending = repo.get_pending_pairings(OWNER_A).await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].code, "123456");
+        assert_eq!(pending[0].id, "pair-1");
+        assert_eq!(pending[0].code_hash, "hash-123456");
     }
 
     #[tokio::test]
-    async fn get_pairing_by_code_not_found() {
+    async fn pairing_lookups_not_found() {
         let (repo, _db) = setup().await;
-        assert!(repo.get_pairing_by_code(OWNER_A, "000000").await.unwrap().is_none());
+        assert!(repo.get_pairing(OWNER_A, "nope").await.unwrap().is_none());
+        assert!(
+            repo.get_pending_pairing_by_code_hash(OWNER_A, "hash-000000")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A non-pending request is invisible to the code-hash lookup, so an
+    /// already-used code cannot be replayed.
+    #[tokio::test]
+    async fn code_hash_lookup_ignores_non_pending() {
+        let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
+        repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
+        repo.update_pairing_status(OWNER_A, "pair-1", "rejected", None)
+            .await
+            .unwrap();
+
+        assert!(
+            repo.get_pending_pairing_by_code_hash(OWNER_A, "hash-123456")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The row itself is still addressable by id.
+        assert_eq!(
+            repo.get_pairing(OWNER_A, "pair-1").await.unwrap().unwrap().status,
+            "rejected"
+        );
     }
 
     #[tokio::test]
-    async fn update_pairing_status_changes_status() {
+    async fn update_pairing_status_records_approved_user() {
         let (repo, _db) = setup().await;
+        seed_user(&repo).await;
         repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
 
-        repo.update_pairing_status(OWNER_A, "123456", "approved").await.unwrap();
+        repo.update_pairing_status(OWNER_A, "pair-1", "approved", Some("usr-1"))
+            .await
+            .unwrap();
 
-        let found = repo.get_pairing_by_code(OWNER_A, "123456").await.unwrap().unwrap();
+        let found = repo.get_pairing(OWNER_A, "pair-1").await.unwrap().unwrap();
         assert_eq!(found.status, "approved");
+        assert_eq!(found.approved_channel_user_id.as_deref(), Some("usr-1"));
     }
 
     #[tokio::test]
     async fn update_pairing_status_not_found() {
         let (repo, _db) = setup().await;
         let err = repo
-            .update_pairing_status(OWNER_A, "000000", "approved")
+            .update_pairing_status(OWNER_A, "nope", "approved", None)
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
+    async fn expire_pending_pairings_for_user_targets_one_user() {
+        let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
+        repo.create_pairing(OWNER_A, &sample_pairing()).await.unwrap();
+
+        let other = ChannelPairingRequestRow {
+            id: "pair-2".into(),
+            platform_user_id: "tg_100".into(),
+            code_hash: "hash-654321".into(),
+            ..sample_pairing()
+        };
+        repo.create_pairing(OWNER_A, &other).await.unwrap();
+
+        let expired = repo
+            .expire_pending_pairings_for_user(OWNER_A, "tg-1", "tg_99")
+            .await
+            .unwrap();
+        assert_eq!(expired, 1);
+
+        assert_eq!(
+            repo.get_pairing(OWNER_A, "pair-1").await.unwrap().unwrap().status,
+            "expired"
+        );
+        assert_eq!(
+            repo.get_pairing(OWNER_A, "pair-2").await.unwrap().unwrap().status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_expired_pairings_marks_expired() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         let now = aionui_common::now_ms();
 
         // Create an already-expired pairing.
-        let expired = PairingCodeRow {
-            code: "111111".into(),
+        let expired = ChannelPairingRequestRow {
+            id: "pair-expired".into(),
+            platform_user_id: "tg_expired".into(),
+            code_hash: "hash-111111".into(),
             expires_at: now - 1000,
             ..sample_pairing()
         };
         repo.create_pairing(OWNER_A, &expired).await.unwrap();
 
         // Create a still-valid pairing.
-        let valid = PairingCodeRow {
-            code: "222222".into(),
+        let valid = ChannelPairingRequestRow {
+            id: "pair-valid".into(),
+            platform_user_id: "tg_valid".into(),
+            code_hash: "hash-222222".into(),
             expires_at: now + 600_000,
             ..sample_pairing()
         };
@@ -1425,21 +1767,23 @@ mod tests {
         let cleaned = repo.cleanup_expired_pairings(OWNER_A, now).await.unwrap();
         assert_eq!(cleaned, 1);
 
-        let found_expired = repo.get_pairing_by_code(OWNER_A, "111111").await.unwrap().unwrap();
+        let found_expired = repo.get_pairing(OWNER_A, "pair-expired").await.unwrap().unwrap();
         assert_eq!(found_expired.status, "expired");
 
-        let found_valid = repo.get_pairing_by_code(OWNER_A, "222222").await.unwrap().unwrap();
+        let found_valid = repo.get_pairing(OWNER_A, "pair-valid").await.unwrap().unwrap();
         assert_eq!(found_valid.status, "pending");
     }
 
     #[tokio::test]
     async fn cleanup_expired_pairings_skips_non_pending() {
         let (repo, _db) = setup().await;
+        seed_connection(&repo, OWNER_A).await;
         let now = aionui_common::now_ms();
 
         // Create an expired pairing that is already approved.
-        let approved = PairingCodeRow {
-            code: "333333".into(),
+        let approved = ChannelPairingRequestRow {
+            id: "pair-approved".into(),
+            code_hash: "hash-333333".into(),
             expires_at: now - 1000,
             status: "approved".into(),
             ..sample_pairing()
@@ -1449,7 +1793,7 @@ mod tests {
         let cleaned = repo.cleanup_expired_pairings(OWNER_A, now).await.unwrap();
         assert_eq!(cleaned, 0);
 
-        let found = repo.get_pairing_by_code(OWNER_A, "333333").await.unwrap().unwrap();
+        let found = repo.get_pairing(OWNER_A, "pair-approved").await.unwrap().unwrap();
         assert_eq!(found.status, "approved");
     }
 }

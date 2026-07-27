@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{generate_id, now_ms};
-use aionui_db::models::AssistantUserRow;
+use aionui_db::models::{ChannelConnectionRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository, init_database_memory};
 use aionui_realtime::EventBroadcaster;
 
 use aionui_channel::action::{ActionExecutor, MessageResult};
 use aionui_channel::channel_settings::ChannelSettingsService;
-use aionui_channel::pairing::PairingService;
+use aionui_channel::pairing::{PairingSelector, PairingService};
 use aionui_channel::session::SessionManager;
 use aionui_channel::types::{
     ActionBehavior, ActionCategory, ActionContext, MessageContentType, PluginType, UnifiedAction,
@@ -22,6 +22,12 @@ use aionui_channel::types::{
 
 // ── Test infrastructure ─────────────────────────────────────────────
 const OWNER_ID: &str = "system_default_user";
+/// Fixed key for the pairing code HMAC.
+const TEST_KEY: [u8; 32] = [0x42u8; 32];
+
+fn connection_id_for(plugin_key: &str) -> String {
+    format!("conn-{plugin_key}")
+}
 
 struct MockBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -51,9 +57,34 @@ async fn setup() -> (
     let repo: Arc<dyn IChannelRepository> = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
     let bc: Arc<dyn EventBroadcaster> = Arc::new(MockBroadcaster::new());
 
+    // Channel users and pairing requests hang off a connection.
+    for plugin_key in ["telegram", "lark"] {
+        repo.upsert_connection(
+            OWNER_ID,
+            &ChannelConnectionRow {
+                id: connection_id_for(plugin_key),
+                owner_user_id: OWNER_ID.to_owned(),
+                plugin_key: plugin_key.to_owned(),
+                name: format!("{plugin_key} bot"),
+                enabled: true,
+                config: "{}".into(),
+                status: None,
+                last_connected: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     let session_mgr = SessionManager::new(repo.clone());
-    let pairing = PairingService::new(repo.clone(), bc);
-    let pairing_arc = Arc::new(PairingService::new(repo.clone(), Arc::new(MockBroadcaster::new())));
+    let pairing = PairingService::new(repo.clone(), bc, TEST_KEY);
+    let pairing_arc = Arc::new(PairingService::new(
+        repo.clone(),
+        Arc::new(MockBroadcaster::new()),
+        TEST_KEY,
+    ));
     let session_mgr_arc = Arc::new(SessionManager::new(repo.clone()));
     let pref_repo: Arc<dyn aionui_db::IClientPreferenceRepository> =
         Arc::new(aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()));
@@ -65,18 +96,21 @@ async fn setup() -> (
     (session_mgr, executor, pairing, repo)
 }
 
-/// Create an assistant_users record (required for FK on sessions).
+/// Create a channel_users record (required for FK on sessions).
 async fn create_user(repo: &Arc<dyn IChannelRepository>, platform_user_id: &str, platform_type: &str) -> String {
     let user_id = generate_id();
-    let row = AssistantUserRow {
+    let row = ChannelUserRow {
         id: user_id.clone(),
         owner_user_id: OWNER_ID.to_owned(),
+        connection_id: connection_id_for(platform_type),
         platform_user_id: platform_user_id.to_owned(),
+        // Derived from the connection on read; ignored on write.
         platform_type: platform_type.to_owned(),
         display_name: Some("Test User".into()),
+        status: "active".into(),
+        revoked_at: None,
         authorized_at: now_ms(),
         last_active: None,
-        session_id: None,
     };
     repo.create_user(OWNER_ID, &row).await.unwrap();
     user_id
@@ -154,7 +188,10 @@ async fn authorize_user(pairing: &PairingService, platform_user_id: &str, platfo
         .request_pairing(OWNER_ID, platform_user_id, platform_type, Some("Test"))
         .await
         .unwrap();
-    pairing.approve_pairing(OWNER_ID, &code).await.unwrap();
+    pairing
+        .approve_pairing(OWNER_ID, PairingSelector::Code(&code))
+        .await
+        .unwrap();
 }
 
 // ── GS-1: No active sessions returns empty ─────────────────────────

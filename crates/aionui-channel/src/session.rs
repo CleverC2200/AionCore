@@ -197,7 +197,7 @@ impl SessionManager {
 mod tests {
     use super::*;
     use aionui_common::TimestampMs;
-    use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+    use aionui_db::models::{AssistantSessionRow, ChannelConnectionRow, ChannelPairingRequestRow, ChannelUserRow};
     use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::sync::Mutex;
 
@@ -257,7 +257,7 @@ mod tests {
         }
 
         // -- User CRUD (unused stubs) --
-        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
+        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<ChannelUserRow>, DbError> {
             Ok(vec![])
         }
         async fn get_user_by_platform(
@@ -265,10 +265,10 @@ mod tests {
             _owner_user_id: &str,
             _platform_user_id: &str,
             _platform_type: &str,
-        ) -> Result<Option<AssistantUserRow>, DbError> {
+        ) -> Result<Option<ChannelUserRow>, DbError> {
             Ok(None)
         }
-        async fn create_user(&self, _owner_user_id: &str, _row: &AssistantUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, _owner_user_id: &str, _row: &ChannelUserRow) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_user_last_active(
@@ -279,7 +279,7 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn revoke_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
@@ -378,22 +378,43 @@ mod tests {
             Ok(())
         }
 
-        // -- Pairing codes (unused stubs) --
-        async fn create_pairing(&self, _owner_user_id: &str, _row: &PairingCodeRow) -> Result<(), DbError> {
+        // -- Pairing requests (unused stubs) --
+        async fn create_pairing(&self, _owner_user_id: &str, _row: &ChannelPairingRequestRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
+        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<ChannelPairingRequestRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_pairing_by_code(
+        async fn get_pairing(
             &self,
             _owner_user_id: &str,
-            _code: &str,
-        ) -> Result<Option<PairingCodeRow>, DbError> {
+            _id: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
             Ok(None)
         }
-        async fn update_pairing_status(&self, _owner_user_id: &str, _code: &str, _status: &str) -> Result<(), DbError> {
+        async fn get_pending_pairing_by_code_hash(
+            &self,
+            _owner_user_id: &str,
+            _code_hash: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_pairing_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _status: &str,
+            _approved_channel_user_id: Option<&str>,
+        ) -> Result<(), DbError> {
             Ok(())
+        }
+        async fn expire_pending_pairings_for_user(
+            &self,
+            _owner_user_id: &str,
+            _connection_id: &str,
+            _external_user_id: &str,
+        ) -> Result<u64, DbError> {
+            Ok(0)
         }
         async fn cleanup_expired_pairings(&self, _owner_user_id: &str, _now: TimestampMs) -> Result<u64, DbError> {
             Ok(0)

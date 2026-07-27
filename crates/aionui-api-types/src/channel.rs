@@ -53,14 +53,26 @@ pub struct TestPluginExtraConfig {
 
 /// Request body for `POST /api/channel/pairings/approve`.
 #[derive(Debug, Deserialize)]
+/// Identifies the pairing request either by the transient plaintext `code`
+/// (from the `channel.pairing-requested` event or manual entry) or by the
+/// stored request `id` (from the cold-loaded pending list). Exactly one
+/// should be supplied; `id` wins when both are present.
 pub struct ApprovePairingRequest {
-    pub code: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Request body for `POST /api/channel/pairings/reject`.
+///
+/// Same selector semantics as [`ApprovePairingRequest`].
 #[derive(Debug, Deserialize)]
 pub struct RejectPairingRequest {
-    pub code: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +210,11 @@ pub struct BridgeResponse {
 /// Corresponds to `IChannelPairingRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairingRequestResponse {
-    pub code: String,
+    /// Stored request id — the stable approve/reject selector. The plaintext
+    /// code is not persisted (only its server-side hash) and therefore cannot
+    /// appear in cold-loaded listings; it travels only in the transient
+    /// `channel.pairing-requested` event.
+    pub id: String,
     pub platform_user_id: String,
     pub platform_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +275,9 @@ pub struct ChannelSessionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairingRequestedPayload {
     pub user_id: String,
+    /// Stored request id (stable approve/reject selector).
+    pub id: String,
+    /// Transient plaintext code — shown once; never persisted server-side.
     pub code: String,
     pub platform_user_id: String,
     pub platform_type: String,
@@ -399,21 +418,43 @@ mod tests {
     fn test_approve_pairing_request_deserialize() {
         let raw = json!({ "code": "123456" });
         let req: ApprovePairingRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.code, "123456");
+        assert_eq!(req.code.as_deref(), Some("123456"));
+        assert_eq!(req.id, None);
     }
 
     #[test]
-    fn test_approve_pairing_request_missing_code() {
+    fn test_approve_pairing_request_accepts_id_selector() {
+        let raw = json!({ "id": "pair-1" });
+        let req: ApprovePairingRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.id.as_deref(), Some("pair-1"));
+        assert_eq!(req.code, None);
+    }
+
+    /// Both selectors are optional at the DTO layer — an empty body
+    /// deserializes, and the route rejects it with a 400 (see
+    /// `pairing_selector` in the channel routes).
+    #[test]
+    fn test_approve_pairing_request_empty_body_leaves_both_selectors_none() {
         let raw = json!({});
-        let result = serde_json::from_value::<ApprovePairingRequest>(raw);
-        assert!(result.is_err());
+        let req: ApprovePairingRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.code, None);
+        assert_eq!(req.id, None);
     }
 
     #[test]
     fn test_reject_pairing_request_deserialize() {
         let raw = json!({ "code": "654321" });
         let req: RejectPairingRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.code, "654321");
+        assert_eq!(req.code.as_deref(), Some("654321"));
+        assert_eq!(req.id, None);
+    }
+
+    #[test]
+    fn test_reject_pairing_request_accepts_id_selector() {
+        let raw = json!({ "id": "pair-9" });
+        let req: RejectPairingRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.id.as_deref(), Some("pair-9"));
+        assert_eq!(req.code, None);
     }
 
     // -- C. User management requests ------------------------------------------
@@ -579,7 +620,7 @@ mod tests {
     #[test]
     fn test_pairing_request_response_serde() {
         let resp = PairingRequestResponse {
-            code: "123456".into(),
+            id: "pair-1".into(),
             platform_user_id: "tg_user_42".into(),
             platform_type: "telegram".into(),
             display_name: Some("Alice".into()),
@@ -587,7 +628,10 @@ mod tests {
             expires_at: 1700000600000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["code"], "123456");
+        assert_eq!(json["id"], "pair-1");
+        // The plaintext code is transient and must never appear in the
+        // cold-loaded pending list.
+        assert!(json.get("code").is_none());
         assert_eq!(json["platform_user_id"], "tg_user_42");
         assert_eq!(json["platform_type"], "telegram");
         assert_eq!(json["display_name"], "Alice");
@@ -598,7 +642,7 @@ mod tests {
     #[test]
     fn test_pairing_request_response_no_display_name() {
         let resp = PairingRequestResponse {
-            code: "999999".into(),
+            id: "pair-2".into(),
             platform_user_id: "user_1".into(),
             platform_type: "lark".into(),
             display_name: None,
@@ -694,6 +738,7 @@ mod tests {
     fn test_pairing_requested_payload_serde() {
         let payload = PairingRequestedPayload {
             user_id: "user-1".into(),
+            id: "pair-1".into(),
             code: "123456".into(),
             platform_user_id: "tg_42".into(),
             platform_type: "telegram".into(),
@@ -702,6 +747,8 @@ mod tests {
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["user_id"], "user-1");
+        // The event carries both the transient code and the addressable id.
+        assert_eq!(json["id"], "pair-1");
         assert_eq!(json["code"], "123456");
         assert_eq!(json["platform_user_id"], "tg_42");
         assert_eq!(json["platform_type"], "telegram");
@@ -713,6 +760,7 @@ mod tests {
     fn test_pairing_requested_payload_no_display_name() {
         let payload = PairingRequestedPayload {
             user_id: "user-1".into(),
+            id: "pair-2".into(),
             code: "000001".into(),
             platform_user_id: "u1".into(),
             platform_type: "dingtalk".into(),

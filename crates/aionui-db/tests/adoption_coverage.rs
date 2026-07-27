@@ -45,12 +45,12 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
 /// ownership root by accident and the gate would pass without a conscious
 /// decision. Each entry: (table, the non-Core table its `user_id` points at).
 const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
-    // assistant_sessions.user_id -> assistant_users.id (a channel/platform
-    // user). Core ownership flows through assistant_users.owner_user_id, which
+    // assistant_sessions.user_id -> channel_users.id (a channel/platform
+    // user). Core ownership flows through channel_users.owner_user_id, which
     // adoption re-owns; adoption's UPDATE on this `user_id` never matches
-    // 'system_default_user' (it holds assistant_users UUIDs), so it is a
+    // 'system_default_user' (it holds channel_users UUIDs), so it is a
     // harmless no-op.
-    ("assistant_sessions", "assistant_users"),
+    ("assistant_sessions", "channel_users"),
 ];
 
 /// Identity / infrastructure tables outside the ownership model.
@@ -220,10 +220,21 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
     let (project_id, pe_id) = seed_default_user_project(pool).await;
 
     // Channel binding owned by the pre-upgrade local user (`owner_user_id`
-    // table with a coexisting platform identity column).
+    // table with a coexisting platform identity column). The binding hangs
+    // off a connection, itself an owner_user_id table, so both must be
+    // adopted together for the composite FK to stay satisfied.
     sqlx::query(
-        "INSERT INTO assistant_users (id, platform_user_id, platform_type, display_name, authorized_at, owner_user_id)
-         VALUES ('au-legacy', 'tg-123', 'telegram', 'TG User', 1, 'system_default_user')",
+        "INSERT INTO channel_connections
+             (id, owner_user_id, plugin_key, name, enabled, config, created_at, updated_at)
+         VALUES ('conn-legacy', 'system_default_user', 'telegram', 'TG', 0, '{}', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO channel_users
+             (id, owner_user_id, connection_id, external_user_id, display_name, status, authorized_at)
+         VALUES ('au-legacy', 'system_default_user', 'conn-legacy', 'tg-123', 'TG User', 'active', 1)",
     )
     .execute(pool)
     .await
@@ -247,11 +258,20 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
         "conversation + project + explorer entry + channel binding must move, moved={moved}"
     );
 
-    let binding_owner: String = sqlx::query_scalar("SELECT owner_user_id FROM assistant_users WHERE id = 'au-legacy'")
+    let binding_owner: String = sqlx::query_scalar("SELECT owner_user_id FROM channel_users WHERE id = 'au-legacy'")
         .fetch_one(pool)
         .await
         .unwrap();
     assert_eq!(binding_owner, user.id, "channel platform binding must be adopted");
+
+    // Its connection must move with it, or the composite FK
+    // (owner_user_id, connection_id) would dangle.
+    let connection_owner: String =
+        sqlx::query_scalar("SELECT owner_user_id FROM channel_connections WHERE id = 'conn-legacy'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(connection_owner, user.id, "channel connection must be adopted too");
 
     let conv_owner: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = 'conv-legacy'")
         .fetch_one(pool)

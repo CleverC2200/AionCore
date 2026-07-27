@@ -90,10 +90,12 @@ async fn migration_029_adds_user_scope_to_independent_roots() {
         ("oauth_tokens", "user_id"),
         ("system_settings", "user_id"),
         ("client_preferences", "user_id"),
-        // 030 renamed assistant_plugins to channel_connections (connection entity).
+        // 030 renamed the channel tables: assistant_plugins →
+        // channel_connections (connection entity), assistant_users →
+        // channel_users, assistant_pairing_codes → channel_pairing_requests.
         ("channel_connections", "owner_user_id"),
-        ("assistant_users", "owner_user_id"),
-        ("assistant_pairing_codes", "owner_user_id"),
+        ("channel_users", "owner_user_id"),
+        ("channel_pairing_requests", "owner_user_id"),
     ] {
         let columns = table_columns(db.pool(), table).await;
         assert!(

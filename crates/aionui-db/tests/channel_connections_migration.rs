@@ -95,7 +95,7 @@ async fn migration_030_rebuilds_plugins_as_connections() {
     assert_ne!(conn_id, "weixin");
     assert_eq!(weixin.get::<String, _>("owner_user_id"), "system_default_user");
     assert_eq!(weixin.get::<String, _>("name"), "WeChat");
-    assert_eq!(weixin.get::<bool, _>("enabled"), true);
+    assert!(weixin.get::<bool, _>("enabled"));
     assert_eq!(weixin.get::<String, _>("config"), "enc-config");
     assert_eq!(weixin.get::<Option<String>, _>("status").as_deref(), Some("running"));
     assert_eq!(weixin.get::<Option<i64>, _>("last_connected"), Some(111));

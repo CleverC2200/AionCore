@@ -24,20 +24,31 @@ pub struct ChannelConnectionRow {
     pub updated_at: TimestampMs,
 }
 
-/// Row mapping for the `assistant_users` table.
+/// Row mapping for the `channel_users` table (+ derived platform).
 ///
-/// Represents an IM user authorized to chat with the assistant.
-/// UNIQUE constraint on (owner_user_id, platform_user_id, platform_type).
+/// Represents an IM user authorized to chat with the assistant, attached to
+/// the connection that authorized them. Revocation is a soft delete
+/// (`status` = active|revoked) so authorization history survives for audit.
+///
+/// Field-name bridge (channel refactor A2): the DB column is
+/// `external_user_id`, surfaced here as `platform_user_id` to keep the wide
+/// caller surface stable; `platform_type` is NOT a column — reads derive it
+/// from the connection (`channel_connections.plugin_key`), and writes ignore
+/// it in favor of `connection_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct AssistantUserRow {
+pub struct ChannelUserRow {
     pub id: String,
     pub owner_user_id: String,
+    pub connection_id: String,
+    #[sqlx(rename = "external_user_id")]
     pub platform_user_id: String,
+    /// Derived from the joined connection; not stored on this table.
     pub platform_type: String,
     pub display_name: Option<String>,
+    pub status: String,
+    pub revoked_at: Option<TimestampMs>,
     pub authorized_at: TimestampMs,
     pub last_active: Option<TimestampMs>,
-    pub session_id: Option<String>,
 }
 
 /// Row mapping for the `assistant_sessions` table.
@@ -57,18 +68,29 @@ pub struct AssistantSessionRow {
     pub last_activity: TimestampMs,
 }
 
-/// Row mapping for the `assistant_pairing_codes` table.
+/// Row mapping for the `channel_pairing_requests` table (+ derived platform).
 ///
 /// 6-digit pairing code with 10-minute expiry. Status transitions:
-/// pending → approved | rejected | expired.
+/// pending → approved | rejected | expired. Only a server-side HMAC of the
+/// code is stored (`code_hash`); the plaintext code exists solely in the
+/// transient pairing flow (IM message + WebSocket event).
+///
+/// Same field-name bridge as [`ChannelUserRow`]: `platform_user_id` maps the
+/// `external_user_id` column and `platform_type` is derived from the joined
+/// connection.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct PairingCodeRow {
-    pub code: String,
+pub struct ChannelPairingRequestRow {
+    pub id: String,
     pub owner_user_id: String,
+    pub connection_id: String,
+    #[sqlx(rename = "external_user_id")]
     pub platform_user_id: String,
+    /// Derived from the joined connection; not stored on this table.
     pub platform_type: String,
     pub display_name: Option<String>,
+    pub code_hash: String,
+    pub status: String,
     pub requested_at: TimestampMs,
     pub expires_at: TimestampMs,
-    pub status: String,
+    pub approved_channel_user_id: Option<String>,
 }
