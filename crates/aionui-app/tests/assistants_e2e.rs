@@ -1801,3 +1801,109 @@ async fn create_user(fx: &Fixture, id: &str, name: &str) {
 fn find_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
     list.as_array()?.iter().find(|a| a["id"].as_str() == Some(id))
 }
+
+// ---------------------------------------------------------------------------
+// Two-user filesystem isolation: avatars
+// ---------------------------------------------------------------------------
+
+/// Two Core Users each upload an avatar. Each must land under its owner's
+/// `assistant-avatars/users/{dir}/` (never a shared flat dir), keep its own
+/// bytes, and be served per-user. (The service rejects reusing another user's
+/// assistant id outright — asserted here too — so a same-name overwrite can't
+/// even be attempted.)
+#[tokio::test]
+async fn avatars_of_two_users_are_physically_isolated() {
+    let mut fx = fixture().await;
+
+    // Second user alongside the fixture's admin (system_default_user).
+    let (token_b, csrf_b) = setup_and_login(&mut fx.app, &fx.services, "bob", "StrongP@ss2").await;
+    let user_b = fx
+        .services
+        .user_repo
+        .find_by_username("bob")
+        .await
+        .unwrap()
+        .expect("bob should exist");
+    let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
+
+    // Same-named source file, different bytes per user.
+    let src_a = fx.user_data_dir.join("picked-a.png");
+    let src_b = fx.user_data_dir.join("picked-b.png");
+    std::fs::write(&src_a, b"avatar-bytes-A").unwrap();
+    std::fs::write(&src_b, b"avatar-bytes-B").unwrap();
+
+    for (id_body, token, csrf) in [
+        (
+            json!({ "id": "av-iso-a", "name": "Iso A", "avatar": src_a.to_string_lossy(), "agent_id": "632f31d2" }),
+            &fx.token,
+            &fx.csrf,
+        ),
+        (
+            json!({ "id": "av-iso-b", "name": "Iso B", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+            &token_b,
+            &csrf_b,
+        ),
+    ] {
+        let req = json_with_token("POST", "/api/assistants", id_body, token, csrf);
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Reusing another user's assistant id is rejected outright, so a
+    // same-name avatar overwrite cannot even be attempted.
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({ "id": "av-iso-a", "name": "Steal", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+        &token_b,
+        &csrf_b,
+    );
+    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "cross-user assistant id reuse must be rejected"
+    );
+
+    // Physically distinct per-user files, each with its own bytes.
+    let file_a = fx
+        .user_data_dir
+        .join("assistant-avatars/users/system_default_user/av-iso-a.png");
+    let file_b = fx
+        .user_data_dir
+        .join(format!("assistant-avatars/users/{dir_b}/av-iso-b.png"));
+    assert!(file_a.exists(), "A's avatar missing: {}", file_a.display());
+    assert!(file_b.exists(), "B's avatar missing: {}", file_b.display());
+    assert_eq!(
+        std::fs::read(&file_a).unwrap(),
+        b"avatar-bytes-A",
+        "A's avatar bytes must be untouched"
+    );
+    assert_eq!(std::fs::read(&file_b).unwrap(), b"avatar-bytes-B");
+    // Nothing leaked into a shared flat root or the other user's dir.
+    assert!(!fx.user_data_dir.join("assistant-avatars/av-iso-b.png").exists());
+    assert!(
+        !fx.user_data_dir
+            .join("assistant-avatars/users/system_default_user/av-iso-b.png")
+            .exists()
+    );
+
+    // Serving is per-user: each token gets its own bytes.
+    for (id, token, expected) in [
+        ("av-iso-a", &fx.token, &b"avatar-bytes-A"[..]),
+        ("av-iso-b", &token_b, &b"avatar-bytes-B"[..]),
+    ] {
+        let resp = fx
+            .app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/assistants/{id}/avatar"), token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&bytes[..], expected);
+    }
+}

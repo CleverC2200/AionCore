@@ -1138,3 +1138,73 @@ async fn sc8_every_negative_interval() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── Cross-account: cron job may not bind another user's conversation ─
+//
+// Real HTTP round-trip for the CROSS_ACCOUNT_REFERENCE contract: user B
+// creates a cron job whose conversation_id belongs to user A and must get a
+// 409 with the exact error code — not a generic conflict.
+
+#[tokio::test]
+async fn cross_account_conversation_reference_returns_409_over_http() {
+    let (mut app, services) = build_app().await;
+
+    // User A owns a conversation.
+    let (_token_a, _csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let user_a = services
+        .user_repo
+        .find_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin user should exist");
+    ensure_conversation(&services, &user_a.id, "conv_cross_acct", "A's Conversation").await;
+
+    // User B (their own assistant, so agent resolution succeeds and the
+    // request reaches the conversation ownership check).
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "mallory", "StrongP@ss2").await;
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "cron-e2e-assistant-b",
+            "name": "Mallory Assistant",
+            "agent_id": "2d23ff1c"
+        }),
+        &token_b,
+        &csrf_b,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+        "assistant seed for B failed: {}",
+        resp.status()
+    );
+
+    let body = json!({
+        "name": "Steal A's Conversation",
+        "schedule": { "kind": "every", "every_ms": 60000 },
+        "message": "x",
+        "conversation_id": "conv_cross_acct",
+        "created_by": "user",
+        "agent_config": { "name": "Steal A's Conversation", "assistant_id": "cron-e2e-assistant-b" }
+    });
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token_b, &csrf_b);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "cross-account bind must be 409");
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["code"], "CROSS_ACCOUNT_REFERENCE",
+        "must surface the exact contract code, got: {json}"
+    );
+
+    // And no job leaked into the store for either user.
+    let repo = SqliteCronRepository::new(services.database.pool().clone());
+    assert!(repo.list_all_for_user(&user_a.id).await.unwrap().is_empty());
+    let user_b = services
+        .user_repo
+        .find_by_username("mallory")
+        .await
+        .unwrap()
+        .expect("mallory should exist");
+    assert!(repo.list_all_for_user(&user_b.id).await.unwrap().is_empty());
+}
