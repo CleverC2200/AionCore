@@ -144,7 +144,11 @@ pub struct ChannelPlatformSettingsResponse {
 /// Excludes encrypted config data for security.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginStatusResponse {
+    /// Platform key — the UI's stable plugin addressing (e.g. "telegram").
     pub plugin_id: String,
+    /// Connection identity behind this plugin entry (channel refactor A1).
+    #[serde(default)]
+    pub connection_id: String,
     #[serde(rename = "type")]
     pub plugin_type: String,
     pub name: String,
@@ -450,6 +454,7 @@ mod tests {
     fn test_plugin_status_response_serde() {
         let resp = PluginStatusResponse {
             plugin_id: "telegram".into(),
+            connection_id: String::new(),
             plugin_type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
@@ -481,6 +486,7 @@ mod tests {
     fn test_plugin_status_response_optional_fields_omitted() {
         let resp = PluginStatusResponse {
             plugin_id: "lark".into(),
+            connection_id: String::new(),
             plugin_type: "lark".into(),
             name: "Lark Bot".into(),
             enabled: false,
@@ -724,6 +730,7 @@ mod tests {
             plugin_id: "telegram".into(),
             status: PluginStatusResponse {
                 plugin_id: "telegram".into(),
+                connection_id: String::new(),
                 plugin_type: "telegram".into(),
                 name: "Telegram Bot".into(),
                 enabled: true,
@@ -781,6 +788,7 @@ mod tests {
     fn test_plugin_status_response_roundtrip() {
         let resp = PluginStatusResponse {
             plugin_id: "dingtalk".into(),
+            connection_id: String::new(),
             plugin_type: "dingtalk".into(),
             name: "DingTalk Bot".into(),
             enabled: true,

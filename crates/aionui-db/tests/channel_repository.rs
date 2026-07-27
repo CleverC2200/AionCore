@@ -6,8 +6,10 @@
 
 use std::sync::Arc;
 
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-use aionui_db::{DbError, IChannelRepository, SqliteChannelRepository, UpdatePluginStatusParams, init_database_memory};
+use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+use aionui_db::{
+    DbError, IChannelRepository, SqliteChannelRepository, UpdateConnectionStatusParams, init_database_memory,
+};
 
 const OWNER_ID: &str = "system_default_user";
 
@@ -17,12 +19,12 @@ async fn repo() -> (Arc<dyn IChannelRepository>, aionui_db::Database) {
     (r as Arc<dyn IChannelRepository>, db)
 }
 
-fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
+fn make_plugin(id: &str, plugin_type: &str) -> ChannelConnectionRow {
     let now = aionui_common::now_ms();
-    ChannelPluginRow {
+    ChannelConnectionRow {
         id: id.into(),
         owner_user_id: OWNER_ID.into(),
-        r#type: plugin_type.into(),
+        plugin_key: plugin_type.into(),
         name: format!("{plugin_type} bot"),
         enabled: false,
         config: r#"{"credentials":{}}"#.into(),
@@ -82,22 +84,22 @@ async fn plugin_full_lifecycle() {
     let (repo, _db) = repo().await;
 
     // Empty initially.
-    assert!(repo.get_all_plugins(OWNER_ID).await.unwrap().is_empty());
+    assert!(repo.get_all_connections(OWNER_ID).await.unwrap().is_empty());
 
     // Create two plugins.
-    repo.upsert_plugin(OWNER_ID, &make_plugin("tg-1", "telegram"))
+    repo.upsert_connection(OWNER_ID, &make_plugin("tg-1", "telegram"))
         .await
         .unwrap();
-    repo.upsert_plugin(OWNER_ID, &make_plugin("lark-1", "lark"))
+    repo.upsert_connection(OWNER_ID, &make_plugin("lark-1", "lark"))
         .await
         .unwrap();
-    assert_eq!(repo.get_all_plugins(OWNER_ID).await.unwrap().len(), 2);
+    assert_eq!(repo.get_all_connections(OWNER_ID).await.unwrap().len(), 2);
 
     // Update status.
-    repo.update_plugin_status(
+    repo.update_connection_status(
         OWNER_ID,
         "tg-1",
-        &UpdatePluginStatusParams {
+        &UpdateConnectionStatusParams {
             status: Some("running".into()),
             enabled: Some(true),
             ..Default::default()
@@ -106,13 +108,43 @@ async fn plugin_full_lifecycle() {
     .await
     .unwrap();
 
-    let tg = repo.get_plugin(OWNER_ID, "tg-1").await.unwrap().unwrap();
+    let tg = repo.get_connection(OWNER_ID, "tg-1").await.unwrap().unwrap();
     assert!(tg.enabled);
     assert_eq!(tg.status.as_deref(), Some("running"));
 
     // Delete one.
-    repo.delete_plugin(OWNER_ID, "lark-1").await.unwrap();
-    assert_eq!(repo.get_all_plugins(OWNER_ID).await.unwrap().len(), 1);
+    repo.delete_connection(OWNER_ID, "lark-1").await.unwrap();
+    assert_eq!(repo.get_all_connections(OWNER_ID).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn phase1_single_connection_per_plugin_key_enforced() {
+    let (repo, _db) = repo().await;
+    repo.upsert_connection(OWNER_ID, &make_plugin("conn-a", "telegram"))
+        .await
+        .unwrap();
+
+    // A second connection for the same (owner, plugin_key) violates the
+    // phase-1 single-instance unique index.
+    let err = repo
+        .upsert_connection(OWNER_ID, &make_plugin("conn-b", "telegram"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "unexpected error: {err}");
+
+    // Plugin-key lookup resolves the single instance.
+    let found = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "conn-a");
+    assert!(
+        repo.get_connection_by_plugin_key(OWNER_ID, "lark")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ── DC-3: Same platform user uniqueness constraint ───────────────────

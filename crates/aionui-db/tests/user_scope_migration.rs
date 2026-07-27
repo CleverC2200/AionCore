@@ -90,7 +90,8 @@ async fn migration_029_adds_user_scope_to_independent_roots() {
         ("oauth_tokens", "user_id"),
         ("system_settings", "user_id"),
         ("client_preferences", "user_id"),
-        ("assistant_plugins", "owner_user_id"),
+        // 030 renamed assistant_plugins to channel_connections (connection entity).
+        ("channel_connections", "owner_user_id"),
         ("assistant_users", "owner_user_id"),
         ("assistant_pairing_codes", "owner_user_id"),
     ] {

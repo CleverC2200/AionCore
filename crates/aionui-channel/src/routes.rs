@@ -377,7 +377,7 @@ async fn disable_plugin(
         .is_some()
         && state
             .repo
-            .get_plugin(&user.id, &req.plugin_id)
+            .get_connection_by_plugin_key(&user.id, &req.plugin_id)
             .await
             .map_err(db_error_to_api_error)?
             .is_none()

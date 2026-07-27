@@ -1,17 +1,19 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
-/// Row mapping for the `assistant_plugins` table.
+/// Row mapping for the `channel_connections` table.
 ///
-/// Stores channel plugin configurations. The `config` column holds an
-/// encrypted JSON blob containing credentials and options.
+/// One connection instance of a channel plugin. `id` is a generated,
+/// meaning-free connection id; the platform lives in `plugin_key`. The
+/// `config` column holds an encrypted JSON blob containing credentials and
+/// options. Phase 1 keeps one connection per (owner, plugin_key).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct ChannelPluginRow {
+pub struct ChannelConnectionRow {
     pub id: String,
     pub owner_user_id: String,
-    /// Platform type (telegram, lark, dingtalk, weixin, slack, discord).
-    #[sqlx(rename = "type")]
-    pub r#type: String,
+    /// Platform key (telegram, lark, dingtalk, weixin, slack, discord, or an
+    /// extension-contributed plugin id).
+    pub plugin_key: String,
     pub name: String,
     pub enabled: bool,
     /// JSON blob: `{ credentials, config }`. Stored encrypted at rest.

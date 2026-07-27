@@ -1,8 +1,8 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams};
+use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+use crate::repository::channel::{IChannelRepository, UpdateConnectionStatusParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
 #[derive(Clone, Debug)]
@@ -18,11 +18,11 @@ impl SqliteChannelRepository {
 
 #[async_trait::async_trait]
 impl IChannelRepository for SqliteChannelRepository {
-    // ── Plugin CRUD ──────────────────────────────────────────────────
+    // ── Connection CRUD ──────────────────────────────────────────────
 
-    async fn get_all_plugins(&self, owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
-        let rows = sqlx::query_as::<_, ChannelPluginRow>(
-            "SELECT * FROM assistant_plugins WHERE owner_user_id = ? ORDER BY created_at ASC",
+    async fn get_all_connections(&self, owner_user_id: &str) -> Result<Vec<ChannelConnectionRow>, DbError> {
+        let rows = sqlx::query_as::<_, ChannelConnectionRow>(
+            "SELECT * FROM channel_connections WHERE owner_user_id = ? ORDER BY created_at ASC",
         )
         .bind(owner_user_id)
         .fetch_all(&self.pool)
@@ -30,23 +30,39 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(rows)
     }
 
-    async fn get_plugin(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-        let row =
-            sqlx::query_as::<_, ChannelPluginRow>("SELECT * FROM assistant_plugins WHERE owner_user_id = ? AND id = ?")
-                .bind(owner_user_id)
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+    async fn get_connection(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelConnectionRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelConnectionRow>(
+            "SELECT * FROM channel_connections WHERE owner_user_id = ? AND id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
-    async fn upsert_plugin(&self, owner_user_id: &str, row: &ChannelPluginRow) -> Result<(), DbError> {
+    async fn get_connection_by_plugin_key(
+        &self,
+        owner_user_id: &str,
+        plugin_key: &str,
+    ) -> Result<Option<ChannelConnectionRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelConnectionRow>(
+            "SELECT * FROM channel_connections WHERE owner_user_id = ? AND plugin_key = ?",
+        )
+        .bind(owner_user_id)
+        .bind(plugin_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn upsert_connection(&self, owner_user_id: &str, row: &ChannelConnectionRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO assistant_plugins \
-                (id, owner_user_id, type, name, enabled, config, status, last_connected, created_at, updated_at) \
+            "INSERT INTO channel_connections \
+                (id, owner_user_id, plugin_key, name, enabled, config, status, last_connected, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(owner_user_id, id) DO UPDATE SET \
-                type = excluded.type, \
+                plugin_key = excluded.plugin_key, \
                 name = excluded.name, \
                 enabled = excluded.enabled, \
                 config = excluded.config, \
@@ -56,7 +72,7 @@ impl IChannelRepository for SqliteChannelRepository {
         )
         .bind(&row.id)
         .bind(owner_user_id)
-        .bind(&row.r#type)
+        .bind(&row.plugin_key)
         .bind(&row.name)
         .bind(row.enabled)
         .bind(&row.config)
@@ -69,11 +85,11 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(())
     }
 
-    async fn update_plugin_status(
+    async fn update_connection_status(
         &self,
         owner_user_id: &str,
         id: &str,
-        params: &UpdatePluginStatusParams,
+        params: &UpdateConnectionStatusParams,
     ) -> Result<(), DbError> {
         let mut set_clauses = Vec::new();
         if params.status.is_some() {
@@ -92,7 +108,7 @@ impl IChannelRepository for SqliteChannelRepository {
 
         set_clauses.push("updated_at = ?");
         let sql = format!(
-            "UPDATE assistant_plugins SET {} WHERE owner_user_id = ? AND id = ?",
+            "UPDATE channel_connections SET {} WHERE owner_user_id = ? AND id = ?",
             set_clauses.join(", ")
         );
 
@@ -114,19 +130,19 @@ impl IChannelRepository for SqliteChannelRepository {
 
         let result = query.execute(&self.pool).await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!("Connection '{id}' not found")));
         }
         Ok(())
     }
 
-    async fn delete_plugin(&self, owner_user_id: &str, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM assistant_plugins WHERE owner_user_id = ? AND id = ?")
+    async fn delete_connection(&self, owner_user_id: &str, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM channel_connections WHERE owner_user_id = ? AND id = ?")
             .bind(owner_user_id)
             .bind(id)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!("Connection '{id}' not found")));
         }
         Ok(())
     }
@@ -587,12 +603,12 @@ mod tests {
         .unwrap();
     }
 
-    fn sample_plugin() -> ChannelPluginRow {
+    fn sample_connection() -> ChannelConnectionRow {
         let now = aionui_common::now_ms();
-        ChannelPluginRow {
+        ChannelConnectionRow {
             id: "tg-1".into(),
             owner_user_id: OWNER_A.into(),
-            r#type: "telegram".into(),
+            plugin_key: "telegram".into(),
             name: "My Telegram Bot".into(),
             enabled: false,
             config: r#"{"credentials":{"token":"enc_xxx"}}"#.into(),
@@ -648,21 +664,21 @@ mod tests {
     // ── Plugin tests ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn get_all_plugins_empty() {
+    async fn get_all_connections_empty() {
         let (repo, _db) = setup().await;
-        let plugins = repo.get_all_plugins(OWNER_A).await.unwrap();
+        let plugins = repo.get_all_connections(OWNER_A).await.unwrap();
         assert!(plugins.is_empty());
     }
 
     #[tokio::test]
     async fn upsert_and_get_plugin() {
         let (repo, _db) = setup().await;
-        let plugin = sample_plugin();
-        repo.upsert_plugin(OWNER_A, &plugin).await.unwrap();
+        let plugin = sample_connection();
+        repo.upsert_connection(OWNER_A, &plugin).await.unwrap();
 
-        let found = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let found = repo.get_connection(OWNER_A, "tg-1").await.unwrap().unwrap();
         assert_eq!(found.id, "tg-1");
-        assert_eq!(found.r#type, "telegram");
+        assert_eq!(found.plugin_key, "telegram");
         assert_eq!(found.name, "My Telegram Bot");
         assert!(!found.enabled);
     }
@@ -670,32 +686,32 @@ mod tests {
     #[tokio::test]
     async fn upsert_plugin_updates_existing() {
         let (repo, _db) = setup().await;
-        let plugin = sample_plugin();
-        repo.upsert_plugin(OWNER_A, &plugin).await.unwrap();
+        let plugin = sample_connection();
+        repo.upsert_connection(OWNER_A, &plugin).await.unwrap();
 
-        let updated = ChannelPluginRow {
+        let updated = ChannelConnectionRow {
             name: "Updated Bot".into(),
             enabled: true,
             updated_at: aionui_common::now_ms(),
             ..plugin
         };
-        repo.upsert_plugin(OWNER_A, &updated).await.unwrap();
+        repo.upsert_connection(OWNER_A, &updated).await.unwrap();
 
-        let found = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let found = repo.get_connection(OWNER_A, "tg-1").await.unwrap().unwrap();
         assert_eq!(found.name, "Updated Bot");
         assert!(found.enabled);
     }
 
     #[tokio::test]
-    async fn get_all_plugins_returns_multiple() {
+    async fn get_all_connections_returns_multiple() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(OWNER_A, &sample_plugin()).await.unwrap();
+        repo.upsert_connection(OWNER_A, &sample_connection()).await.unwrap();
 
         let now = aionui_common::now_ms();
-        let lark = ChannelPluginRow {
+        let lark = ChannelConnectionRow {
             id: "lark-1".into(),
             owner_user_id: OWNER_A.into(),
-            r#type: "lark".into(),
+            plugin_key: "lark".into(),
             name: "Lark Bot".into(),
             enabled: true,
             config: "{}".into(),
@@ -704,9 +720,9 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        repo.upsert_plugin(OWNER_A, &lark).await.unwrap();
+        repo.upsert_connection(OWNER_A, &lark).await.unwrap();
 
-        let all = repo.get_all_plugins(OWNER_A).await.unwrap();
+        let all = repo.get_all_connections(OWNER_A).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -715,10 +731,10 @@ mod tests {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
 
-        repo.upsert_plugin(OWNER_A, &sample_plugin()).await.unwrap();
+        repo.upsert_connection(OWNER_A, &sample_connection()).await.unwrap();
 
-        assert!(repo.get_plugin(OWNER_B, "tg-1").await.unwrap().is_none());
-        assert!(repo.get_all_plugins(OWNER_B).await.unwrap().is_empty());
+        assert!(repo.get_connection(OWNER_B, "tg-1").await.unwrap().is_none());
+        assert!(repo.get_all_connections(OWNER_B).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -726,28 +742,28 @@ mod tests {
         let (repo, db) = setup().await;
         create_owner(db.pool(), OWNER_B).await;
 
-        let owner_a_plugin = sample_plugin();
-        let owner_b_plugin = ChannelPluginRow {
+        let owner_a_plugin = sample_connection();
+        let owner_b_plugin = ChannelConnectionRow {
             owner_user_id: OWNER_B.into(),
             name: "Owner B Telegram Bot".into(),
             enabled: true,
-            ..sample_plugin()
+            ..sample_connection()
         };
 
-        repo.upsert_plugin(OWNER_A, &owner_a_plugin).await.unwrap();
-        repo.upsert_plugin(OWNER_B, &owner_b_plugin).await.unwrap();
+        repo.upsert_connection(OWNER_A, &owner_a_plugin).await.unwrap();
+        repo.upsert_connection(OWNER_B, &owner_b_plugin).await.unwrap();
 
-        let owner_a_found = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
-        let owner_b_found = repo.get_plugin(OWNER_B, "tg-1").await.unwrap().unwrap();
+        let owner_a_found = repo.get_connection(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let owner_b_found = repo.get_connection(OWNER_B, "tg-1").await.unwrap().unwrap();
         assert_eq!(owner_a_found.id, "tg-1");
         assert_eq!(owner_b_found.id, "tg-1");
         assert_eq!(owner_a_found.name, "My Telegram Bot");
         assert_eq!(owner_b_found.name, "Owner B Telegram Bot");
 
-        repo.update_plugin_status(
+        repo.update_connection_status(
             OWNER_B,
             "tg-1",
-            &UpdatePluginStatusParams {
+            &UpdateConnectionStatusParams {
                 status: Some("running".into()),
                 last_connected: None,
                 enabled: None,
@@ -756,22 +772,22 @@ mod tests {
         .await
         .unwrap();
 
-        let owner_a_after = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
-        let owner_b_after = repo.get_plugin(OWNER_B, "tg-1").await.unwrap().unwrap();
+        let owner_a_after = repo.get_connection(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let owner_b_after = repo.get_connection(OWNER_B, "tg-1").await.unwrap().unwrap();
         assert_eq!(owner_a_after.status, None);
         assert_eq!(owner_b_after.status, Some("running".into()));
     }
 
     #[tokio::test]
-    async fn update_plugin_status_sets_fields() {
+    async fn update_connection_status_sets_fields() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(OWNER_A, &sample_plugin()).await.unwrap();
+        repo.upsert_connection(OWNER_A, &sample_connection()).await.unwrap();
 
         let now = aionui_common::now_ms();
-        repo.update_plugin_status(
+        repo.update_connection_status(
             OWNER_A,
             "tg-1",
-            &UpdatePluginStatusParams {
+            &UpdateConnectionStatusParams {
                 status: Some("running".into()),
                 last_connected: Some(now),
                 enabled: Some(true),
@@ -780,20 +796,20 @@ mod tests {
         .await
         .unwrap();
 
-        let found = repo.get_plugin(OWNER_A, "tg-1").await.unwrap().unwrap();
+        let found = repo.get_connection(OWNER_A, "tg-1").await.unwrap().unwrap();
         assert_eq!(found.status.as_deref(), Some("running"));
         assert_eq!(found.last_connected, Some(now));
         assert!(found.enabled);
     }
 
     #[tokio::test]
-    async fn update_plugin_status_not_found() {
+    async fn update_connection_status_not_found() {
         let (repo, _db) = setup().await;
         let err = repo
-            .update_plugin_status(
+            .update_connection_status(
                 OWNER_A,
                 "nope",
-                &UpdatePluginStatusParams {
+                &UpdateConnectionStatusParams {
                     status: Some("error".into()),
                     ..Default::default()
                 },
@@ -804,11 +820,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_plugin_status_empty_params_is_noop() {
+    async fn update_connection_status_empty_params_is_noop() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(OWNER_A, &sample_plugin()).await.unwrap();
+        repo.upsert_connection(OWNER_A, &sample_connection()).await.unwrap();
         // No fields to update → no-op, no error.
-        repo.update_plugin_status(OWNER_A, "tg-1", &UpdatePluginStatusParams::default())
+        repo.update_connection_status(OWNER_A, "tg-1", &UpdateConnectionStatusParams::default())
             .await
             .unwrap();
     }
@@ -816,15 +832,15 @@ mod tests {
     #[tokio::test]
     async fn delete_plugin_removes_row() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(OWNER_A, &sample_plugin()).await.unwrap();
-        repo.delete_plugin(OWNER_A, "tg-1").await.unwrap();
-        assert!(repo.get_plugin(OWNER_A, "tg-1").await.unwrap().is_none());
+        repo.upsert_connection(OWNER_A, &sample_connection()).await.unwrap();
+        repo.delete_connection(OWNER_A, "tg-1").await.unwrap();
+        assert!(repo.get_connection(OWNER_A, "tg-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_plugin_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete_plugin(OWNER_A, "nope").await.unwrap_err();
+        let err = repo.delete_connection(OWNER_A, "nope").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 

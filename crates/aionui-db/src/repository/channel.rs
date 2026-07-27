@@ -1,37 +1,49 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
+use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
 
 /// Data access abstraction for channel integration tables.
 ///
-/// Covers four tables: `assistant_plugins`, `assistant_users`,
+/// Covers four tables: `channel_connections`, `assistant_users`,
 /// `assistant_sessions`, and `assistant_pairing_codes`.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
 pub trait IChannelRepository: Send + Sync {
-    // ── Plugin CRUD ──────────────────────────────────────────────────
+    // ── Connection CRUD ──────────────────────────────────────────────
 
-    /// Returns all registered plugins for an owner.
-    async fn get_all_plugins(&self, owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError>;
+    /// Returns all channel connections for an owner.
+    async fn get_all_connections(&self, owner_user_id: &str) -> Result<Vec<ChannelConnectionRow>, DbError>;
 
-    /// Returns a single plugin by id, or `None` if not found.
-    async fn get_plugin(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelPluginRow>, DbError>;
+    /// Returns a single connection by connection id, or `None` if not found.
+    async fn get_connection(&self, owner_user_id: &str, id: &str) -> Result<Option<ChannelConnectionRow>, DbError>;
 
-    /// Inserts a new plugin or updates an existing one (by id).
-    async fn upsert_plugin(&self, owner_user_id: &str, row: &ChannelPluginRow) -> Result<(), DbError>;
+    /// Returns the owner's connection for a plugin key, or `None`.
+    ///
+    /// Phase 1 guarantees at most one connection per (owner, plugin_key)
+    /// (`idx_channel_connections_single_instance`), which is what makes this
+    /// lookup well-defined; it is the bridge for callers that still address
+    /// channels by platform.
+    async fn get_connection_by_plugin_key(
+        &self,
+        owner_user_id: &str,
+        plugin_key: &str,
+    ) -> Result<Option<ChannelConnectionRow>, DbError>;
 
-    /// Updates only the `status` and `last_connected` of a plugin.
-    async fn update_plugin_status(
+    /// Inserts a new connection or updates an existing one (by connection id).
+    async fn upsert_connection(&self, owner_user_id: &str, row: &ChannelConnectionRow) -> Result<(), DbError>;
+
+    /// Updates only the `status` / `last_connected` / `enabled` of a connection.
+    async fn update_connection_status(
         &self,
         owner_user_id: &str,
         id: &str,
-        params: &UpdatePluginStatusParams,
+        params: &UpdateConnectionStatusParams,
     ) -> Result<(), DbError>;
 
-    /// Deletes a plugin by id. Returns `DbError::NotFound` if absent.
-    async fn delete_plugin(&self, owner_user_id: &str, id: &str) -> Result<(), DbError>;
+    /// Deletes a connection by connection id. Returns `DbError::NotFound` if absent.
+    async fn delete_connection(&self, owner_user_id: &str, id: &str) -> Result<(), DbError>;
 
     // ── User CRUD ────────────────────────────────────────────────────
 
@@ -130,9 +142,9 @@ pub trait IChannelRepository: Send + Sync {
     async fn cleanup_expired_pairings(&self, owner_user_id: &str, now: TimestampMs) -> Result<u64, DbError>;
 }
 
-/// Parameters for updating plugin runtime status.
+/// Parameters for updating connection runtime status.
 #[derive(Debug, Clone, Default)]
-pub struct UpdatePluginStatusParams {
+pub struct UpdateConnectionStatusParams {
     pub status: Option<String>,
     pub last_connected: Option<TimestampMs>,
     pub enabled: Option<bool>,

@@ -280,8 +280,8 @@ impl PairingService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-    use aionui_db::{DbError, IChannelRepository, UpdatePluginStatusParams};
+    use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelConnectionRow, PairingCodeRow};
+    use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::sync::Mutex;
 
     // ── Mock EventBroadcaster ──────────────────────────────────────────
@@ -337,24 +337,36 @@ mod tests {
     impl IChannelRepository for MockRepo {
         // -- Plugin CRUD (unused stubs) --
 
-        async fn get_all_plugins(&self, _owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
+        async fn get_all_connections(&self, _owner_user_id: &str) -> Result<Vec<ChannelConnectionRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-            Ok(None)
-        }
-        async fn upsert_plugin(&self, _owner_user_id: &str, _row: &ChannelPluginRow) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn update_plugin_status(
+        async fn get_connection(
             &self,
             _owner_user_id: &str,
             _id: &str,
-            _params: &UpdatePluginStatusParams,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_connection_by_plugin_key(
+            &self,
+            _owner_user_id: &str,
+            _plugin_key: &str,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
+            Ok(None)
+        }
+        async fn upsert_connection(&self, _owner_user_id: &str, _row: &ChannelConnectionRow) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn update_connection_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _params: &UpdateConnectionStatusParams,
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn delete_connection(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
