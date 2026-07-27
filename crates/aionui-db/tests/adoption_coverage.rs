@@ -37,6 +37,22 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     ("folders", "global canonical path registry"),
 ];
 
+/// Tables whose `user_id` column is NOT a Core-user ownership column — it
+/// foreign-keys a non-Core identity table (a channel/platform user). The row's
+/// Core owner is reached by joining that parent to its adopted root, so the
+/// misleading `user_id` must be excluded from the ownership-root heuristic.
+/// Without this, "has a `user_id` column" would classify the table as an
+/// ownership root by accident and the gate would pass without a conscious
+/// decision. Each entry: (table, the non-Core table its `user_id` points at).
+const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
+    // assistant_sessions.user_id -> assistant_users.id (a channel/platform
+    // user). Core ownership flows through assistant_users.owner_user_id, which
+    // adoption re-owns; adoption's UPDATE on this `user_id` never matches
+    // 'system_default_user' (it holds assistant_users UUIDs), so it is a
+    // harmless no-op.
+    ("assistant_sessions", "assistant_users"),
+];
+
 /// Identity / infrastructure tables outside the ownership model.
 const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];
 
@@ -66,16 +82,24 @@ async fn every_table_is_classified_for_aionpro_adoption() {
     let mut overlaps = Vec::new();
 
     for table in table_names(pool).await {
-        let owned_by_user_id = has_column(pool, &table, "user_id").await && table != "users";
+        let non_core_user_id = NON_CORE_USER_ID_TABLES.iter().any(|(name, _)| *name == table);
+        let owned_by_user_id = has_column(pool, &table, "user_id").await && table != "users" && !non_core_user_id;
         let owned_by_owner_user_id = has_column(pool, &table, "owner_user_id").await;
         let parent_scoped = PARENT_SCOPED.iter().any(|(name, _, _)| *name == table);
         let global = GLOBAL_TABLES.iter().any(|(name, _)| *name == table);
         let infra = INFRA_TABLES.contains(&table.as_str());
 
-        let categories = [owned_by_user_id, owned_by_owner_user_id, parent_scoped, global, infra]
-            .iter()
-            .filter(|hit| **hit)
-            .count();
+        let categories = [
+            owned_by_user_id,
+            owned_by_owner_user_id,
+            parent_scoped,
+            global,
+            infra,
+            non_core_user_id,
+        ]
+        .iter()
+        .filter(|hit| **hit)
+        .count();
 
         match categories {
             0 => unclassified.push(table),
@@ -131,6 +155,23 @@ async fn parent_scoped_declarations_match_the_live_schema() {
         assert!(
             tables.iter().any(|name| name == table),
             "global-table declaration references missing table {table}"
+        );
+    }
+
+    for (table, parent) in NON_CORE_USER_ID_TABLES {
+        assert!(
+            tables.iter().any(|name| name == table),
+            "non-core-user-id declaration references missing table {table}"
+        );
+        assert!(
+            has_column(pool, table, "user_id").await,
+            "{table} was declared as carrying a non-core user_id but has no user_id column"
+        );
+        // The parent its user_id points at must itself be an adopted root —
+        // owned via owner_user_id — so Core ownership genuinely flows through it.
+        assert!(
+            has_column(pool, parent, "owner_user_id").await,
+            "{table}.user_id points at {parent}, which is not an owner_user_id root"
         );
     }
 

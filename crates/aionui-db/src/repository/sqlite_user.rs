@@ -251,6 +251,22 @@ impl IUserRepository for SqliteUserRepository {
         Ok(moved)
     }
 
+    async fn is_sole_external_user(&self, owner_id: &str) -> Result<bool, DbError> {
+        // Mirrors the adoption-window precondition in `adopt_system_default_data`:
+        // exactly one external user, and it is the caller.
+        let (external_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE user_type != 'local'")
+            .fetch_one(&self.pool)
+            .await?;
+        if external_count != 1 {
+            return Ok(false);
+        }
+        let (is_owner,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
+            .bind(owner_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(is_owner == 1)
+    }
+
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(id)

@@ -74,23 +74,8 @@ impl ICronRepository for SqliteCronRepository {
         Ok(())
     }
 
-    async fn update_system(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
-        self.update_inner(None, id, params).await
-    }
-
     async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
         self.update_inner(Some(user_id), id, params).await
-    }
-
-    async fn delete_system(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM cron_jobs WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("cron job '{id}'")));
-        }
-        Ok(())
     }
 
     async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
@@ -173,14 +158,6 @@ impl ICronRepository for SqliteCronRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
-    }
-
-    async fn delete_by_conversation_system(&self, conversation_id: &str) -> Result<u64, DbError> {
-        let result = sqlx::query("DELETE FROM cron_jobs WHERE conversation_id = ?")
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
     }
 
     async fn claim_run(&self, params: &ClaimCronRunParams<'_>) -> Result<CronRunClaimResult, DbError> {
@@ -685,7 +662,7 @@ mod tests {
             run_count: Some(42),
             ..Default::default()
         };
-        repo.update_system("cron_u1", &params).await.unwrap();
+        repo.update_for_user("user_1", "cron_u1", &params).await.unwrap();
 
         let updated = repo.get_by_id_system("cron_u1").await.unwrap().unwrap();
         assert_eq!(updated.name, "Renamed");
@@ -699,7 +676,8 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.insert(&make_row("cron_queue")).await.unwrap();
 
-        repo.update_system(
+        repo.update_for_user(
+            "user_1",
             "cron_queue",
             &UpdateCronJobParams {
                 queue_enabled: Some(true),
@@ -980,7 +958,7 @@ mod tests {
             skill_content: Some(Some("---\nname: skill\n---\nDo it".into())),
             ..Default::default()
         };
-        repo.update_system("cron_u2", &params).await.unwrap();
+        repo.update_for_user("user_1", "cron_u2", &params).await.unwrap();
 
         let updated = repo.get_by_id_system("cron_u2").await.unwrap().unwrap();
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
@@ -993,7 +971,7 @@ mod tests {
             skill_content: Some(None),
             ..Default::default()
         };
-        repo.update_system("cron_u2", &clear_params).await.unwrap();
+        repo.update_for_user("user_1", "cron_u2", &clear_params).await.unwrap();
 
         let cleared = repo.get_by_id_system("cron_u2").await.unwrap().unwrap();
         assert!(cleared.last_status.is_none());
@@ -1008,7 +986,7 @@ mod tests {
             name: Some("x".into()),
             ..Default::default()
         };
-        let err = repo.update_system("cron_nope", &params).await.unwrap_err();
+        let err = repo.update_for_user("user_1", "cron_nope", &params).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -1018,7 +996,7 @@ mod tests {
         repo.insert(&make_row("cron_noop")).await.unwrap();
 
         let before = repo.get_by_id_system("cron_noop").await.unwrap().unwrap();
-        repo.update_system("cron_noop", &UpdateCronJobParams::default())
+        repo.update_for_user("user_1", "cron_noop", &UpdateCronJobParams::default())
             .await
             .unwrap();
         let after = repo.get_by_id_system("cron_noop").await.unwrap().unwrap();
@@ -1031,7 +1009,7 @@ mod tests {
         let (repo, _db) = setup().await;
         repo.insert(&make_row("cron_d1")).await.unwrap();
 
-        repo.delete_system("cron_d1").await.unwrap();
+        repo.delete_for_user("user_1", "cron_d1").await.unwrap();
         let result = repo.get_by_id_system("cron_d1").await.unwrap();
         assert!(result.is_none());
     }
@@ -1039,28 +1017,8 @@ mod tests {
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete_system("cron_nope").await.unwrap_err();
+        let err = repo.delete_for_user("user_1", "cron_nope").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn delete_by_conversation_removes_all_related() {
-        let (repo, _db) = setup().await;
-        repo.insert(&make_row("cron_dc1")).await.unwrap();
-        repo.insert(&make_row("cron_dc2")).await.unwrap();
-
-        let deleted = repo.delete_by_conversation_system("conv_1").await.unwrap();
-        assert_eq!(deleted, 2);
-
-        let remaining = repo.list_all_system().await.unwrap();
-        assert!(remaining.is_empty());
-    }
-
-    #[tokio::test]
-    async fn delete_by_conversation_returns_zero_for_no_match() {
-        let (repo, _db) = setup().await;
-        let deleted = repo.delete_by_conversation_system("conv_none").await.unwrap();
-        assert_eq!(deleted, 0);
     }
 
     #[tokio::test]
@@ -1076,7 +1034,7 @@ mod tests {
             next_run_at: Some(Some(9999999)),
             ..Default::default()
         };
-        repo.update_system("cron_s1", &params).await.unwrap();
+        repo.update_for_user("user_1", "cron_s1", &params).await.unwrap();
 
         let updated = repo.get_by_id_system("cron_s1").await.unwrap().unwrap();
         assert_eq!(updated.schedule_kind, "cron");

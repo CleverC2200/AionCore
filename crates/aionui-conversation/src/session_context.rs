@@ -159,7 +159,6 @@ impl<'a> SessionContextBuilder<'a> {
             Err(WorkspacePathValidationError::DoesNotExist(path))
                 if is_auto_workspace(
                     self.workspace_root,
-                    &row.user_id,
                     &row.id,
                     agent_type,
                     extra.get("backend"),
@@ -177,7 +176,6 @@ impl<'a> SessionContextBuilder<'a> {
         Ok(WorkspaceContext {
             is_custom: !is_auto_workspace(
                 self.workspace_root,
-                &row.user_id,
                 &row.id,
                 agent_type,
                 extra.get("backend"),
@@ -608,32 +606,48 @@ fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
         .join(format!("{:02}", now.day()))
 }
 
-/// Legacy (pre-per-user) auto-workspace parent: `conversations/{Y}/{M}/{D}`
-/// with no `users/{dir}` segment. Retained so conversations created before the
-/// per-user layout are still recognized as auto workspaces (not misclassified
-/// as custom) — see [`is_auto_workspace`].
-fn legacy_auto_workspace_parent(workspace_root: &Path) -> PathBuf {
-    let now = chrono::Local::now();
-    workspace_root
-        .join("conversations")
-        .join(format!("{:04}", now.year()))
-        .join(format!("{:02}", now.month()))
-        .join(format!("{:02}", now.day()))
-}
-
-/// Whether `candidate` is an auto-provisioned workspace for this conversation,
-/// accepting BOTH the current per-user layout and the legacy userless layout.
+/// Whether `candidate` is an auto-provisioned workspace for this conversation.
+///
+/// Matches by path STRUCTURE, not by an exact per-user/dated path. The leaf
+/// carries the globally-unique `conversation_id` and the caller has already
+/// validated ownership, so the `users/{dir}` segment and the `{Y}/{M}/{D}`
+/// date are wildcarded. Accepts:
+///   - legacy userless:     `conversations/{Y}/{M}/{D}/{leaf}`
+///   - per-user type-first: `conversations/users/{any_dir}/{Y}/{M}/{D}/{leaf}`
+///
+/// The previous exact-match compared against `auto_workspace_parent(_, user_id)`
+/// built from TODAY's date and the acting user's dir. That misclassified as
+/// "custom" any workspace created on an earlier day, and any workspace still
+/// under `users/system_default_user/` after an account adoption. Structural
+/// matching fixes both. Mirrors the delete-side
+/// `is_dated_auto_workspace_relative_path` in `service.rs`.
 fn is_auto_workspace(
     workspace_root: &Path,
-    user_id: &str,
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
     candidate: &Path,
 ) -> bool {
-    let leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
-    candidate == auto_workspace_parent(workspace_root, user_id).join(&leaf)
-        || candidate == legacy_auto_workspace_parent(workspace_root).join(&leaf)
+    let expected_leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
+    let Ok(relative) = candidate.strip_prefix(workspace_root.join("conversations")) else {
+        return false;
+    };
+    let Some(parts) = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let dated = |year: &str, month: &str, day: &str| {
+        year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+    };
+    match parts.as_slice() {
+        [year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
+        ["users", _user_dir, year, month, day, leaf] => dated(year, month, day) && *leaf == expected_leaf,
+        _ => false,
+    }
 }
 
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -1228,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_is_user_scoped_and_legacy_still_recognized() {
+    fn is_auto_workspace_matches_by_structure_across_user_and_date() {
         let root = std::path::Path::new("/w");
         let user = "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee";
         let new_path = expected_auto_workspace_path(root, user, "conv-1", &AgentType::Acp, None);
@@ -1241,28 +1255,59 @@ mod tests {
         );
         assert!(new_path.to_string_lossy().ends_with("-temp-conv-1"));
 
-        // Both the new per-user path and the legacy userless path must count as
-        // auto workspaces (so old conversations are not misclassified custom).
-        assert!(is_auto_workspace(
-            root,
-            user,
-            "conv-1",
-            &AgentType::Acp,
-            None,
-            &new_path
-        ));
-        let now = chrono::Local::now();
-        let legacy = root
-            .join("conversations")
-            .join(format!("{:04}", now.year()))
-            .join(format!("{:02}", now.month()))
-            .join(format!("{:02}", now.day()))
-            .join("acp-temp-conv-1");
-        assert!(is_auto_workspace(root, user, "conv-1", &AgentType::Acp, None, &legacy));
+        let auto = |candidate: &std::path::Path| is_auto_workspace(root, "conv-1", &AgentType::Acp, None, candidate);
+        let dated = |segments: &[&str], leaf: &str| {
+            let mut p = root.join("conversations");
+            for seg in segments {
+                p = p.join(seg);
+            }
+            p.join(leaf)
+        };
 
-        // A genuinely custom path is neither.
-        let custom = root.join("somewhere-else");
-        assert!(!is_auto_workspace(root, user, "conv-1", &AgentType::Acp, None, &custom));
+        // Current per-user path (today, acting user's dir).
+        assert!(auto(&new_path));
+
+        // Legacy userless path (today).
+        let now = chrono::Local::now();
+        let legacy = dated(
+            &[
+                &format!("{:04}", now.year()),
+                &format!("{:02}", now.month()),
+                &format!("{:02}", now.day()),
+            ],
+            "acp-temp-conv-1",
+        );
+        assert!(auto(&legacy));
+
+        // Cross-day per-user path (a different date than today): the old exact
+        // match rejected this, structural matching accepts it.
+        let cross_day = dated(
+            &["users", "019f8de8-3537-7c73-8d92-3bfde17eb1ee", "2020", "01", "02"],
+            "acp-temp-conv-1",
+        );
+        assert!(
+            auto(&cross_day),
+            "a workspace created on an earlier day must still count as auto"
+        );
+
+        // Post-adoption path still under users/system_default_user/: must be
+        // recognized so adopted conversations are not misclassified as custom.
+        let adopted = dated(&["users", "system_default_user", "2020", "01", "02"], "acp-temp-conv-1");
+        assert!(
+            auto(&adopted),
+            "old system_default_user workspace must still count as auto"
+        );
+
+        // Different conversation's leaf → not THIS conversation's auto workspace.
+        let other_conv = dated(&["users", "d", "2020", "01", "02"], "acp-temp-conv-2");
+        assert!(!auto(&other_conv));
+
+        // Non-dated segments must be rejected (guards the structural matcher).
+        let bad_date = dated(&["users", "d", "YY", "MM", "DD"], "acp-temp-conv-1");
+        assert!(!auto(&bad_date));
+
+        // A genuinely custom path is not auto.
+        assert!(!auto(&root.join("somewhere-else")));
     }
 
     #[test]

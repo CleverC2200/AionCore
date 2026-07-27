@@ -70,17 +70,8 @@ pub trait ICronRepository: Send + Sync {
     /// Inserts a new cron job row.
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError>;
 
-    /// System-only update path for scheduler/recovery code that already
-    /// operates on persisted job identity. User-facing code must use
-    /// `update_for_user`.
-    async fn update_system(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
-
     /// Updates a cron job whose conversation is owned by `user_id`.
     async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
-
-    /// System-only delete path for scheduler/recovery cleanup. User-facing
-    /// code must use `delete_for_user`.
-    async fn delete_system(&self, id: &str) -> Result<(), DbError>;
 
     /// Deletes a cron job whose conversation is owned by `user_id`.
     async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError>;
@@ -111,10 +102,6 @@ pub trait ICronRepository: Send + Sync {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<CronJobRow>, DbError>;
-
-    /// System-only conversation cleanup. User-facing code must verify the
-    /// conversation owner first and use scoped paths.
-    async fn delete_by_conversation_system(&self, conversation_id: &str) -> Result<u64, DbError>;
 
     /// Atomically claims one scheduled occurrence across all backend processes.
     async fn claim_run(&self, params: &ClaimCronRunParams<'_>) -> Result<CronRunClaimResult, DbError>;

@@ -63,6 +63,16 @@ pub trait IUserRepository: Send + Sync {
     /// data authoritative.
     async fn adopt_system_default_data(&self, owner_id: &str) -> Result<u64, DbError>;
 
+    /// Whether `owner_id` currently holds the adoption window — i.e. it is the
+    /// ONLY external (aionpro) user in this database. This is the same
+    /// precondition `adopt_system_default_data` checks internally, exposed so
+    /// the on-disk file adoption can re-run after a partial move: once the DB
+    /// rows are adopted `adopt_system_default_data` returns 0, but leftover
+    /// files under `users/system_default_user/` may still need moving on a
+    /// later login. Returns `false` the moment a second external user exists,
+    /// so files can never leak to a later account.
+    async fn is_sole_external_user(&self, owner_id: &str) -> Result<bool, DbError>;
+
     /// Finds a user by ID.
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
 

@@ -89,12 +89,21 @@ impl AuthProvisionService {
         let adopted = self.user_repo.adopt_system_default_data(&user.id).await?;
         if adopted > 0 {
             tracing::info!(user_id = %user.id, rows = adopted, "adopted system_default_user data into first external user");
-            // Move the corresponding on-disk files to the adopter's per-user
-            // roots so the upgraded account can see its files (DB rows already
-            // point at it). Best-effort; never fails provisioning.
-            if let Some(fs_adopter) = &self.fs_adopter {
-                fs_adopter.adopt_filesystem(&user.id).await;
-            }
+        }
+        // Move the corresponding on-disk files to the adopter's per-user roots
+        // so the upgraded account can see its files (DB rows already point at
+        // it). Gated on the adoption window (sole external user), NOT on
+        // "rows moved this call": the on-disk move is idempotent and MUST be
+        // able to re-run after a partial failure — the first login may adopt
+        // the DB rows (adopted > 0) yet fail halfway through the file move, so
+        // a later login (adopted == 0, window still held) has to pick up the
+        // leftover files. The window predicate is false once a second external
+        // user exists, so files can never leak to a later account.
+        // Best-effort; never fails provisioning.
+        if let Some(fs_adopter) = &self.fs_adopter
+            && self.user_repo.is_sole_external_user(&user.id).await?
+        {
+            fs_adopter.adopt_filesystem(&user.id).await;
         }
 
         Ok(external_user_response(user, request.user_type))

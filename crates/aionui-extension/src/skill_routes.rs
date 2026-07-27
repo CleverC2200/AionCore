@@ -420,6 +420,10 @@ async fn read_assistant_rule(
             .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule read fallback (must not happen in production)"
+    );
     let content =
         skill_service::read_assistant_rule(&state.skill_paths, &req.assistant_id, req.locale.as_deref()).await?;
     Ok(Json(ApiResponse::ok(content)))
@@ -440,6 +444,10 @@ async fn write_assistant_rule(
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule write fallback (must not happen in production)"
+    );
     let ok = skill_service::write_assistant_rule(
         &state.skill_paths,
         &req.assistant_id,
@@ -460,6 +468,10 @@ async fn delete_assistant_rule(
         let ok = dispatcher.delete_rule(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
+    tracing::warn!(
+        assistant_id = %id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-rule delete fallback (must not happen in production)"
+    );
     let ok = skill_service::delete_assistant_rule(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }
@@ -483,6 +495,10 @@ async fn read_assistant_skill(
             .await?;
         return Ok(Json(ApiResponse::ok(content)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill read fallback (must not happen in production)"
+    );
     let content =
         skill_service::read_assistant_skill(&state.skill_paths, &req.assistant_id, req.locale.as_deref()).await?;
     Ok(Json(ApiResponse::ok(content)))
@@ -503,6 +519,10 @@ async fn write_assistant_skill(
             .await?;
         return Ok(Json(ApiResponse::ok(true)));
     }
+    tracing::warn!(
+        assistant_id = %req.assistant_id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill write fallback (must not happen in production)"
+    );
     let ok = skill_service::write_assistant_skill(
         &state.skill_paths,
         &req.assistant_id,
@@ -523,6 +543,10 @@ async fn delete_assistant_skill(
         let ok = dispatcher.delete_skill(&current_user.id, &id).await?;
         return Ok(Json(ApiResponse::ok(ok)));
     }
+    tracing::warn!(
+        assistant_id = %id,
+        "assistant_dispatcher not configured; using unscoped legacy assistant-skill delete fallback (must not happen in production)"
+    );
     let ok = skill_service::delete_assistant_skill(&state.skill_paths, &id).await?;
     Ok(Json(ApiResponse::ok(ok)))
 }

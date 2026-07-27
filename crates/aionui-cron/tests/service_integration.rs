@@ -3314,7 +3314,7 @@ async fn sr1_system_resume_missed_job() {
         next_run_at: Some(Some(past_ms)),
         ..Default::default()
     };
-    repo.update_system(&job.id, &params).await.unwrap();
+    repo.update_for_user("u1", &job.id, &params).await.unwrap();
 
     svc.handle_system_resume().await;
 

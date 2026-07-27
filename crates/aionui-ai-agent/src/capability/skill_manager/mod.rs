@@ -226,6 +226,14 @@ impl AcpSkillManager {
         if let Some(repo) = &self.skill_repo {
             aionui_extension::list_available_skills_with_repo_for_user(&self.paths, repo.as_ref(), user_id).await
         } else {
+            // No skill repo → fall back to unscoped on-disk discovery. This
+            // path is NOT per-user isolated (it scans every user's dir) and is
+            // only meant for dev / no-DB test setups; production always injects
+            // the repo. Warn so a production hit is diagnosable.
+            tracing::warn!(
+                user_id,
+                "skill_repo not configured; using unscoped on-disk skill discovery fallback (must not happen in production)"
+            );
             aionui_extension::list_available_skills(&self.paths).await
         }
     }

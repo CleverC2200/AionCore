@@ -153,6 +153,73 @@ async fn dc1_delete_user_cascades_sessions() {
     assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
 }
 
+// ── Cross-account guard: a channel session may not bind another Core user's
+//    conversation. The INSERT's ownership predicate matches zero rows, so the
+//    session is never created and no data leaks across accounts.
+#[tokio::test]
+async fn session_rejects_conversation_owned_by_another_core_user() {
+    let (repo, db) = repo().await;
+    let pool = db.pool();
+
+    repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
+        .await
+        .unwrap();
+
+    // Core users referenced by the conversations below (conversations.user_id
+    // FK → users). OWNER_ID may already be seeded; the other must be created.
+    for uid in [OWNER_ID, "other_core_user"] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO users \
+                (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(uid)
+        .bind(uid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    for (id, owner) in [("conv-own", OWNER_ID), ("conv-other", "other_core_user")] {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES (?, ?, 'c', 'gemini', '{}', 'pending', 1, 1)",
+        )
+        .bind(id)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let with_conv = |sid: &str, conv: &str| {
+        let mut session = make_session(sid, "u1", "chat-a");
+        session.conversation_id = Some(conv.to_owned());
+        session
+    };
+
+    // Binding the owner's OWN conversation succeeds.
+    let ok = repo
+        .get_or_create_session(OWNER_ID, "u1", "chat-a", &with_conv("s-own", "conv-own"))
+        .await
+        .unwrap();
+    assert_eq!(ok.conversation_id.as_deref(), Some("conv-own"));
+
+    // Binding a DIFFERENT Core user's conversation is rejected.
+    let err = repo
+        .get_or_create_session(OWNER_ID, "u1", "chat-b", &with_conv("s-other", "conv-other"))
+        .await;
+    assert!(
+        matches!(err, Err(DbError::NotFound(_))),
+        "cross-account conversation bind must be rejected, got {err:?}"
+    );
+
+    // Only the legitimate session exists — the rejected one never landed.
+    let sessions = repo.get_all_sessions(OWNER_ID).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "s-own");
+}
+
 // ── PC-1: Same user, different chatId → different sessions ───────────
 
 #[tokio::test]

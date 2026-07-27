@@ -292,6 +292,11 @@ impl IChannelRepository for SqliteChannelRepository {
              WHERE EXISTS (
                  SELECT 1 FROM assistant_users
                  WHERE owner_user_id = ? AND id = ?
+             )
+             AND (
+                 ? IS NULL OR EXISTS (
+                     SELECT 1 FROM conversations WHERE id = ? AND user_id = ?
+                 )
              )",
         )
         .bind(&new_row.id)
@@ -304,6 +309,13 @@ impl IChannelRepository for SqliteChannelRepository {
         .bind(new_row.last_activity)
         .bind(owner_user_id)
         .bind(channel_user_id)
+        // Cross-account guard: a bound conversation must belong to the same
+        // Core owner. NULL conversation_id (the current caller contract) is
+        // allowed; a conversation owned by another user makes the INSERT match
+        // zero rows, so get_session below returns NotFound.
+        .bind(&new_row.conversation_id)
+        .bind(&new_row.conversation_id)
+        .bind(owner_user_id)
         .execute(&self.pool)
         .await?;
 

@@ -287,7 +287,7 @@ async fn cj8_update_name_and_enabled() {
         enabled: Some(false),
         ..Default::default()
     };
-    r.update_system("cron_u1", &params).await.unwrap();
+    r.update_for_user("user_1", "cron_u1", &params).await.unwrap();
 
     let updated = r.get_by_id_system("cron_u1").await.unwrap().unwrap();
     assert_eq!(updated.name, "Renamed");
@@ -307,7 +307,7 @@ async fn cj9_update_schedule_type() {
         next_run_at: Some(Some(9999999)),
         ..Default::default()
     };
-    r.update_system("cron_s1", &params).await.unwrap();
+    r.update_for_user("user_1", "cron_s1", &params).await.unwrap();
 
     let updated = r.get_by_id_system("cron_s1").await.unwrap().unwrap();
     assert_eq!(updated.schedule_kind, "cron");
@@ -323,7 +323,7 @@ async fn cj10_update_nonexistent() {
         name: Some("x".into()),
         ..Default::default()
     };
-    let err = r.update_system("cron_nope", &params).await.unwrap_err();
+    let err = r.update_for_user("user_1", "cron_nope", &params).await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -331,7 +331,7 @@ async fn cj10_update_nonexistent() {
 async fn cj11_delete() {
     let (r, _db) = repo().await;
     r.insert(&make_job("cron_d1")).await.unwrap();
-    r.delete_system("cron_d1").await.unwrap();
+    r.delete_for_user("user_1", "cron_d1").await.unwrap();
 
     let found = r.get_by_id_system("cron_d1").await.unwrap();
     assert!(found.is_none());
@@ -340,7 +340,7 @@ async fn cj11_delete() {
 #[tokio::test]
 async fn cj12_delete_nonexistent() {
     let (r, _db) = repo().await;
-    let err = r.delete_system("cron_nope").await.unwrap_err();
+    let err = r.delete_for_user("user_1", "cron_nope").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -421,7 +421,7 @@ async fn sk1_save_skill_content() {
         skill_content: Some(Some("---\nname: test\n---\nDo something".into())),
         ..Default::default()
     };
-    r.update_system("cron_sk1", &params).await.unwrap();
+    r.update_for_user("user_1", "cron_sk1", &params).await.unwrap();
 
     let updated = r.get_by_id_system("cron_sk1").await.unwrap().unwrap();
     assert!(updated.skill_content.is_some());
@@ -455,31 +455,9 @@ async fn sk7_delete_clears_skill() {
     job.skill_content = Some("content".into());
     r.insert(&job).await.unwrap();
 
-    r.delete_system("cron_sk7").await.unwrap();
+    r.delete_for_user("user_1", "cron_sk7").await.unwrap();
     let found = r.get_by_id_system("cron_sk7").await.unwrap();
     assert!(found.is_none());
-}
-
-// ── H. Cascade delete (data layer) ──────────────────────────────────
-
-#[tokio::test]
-async fn cd1_delete_by_conversation_removes_all() {
-    let (r, _db) = repo().await;
-    r.insert(&make_job("cron_cd1")).await.unwrap();
-    r.insert(&make_job("cron_cd2")).await.unwrap();
-
-    let deleted = r.delete_by_conversation_system("conv_1").await.unwrap();
-    assert_eq!(deleted, 2);
-
-    let remaining = r.list_all_system().await.unwrap();
-    assert!(remaining.is_empty());
-}
-
-#[tokio::test]
-async fn delete_by_conversation_no_match_returns_zero() {
-    let (r, _db) = repo().await;
-    let deleted = r.delete_by_conversation_system("conv_none").await.unwrap();
-    assert_eq!(deleted, 0);
 }
 
 // ── Execution state tracking ────────────────────────────────────────
@@ -498,7 +476,7 @@ async fn update_execution_state() {
         next_run_at: Some(Some(now + 60_000)),
         ..Default::default()
     };
-    r.update_system("cron_ex1", &params).await.unwrap();
+    r.update_for_user("user_1", "cron_ex1", &params).await.unwrap();
 
     let updated = r.get_by_id_system("cron_ex1").await.unwrap().unwrap();
     assert_eq!(updated.last_run_at, Some(now));
@@ -518,7 +496,7 @@ async fn update_error_state() {
         retry_count: Some(1),
         ..Default::default()
     };
-    r.update_system("cron_err1", &params).await.unwrap();
+    r.update_for_user("user_1", "cron_err1", &params).await.unwrap();
 
     let updated = r.get_by_id_system("cron_err1").await.unwrap().unwrap();
     assert_eq!(updated.last_status.as_deref(), Some("error"));
