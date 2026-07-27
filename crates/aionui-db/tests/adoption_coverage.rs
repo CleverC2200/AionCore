@@ -278,6 +278,66 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
     db.close().await;
 }
 
+/// `client_preferences` is an ownership root by its `user_id` column, but that
+/// column is nullable since migration 031: device-scope rows describe the
+/// machine and carry no owner. Adoption must move the account rows and leave
+/// the machine rows exactly where they are — the same rule the ownership loop
+/// already applies to NULL-owner catalog rows.
+#[tokio::test]
+async fn adoption_moves_account_preferences_and_leaves_device_preferences_machine_global() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+
+    sqlx::query(
+        "INSERT INTO client_preferences (scope, user_id, key, value, updated_at)
+         VALUES ('account', 'system_default_user', 'theme', '\"dark\"', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO client_preferences (scope, user_id, key, value, updated_at)
+         VALUES ('device', NULL, 'keepAwake', 'true', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let user = repo
+        .ensure_external_user(
+            UserType::Aionpro,
+            "ext-prefs",
+            ExternalUserProjection {
+                username: Some("Pro".into()),
+                email: None,
+                avatar_path: None,
+            },
+        )
+        .await
+        .unwrap();
+    repo.adopt_system_default_data(&user.id).await.unwrap();
+
+    let theme_owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM client_preferences WHERE key = 'theme'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        theme_owner.as_deref(),
+        Some(user.id.as_str()),
+        "account pref is adopted"
+    );
+
+    let keep_awake_owner: Option<String> =
+        sqlx::query_scalar("SELECT user_id FROM client_preferences WHERE key = 'keepAwake'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(keep_awake_owner, None, "device pref must stay owner-less");
+
+    db.close().await;
+}
+
 #[tokio::test]
 async fn adoption_window_closes_with_second_external_user() {
     let db = init_database_memory().await.unwrap();

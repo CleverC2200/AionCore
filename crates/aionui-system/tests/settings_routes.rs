@@ -271,12 +271,12 @@ async fn settings_are_scoped_by_current_user() {
 async fn language_is_one_truth_across_settings_and_client_prefs() {
     let (app, db) = setup().await;
 
-    // PATCH /api/settings writes the language…
+    // PATCH /api/settings writes the language and a boolean switch…
     let resp = app
         .oneshot(json_request(
             "PATCH",
             "/api/settings",
-            serde_json::json!({"language": "ko-KR"}),
+            serde_json::json!({"language": "ko-KR", "notification_enabled": false}),
         ))
         .await
         .unwrap();
@@ -285,11 +285,14 @@ async fn language_is_one_truth_across_settings_and_client_prefs() {
     // …and /api/settings/client sees the exact same stored truth.
     let client_app = settings_routes(build_state(&db));
     let resp = client_app
-        .oneshot(get_request("/api/settings/client?keys=language"))
+        .oneshot(get_request(
+            "/api/settings/client?keys=language,system.notificationEnabled",
+        ))
         .await
         .unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["language"], "ko-KR");
+    assert_eq!(json["data"]["system.notificationEnabled"], false);
 
     // Writing via client prefs flips what /api/settings reports (pref wins).
     let client_app = settings_routes(build_state(&db));
@@ -297,7 +300,7 @@ async fn language_is_one_truth_across_settings_and_client_prefs() {
         .oneshot(json_request(
             "PUT",
             "/api/settings/client",
-            serde_json::json!({"language": "pt-BR"}),
+            serde_json::json!({"language": "pt-BR", "system.notificationEnabled": true}),
         ))
         .await
         .unwrap();
@@ -307,6 +310,7 @@ async fn language_is_one_truth_across_settings_and_client_prefs() {
     let resp = settings_app.oneshot(get_request("/api/settings")).await.unwrap();
     let json = body_json(resp).await;
     assert_eq!(json["data"]["language"], "pt-BR");
+    assert_eq!(json["data"]["notification_enabled"], true);
 }
 
 // ===========================================================================
