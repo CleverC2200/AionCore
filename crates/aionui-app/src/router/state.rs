@@ -407,13 +407,17 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
     let client_pref_service = if services.identity_mode.is_local() {
-        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
+        ClientPrefService::with_keep_awake_controller(
+            client_pref_repo.clone(),
+            keep_awake_controller,
+            "system_default_user",
+        )
     } else {
-        ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
+        ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo.clone(), keep_awake_controller)
     };
 
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
+        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone())), client_pref_repo),
         client_pref_service,
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
