@@ -540,6 +540,10 @@ fn build_channel_settings_service(
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
 
     let mut service = aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+        // Connection-scoped preference keys (channel refactor A4).
+        .with_channel_repo(Arc::new(aionui_db::SqliteChannelRepository::new(
+            services.database.pool().clone(),
+        )))
         .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
             services.database.pool().clone(),
         )))
