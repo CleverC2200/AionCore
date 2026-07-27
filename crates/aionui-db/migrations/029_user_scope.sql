@@ -353,9 +353,13 @@ CREATE TABLE agent_metadata_new (
     -- Surrogate row key; the logical agent identity is agent_id, which is
     -- globally UNIQUE — the catalog holds exactly one row per agent. Builtin
     -- rows have user_id NULL; custom agents carry their creator's user_id as
-    -- a pure ownership/visibility attribute. Per-user runtime state (enabled
-    -- toggle, overrides, session snapshots, handshake caches) lives in
-    -- agent_user_state, never as catalog row copies.
+    -- a pure ownership/visibility attribute. An agent is a machine-level
+    -- resource (one CLI binary + login per device, shared by all Core Users),
+    -- so this single row holds ALL of its state — capabilities, availability
+    -- probe, command/env overrides, AND the enable/disable toggle (which gates
+    -- whether the registry starts the agent, hence machine-level). There is no
+    -- per-user agent state table; per-user enable/disable happens one layer up,
+    -- on assistants (assistant_overrides).
     id                       TEXT PRIMARY KEY NOT NULL,
     agent_id                 TEXT NOT NULL,
     user_id                  TEXT REFERENCES users(id),
@@ -442,36 +446,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_metadata_backend ON agent_metadata(backend)
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent_type ON agent_metadata(agent_type);
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_sort_order ON agent_metadata(sort_order);
 
--- Per-user runtime deltas over the agent catalog. The catalog stays one row
--- per agent (machine facts: identity + startup probe state); everything a
--- user can personally change or experience lives here. NULL fields mean "no
--- override — fall through to the catalog row". Pre-migration data was
--- single-user, so this starts empty and fills lazily at runtime.
-CREATE TABLE IF NOT EXISTS agent_user_state (
-    user_id                  TEXT    NOT NULL REFERENCES users(id),
-    agent_id                 TEXT    NOT NULL,
-    enabled                  INTEGER,
-    command_override         TEXT,
-    env_override             TEXT,
-    agent_capabilities       TEXT,
-    auth_methods             TEXT,
-    config_options           TEXT,
-    available_modes          TEXT,
-    available_models         TEXT,
-    available_commands       TEXT,
-    last_check_status        TEXT,
-    last_check_kind          TEXT,
-    last_check_error_code    TEXT,
-    last_check_error_message TEXT,
-    last_check_guidance      TEXT,
-    last_check_latency_ms    INTEGER,
-    last_check_at            INTEGER,
-    last_success_at          INTEGER,
-    last_failure_at          INTEGER,
-    created_at               INTEGER NOT NULL,
-    updated_at               INTEGER NOT NULL,
-    PRIMARY KEY (user_id, agent_id)
-);
+-- No per-user agent table: agents are machine-level (see agent_metadata note
+-- above). Per-user enable/disable lives on assistants via assistant_overrides.
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_user_sort
     ON agent_metadata(user_id, sort_order, name);
 

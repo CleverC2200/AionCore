@@ -26,7 +26,6 @@ use crate::protocol::custom_agent_probe::try_connect_custom_agent as probe;
 use crate::runtime_status::custom_agent_runtime_reporter;
 
 const CUSTOM_SORT_ORDER_DEFAULT: i64 = 1500;
-const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 impl AgentService {
     /// Public accessor for the probe — powers both
@@ -106,9 +105,11 @@ impl AgentService {
         if !removed {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if user_id == SYSTEM_DEFAULT_USER_ID
-            && let Err(err) = self.registry().reload_one(id).await
-        {
+        // Agents are machine-level, so the machine cache must be refreshed
+        // regardless of which user triggered the change. reload_one is a safe
+        // no-op for rows the machine cache never held (a non-default user's own
+        // custom agent).
+        if let Err(err) = self.registry().reload_one(id).await {
             warn!(agent_id = %id, error = %err, "registry reload failed after delete_custom_agent");
         }
         Ok(())
@@ -124,9 +125,11 @@ impl AgentService {
         if !updated {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
-        if user_id == SYSTEM_DEFAULT_USER_ID
-            && let Err(err) = self.registry().reload_one(id).await
-        {
+        // enabled is machine-level and gates the registry's runtime start, so
+        // any user's toggle must refresh the machine cache — not just the
+        // default user's. (Previously gated on SYSTEM_DEFAULT_USER_ID, which
+        // left a builtin toggled by another user stale in the cache.)
+        if let Err(err) = self.registry().reload_one(id).await {
             warn!(agent_id = %id, error = %err, "registry reload failed after set_agent_enabled");
         }
         self.registry()
@@ -198,12 +201,12 @@ impl AgentService {
             .await
             .map_err(|e| AgentError::internal(format!("repo.upsert_for_user: {e}")))?;
 
-        if user_id == SYSTEM_DEFAULT_USER_ID {
-            self.registry()
-                .reload_one(id)
-                .await
-                .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
-        }
+        // Machine-level cache refresh; harmless no-op when the row is a
+        // non-default user's own custom agent (never in the machine cache).
+        self.registry()
+            .reload_one(id)
+            .await
+            .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
 
         self.registry()
             .get_for_user(user_id, id)

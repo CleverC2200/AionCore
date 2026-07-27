@@ -189,11 +189,10 @@ impl AgentRegistry {
             available_commands: available_commands.as_deref().map(Some),
         };
 
-        let row = if user_id == SYSTEM_DEFAULT_USER_ID {
-            self.repo.apply_handshake(id, &params).await
-        } else {
-            self.repo.apply_handshake_for_user(user_id, id, &params).await
-        };
+        // Handshake capabilities are machine-level (they come from the agent
+        // CLI's own login, shared by every user), so the write always targets
+        // the single catalog row regardless of the acting user.
+        let row = self.repo.apply_handshake(id, &params).await;
         let Some(row) = row.map_err(|e| AgentError::internal(format!("apply_handshake: {e}")))? else {
             return Ok(());
         };
@@ -1734,11 +1733,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_handshake_scopes_custom_agent_by_user() {
-        // Single-row catalog: the builtin agent has exactly one catalog row;
-        // the default user's handshake lands on it (machine level) while a
-        // real user's handshake lands in their agent_user_state delta —
-        // neither may pollute the other.
+    async fn apply_handshake_is_machine_level_shared_by_all_users() {
+        // Handshake capabilities come from the agent CLI's own login and are
+        // machine-level: every user's handshake lands on the single catalog
+        // row, and every user reads the same merged result. There is no
+        // per-user handshake divergence.
         let db = init_database_memory().await.unwrap();
         sqlx::query(
             "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
@@ -1771,6 +1770,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // A different user's handshake targets the SAME catalog row.
         reg.apply_handshake_inner(
             "user-b",
             "2d23ff1c",
@@ -1800,49 +1800,30 @@ mod tests {
             .unwrap()
             .unwrap();
         let user_b_row = repo.get_for_user("user-b", "2d23ff1c").await.unwrap().unwrap();
-        assert!(default_row.auth_methods.is_none());
-        assert!(
-            default_row
-                .config_options
-                .as_deref()
-                .is_some_and(|value| value.contains(r#""id":"mode""#))
-        );
-        assert!(
-            default_row
-                .config_options
-                .as_deref()
-                .is_none_or(|value| !value.contains(r#""id":"model""#))
-        );
+
+        // Machine-level: both users see identical handshake state.
+        assert_eq!(default_row.auth_methods, user_b_row.auth_methods);
+        assert_eq!(default_row.config_options, user_b_row.config_options);
+
+        // The second (user-b) handshake landed on the catalog: auth_methods is
+        // present, and its config option merged in alongside the first.
         assert_eq!(
-            user_b_row.auth_methods.as_deref(),
+            default_row.auth_methods.as_deref(),
             Some(r#"[{"id":"oauth","type":"agent"}]"#)
         );
         assert!(
-            user_b_row
+            default_row
                 .config_options
                 .as_deref()
                 .is_some_and(|value| value.contains(r#""id":"model""#))
         );
-        // Inheriting the machine baseline ("mode") into the user's merged
-        // handshake is expected — the guarded direction is that the user's
-        // write never leaks back into the catalog (asserted above).
 
-        let default_management = reg
-            .management_row_by_id_for_user(SYSTEM_DEFAULT_USER_ID, "2d23ff1c")
+        // Everything lives on the single catalog row — no row was duplicated.
+        let catalog_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = '2d23ff1c'")
+            .fetch_one(db.pool())
             .await
-            .unwrap()
             .unwrap();
-        let default_options = default_management.config_options.unwrap();
-        assert!(default_options.to_string().contains(r#""mode""#));
-        assert!(!default_options.to_string().contains(r#""model""#));
-
-        let user_b_management = reg
-            .management_row_by_id_for_user("user-b", "2d23ff1c")
-            .await
-            .unwrap()
-            .unwrap();
-        let user_b_options = user_b_management.config_options.unwrap();
-        assert!(user_b_options.to_string().contains(r#""model""#));
+        assert_eq!(catalog_rows, 1, "handshake must not duplicate the catalog row");
     }
 
     /// Partial updates must leave unrelated columns untouched.
