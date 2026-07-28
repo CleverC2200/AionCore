@@ -908,6 +908,20 @@ mod tests {
         async fn delete_keys(&self, _user_id: &str, _keys: &[&str]) -> Result<(), DbError> {
             Ok(())
         }
+        // Channel settings only use account-scope keys; the device scope is
+        // never exercised from here.
+        async fn get_all_device(&self) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn get_device_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn upsert_device_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn delete_device_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            Ok(())
+        }
     }
 
     // ── Test helpers ───────────────────────────────────────────────────

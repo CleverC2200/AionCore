@@ -661,7 +661,8 @@ mod tests {
             Ok(data
                 .iter()
                 .map(|(k, v)| ClientPreference {
-                    user_id: TEST_USER_ID.to_owned(),
+                    scope: "account".to_owned(),
+                    user_id: Some(TEST_USER_ID.to_owned()),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -675,7 +676,8 @@ mod tests {
                 .iter()
                 .filter(|(k, _)| keys.contains(&k.as_str()))
                 .map(|(k, v)| ClientPreference {
-                    user_id: TEST_USER_ID.to_owned(),
+                    scope: "account".to_owned(),
+                    user_id: Some(TEST_USER_ID.to_owned()),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -699,6 +701,24 @@ mod tests {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| !keys.contains(&k.as_str()));
             Ok(())
+        }
+
+        // Channel settings keys (`assistant.{platform}.*`) are per-account by
+        // design; touching the device scope from here would be a bug.
+        async fn get_all_device(&self) -> Result<Vec<ClientPreference>, DbError> {
+            unreachable!("channel settings must not read device-scope preferences")
+        }
+
+        async fn get_device_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            unreachable!("channel settings must not read device-scope preferences")
+        }
+
+        async fn upsert_device_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            unreachable!("channel settings must not write device-scope preferences")
+        }
+
+        async fn delete_device_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            unreachable!("channel settings must not write device-scope preferences")
         }
     }
 
