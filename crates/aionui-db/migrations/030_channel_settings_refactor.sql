@@ -1,4 +1,8 @@
--- Migration 030: Channel connection entity (channel refactor, segment 1 of 3).
+-- Migration 030: channel connection entity + settings scope (4 segments).
+--
+-- Segments 1-3: channel refactor A1-A3 (connection entity, users/pairing,
+-- conversation bindings). Segment 4: settings-dedup B2 (preference scopes).
+-- Segment 1 (channel refactor A1):
 --
 -- Replaces `assistant_plugins` with `channel_connections`, decoupling the
 -- connection instance from the platform type (07-16 §5.2 via the 2026-07-27
@@ -336,3 +340,126 @@ WHEN NEW.conversation_id IS NOT NULL AND NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'CROSS_ACCOUNT_REFERENCE: conversation belongs to another user');
 END;
+
+-- ---------------------------------------------------------------------------
+-- Segment 4: device/account scope for client_preferences (settings-dedup B2;
+-- disposition table in docs/superpowers/2026-07-27-settings-dedup-b1-inventory.md).
+-- Folded into this migration so the combined channel/settings refactor ships
+-- as a single migration file.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE client_preferences_new (
+    scope      TEXT    NOT NULL DEFAULT 'account' CHECK (scope IN ('device', 'account')),
+    user_id    TEXT    REFERENCES users(id),
+    key        TEXT    NOT NULL,
+    value      TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (
+        (scope = 'device' AND user_id IS NULL)
+        OR (scope = 'account' AND user_id IS NOT NULL)
+    )
+);
+
+INSERT INTO client_preferences_new (scope, user_id, key, value, updated_at)
+SELECT 'account', user_id, key, value, updated_at
+FROM client_preferences;
+
+CREATE TEMPORARY TABLE client_preference_scope_checks (
+    ok INTEGER NOT NULL CHECK (ok = 1)
+);
+
+INSERT INTO client_preference_scope_checks (ok)
+SELECT CASE
+    WHEN (SELECT COUNT(*) FROM client_preferences_new) = (SELECT COUNT(*) FROM client_preferences)
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE client_preferences;
+ALTER TABLE client_preferences_new RENAME TO client_preferences;
+
+-- Scope-aware uniqueness: one device value per key, one account value per
+-- (user, key).
+CREATE UNIQUE INDEX idx_client_preferences_device_key
+    ON client_preferences(key) WHERE scope = 'device';
+CREATE UNIQUE INDEX idx_client_preferences_account_key
+    ON client_preferences(user_id, key) WHERE scope = 'account';
+
+-- Promote confirmed device-level keys: latest write wins across users.
+INSERT INTO client_preferences (scope, user_id, key, value, updated_at)
+SELECT 'device', NULL, key, value, updated_at
+FROM (
+    SELECT
+        key, value, updated_at,
+        ROW_NUMBER() OVER (PARTITION BY key ORDER BY updated_at DESC, user_id ASC) AS rn
+    FROM client_preferences
+    WHERE scope = 'account'
+      AND (
+          key IN ('system.closeToTray', 'keepAwake', 'autoPreviewOfficeFiles')
+          OR key LIKE 'pet.%'
+      )
+)
+WHERE rn = 1;
+
+DELETE FROM client_preferences
+WHERE scope = 'account'
+  AND (
+      key IN ('system.closeToTray', 'keepAwake', 'autoPreviewOfficeFiles')
+      OR key LIKE 'pet.%'
+  );
+
+-- Materialize the system_settings switches as account-scope keys. INSERT OR
+-- IGNORE: an existing preference row (e.g. written post-B1) is the newer
+-- truth and must not be clobbered.
+INSERT OR IGNORE INTO client_preferences (scope, user_id, key, value, updated_at)
+SELECT 'account', s.user_id, 'system.notificationEnabled',
+       CASE WHEN s.notification_enabled THEN 'true' ELSE 'false' END, s.updated_at
+FROM system_settings s;
+
+INSERT OR IGNORE INTO client_preferences (scope, user_id, key, value, updated_at)
+SELECT 'account', s.user_id, 'cron.notificationEnabled',
+       CASE WHEN s.cron_notification_enabled THEN 'true' ELSE 'false' END, s.updated_at
+FROM system_settings s;
+
+INSERT OR IGNORE INTO client_preferences (scope, user_id, key, value, updated_at)
+SELECT 'account', s.user_id, 'system.commandQueueEnabled',
+       CASE WHEN s.command_queue_enabled THEN 'true' ELSE 'false' END, s.updated_at
+FROM system_settings s;
+
+INSERT OR IGNORE INTO client_preferences (scope, user_id, key, value, updated_at)
+SELECT 'account', s.user_id, 'system.saveUploadToWorkspace',
+       CASE WHEN s.save_upload_to_workspace THEN 'true' ELSE 'false' END, s.updated_at
+FROM system_settings s;
+
+-- Migration validation: every migrated switch column is readable back as a
+-- preference for every settings row.
+INSERT INTO client_preference_scope_checks (ok)
+SELECT CASE
+    WHEN NOT EXISTS (
+        SELECT 1 FROM system_settings s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM client_preferences p
+            WHERE p.scope = 'account' AND p.user_id = s.user_id
+              AND p.key = 'system.notificationEnabled'
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM client_preferences p
+            WHERE p.scope = 'account' AND p.user_id = s.user_id
+              AND p.key = 'cron.notificationEnabled'
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM client_preferences p
+            WHERE p.scope = 'account' AND p.user_id = s.user_id
+              AND p.key = 'system.commandQueueEnabled'
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM client_preferences p
+            WHERE p.scope = 'account' AND p.user_id = s.user_id
+              AND p.key = 'system.saveUploadToWorkspace'
+        )
+    )
+    THEN 1
+    ELSE 0
+END;
+
+DROP TABLE client_preference_scope_checks;
