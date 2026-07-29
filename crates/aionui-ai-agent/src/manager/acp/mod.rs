@@ -8,12 +8,14 @@ pub(crate) mod config_option_catalog;
 pub(crate) mod config_options;
 mod error_mapping;
 pub mod hooks;
+pub mod legacy_session_model;
 pub(crate) mod mode_normalize;
 pub mod permission_router;
 pub mod session;
 mod stderr_error_extractor;
 
 pub use agent::AcpAgentManager;
+pub use agent::RequiredFullAutoApplication;
 pub use agent_event_tracker::AcpSessionEvent;
 pub use agent_reconcile::ReconcileAction;
 pub use catalog_forwarder::CatalogForwarder;

@@ -25,31 +25,44 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
-    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
+    ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
     SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, Client, ConnectionTo, Lines, Responder, UntypedMessage, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
+use crate::protocol::acp_dialect;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, CloseSessionRequest, ExtNotification,
     ExtRequest, ForkSessionRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     NewSessionRequest, NewSessionResponse, PromptRequest, ResumeSessionRequest, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModelRequest,
+    SetSessionModeRequest,
 };
+
+/// Method name of the legacy model-selection RPC. The typed request/response
+/// pair was removed from the SDK (model selection moved to session config
+/// options), but old-camp agents still implement the method, so the frame is
+/// sent untyped. See `manager::acp::legacy_session_model` for the state DTOs.
+const LEGACY_SESSION_SET_MODEL_METHOD: &str = "session/set_model";
+
+/// Params frame for the legacy `session/set_model` request.
+fn build_legacy_set_model_params(session_id: &str, model_id: &str) -> serde_json::Value {
+    serde_json::json!({ "sessionId": session_id, "modelId": model_id })
+}
 
 /// Timeout for the ACP initialize handshake (seconds).
 const INIT_TIMEOUT_SECS: u64 = 30;
@@ -223,8 +236,18 @@ impl AcpProtocol {
     }
 
     /// Create a new ACP session.
-    pub async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_new).await
+    ///
+    /// Returns the typed response plus the raw top-level `models` value when
+    /// the agent sent one: the legacy session-model state is no longer part
+    /// of the typed schema, but old-camp agents still include it, so the
+    /// response is received untyped and the key captured before typed
+    /// parsing (typed parsing alone would silently drop it).
+    pub async fn new_session(
+        &self,
+        req: NewSessionRequest,
+    ) -> Result<(NewSessionResponse, Option<serde_json::Value>), AcpError> {
+        self.send_request_capturing_legacy_models(req, AGENT_METHOD_NAMES.session_new)
+            .await
     }
 
     /// Load (resume) an existing ACP session.
@@ -240,9 +263,16 @@ impl AcpProtocol {
     ///
     /// Note: Claude resumes via `session/new` with `_meta.claudeCode.options.resume`
     /// and never calls this method, so it is unaffected by the guard.
-    pub async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, AcpError> {
+    ///
+    /// Like [`Self::new_session`], returns the raw top-level `models` value
+    /// alongside the typed response for legacy-surface agents.
+    pub async fn load_session(
+        &self,
+        req: LoadSessionRequest,
+    ) -> Result<(LoadSessionResponse, Option<serde_json::Value>), AcpError> {
         let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
-        self.send_request(req, AGENT_METHOD_NAMES.session_load).await
+        self.send_request_capturing_legacy_models(req, AGENT_METHOD_NAMES.session_load)
+            .await
     }
 
     /// Fork an existing ACP session into a new session.
@@ -294,16 +324,23 @@ impl AcpProtocol {
         .await
     }
 
-    /// Set the session model.
+    /// Set the session model via the legacy `session/set_model` RPC, sent as
+    /// an untyped frame (the typed pair no longer exists in the SDK).
     ///
     /// Bounded by `CONFIG_RPC_TIMEOUT_SECS`; see [`Self::set_mode`].
-    pub async fn set_model(&self, req: SetSessionModelRequest) -> Result<SetSessionModelResponse, AcpError> {
+    pub async fn set_model(&self, session_id: &str, model_id: &str) -> Result<(), AcpError> {
+        let req = UntypedMessage::new(
+            LEGACY_SESSION_SET_MODEL_METHOD,
+            build_legacy_set_model_params(session_id, model_id),
+        )
+        .map_err(|e| AcpError::from_sdk(e, LEGACY_SESSION_SET_MODEL_METHOD))?;
         self.send_config_request(
             req,
-            AGENT_METHOD_NAMES.session_set_model,
+            LEGACY_SESSION_SET_MODEL_METHOD,
             std::time::Duration::from_secs(CONFIG_RPC_TIMEOUT_SECS),
         )
         .await
+        .map(|_ack: serde_json::Value| ())
     }
 
     /// Set a session config option.
@@ -451,6 +488,33 @@ impl AcpProtocol {
         rsp.map_err(|e| AcpError::from_sdk(e, method))
     }
 
+    /// Like [`Self::send_request`], but receives the response untyped so keys
+    /// outside the typed schema survive, captures the legacy top-level
+    /// `models` value, then parses the typed response from the same raw JSON.
+    async fn send_request_capturing_legacy_models<Req>(
+        &self,
+        req: Req,
+        method: &str,
+    ) -> Result<(Req::Response, Option<serde_json::Value>), AcpError>
+    where
+        Req: agent_client_protocol::JsonRpcRequest + serde::Serialize + std::fmt::Debug,
+        Req::Response: serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug + Send,
+    {
+        self.ensure_connected()?;
+        log_client_request(method, &json_str(&req));
+        let untyped = UntypedMessage::new(method, &req).map_err(|e| AcpError::from_sdk(e, method))?;
+        let raw = self.connection.send_request(untyped).block_task().await;
+        log_agent_response(method, &json_or_err(&raw));
+        let raw = raw.map_err(|e| AcpError::from_sdk(e, method))?;
+        let legacy_models = raw.get("models").cloned();
+        let response: Req::Response = serde_json::from_value(raw).map_err(|e| AcpError::AgentInternal {
+            message: format!("failed to parse {method} response: {e}"),
+            code: -32603,
+            data: None,
+        })?;
+        Ok((response, legacy_models))
+    }
+
     /// Return `Err(NotConnected)` if the connection is dead.
     fn ensure_connected(&self) -> Result<(), AcpError> {
         if self.is_connected() {
@@ -514,7 +578,44 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
 ) {
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    // Tolerant transport: intercept incoming lines *before* the SDK parses them
+    // so CodeBuddy's non-standard dialect notifications (`session_end` /
+    // `compact-maxtoken`) are absorbed into an internal signal instead of
+    // surfacing a `-32602` deserialization error and being silently dropped.
+    // We use the vendored `Lines` transport — the crate's documented
+    // first-party interception point — whose newline framing is equivalent to
+    // `ByteStreams` (which internally splits stdout on `\n` and appends `\n` on
+    // writes). Only the two recognised shapes are absorbed; every other line,
+    // including genuinely malformed input, is forwarded unchanged.
+    let dialect_event_tx = event_tx.clone();
+    let incoming = FramedRead::new(stdout, LinesCodec::new())
+        .map_err(std::io::Error::other)
+        .filter_map(move |line: std::io::Result<String>| {
+            let dialect_event_tx = dialect_event_tx.clone();
+            async move {
+                match line {
+                    Ok(line) => match acp_dialect::classify_incoming_line(&line) {
+                        acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
+                        acp_dialect::LineDisposition::Absorb(kind) => {
+                            log_acp_dialect_absorbed(kind, &line);
+                            // `broadcast::send` is synchronous and non-blocking; a
+                            // send error only means no active subscriber for this
+                            // turn (nothing to correlate against), which is fine.
+                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
+                                stream_event::AcpDialectSignalData { kind },
+                            ));
+                            None
+                        }
+                    },
+                    Err(err) => Some(Err(err)),
+                }
+            }
+        });
+    // Pin the sink item type to `String` (LinesCodec encodes any `AsRef<str>`,
+    // so the item type would otherwise be ambiguous) — `Lines` requires a
+    // `Sink<String>`.
+    let outgoing = SinkExt::<String>::sink_map_err(FramedWrite::new(stdin, LinesCodec::new()), std::io::Error::other);
+    let transport = Lines::new(outgoing, incoming);
 
     // `init_tx` / `ready_tx` are consumed inside the main_fn closure; wrap
     // them in Option so we can .take() without moving out of captured state.
@@ -857,6 +958,26 @@ fn log_agent_notify(method: &str, body: &str) {
     }
 }
 
+/// Log that the tolerant transport layer absorbed a CodeBuddy dialect
+/// notification the stock ACP schema would otherwise `-32602`-reject.
+///
+/// Low-volume, production-diagnostic (`info`): once the layer absorbs a line
+/// the SDK never sees it, so the SDK's `-32602 warn` disappears — this restores
+/// that visibility. Records only the signal kind and non-sensitive correlation
+/// context (`session_id`, the sessionUpdate/compactType marker); never the
+/// compaction summary, prompt, tokens, or other payload.
+fn log_acp_dialect_absorbed(kind: stream_event::AcpDialectSignalKind, line: &str) {
+    let (session_id, marker) = acp_dialect::absorbed_log_context(line);
+    info!(
+        direction = "agent_notify",
+        method = "session/update",
+        dialect_signal = ?kind,
+        session_id = session_id.as_deref().unwrap_or("none"),
+        marker = marker.as_deref().unwrap_or("none"),
+        "[ACP] absorbed CodeBuddy dialect notification (tolerant layer); not forwarded to SDK"
+    );
+}
+
 /// Log an inbound request from the agent (e.g. session/request_permission).
 fn log_agent_request(method: &str, body: &str) {
     let summary = AcpLogSummary::from_payload(body);
@@ -894,6 +1015,15 @@ impl std::fmt::Debug for AcpProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_set_model_frame_shape() {
+        let frame = build_legacy_set_model_params("sess-1", "deepseek-v4-pro");
+        assert_eq!(
+            frame,
+            serde_json::json!({"sessionId": "sess-1", "modelId": "deepseek-v4-pro"})
+        );
+    }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {
         use std::io::Write;
@@ -1122,7 +1252,7 @@ mod tests {
         for method in [
             AGENT_METHOD_NAMES.session_set_config_option,
             AGENT_METHOD_NAMES.session_set_mode,
-            AGENT_METHOD_NAMES.session_set_model,
+            LEGACY_SESSION_SET_MODEL_METHOD,
         ] {
             let result = AcpProtocol::await_config_rpc_detached(
                 method,

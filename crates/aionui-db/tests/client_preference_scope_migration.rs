@@ -95,7 +95,7 @@ async fn seed_pre_031() -> sqlx::SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 30).await;
 
     for user_id in [USER_A, USER_B] {
         sqlx::query(
@@ -130,7 +130,7 @@ async fn seed_pre_031() -> sqlx::SqlitePool {
     insert_settings(&pool, USER_A, "zh-CN", true, false, true, false).await;
     insert_settings(&pool, USER_B, "en-US", false, true, false, true).await;
 
-    run_migration(&pool, 30).await;
+    run_migration(&pool, 31).await;
     pool
 }
 

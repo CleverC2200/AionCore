@@ -19,7 +19,7 @@ mod types;
 
 pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
-pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities};
+pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
 pub use orchestrator::Orchestrator;
 pub use rehydrate::rehydrate;
@@ -94,6 +94,17 @@ pub trait SessionBackend: Send + Sync {
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         Vec::new()
     }
+
+    /// Force-terminate this session's process tree NOW (the `UserCancelTimeout`
+    /// force-kill path), WITHOUT waiting for the last `Arc<dyn SessionBackend>`
+    /// to drop. The Drop-driven reap needs the last handle released to fire
+    /// `kill_on_drop`; during an in-flight turn the orchestrator legitimately
+    /// holds a clone, so Drop never fires and the process outlives the kill.
+    /// This gives the force-kill path a synchronous teardown that does not
+    /// depend on the Arc being last. Default no-op: backends whose teardown is
+    /// purely Drop-driven (and every test double) are unchanged — only the
+    /// direct-CLI claude/codex backends override this.
+    async fn terminate(&self) {}
 }
 
 /// Connection-level factory (§C1): holds the transport singleton and mints many

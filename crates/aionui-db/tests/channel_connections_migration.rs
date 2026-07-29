@@ -57,7 +57,7 @@ async fn migration_030_rebuilds_plugins_as_connections() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 30).await;
 
     // Legacy rows: id IS the platform type (one per owner+platform).
     sqlx::query(
@@ -72,7 +72,7 @@ async fn migration_030_rebuilds_plugins_as_connections() {
     .await
     .unwrap();
 
-    run_migration(&pool, 30).await;
+    run_migration(&pool, 31).await;
 
     // Old table is gone; new table holds one connection per legacy row.
     let old_table: i64 =
@@ -128,7 +128,7 @@ async fn migration_030_rebuilds_sessions_as_conversation_bindings() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    run_migrations_through(&pool, 29).await;
+    run_migrations_through(&pool, 30).await;
 
     for uid in ["system_default_user", "other_core_user"] {
         sqlx::query(
@@ -184,7 +184,7 @@ async fn migration_030_rebuilds_sessions_as_conversation_bindings() {
     .await
     .unwrap();
 
-    run_migration(&pool, 30).await;
+    run_migration(&pool, 31).await;
 
     // The legacy table is gone, replaced by the binding table.
     let old_table: i64 =

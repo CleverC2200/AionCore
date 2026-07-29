@@ -15,9 +15,9 @@ use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::{
-    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionModelState,
-    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+use agent_client_protocol::schema::v1::{
+    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionNotification,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -77,8 +77,10 @@ fn build_acp_final_input_dump_value(
 
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
+use super::legacy_session_model::LegacySessionModelState;
 use super::mode_normalize::normalize_requested_mode;
 use super::mode_normalize::normalize_requested_mode_for_available_values;
+use super::mode_normalize::{RequiredFullAutoMode, resolve_required_full_auto_mode};
 
 /// Grace period before force-killing an ACP process (ms).
 const ACP_KILL_GRACE_MS: u64 = 500;
@@ -463,6 +465,16 @@ fn mark_session_opened_after_protocol_ready(
     Ok(sid)
 }
 
+/// Result of applying cron's full-auto required-runtime-mode (a-pure) for a
+/// metadata-bearing ACP agent. `Applied` set the backend-native YOLO id;
+/// `Skipped` left the session's already-resolved mode untouched because the
+/// resolved id was not selectable in the live catalog (look-before-leap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequiredFullAutoApplication {
+    Applied { effective: String },
+    Skipped { resolved: String },
+}
+
 pub struct AcpAgentManager {
     /// Pre-computed, immutable session parameters assembled by the factory.
     pub(super) params: Arc<AcpSessionParams>,
@@ -684,7 +696,7 @@ impl AcpAgentManager {
     }
 
     /// Cached model info from the ACP backend, if any has been received.
-    pub(crate) async fn model(&self) -> Option<SessionModelState> {
+    pub(crate) async fn model(&self) -> Option<LegacySessionModelState> {
         self.session.read().await.model_info().cloned()
     }
 
@@ -698,6 +710,65 @@ impl AcpAgentManager {
         Ok(GetConfigOptionsResponse {
             config_options: session.config_snapshot().options,
         })
+    }
+
+    /// Live `mode` option ids from this backend's catalog. `None` only on a
+    /// catalog read failure (caller then falls back to the pre-fix
+    /// unnormalized apply); a catalog with no `mode` option yields `Some([])`.
+    async fn live_mode_catalog_ids(&self) -> Option<Vec<String>> {
+        match self.config_options().await {
+            Ok(resp) => Some(
+                resp.config_options
+                    .into_iter()
+                    .find(|opt| opt.id == "mode")
+                    .map(|opt| opt.options.into_iter().map(|o| o.value).collect())
+                    .unwrap_or_default(),
+            ),
+            Err(err) => {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    error = %err,
+                    "apply full-auto mode: live catalog read failed — applying resolved mode unnormalized"
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply cron's full-auto required-runtime-mode (a-pure, ELECTRON-3RQ).
+    ///
+    /// A cron turn is ALWAYS a full-auto request, so the persisted literal is
+    /// ignored: resolve "yolo" to this backend's native YOLO id against its
+    /// live mode catalog. Look-before-leap — only set the mode when the
+    /// resolved id is actually selectable; otherwise `warn` and skip the
+    /// override, keeping the session's already-resolved mode (never fail the
+    /// turn). A catalog read failure falls back to the conservative pre-fix
+    /// behaviour: apply the resolved value and let `set_config_option`
+    /// reject it locally if unselectable.
+    pub(crate) async fn apply_required_full_auto_mode(&self) -> Result<RequiredFullAutoApplication, AgentError> {
+        match self.live_mode_catalog_ids().await {
+            Some(ids) => match resolve_required_full_auto_mode(&self.params.metadata, ids.iter().map(String::as_str)) {
+                RequiredFullAutoMode::Apply(mode) => {
+                    self.set_config_option_confirmed("mode", &mode).await?;
+                    Ok(RequiredFullAutoApplication::Applied { effective: mode })
+                }
+                RequiredFullAutoMode::Skip { resolved } => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        resolved = %resolved,
+                        "apply full-auto mode: resolved YOLO not in live catalog — skipping override, keeping session mode"
+                    );
+                    Ok(RequiredFullAutoApplication::Skipped { resolved })
+                }
+            },
+            None => {
+                let resolved = normalize_requested_mode(&self.params.metadata, "yolo");
+                self.set_config_option_confirmed("mode", &resolved).await?;
+                Ok(RequiredFullAutoApplication::Applied { effective: resolved })
+            }
+        }
     }
 
     pub(crate) async fn set_config_option_confirmed(
@@ -799,7 +870,7 @@ impl AcpAgentManager {
                     .set_config_option(SetSessionConfigOptionRequest::new(
                         SessionId::new(session_id.clone()),
                         config_id.clone(),
-                        resolved_value.clone(),
+                        resolved_value.as_str(),
                     ))
                     .await
                     .map_err(|err| {
@@ -885,10 +956,7 @@ impl AcpAgentManager {
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
-                    .set_model(SetSessionModelRequest::new(
-                        SessionId::new(session_id.clone()),
-                        resolved_value.clone(),
-                    ))
+                    .set_model(&session_id, &resolved_value)
                     .await
                     .map_err(|err| {
                         warn!(
@@ -1559,7 +1627,7 @@ mod tests {
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
     use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
     use aionui_api_types::{AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};

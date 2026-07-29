@@ -36,7 +36,8 @@ use aionui_mcp::{
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
 };
-use aionui_realtime::{NoopMessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_project::ProjectRouterState;
+use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
@@ -44,8 +45,9 @@ use aionui_system::{
     VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
+    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
+    TeamSessionService,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
@@ -128,6 +130,7 @@ pub struct ModuleStates {
 
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
+    pub project: ProjectRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -307,6 +310,7 @@ pub async fn build_module_states(
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
+        project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -406,9 +410,9 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
-    // `keepAwake` is device-scoped (migration 031): one value for the machine,
-    // owned by no account. Restoring it at startup is therefore correct in both
-    // identity modes — there is no per-user value that could leak.
+    // `keepAwake` is device-scoped (migration 031 segment): one value for the
+    // machine, owned by no account. Restoring it at startup is therefore
+    // correct in both identity modes — there is no per-user value to leak.
     let client_pref_service =
         ClientPrefService::with_keep_awake_controller(client_pref_repo.clone(), keep_awake_controller);
 
@@ -475,6 +479,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         file_service,
         watch_service,
         snapshot_service,
+        project: Arc::new(services.project_service.clone()),
         allowed_roots,
         browse_roots,
     })
@@ -482,6 +487,13 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 
 fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
     RouterBuildError::new("router.file_watch", "failed to initialize file watch service").with_source(error)
+}
+
+/// Build the project control-plane router state from application services.
+pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
+    ProjectRouterState {
+        project: Arc::new(services.project_service.clone()),
+    }
 }
 
 /// Build the default `McpRouterState` from application services.
@@ -722,11 +734,13 @@ pub fn build_team_state(
     let adapters = Arc::new(TeamConversationAdapters::new(
         conv_service,
         conv_repo,
+        Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
         services.worker_task_manager.clone(),
     ));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = adapters.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = adapters.clone();
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
+    let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
     let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
@@ -743,6 +757,7 @@ pub fn build_team_state(
         services.worker_task_manager.clone(),
         turn_port,
         cancellation_port,
+        slash_command_port,
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
@@ -917,12 +932,14 @@ pub async fn build_extension_states(
     (ext_state, hub_state, skill_state)
 }
 
-/// Build the default `WsHandlerState` from application services.
-pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
+/// Build the `WsHandlerState` from application services with an explicit inbound
+/// `router`. Callers supply the filesystem-monitor router in production and a
+/// no-op router for router-only/test assembly.
+pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
-            router: Arc::new(NoopMessageRouter),
+            router,
             token_validator: Arc::new(|_| true),
             token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
             token_extractor: Arc::new(|_| Some("local".into())),
@@ -951,7 +968,7 @@ pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router: Arc::new(NoopMessageRouter),
+        router,
         token_validator,
         token_user_resolver,
         token_extractor,
@@ -1126,7 +1143,7 @@ mod tests {
     async fn build_ws_state_rejects_stale_session_generation() {
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-        let ws_state = build_ws_state(&services);
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
         let token = services
             .jwt_service
             .sign_with_session_generation("system_default_user", "admin", 0)
@@ -1156,7 +1173,7 @@ mod tests {
             ..AppConfig::default()
         };
         let services = AppServices::from_config(db, &config).await.unwrap();
-        let ws_state = build_ws_state(&services);
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
         let token = services
             .jwt_service
             .sign_with_session_generation("system_default_user", "admin", 0)
@@ -1200,10 +1217,10 @@ mod tests {
         let session = ChannelConversationBindingRow {
             id: "session-channel-state".to_owned(),
             owner_user_id: "system_default_user".to_owned(),
-            connection_id: "conn-weixin".to_owned(),
+            connection_id: "conn-channel-state".to_owned(),
             user_id: "channel-user-state".to_owned(),
-            conversation_id: None,
             chat_id: Some("wx-chat-state".to_owned()),
+            conversation_id: None,
             created_at: 1,
             last_activity: 1,
         };

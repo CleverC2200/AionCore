@@ -9,7 +9,9 @@ use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::registry::AgentRegistry;
 use crate::session_context::AcpSessionBuildContext;
-use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
+use agent_client_protocol::schema::v1::{
+    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+};
 use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
@@ -868,7 +870,7 @@ mod tests {
         )
         .await
         .expect("resolved release-pinned builtin command spec");
-        assert_eq!(spec.args, vec!["-y", "pi-acp@0.0.31"]);
+        assert_eq!(spec.args, vec!["-y", "pi-acp@0.0.32"]);
     }
 
     #[cfg(unix)]
