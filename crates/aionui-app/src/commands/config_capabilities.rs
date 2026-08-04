@@ -67,7 +67,7 @@ pub(crate) fn data() -> Value {
                 stdin(&["assistants", "create"], "Create an assistant.", &["name", "description", "agent_id", "prompts", "enabled_skills"], &[], true, false),
                 stdin(&["assistants", "update"], "Update assistant metadata, defaults, or enabled skills.", &["assistant_id", "locale"], &["assistant_id"], true, false),
                 stdin(&["assistants", "delete"], "Delete an assistant.", &["assistant_id"], &["assistant_id"], true, true),
-                stdin(&["assistants", "import"], "Import assistants.", &["items"], &[], true, false),
+                stdin(&["assistants", "import"], "Import assistants.", &["assistants"], &[], true, false),
                 stdin(&["assistants", "state"], "Enable, disable, or reorder an assistant.", &["assistant_id", "enabled", "sort_order"], &["assistant_id"], true, false),
                 stdin_redacted(&["assistants", "rule", "read"], "Read an assistant rule.", &["assistant_id", "locale"], &["assistant_id"], false, false, &[]),
                 stdin_redacted(&["assistants", "rule", "write"], "Write an assistant rule.", &["assistant_id", "locale", "content"], &["assistant_id"], true, false, &["content"]),
