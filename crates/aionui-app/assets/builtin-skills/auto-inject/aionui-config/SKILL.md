@@ -126,6 +126,23 @@ Create an assistant:
 JSON
 ```
 
+Import assistants in bulk:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants import <<'JSON'
+{
+  "assistants": [
+    {
+      "name": "Requirements Analyst",
+      "description": "Turn rough product ideas into clear PRDs",
+      "agent_id": "2d23ff1c",
+      "enabled_skills": ["aionui-config"]
+    }
+  ]
+}
+JSON
+```
+
 Update assistant metadata or defaults:
 
 ```bash
@@ -162,6 +179,16 @@ Enable, disable, or reorder an assistant:
 JSON
 ```
 
+Delete an assistant only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants delete <<'JSON'
+{
+  "assistant_id": "assistant_123"
+}
+JSON
+```
+
 ## Assistant Rules
 
 Assistant rules are the system prompt that defines assistant behavior.
@@ -189,6 +216,17 @@ Write the current assistant rule:
 JSON
 ```
 
+Delete the current assistant rule only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants rule delete <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US"
+}
+JSON
+```
+
 For rule edits, preserve the user's existing useful instructions unless the
 user explicitly asks to replace them.
 
@@ -197,12 +235,58 @@ saved and read back, but it applies only to new conversations created from this
 assistant. The current conversation continues using the rule snapshot it started
 with.
 
+## Assistant Skill Content
+
+Assistant skill content is per-assistant supplemental skill text. Treat it like
+runtime instructions: read first, preserve useful existing content, and tell the
+user that changes apply to new conversations only.
+
+Read assistant skill content:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants skill read <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US"
+}
+JSON
+```
+
+Write assistant skill content:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants skill write <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US",
+  "content": "# Extra Instructions\nUse the team's glossary."
+}
+JSON
+```
+
+Delete assistant skill content only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config assistants skill delete <<'JSON'
+{
+  "assistant_id": "current",
+  "locale": "en-US"
+}
+JSON
+```
+
 ## Skills
 
 List available skills:
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills list
+```
+
+List configured skill directories:
+
+```bash
+"$AIONUI_HELPER_BIN" config skills paths
 ```
 
 Inspect a skill directory before importing:
@@ -215,12 +299,32 @@ Inspect a skill directory before importing:
 JSON
 ```
 
+Scan a folder for importable skills:
+
+```bash
+"$AIONUI_HELPER_BIN" config skills scan <<'JSON'
+{
+  "folder_path": "/absolute/path/to/skills-folder"
+}
+JSON
+```
+
 Import a skill:
 
 ```bash
 "$AIONUI_HELPER_BIN" config skills import <<'JSON'
 {
   "skill_path": "/absolute/path/to/skill-or-parent-or-zip"
+}
+JSON
+```
+
+Delete a skill only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config skills delete <<'JSON'
+{
+  "skill_name": "team-glossary"
 }
 JSON
 ```
@@ -284,6 +388,16 @@ List MCP servers:
 "$AIONUI_HELPER_BIN" config mcp servers list
 ```
 
+Inspect one MCP server:
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp servers get <<'JSON'
+{
+  "server_id": "mcp_123"
+}
+JSON
+```
+
 Create an MCP server:
 
 ```bash
@@ -311,6 +425,43 @@ Update an MCP server:
 JSON
 ```
 
+Delete or toggle an MCP server only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp servers toggle <<'JSON'
+{
+  "server_id": "mcp_123"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp servers delete <<'JSON'
+{
+  "server_id": "mcp_123"
+}
+JSON
+```
+
+Import MCP servers in bulk:
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp servers import <<'JSON'
+{
+  "servers": [
+    {
+      "name": "Local Tools",
+      "transport": {
+        "type": "stdio",
+        "command": "my-mcp-server",
+        "args": []
+      }
+    }
+  ]
+}
+JSON
+```
+
 Test a server configuration:
 
 ```bash
@@ -326,6 +477,12 @@ Test a server configuration:
 JSON
 ```
 
+List agent MCP config state:
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp agent-configs
+```
+
 OAuth helpers:
 
 ```bash
@@ -334,6 +491,26 @@ OAuth helpers:
   "server_url": "https://mcp.example.com"
 }
 JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp oauth login <<'JSON'
+{
+  "server_url": "https://mcp.example.com"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp oauth logout <<'JSON'
+{
+  "server_url": "https://mcp.example.com"
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config mcp oauth authenticated
 ```
 
 Never show MCP headers or stdio env values to the user. CLI output redacts
@@ -371,11 +548,31 @@ Update a provider:
 JSON
 ```
 
+Delete a provider only after explicit user confirmation:
+
+```bash
+"$AIONUI_HELPER_BIN" config providers delete <<'JSON'
+{
+  "provider_id": "provider_123"
+}
+JSON
+```
+
 Detect protocol, fetch models, or run a provider health check:
 
 ```bash
 "$AIONUI_HELPER_BIN" config providers detect-protocol <<'JSON'
 {
+  "base_url": "https://api.example.com/v1",
+  "api_key": "..."
+}
+JSON
+```
+
+```bash
+"$AIONUI_HELPER_BIN" config providers fetch-models <<'JSON'
+{
+  "platform": "openai",
   "base_url": "https://api.example.com/v1",
   "api_key": "..."
 }

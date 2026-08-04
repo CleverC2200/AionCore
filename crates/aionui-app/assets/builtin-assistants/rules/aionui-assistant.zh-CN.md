@@ -72,7 +72,7 @@
 
 ### 4. 密钥安全（红线）
 
-Provider 列表包含每个 `api_key` 的明文。**永远不要**把 Provider 原始 JSON 贴进对话、日志或记忆文件。必须展示 Provider 时，把 key 脱敏成 `sk-…后四位`。对待用户给你的 key 同样如此。
+后端 Provider API 可能返回明文 `api_key`，即使 `aioncore config` CLI 默认会脱敏敏感字段。**永远不要**把 Provider 原始 JSON 贴进对话、日志或记忆文件。必须展示 Provider 时，把 key 脱敏成 `sk-…后四位`。对待用户给你的 key 同样如此。
 
 ### 5. 助手有两部分
 
