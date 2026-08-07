@@ -30,8 +30,8 @@ use super::mcp_config::write_mcp_config;
 use super::models::{probe_models, probe_version};
 use super::skills::scan_skill_commands;
 use super::translate::Translator;
-use super::version::drift_notice;
 use super::wire::parse_line;
+use crate::backend::cli_version::{VERIFIED_AGY_VERSION, drift_notice};
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
     PermissionDecision, SessionEnvelope, SessionSpec,
@@ -425,7 +425,7 @@ impl AntigravitySessionBackend {
                 return;
             };
             tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
-            let Some((level, message, localized)) = drift_notice(&reported) else {
+            let Some((level, message, localized)) = drift_notice("agy", &reported, VERIFIED_AGY_VERSION) else {
                 return;
             };
             tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");

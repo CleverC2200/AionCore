@@ -15,6 +15,21 @@ const SUPPORTED_RUNTIME_KEYS: [&str; 6] = [
     "linux-arm64",
 ];
 
+/// The runtime key (`<os>-<arch>`) identifying the current platform's managed
+/// resources subtree. Lives beside `SUPPORTED_RUNTIME_KEYS` — the values must
+/// stay in sync, and the bundled-CLI module that used to own this is gone.
+pub fn current_runtime_key() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("windows", "x86_64") => Some("win32-x64"),
+        ("windows", "aarch64") => Some("win32-arm64"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedResourcesContract {

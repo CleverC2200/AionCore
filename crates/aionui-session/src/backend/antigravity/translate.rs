@@ -4,7 +4,7 @@
 //! counting across a `--conversation` resume, so `step-<index>` is a stable
 //! id for pairing a tool's ACTIVE and DONE frames.
 
-use super::version::CODE_STEPS_FAILED;
+use super::CODE_STEPS_FAILED;
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgySubagent, AgyUsage};
 use crate::event::{
     CancelReason, LocalizedText, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown,

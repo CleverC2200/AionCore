@@ -1891,7 +1891,13 @@ fn resolve_session_cli_program(
         });
     }
 
-    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
+    // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
+    // which silently diverged from whatever the user had installed: the same
+    // prompt behaved differently in AionUi and in the user's terminal, with
+    // nothing on screen explaining why. They are now treated exactly like agy —
+    // the user's own install is the one that runs, and a drift from the version
+    // this integration was verified against is reported rather than hidden.
+    aionui_runtime::resolve_command_path(backend_label)
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
