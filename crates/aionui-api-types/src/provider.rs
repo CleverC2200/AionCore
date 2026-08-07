@@ -37,6 +37,14 @@ pub enum ModelOpenAiApiMode {
     Responses,
 }
 
+/// Tool selection policy for the first model turn of each user message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInitialToolChoice {
+    Auto,
+    Required,
+}
+
 /// Explicit image-input support configured for one model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,6 +62,8 @@ pub struct ModelSettings {
     pub image_input: Option<ModelImageInputCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_mode: Option<ModelOpenAiApiMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_tool_choice: Option<ModelInitialToolChoice>,
 }
 
 /// Health status values for a model.

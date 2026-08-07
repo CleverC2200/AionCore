@@ -33,6 +33,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         max_turns: None,
         max_tool_call_malformed_turns: None,
         max_tool_call_failure_turns: None,
+        initial_tool_choice: Default::default(),
         compat_overrides: Default::default(),
         session_directory: env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,

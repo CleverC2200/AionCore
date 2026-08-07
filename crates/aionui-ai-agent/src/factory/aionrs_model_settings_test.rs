@@ -1,4 +1,5 @@
 use aion_config::compat::OpenAiApiMode;
+use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
 
 use crate::capability::image_input::resolve_image_input_capability;
@@ -23,11 +24,20 @@ fn model_settings_resolve_explicit_vision_and_api_overrides() {
 }
 
 #[test]
+fn model_settings_resolve_required_initial_tool_choice() {
+    let overrides =
+        resolve_model_compat_overrides("gea-model", r#"{"gea-model":{"initial_tool_choice":"required"}}"#).unwrap();
+
+    assert_eq!(overrides.initial_tool_choice, Some(ToolChoice::Required));
+}
+
+#[test]
 fn missing_model_settings_keep_vision_and_api_automatic() {
     let overrides = resolve_model_compat_overrides("gpt-5.6-sol", r#"{"gpt-4o":{"image_input":"supported"}}"#).unwrap();
 
     assert_eq!(overrides.image_input, None);
     assert_eq!(overrides.openai_api_mode, None);
+    assert_eq!(overrides.initial_tool_choice, None);
 }
 
 #[test]
