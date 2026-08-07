@@ -21,7 +21,7 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteVoiceConfigurationRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -47,9 +47,11 @@ use aionui_team::{
     TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
     TeamSessionService,
 };
+use aionui_voice::{VoiceProviderRegistry, VoiceRouterState};
 
 use crate::config::{IdentityMode, derive_encryption_key};
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
+use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -139,6 +141,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub voice: VoiceRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -326,6 +329,7 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        voice: build_module_state_phase(&boot, "voice", || build_voice_state(services)),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -338,6 +342,22 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+fn build_voice_state(services: &AppServices) -> VoiceRouterState {
+    let agent = Arc::new(ConversationVoiceAgent::new(
+        services.conversation_service.clone(),
+        services.worker_task_manager.clone(),
+        services.event_bus.clone(),
+    ));
+    let repo = Arc::new(SqliteVoiceConfigurationRepository::new(
+        services.database.pool().clone(),
+    ));
+    let registry = Arc::new(VoiceProviderRegistry::new(
+        repo,
+        derive_encryption_key(&services.jwt_secret_raw),
+    ));
+    VoiceRouterState::with_registry(registry, agent)
 }
 
 /// Build the default `AssistantRouterState` from application services.
