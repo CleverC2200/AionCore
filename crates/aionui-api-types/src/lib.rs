@@ -33,6 +33,7 @@ mod system;
 mod team;
 mod team_mcp;
 mod team_tools;
+mod voice;
 mod websocket;
 
 pub use acp::{
@@ -190,6 +191,12 @@ pub use team_tools::{
     TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
     TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+};
+pub use voice::{
+    ManagedVoiceCapability, ManagedVoiceConfigurationResponse, ManagedVoiceConfigurationSource,
+    ManagedVoiceHealthResponse, ManagedVoiceHealthStatus, ManagedVoiceProvider, ManagedVoiceSessionMode,
+    SetManagedVoiceConfigurationEnabledRequest, UpdateManagedVoiceConfigurationRequest, VoiceSessionCreateRequest,
+    VoiceSessionCreateResponse, VoiceSessionRtcCredentials, VoiceTurnRequest, VoiceTurnResponse,
 };
 pub use websocket::WebSocketMessage;
 

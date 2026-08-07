@@ -24,6 +24,7 @@ members = [
     "crates/aionui-project",
     "crates/aionui-cron",
     "crates/aionui-assistant",
+    "crates/aionui-voice",
     "crates/aionui-app",
 ]
 
@@ -57,6 +58,7 @@ aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
+aionui-voice = { path = "crates/aionui-voice" }
 aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.10" }
@@ -162,6 +164,7 @@ calamine = "0.36"
 rust_xlsxwriter = "0.82"
 sha1 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 
 # AWS
 aws-config = { version = "1", features = ["behavior-version-latest"] }

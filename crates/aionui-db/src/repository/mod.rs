@@ -31,8 +31,10 @@ mod sqlite_settings;
 mod sqlite_skill;
 mod sqlite_team;
 mod sqlite_user;
+mod sqlite_voice_configuration;
 pub mod team;
 mod user;
+mod voice_configuration;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
@@ -75,5 +77,7 @@ pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
+pub use sqlite_voice_configuration::SqliteVoiceConfigurationRepository;
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use user::IUserRepository;
+pub use voice_configuration::IVoiceConfigurationRepository;
