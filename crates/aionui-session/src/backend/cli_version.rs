@@ -110,16 +110,18 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
         VersionVerdict::Older => Some((
             NoticeLevel::Warning,
             format!(
-                "{cli} {reported} is older than the {verified} this integration was verified against; \
-                 some features may be missing. Consider upgrading {cli}."
+                "The installed {cli} is older than the version AionUi verified; \
+                 some features may be missing. Consider upgrading {cli}. \
+                 (installed {reported} / verified by AionUi: {verified})"
             ),
             localized(CODE_CLI_VERSION_OLDER),
         )),
         VersionVerdict::Newer => Some((
             NoticeLevel::Info,
             format!(
-                "{cli} {reported} is newer than the {verified} this integration was verified against. \
-                 It should still work; report anything that behaves oddly."
+                "The installed {cli} is newer than the version AionUi verified. \
+                 It should still work; report anything that behaves oddly. \
+                 (installed {reported} / verified by AionUi: {verified})"
             ),
             localized(CODE_CLI_VERSION_NEWER),
         )),
