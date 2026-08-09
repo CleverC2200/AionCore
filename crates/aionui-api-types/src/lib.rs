@@ -139,8 +139,8 @@ pub use project::{
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,
-    ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelOpenAiApiMode, ModelSettings, ModelType,
-    MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
+    ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelInitialToolChoice, ModelOpenAiApiMode, ModelSettings,
+    ModelType, MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
     ProviderHealthCheckResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
 };
 pub use remote_agent::{
