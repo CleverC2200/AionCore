@@ -2,12 +2,15 @@ use std::sync::Weak;
 use std::time::Instant;
 
 use aionui_api_types::{
-    TeamToolCall, TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolRole,
-    TeamToolTransport,
+    CreateTeamWorkTaskRequest, TeamToolCall, TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName,
+    TeamToolRole, TeamToolTransport, TeamWorkActor, TeamWorkActorKind, TeamWorkCommand, TeamWorkCommandEnvelope,
+    TeamWorkErrorCode,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::TeamError;
 use crate::mcp::server::ToolCallError;
 use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
@@ -40,18 +43,25 @@ impl<'a> TeamToolExecutor<'a> {
     pub async fn execute(&self, context: &TeamToolContext, call: TeamToolCall) -> Result<Value, TeamToolErrorPayload> {
         let started = Instant::now();
         let tool = call.tool.as_str();
-        let result = crate::mcp::server::dispatch_tool(
-            tool,
-            &call.arguments,
-            self.scheduler,
-            self.service,
-            &context.team_id,
-            &context.caller_slot_id,
-            context.caller_role,
-        )
-        .await
-        .map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
-        .map_err(map_tool_error);
+        let result = if matches!(
+            call.tool,
+            TeamToolName::TeamWorkCreate | TeamToolName::TeamWorkList | TeamToolName::TeamWorkCommand
+        ) {
+            self.execute_team_work(context, call).await
+        } else {
+            crate::mcp::server::dispatch_tool(
+                tool,
+                &call.arguments,
+                self.scheduler,
+                self.service,
+                &context.team_id,
+                &context.caller_slot_id,
+                context.caller_role,
+            )
+            .await
+            .map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
+            .map_err(map_tool_error)
+        };
 
         let duration_ms = started.elapsed().as_millis();
         match &result {
@@ -79,6 +89,133 @@ impl<'a> TeamToolExecutor<'a> {
         }
         result
     }
+
+    async fn execute_team_work(
+        &self,
+        context: &TeamToolContext,
+        call: TeamToolCall,
+    ) -> Result<Value, TeamToolErrorPayload> {
+        let user_id = context.user_id.as_deref().ok_or_else(|| {
+            TeamToolErrorPayload::new(
+                TeamToolErrorCode::RuntimeAuthFailed,
+                "Team Work requires an authenticated user",
+            )
+        })?;
+        let service = self
+            .service
+            .upgrade()
+            .and_then(|service| service.team_work_service())
+            .ok_or_else(|| {
+                TeamToolErrorPayload::new(
+                    TeamToolErrorCode::TransportUnavailable,
+                    "Team Work service not available",
+                )
+            })?;
+        match call.tool {
+            TeamToolName::TeamWorkCreate => {
+                let request: CreateTeamWorkTaskRequest = serde_json::from_value(call.arguments).map_err(|_| {
+                    TeamToolErrorPayload::new(
+                        TeamToolErrorCode::SchemaValidationFailed,
+                        "Invalid team_work_create arguments",
+                    )
+                })?;
+                serde_json::to_value(
+                    service
+                        .create_task(user_id, &context.team_id, request)
+                        .await
+                        .map_err(map_work_error)?,
+                )
+                .map_err(|_| {
+                    TeamToolErrorPayload::new(
+                        TeamToolErrorCode::RuntimeContextMissing,
+                        "Failed to encode Team Work task",
+                    )
+                })
+            }
+            TeamToolName::TeamWorkList => {
+                if call
+                    .arguments
+                    .as_object()
+                    .is_some_and(|arguments| !arguments.is_empty())
+                {
+                    return Err(TeamToolErrorPayload::new(
+                        TeamToolErrorCode::SchemaValidationFailed,
+                        "team_work_list does not accept arguments",
+                    ));
+                }
+                serde_json::to_value(
+                    service
+                        .snapshot(user_id, &context.team_id)
+                        .await
+                        .map_err(map_work_error)?,
+                )
+                .map_err(|_| {
+                    TeamToolErrorPayload::new(
+                        TeamToolErrorCode::RuntimeContextMissing,
+                        "Failed to encode Team Work snapshot",
+                    )
+                })
+            }
+            TeamToolName::TeamWorkCommand => {
+                #[derive(Deserialize)]
+                struct CommandArgs {
+                    task_id: String,
+                    expected_version: u64,
+                    idempotency_key: String,
+                    command: TeamWorkCommand,
+                }
+                let arguments: CommandArgs = serde_json::from_value(call.arguments).map_err(|_| {
+                    TeamToolErrorPayload::new(
+                        TeamToolErrorCode::SchemaValidationFailed,
+                        "Invalid team_work_command arguments",
+                    )
+                })?;
+                let receipt = service
+                    .apply_command(
+                        user_id,
+                        &context.team_id,
+                        &arguments.task_id,
+                        TeamWorkCommandEnvelope {
+                            expected_version: arguments.expected_version,
+                            idempotency_key: arguments.idempotency_key,
+                            actor: TeamWorkActor {
+                                kind: TeamWorkActorKind::Agent,
+                                id: context.caller_slot_id.clone(),
+                            },
+                            command: arguments.command,
+                        },
+                    )
+                    .await
+                    .map_err(map_work_error)?;
+                serde_json::to_value(receipt).map_err(|_| {
+                    TeamToolErrorPayload::new(
+                        TeamToolErrorCode::RuntimeContextMissing,
+                        "Failed to encode Team Work receipt",
+                    )
+                })
+            }
+            _ => unreachable!("Team Work dispatch is guarded by the caller"),
+        }
+    }
+}
+
+fn map_work_error(error: TeamError) -> TeamToolErrorPayload {
+    let code = match &error {
+        TeamError::WorkState(state) => match state.code {
+            TeamWorkErrorCode::VersionConflict => TeamToolErrorCode::VersionConflict,
+            TeamWorkErrorCode::LeaseConflict | TeamWorkErrorCode::LeaseExpired => TeamToolErrorCode::LeaseConflict,
+            TeamWorkErrorCode::InvalidTransition => TeamToolErrorCode::InvalidTransition,
+            TeamWorkErrorCode::IdempotencyConflict => TeamToolErrorCode::IdempotencyConflict,
+            TeamWorkErrorCode::DependencyBlocked => TeamToolErrorCode::DependencyBlocked,
+            TeamWorkErrorCode::RetryLimitReached => TeamToolErrorCode::RetryLimitReached,
+            TeamWorkErrorCode::ActorForbidden => TeamToolErrorCode::PermissionDenied,
+        },
+        TeamError::TeamNotFound(_) | TeamError::TaskNotFound(_) => TeamToolErrorCode::TeamNotFound,
+        TeamError::Forbidden(_) | TeamError::LeaderOnly(_) => TeamToolErrorCode::PermissionDenied,
+        TeamError::InvalidRequest(_) | TeamError::BlockedTaskNotFound(_) => TeamToolErrorCode::SchemaValidationFailed,
+        _ => TeamToolErrorCode::RuntimeContextMissing,
+    };
+    TeamToolErrorPayload::new(code, error.to_string())
 }
 
 pub fn team_tool_call_from_name(tool_name: &str, arguments: Value) -> Result<TeamToolCall, TeamToolErrorPayload> {

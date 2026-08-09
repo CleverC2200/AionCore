@@ -744,6 +744,10 @@ pub fn build_team_state(
 
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
+    let work_service = aionui_team::TeamWorkService::new(
+        Arc::new(aionui_db::SqliteTeamWorkRepository::new(pool.clone())),
+        services.event_bus.clone(),
+    );
     let conv_service = services.conversation_service.clone();
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
     let adapters = Arc::new(TeamConversationAdapters::new(
@@ -777,8 +781,10 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    service.with_team_work_service(work_service.clone());
     TeamRouterState {
         service,
+        work_service,
         active_leases: services.active_lease_registry.clone(),
     }
 }

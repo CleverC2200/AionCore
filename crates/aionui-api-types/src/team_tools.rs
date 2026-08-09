@@ -70,6 +70,9 @@ pub enum TeamToolName {
     TeamTaskCreate,
     TeamTaskUpdate,
     TeamTaskList,
+    TeamWorkCreate,
+    TeamWorkList,
+    TeamWorkCommand,
     TeamListAssistants,
     TeamDescribeAssistant,
     TeamSpawnAgent,
@@ -85,6 +88,9 @@ impl TeamToolName {
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
+            Self::TeamWorkCreate => "team_work_create",
+            Self::TeamWorkList => "team_work_list",
+            Self::TeamWorkCommand => "team_work_command",
             Self::TeamListAssistants => "team_list_assistants",
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
@@ -100,6 +106,9 @@ impl TeamToolName {
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
+            "team_work_create" => Self::TeamWorkCreate,
+            "team_work_list" => Self::TeamWorkList,
+            "team_work_command" => Self::TeamWorkCommand,
             "team_list_assistants" => Self::TeamListAssistants,
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
@@ -147,6 +156,12 @@ pub enum TeamToolErrorCode {
     TransportUnavailable,
     RuntimeContextMissing,
     RuntimeAuthFailed,
+    VersionConflict,
+    LeaseConflict,
+    InvalidTransition,
+    IdempotencyConflict,
+    DependencyBlocked,
+    RetryLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -425,6 +440,60 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "owner, status, include_deleted, limit",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamWorkCreate,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Create a durable Team Work task with acceptance criteria and dependencies.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "id": { "type": "string" },
+                    "parent_id": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                    "priority": { "type": "string", "enum": ["urgent", "high", "normal", "low"] },
+                    "blocked_by": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["subject"]
+            }),
+            cli_command: &["work", "create"],
+            when: "Decompose durable work",
+            input_summary: "subject, acceptance, optional deps",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamWorkList,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Read the authoritative Team Work snapshot, including available tasks, runs, leases, and attention.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+            cli_command: &["work", "list"],
+            when: "Find claimable work or inspect state",
+            input_summary: "{}",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamWorkCommand,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Apply one versioned, idempotent Team Work command. Caller identity comes from the runtime and cannot be overridden.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "expected_version": { "type": "integer", "minimum": 1 },
+                    "idempotency_key": { "type": "string" },
+                    "command": { "type": "object", "description": "Tagged TeamWorkCommand with kind and optional payload" }
+                },
+                "required": ["task_id", "expected_version", "idempotency_key", "command"]
+            }),
+            cli_command: &["work", "command"],
+            when: "Claim, heartbeat, report progress, request attention, or submit review",
+            input_summary: "task_id, version, idempotency key, command",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamListAssistants,
             permission: TeamToolPermission::AnyTeamAgent,
             description: TEAM_LIST_ASSISTANTS_DESCRIPTION,
@@ -516,7 +585,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 10);
+        assert_eq!(descriptors.len(), 13);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())

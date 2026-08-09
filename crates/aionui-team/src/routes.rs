@@ -11,9 +11,11 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamActivityPageResponse, TeamAgentResponse, TeamListResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    CreateTeamWorkTaskRequest, GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetModeRequest, TeamActivityPageResponse, TeamAgentResponse,
+    TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamTaskResponse, TeamWorkCommandEnvelope, TeamWorkCommandReceipt, TeamWorkErrorCode, TeamWorkEventBatch,
+    TeamWorkSnapshot, TeamWorkTask,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -21,10 +23,12 @@ use aionui_db::{ActivityCursor, DbError, PageDirection};
 
 use crate::error::{TeamError, classify_public_error};
 use crate::service::{ActivityKind, DEFAULT_ACTIVITY_LIMIT, TeamSessionService};
+use crate::work_service::TeamWorkService;
 
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+    pub work_service: Arc<TeamWorkService>,
     pub active_leases: Arc<ActiveLeaseRegistry>,
 }
 
@@ -83,8 +87,23 @@ impl From<TeamError> for ApiError {
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
             TeamError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
+            TeamError::WorkState(error) => work_state_error_to_api_error(error.code, error.message),
         }
     }
+}
+
+fn work_state_error_to_api_error(code: TeamWorkErrorCode, message: String) -> ApiError {
+    let (status, public_code) = match code {
+        TeamWorkErrorCode::ActorForbidden => (StatusCode::FORBIDDEN, "TEAM_WORK_ACTOR_FORBIDDEN"),
+        TeamWorkErrorCode::InvalidTransition => (StatusCode::CONFLICT, "TEAM_WORK_INVALID_TRANSITION"),
+        TeamWorkErrorCode::VersionConflict => (StatusCode::CONFLICT, "TEAM_WORK_VERSION_CONFLICT"),
+        TeamWorkErrorCode::LeaseConflict => (StatusCode::CONFLICT, "TEAM_WORK_LEASE_CONFLICT"),
+        TeamWorkErrorCode::LeaseExpired => (StatusCode::CONFLICT, "TEAM_WORK_LEASE_EXPIRED"),
+        TeamWorkErrorCode::IdempotencyConflict => (StatusCode::CONFLICT, "TEAM_WORK_IDEMPOTENCY_CONFLICT"),
+        TeamWorkErrorCode::DependencyBlocked => (StatusCode::CONFLICT, "TEAM_WORK_DEPENDENCY_BLOCKED"),
+        TeamWorkErrorCode::RetryLimitReached => (StatusCode::CONFLICT, "TEAM_WORK_RETRY_LIMIT_REACHED"),
+    };
+    ApiError::coded(status, public_code, message, None)
 }
 
 pub fn team_routes(state: TeamRouterState) -> Router {
@@ -95,6 +114,14 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
         .route("/api/teams/{id}/activity", get(list_activity))
+        .route("/api/teams/{id}/work/snapshot", get(get_work_snapshot))
+        .route("/api/teams/{id}/work/events", get(list_work_events))
+        .route("/api/teams/{id}/work/tasks", post(create_work_task))
+        .route("/api/teams/{id}/work/reconcile-stale", post(reconcile_stale_work))
+        .route(
+            "/api/teams/{id}/work/tasks/{task_id}/commands",
+            post(apply_work_command),
+        )
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -122,6 +149,75 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TeamWorkEventsQuery {
+    #[serde(default)]
+    after_sequence: i64,
+    #[serde(default = "default_work_event_limit")]
+    limit: i64,
+}
+
+fn default_work_event_limit() -> i64 {
+    200
+}
+
+async fn get_work_snapshot(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamWorkSnapshot>>, ApiError> {
+    Ok(Json(ApiResponse::ok(state.work_service.snapshot(&user.id, &id).await?)))
+}
+
+async fn list_work_events(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<TeamWorkEventsQuery>,
+) -> Result<Json<ApiResponse<TeamWorkEventBatch>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .work_service
+            .events(&user.id, &id, query.after_sequence, query.limit)
+            .await?,
+    )))
+}
+
+async fn create_work_task(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<CreateTeamWorkTaskRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<TeamWorkTask>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let task = state.work_service.create_task(&user.id, &id, request).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(task))))
+}
+
+async fn apply_work_command(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, task_id)): Path<(String, String)>,
+    body: Result<Json<TeamWorkCommandEnvelope>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamWorkCommandReceipt>>, ApiError> {
+    let Json(envelope) = body.map_err(ApiError::from)?;
+    let receipt = state
+        .work_service
+        .apply_command(&user.id, &id, &task_id, envelope)
+        .await?;
+    Ok(Json(ApiResponse::ok(receipt)))
+}
+
+async fn reconcile_stale_work(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TeamWorkCommandReceipt>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.work_service.reconcile_stale(&user.id, &id).await?,
+    )))
 }
 
 async fn create_team(

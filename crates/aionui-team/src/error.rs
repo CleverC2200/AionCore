@@ -54,6 +54,9 @@ pub enum TeamError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("{0}")]
+    WorkState(#[from] crate::work_kernel::TeamWorkStateError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
