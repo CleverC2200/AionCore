@@ -196,7 +196,7 @@ fn is_error_response(resp: &Value) -> bool {
 /// 1. `TeamSessionService::create_team` with a lead + one worker.
 /// 2. Assert the returned team has a `leader_assistant_id` and two assistants.
 /// 3. Assert `TeamMcpServer` is started for that team (ensure_session).
-/// 4. `tools/list` returns the full 10-tool surface.
+/// 4. `tools/list` returns the full 13-tool surface.
 /// 5. `team_members` returns both agents.
 #[tokio::test]
 #[ignore = "unblocks when TeamSessionService e2e wiring is ready (spawn + ensure_session over real DB)"]

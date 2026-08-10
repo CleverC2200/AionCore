@@ -699,6 +699,7 @@ async fn setup_session_with_turn_recorder_inner(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        session_mode: None,
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
@@ -757,6 +758,7 @@ async fn setup_session_with_runtime_ports(
         id: "e2e-team".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        session_mode: None,
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
         created_at: 1000,
@@ -864,12 +866,15 @@ async fn s1a_mcp_server_starts_and_tools_available() {
     let resp = tcp_recv(&mut stream).await;
 
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 13, "expected exactly 13 MCP tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"team_send_message"), "missing team_send_message");
     assert!(names.contains(&"team_members"), "missing team_members");
     assert!(names.contains(&"team_task_create"), "missing team_task_create");
+    assert!(names.contains(&"team_work_create"), "missing team_work_create");
+    assert!(names.contains(&"team_work_list"), "missing team_work_list");
+    assert!(names.contains(&"team_work_command"), "missing team_work_command");
     assert!(names.contains(&"team_list_assistants"), "missing team_list_assistants");
     assert!(
         !names.contains(&"team_list_models"),

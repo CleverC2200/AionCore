@@ -222,6 +222,51 @@ impl TaskListParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkCreateParams {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    subject: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    blocked_by: Vec<String>,
+}
+
+impl WorkCreateParams {
+    fn into_json(self) -> serde_json::Value {
+        let mut args = serde_json::json!({
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "subject": self.subject,
+            "description": self.description,
+            "acceptance_criteria": self.acceptance_criteria,
+            "priority": self.priority,
+            "blocked_by": self.blocked_by,
+        });
+        args.as_object_mut()
+            .expect("work create params must serialize to object")
+            .retain(|_, value| !value.is_null());
+        args
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkCommandParams {
+    task_id: String,
+    expected_version: u64,
+    idempotency_key: String,
+    command: serde_json::Value,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RenameAgentParams {
     /// Agent slot_id to rename.
     slot_id: String,
@@ -323,6 +368,39 @@ impl TeamStdioServer {
     )]
     async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
         self.forward_to_tcp("team_task_list", &params.into_json()).await
+    }
+
+    #[tool(
+        name = "team_work_create",
+        description = "Create a durable Team Work task with acceptance criteria and dependencies."
+    )]
+    async fn work_create(&self, Parameters(params): Parameters<WorkCreateParams>) -> CallToolResult {
+        self.forward_to_tcp("team_work_create", &params.into_json()).await
+    }
+
+    #[tool(
+        name = "team_work_list",
+        description = "Read the authoritative Team Work snapshot, including available tasks, runs, leases, and attention."
+    )]
+    async fn work_list(&self) -> CallToolResult {
+        self.forward_to_tcp("team_work_list", &serde_json::json!({})).await
+    }
+
+    #[tool(
+        name = "team_work_command",
+        description = "Apply one versioned, idempotent Team Work command. Caller identity comes from the runtime and cannot be overridden."
+    )]
+    async fn work_command(&self, Parameters(params): Parameters<WorkCommandParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_work_command",
+            &serde_json::json!({
+                "task_id": params.task_id,
+                "expected_version": params.expected_version,
+                "idempotency_key": params.idempotency_key,
+                "command": params.command,
+            }),
+        )
+        .await
     }
 
     #[tool(
@@ -795,6 +873,15 @@ mod tests {
     }
 
     #[test]
+    fn team_stdio_router_handles_team_work_tools() {
+        let router = TeamStdioServer::tool_router();
+
+        for name in ["team_work_create", "team_work_list", "team_work_command"] {
+            assert!(router.has_route(name), "stdio route missing for {name}");
+        }
+    }
+
+    #[test]
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
@@ -1084,6 +1171,103 @@ mod tests {
         accept_task.await.unwrap();
         assert_ne!(result.is_error, Some(true));
         assert_eq!(first_text(&result), "[]");
+    }
+
+    #[tokio::test]
+    async fn team_work_methods_forward_expected_calls() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            for (expected_name, expected_arguments) in [
+                (
+                    "team_work_create",
+                    json!({
+                        "subject": "Implement durable work",
+                        "acceptance_criteria": ["stdio call succeeds"],
+                        "priority": "high",
+                        "blocked_by": [],
+                    }),
+                ),
+                ("team_work_list", json!({})),
+                (
+                    "team_work_command",
+                    json!({
+                        "task_id": "task-1",
+                        "expected_version": 1,
+                        "idempotency_key": "claim-task-1",
+                        "command": {
+                            "kind": "start"
+                        }
+                    }),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _init = read_frame(&mut socket).await.unwrap();
+                write_frame(
+                    &mut socket,
+                    &serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+                let call = read_frame(&mut socket).await.unwrap();
+                let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+                assert_eq!(call_value["params"]["name"], expected_name);
+                assert_eq!(call_value["params"]["arguments"], expected_arguments);
+
+                write_frame(
+                    &mut socket,
+                    &serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "content": [{ "type": "text", "text": "ok" }],
+                            "isError": false
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+
+        let create_result = server
+            .work_create(Parameters(WorkCreateParams {
+                id: None,
+                parent_id: None,
+                subject: "Implement durable work".into(),
+                description: None,
+                acceptance_criteria: vec!["stdio call succeeds".into()],
+                priority: Some("high".into()),
+                blocked_by: vec![],
+            }))
+            .await;
+        let list_result = server.work_list().await;
+        let command_result = server
+            .work_command(Parameters(WorkCommandParams {
+                task_id: "task-1".into(),
+                expected_version: 1,
+                idempotency_key: "claim-task-1".into(),
+                command: json!({ "kind": "start" }),
+            }))
+            .await;
+
+        accept_task.await.unwrap();
+        for result in [create_result, list_result, command_result] {
+            assert_eq!(result.is_error, Some(false));
+            assert_eq!(first_text(&result), "ok");
+        }
     }
 
     #[test]

@@ -616,6 +616,7 @@ impl TeamSessionService {
             id: team_id,
             name: req.name,
             workspace: team_workspace,
+            session_mode: None,
             agents,
             lead_agent_id,
             created_at: now,
