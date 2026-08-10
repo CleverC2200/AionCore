@@ -463,6 +463,8 @@ pub struct TeamResponse {
     pub name: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
     #[serde(alias = "agents")]
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
@@ -1142,6 +1144,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            session_mode: Some("default".into()),
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -1164,6 +1167,7 @@ mod tests {
         assert_eq!(json["id"], "team-1");
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
+        assert_eq!(json["session_mode"], "default");
         assert_eq!(json["leader_assistant_id"], "slot-1");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
@@ -1177,6 +1181,7 @@ mod tests {
             id: "team-2".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            session_mode: None,
             assistants: vec![],
             leader_assistant_id: None,
             created_at: 1700000000000,
@@ -1282,6 +1287,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            session_mode: Some("default".into()),
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),

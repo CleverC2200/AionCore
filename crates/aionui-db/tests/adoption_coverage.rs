@@ -27,6 +27,10 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),
+    ("team_work_commands", "team_id", "teams"),
+    ("team_work_events", "team_id", "teams"),
+    ("team_work_runs", "team_id", "teams"),
+    ("team_work_tasks", "team_id", "teams"),
 ];
 
 /// Deliberately machine-global tables — adoption must NOT touch them.

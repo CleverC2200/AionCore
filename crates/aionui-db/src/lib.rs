@@ -46,6 +46,10 @@ pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
+pub use repository::team_work::{
+    CreateTeamWorkTaskParams, ITeamWorkRepository, PersistTeamWorkCommandParams, PersistTeamWorkCommandResult,
+    StoredTeamWorkEvent, StoredTeamWorkRun, StoredTeamWorkTask,
+};
 pub use repository::{
     ActivityCursor, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
@@ -60,7 +64,7 @@ pub use repository::{
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
+    SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

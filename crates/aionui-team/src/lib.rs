@@ -28,6 +28,8 @@ pub mod tool_executor;
 pub mod types;
 pub mod visibility;
 mod work_coordinator;
+pub mod work_kernel;
+pub mod work_service;
 mod work_source;
 mod workspace;
 
@@ -64,3 +66,4 @@ pub use types::{
     MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
 pub use visibility::TeamVisibilityPolicy;
+pub use work_service::TeamWorkService;
