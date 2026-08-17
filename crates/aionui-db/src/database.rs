@@ -7,7 +7,7 @@ use fs2::FileExt;
 use sqlx::migrate::Migrator;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::{Connection, Sqlite, SqlitePool};
 use tracing::{info, warn};
 
 use crate::error::DbError;
@@ -31,6 +31,7 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
 const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] =
     &[(38, "voice configuration", 40), (39, "team work kernel", 41)];
+const LEGACY_PERSONAL_MIGRATION_PERMUTATION: &[(i64, i64)] = &[(38, 40), (39, 41), (40, 38), (41, 39)];
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 /// Stage reported when the database was created by a NEWER app version than
 /// this binary: `_sqlx_migrations` contains a version the embedded migrator
@@ -485,6 +486,66 @@ async fn remap_legacy_personal_migration_versions(conn: &mut sqlx::SqliteConnect
         return Ok(());
     }
 
+    let mut has_exact_permutation = true;
+    for &(stored_version, current_version) in LEGACY_PERSONAL_MIGRATION_PERMUTATION {
+        let Some(current_migration) = DB_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == current_version)
+        else {
+            has_exact_permutation = false;
+            break;
+        };
+        let stored_row = sqlx::query_as::<_, (String, bool, Vec<u8>)>(
+            "SELECT description, success, checksum FROM _sqlx_migrations WHERE version = ?",
+        )
+        .bind(stored_version)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+        if !matches!(
+            stored_row,
+            Some((description, true, checksum))
+                if description == current_migration.description.as_ref()
+                    && checksum.as_slice() == current_migration.checksum.as_ref()
+        ) {
+            has_exact_permutation = false;
+            break;
+        }
+    }
+
+    if has_exact_permutation {
+        let temporary_version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version BETWEEN -41 AND -38")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+        if temporary_version_count != 0 {
+            return Ok(());
+        }
+        let mut tx = conn.begin().await.map_err(DbError::Query)?;
+        sqlx::query("UPDATE _sqlx_migrations SET version = -version WHERE version BETWEEN 38 AND 41")
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+        for &(stored_version, current_version) in LEGACY_PERSONAL_MIGRATION_PERMUTATION {
+            let current_migration = DB_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == current_version)
+                .expect("migration permutation targets must exist");
+            sqlx::query("UPDATE _sqlx_migrations SET version = ?, description = ?, checksum = ? WHERE version = ?")
+                .bind(current_version)
+                .bind(current_migration.description.as_ref())
+                .bind(current_migration.checksum.as_ref())
+                .bind(-stored_version)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+        }
+        tx.commit().await.map_err(DbError::Query)?;
+        info!("remapped displaced official and legacy personal-fork migration versions");
+        return Ok(());
+    }
+
     for &(legacy_version, legacy_description, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
         let Some(current_migration) = DB_MIGRATOR
             .iter()
@@ -908,6 +969,55 @@ mod tests {
             assert!(success);
             assert_eq!(checksum.as_slice(), current_migration.checksum.as_ref());
             assert_eq!(execution_time, 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn displaced_official_and_legacy_personal_migrations_are_remapped_together() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        for &(stored_version, current_version) in &[(38_i64, 40_i64), (39, 41), (40, 38), (41, 39)] {
+            let migration = DB_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == current_version)
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) VALUES (?, ?, TRUE, ?, 7)",
+            )
+            .bind(stored_version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+
+        for current_version in 38_i64..=41_i64 {
+            let (description, checksum): (String, Vec<u8>) =
+                sqlx::query_as("SELECT description, checksum FROM _sqlx_migrations WHERE version = ?")
+                    .bind(current_version)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            let migration = DB_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == current_version)
+                .unwrap();
+            assert_eq!(description, migration.description.as_ref());
+            assert_eq!(checksum.as_slice(), migration.checksum.as_ref());
         }
     }
 
