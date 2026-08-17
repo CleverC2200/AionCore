@@ -29,6 +29,8 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
+const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] =
+    &[(38, "voice configuration", 40), (39, "team work kernel", 41)];
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 /// Stage reported when the database was created by a NEWER app version than
 /// this binary: `_sqlx_migrations` contains a version the embedded migrator
@@ -395,6 +397,13 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
 
+    // Personal-fork migrations 038/039 shipped before official migrations reused
+    // those versions. Move only exact, checksum-verified legacy records to their
+    // new versions before sqlx validates the official migration history.
+    remap_legacy_personal_migration_versions(&mut conn)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", e))?;
+
     // Idempotent pre-migration repair for migration 030 (`user_scope`): normalize
     // benign historical inconsistencies so 030's fail-hard CHECK(ok=1) assertions
     // do not abort startup (Sentry ELECTRON-31Z / ELECTRON-31X). No-op unless the
@@ -464,6 +473,83 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
         }
         Err(e) => Err(DbError::Migration(e)),
     }
+}
+
+async fn remap_legacy_personal_migration_versions(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
+    let has_migrations_table: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    if !has_migrations_table {
+        return Ok(());
+    }
+
+    for &(legacy_version, legacy_description, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
+        let Some(current_migration) = DB_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == current_version)
+        else {
+            continue;
+        };
+        let legacy_row = sqlx::query_as::<_, (String, bool, Vec<u8>)>(
+            "SELECT description, success, checksum FROM _sqlx_migrations WHERE version = ?",
+        )
+        .bind(legacy_version)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+        let Some((description, success, checksum)) = legacy_row else {
+            continue;
+        };
+        if description != legacy_description || !success || checksum.as_slice() != current_migration.checksum.as_ref() {
+            continue;
+        }
+
+        let current_row =
+            sqlx::query_as::<_, (bool, Vec<u8>)>("SELECT success, checksum FROM _sqlx_migrations WHERE version = ?")
+                .bind(current_version)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+        match current_row {
+            Some((current_success, current_checksum))
+                if current_success && current_checksum.as_slice() == current_migration.checksum.as_ref() => {}
+            Some(_) => continue,
+            None => {
+                sqlx::query(
+                    "INSERT INTO _sqlx_migrations \
+                     (version, description, installed_on, success, checksum, execution_time) \
+                     SELECT ?, ?, installed_on, success, ?, execution_time \
+                     FROM _sqlx_migrations WHERE version = ?",
+                )
+                .bind(current_version)
+                .bind(current_migration.description.as_ref())
+                .bind(current_migration.checksum.as_ref())
+                .bind(legacy_version)
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+            }
+        }
+
+        let deleted =
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = ? AND description = ? AND checksum = ?")
+                .bind(legacy_version)
+                .bind(legacy_description)
+                .bind(current_migration.checksum.as_ref())
+                .execute(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+        if deleted.rows_affected() > 0 {
+            info!(
+                legacy_version,
+                current_version, "remapped legacy personal-fork migration version"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Detect the specific "another process inserted this version first" error.
@@ -754,6 +840,7 @@ fn is_corruption_like_error(err: &DbError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
 
     #[test]
     fn recovery_skips_migration_version_mismatch() {
@@ -763,6 +850,96 @@ mod tests {
             !should_attempt_recovery(&err),
             "migration checksum mismatch must not trigger recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_personal_migrations_are_remapped_by_exact_checksum() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        for &(legacy_version, legacy_description, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
+            let current_migration = DB_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == current_version)
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) VALUES (?, ?, TRUE, ?, 7)",
+            )
+            .bind(legacy_version)
+            .bind(legacy_description)
+            .bind(current_migration.checksum.as_ref())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+
+        for &(legacy_version, _, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
+            let legacy_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?")
+                .bind(legacy_version)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(legacy_count, 0);
+
+            let (description, success, checksum, execution_time): (String, bool, Vec<u8>, i64) = sqlx::query_as(
+                "SELECT description, success, checksum, execution_time FROM _sqlx_migrations WHERE version = ?",
+            )
+            .bind(current_version)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            let current_migration = DB_MIGRATOR
+                .iter()
+                .find(|migration| migration.version == current_version)
+                .unwrap();
+            assert_eq!(description, current_migration.description.as_ref());
+            assert!(success);
+            assert_eq!(checksum.as_slice(), current_migration.checksum.as_ref());
+            assert_eq!(execution_time, 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_personal_migration_with_unknown_checksum_is_not_remapped() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (38, 'voice configuration', TRUE, x'00', 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+
+        let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![38]);
     }
 
     #[test]
