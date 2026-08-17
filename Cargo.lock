@@ -666,6 +666,7 @@ dependencies = [
  "junction",
  "mime_guess",
  "notify",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",
@@ -676,6 +677,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "walkdir",
  "zip 2.4.2",
 ]
 

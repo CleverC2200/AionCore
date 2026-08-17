@@ -621,6 +621,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_manifest_supports_declarative_lifecycle_command() {
+        let raw = json!({
+            "name": "aionext-codex",
+            "version": "1.0.0",
+            "lifecycle": {
+                "onInstall": {
+                    "shell": {
+                        "cliCommand": "bun",
+                        "args": ["run", "scripts/install.ts"]
+                    },
+                    "timeout": 120000
+                }
+            }
+        });
+
+        let manifest = parse_manifest(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let hook = manifest.lifecycle.unwrap().on_install.unwrap();
+        let crate::types::LifecycleHook::Command(command) = hook else {
+            panic!("expected declarative command hook");
+        };
+        assert_eq!(command.shell.cli_command, "bun");
+        assert_eq!(command.shell.args, vec!["run", "scripts/install.ts"]);
+        assert_eq!(command.timeout, Some(120000));
+    }
+
+    #[test]
     fn test_parse_manifest_invalid_json() {
         let err = parse_manifest(b"not json").unwrap_err();
         assert!(matches!(err, ExtensionError::JsonParse(_)));

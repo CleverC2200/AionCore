@@ -66,6 +66,8 @@ async fn get_hub_extensions(
                 author: e.author,
                 icon: e.icon,
                 tags: e.tags,
+                hubs: e.hubs,
+                contributes: e.contributes,
                 bundled: e.bundled,
                 status: status_str,
             }

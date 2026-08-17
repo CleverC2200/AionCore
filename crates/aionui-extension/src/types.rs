@@ -331,13 +331,47 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LifecycleHooks {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_install: Option<String>,
+    pub on_install: Option<LifecycleHook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_uninstall: Option<String>,
+    pub on_uninstall: Option<LifecycleHook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_activate: Option<String>,
+    pub on_activate: Option<LifecycleHook>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_deactivate: Option<String>,
+    pub on_deactivate: Option<LifecycleHook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum LifecycleHook {
+    Script(String),
+    Command(LifecycleCommandHook),
+}
+
+impl From<String> for LifecycleHook {
+    fn from(value: String) -> Self {
+        Self::Script(value)
+    }
+}
+
+impl From<&str> for LifecycleHook {
+    fn from(value: &str) -> Self {
+        Self::Script(value.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LifecycleCommandHook {
+    pub shell: LifecycleShellHook,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LifecycleShellHook {
+    #[serde(alias = "cliCommand")]
+    pub cli_command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 /// Complete extension manifest parsed from `aion-extension.json`.
@@ -465,6 +499,10 @@ pub struct HubExtensionWithStatus {
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hubs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contributes: Option<serde_json::Value>,
     #[serde(default)]
     pub bundled: bool,
     pub status: HubExtensionStatus,

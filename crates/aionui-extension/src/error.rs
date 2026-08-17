@@ -111,6 +111,9 @@ pub enum ExtensionError {
     #[error("Internal extension error: {0}")]
     Internal(String),
 
+    #[error("Hub source error: {0}")]
+    Remote(String),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 

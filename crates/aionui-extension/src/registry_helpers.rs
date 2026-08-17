@@ -4,7 +4,7 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::dependency::{DependencyValidationResult, validate_dependencies};
-use crate::lifecycle::{HookKind, execute_hook, resolve_hook_path};
+use crate::lifecycle::{HookKind, execute_lifecycle_hook, resolve_hook};
 use crate::loader::{ScanPath, filter_by_engine_compatibility, load_all};
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
@@ -134,12 +134,12 @@ pub(crate) async fn run_deactivation_hooks(extensions: &[LoadedExtension]) {
         let Some(hooks) = &ext.manifest.lifecycle else {
             continue;
         };
-        let Some(hook_path) = resolve_hook_path(hooks, HookKind::OnDeactivate) else {
+        let Some(hook) = resolve_hook(hooks, HookKind::OnDeactivate) else {
             continue;
         };
 
         let ext_dir = Path::new(&ext.directory);
-        if let Err(e) = execute_hook(ext_dir, hook_path, HookKind::OnDeactivate, &ext.manifest.name).await {
+        if let Err(e) = execute_lifecycle_hook(ext_dir, hook, HookKind::OnDeactivate, &ext.manifest.name).await {
             warn!(
                 extension = %ext.manifest.name,
                 error = %e,

@@ -8,7 +8,9 @@ use crate::constants::{
     LIFECYCLE_ON_UNINSTALL_TIMEOUT_SECS,
 };
 use crate::error::ExtensionError;
-use crate::types::LifecycleHooks;
+use crate::types::{LifecycleHook, LifecycleHooks};
+
+const AGENT_INSTALL_DIR_ENV: &str = "AIONUI_AGENT_INSTALL_DIR";
 
 /// Which lifecycle hook to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,12 +46,29 @@ impl HookKind {
 /// Resolve the hook script path from the manifest for a given hook kind.
 pub fn resolve_hook_path(hooks: &LifecycleHooks, kind: HookKind) -> Option<&str> {
     let value = match kind {
-        HookKind::OnInstall => hooks.on_install.as_deref(),
-        HookKind::OnUninstall => hooks.on_uninstall.as_deref(),
-        HookKind::OnActivate => hooks.on_activate.as_deref(),
-        HookKind::OnDeactivate => hooks.on_deactivate.as_deref(),
+        HookKind::OnInstall => hooks.on_install.as_ref(),
+        HookKind::OnUninstall => hooks.on_uninstall.as_ref(),
+        HookKind::OnActivate => hooks.on_activate.as_ref(),
+        HookKind::OnDeactivate => hooks.on_deactivate.as_ref(),
     };
-    value.filter(|s| !s.is_empty())
+    match value {
+        Some(LifecycleHook::Script(path)) if !path.is_empty() => Some(path),
+        _ => None,
+    }
+}
+
+/// Resolve either a legacy script hook or the current declarative command hook.
+pub fn resolve_hook(hooks: &LifecycleHooks, kind: HookKind) -> Option<&LifecycleHook> {
+    let value = match kind {
+        HookKind::OnInstall => hooks.on_install.as_ref(),
+        HookKind::OnUninstall => hooks.on_uninstall.as_ref(),
+        HookKind::OnActivate => hooks.on_activate.as_ref(),
+        HookKind::OnDeactivate => hooks.on_deactivate.as_ref(),
+    };
+    value.filter(|hook| match hook {
+        LifecycleHook::Script(path) => !path.is_empty(),
+        LifecycleHook::Command(command) => !command.shell.cli_command.is_empty(),
+    })
 }
 
 /// Execute a lifecycle hook script in a child process.
@@ -67,34 +86,69 @@ pub async fn execute_hook(
     kind: HookKind,
     extension_name: &str,
 ) -> Result<(), ExtensionError> {
-    let script = ext_dir.join(hook_path);
+    execute_lifecycle_hook(
+        ext_dir,
+        &LifecycleHook::Script(hook_path.to_owned()),
+        kind,
+        extension_name,
+    )
+    .await
+}
 
-    if !script.exists() {
-        warn!(
-            extension = extension_name,
-            hook = kind.label(),
-            path = %script.display(),
-            "lifecycle hook script not found, skipping"
-        );
-        return Err(ExtensionError::HookNotFound(script.display().to_string()));
+pub async fn execute_lifecycle_hook(
+    ext_dir: &Path,
+    hook: &LifecycleHook,
+    kind: HookKind,
+    extension_name: &str,
+) -> Result<(), ExtensionError> {
+    let (mut builder, hook_description, configured_timeout) = match hook {
+        LifecycleHook::Script(hook_path) => {
+            let script = ext_dir.join(hook_path);
+
+            if !script.exists() {
+                warn!(
+                    extension = extension_name,
+                    hook = kind.label(),
+                    path = %script.display(),
+                    "lifecycle hook script not found, skipping"
+                );
+                return Err(ExtensionError::HookNotFound(script.display().to_string()));
+            }
+
+            (CmdBuilder::clean_cli(&script), script.display().to_string(), None)
+        }
+        LifecycleHook::Command(command) => {
+            let mut builder = CmdBuilder::clean_cli(&command.shell.cli_command);
+            builder.args(&command.shell.args);
+            (builder, command.shell.cli_command.clone(), command.timeout)
+        }
+    };
+
+    if let Some(agent_install_dir) = resolve_agent_install_dir(ext_dir) {
+        std::fs::create_dir_all(&agent_install_dir)?;
+        builder.env(AGENT_INSTALL_DIR_ENV, agent_install_dir);
     }
 
-    let timeout_secs = kind.timeout_secs();
+    let default_timeout = std::time::Duration::from_secs(kind.timeout_secs());
+    let timeout = configured_timeout
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .map(std::time::Duration::from_millis)
+        .map_or(default_timeout, |timeout| timeout.min(default_timeout));
+    let timeout_secs = timeout.as_secs().max(1);
     let label = kind.label();
 
     info!(
         extension = extension_name,
         hook = label,
-        path = %script.display(),
-        timeout_secs,
+        command = %hook_description,
+        timeout_ms = timeout.as_millis(),
         "executing lifecycle hook"
     );
 
-    let mut builder = CmdBuilder::clean_cli(&script);
     builder.current_dir(ext_dir);
     let child_future = builder.output();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child_future).await;
+    let result = tokio::time::timeout(timeout, child_future).await;
 
     match result {
         Err(_elapsed) => {
@@ -152,6 +206,22 @@ pub async fn execute_hook(
             }
         }
     }
+}
+
+fn resolve_agent_install_dir(ext_dir: &Path) -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os(AGENT_INSTALL_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Some(configured.into());
+    }
+
+    infer_agent_install_dir(ext_dir)
+}
+
+fn infer_agent_install_dir(ext_dir: &Path) -> Option<std::path::PathBuf> {
+    let extensions_dir = ext_dir.parent()?;
+    if extensions_dir.file_name()? != "extensions" {
+        return None;
+    }
+    Some(extensions_dir.parent()?.join("agent-runtime"))
 }
 
 /// Determine whether the `onInstall` hook should run.
@@ -215,6 +285,15 @@ mod tests {
         assert_eq!(HookKind::OnDeactivate.label(), "onDeactivate");
     }
 
+    #[test]
+    fn test_agent_install_dir_is_inferred_from_data_extensions_dir() {
+        let ext_dir = Path::new("/tmp/aionui-data/extensions/aionext-codex");
+        assert_eq!(
+            infer_agent_install_dir(ext_dir),
+            Some(Path::new("/tmp/aionui-data/agent-runtime").to_path_buf())
+        );
+    }
+
     // -----------------------------------------------------------------------
     // resolve_hook_path
     // -----------------------------------------------------------------------
@@ -242,7 +321,7 @@ mod tests {
     #[test]
     fn test_resolve_hook_path_empty_string() {
         let hooks = LifecycleHooks {
-            on_install: Some(String::new()),
+            on_install: Some(String::new().into()),
             on_activate: None,
             on_deactivate: None,
             on_uninstall: None,
@@ -279,6 +358,26 @@ mod tests {
         let result = execute_hook(dir.path(), "hook.sh", HookKind::OnActivate, "test-ext").await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_declarative_command_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = LifecycleHook::Command(crate::types::LifecycleCommandHook {
+            shell: crate::types::LifecycleShellHook {
+                cli_command: "sh".into(),
+                args: vec!["-c".into(), "printf installed > command_marker.txt".into()],
+            },
+            timeout: Some(5000),
+        });
+
+        let result = execute_lifecycle_hook(dir.path(), &hook, HookKind::OnInstall, "test-ext").await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("command_marker.txt")).unwrap(),
+            "installed"
+        );
     }
 
     #[tokio::test]
