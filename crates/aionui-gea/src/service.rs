@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aionui_api_types::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallResponse, GeaToolInfo,
-    SetGeaAuthSessionRequest,
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
+    GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallResponse, GeaToolInfo, SetGeaAuthSessionRequest,
 };
 use axum::http::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::GeaError;
+use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command};
 
 const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -344,6 +345,76 @@ impl GeaService {
         })
     }
 
+    pub async fn list_interaction_requests(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<GeaInteractionRequestSnapshot, GeaError> {
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        let mut body = session.gateway_body();
+        body["status"] = Value::String("pending".to_owned());
+        let value = self
+            .post_for_conversation(
+                user_id,
+                conversation_id,
+                &credential,
+                "/ai/gateway/interaction-requests/list",
+                &body,
+            )
+            .await?;
+        let snapshot = parse_snapshot(&value)?;
+        tracing::info!(
+            user_id,
+            conversation_id,
+            revision = snapshot.revision,
+            pending_count = snapshot.items.len(),
+            "GEA interaction request snapshot loaded"
+        );
+        Ok(snapshot)
+    }
+
+    pub async fn act_on_interaction_request(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        command: GeaInteractionRequestActionCommand,
+    ) -> Result<GeaInteractionRequestReceipt, GeaError> {
+        validate_action_command(request_id, &command)?;
+
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        let mut body = session.gateway_body();
+        body["requestId"] = Value::String(request_id.trim().to_owned());
+        body["expectedVersion"] = Value::String(command.expected_version.trim().to_owned());
+        body["idempotencyKey"] = Value::String(command.idempotency_key.trim().to_owned());
+        body["actionId"] = Value::String(command.action_id.trim().to_owned());
+        if let Some(payload) = command.payload {
+            body["payload"] = payload;
+        }
+        let value = self
+            .post_for_conversation(
+                user_id,
+                conversation_id,
+                &credential,
+                "/ai/gateway/interaction-requests/action",
+                &body,
+            )
+            .await?;
+        let receipt = parse_receipt(&value, request_id)?;
+        tracing::info!(
+            user_id,
+            conversation_id,
+            request_id,
+            version = receipt.version,
+            status = ?receipt.status,
+            audit_id = receipt.audit_id,
+            "GEA interaction request action completed"
+        );
+        Ok(receipt)
+    }
+
     async fn credential(&self, user_id: &str) -> Result<GeaCredential, GeaError> {
         self.credentials
             .read()
@@ -568,7 +639,10 @@ fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use aionui_api_types::{CreateGeaSessionRequest, SetGeaAuthSessionRequest};
+    use aionui_api_types::{
+        CreateGeaSessionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
+        GeaInteractionRequestReceiptStatus, GeaInteractionRequestStatus, SetGeaAuthSessionRequest,
+    };
     use serde_json::json;
     use wiremock::matchers::{body_json, body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1080,5 +1154,124 @@ mod tests {
         assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
         assert_eq!(error.body.category, "CONFLICT");
         assert!(service.session("user-1", "conversation-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn interaction_snapshot_uses_the_existing_gateway_session_context() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/list"))
+            .and(body_json(json!({
+                "agentCode": "agent-sales",
+                "sessionId": "gea-session-1",
+                "conversationId": "conversation-1",
+                "delegationToken": "delegation-secret",
+                "status": "pending"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "pending-r1",
+                    "items": [{
+                        "id": "erp:cost-center:payment-1",
+                        "version": "v1",
+                        "status": "pending",
+                        "kind": "question",
+                        "title": "补充成本中心",
+                        "sourceLabel": "ERP 财务系统",
+                        "allowedActions": ["answer", "decline"],
+                        "updatedAt": "2026-08-17T10:00:10+08:00",
+                        "presentation": {
+                            "type": "question",
+                            "questions": [{
+                                "question": "本次付款申请应归属哪个成本中心？",
+                                "multiSelect": false,
+                                "options": [{ "label": "华东业务中心" }]
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = authenticated_service(&server).await;
+        create_session(&service).await;
+        let snapshot = service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.revision, "pending-r1");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].kind, GeaInteractionRequestKind::Question);
+        assert_eq!(snapshot.items[0].status, GeaInteractionRequestStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn interaction_action_injects_gateway_context_and_preserves_the_receipt() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(body_json(json!({
+                "agentCode": "agent-sales",
+                "sessionId": "gea-session-1",
+                "conversationId": "conversation-1",
+                "delegationToken": "delegation-secret",
+                "requestId": "erp:cost-center:payment-1",
+                "expectedVersion": "v1",
+                "idempotencyKey": "interaction:erp:cost-center:payment-1:v1:answer",
+                "actionId": "answer",
+                "payload": {
+                    "answers": [{
+                        "question": "本次付款申请应归属哪个成本中心？",
+                        "labels": ["华东业务中心"]
+                    }]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-1",
+                    "requestId": "erp:cost-center:payment-1",
+                    "version": "v1",
+                    "status": "accepted",
+                    "resolvedAt": "2026-08-17T10:03:00+08:00",
+                    "resolvedBy": "user-opaque-id",
+                    "auditId": "audit-2"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = authenticated_service(&server).await;
+        create_session(&service).await;
+        let receipt = service
+            .act_on_interaction_request(
+                "user-1",
+                "conversation-1",
+                "erp:cost-center:payment-1",
+                GeaInteractionRequestActionCommand {
+                    expected_version: "v1".to_owned(),
+                    idempotency_key: "interaction:erp:cost-center:payment-1:v1:answer".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: Some(json!({
+                        "answers": [{
+                            "question": "本次付款申请应归属哪个成本中心？",
+                            "labels": ["华东业务中心"]
+                        }]
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.receipt_id, "receipt-1");
+        assert_eq!(receipt.status, GeaInteractionRequestReceiptStatus::Accepted);
+        assert_eq!(receipt.audit_id.as_deref(), Some("audit-2"));
     }
 }

@@ -124,8 +124,11 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use gea::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse,
-    GeaToolInfo, SetGeaAuthSessionRequest,
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionPermissionOption, GeaInteractionPresentation,
+    GeaInteractionQuestion, GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand,
+    GeaInteractionRequestKind, GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus,
+    GeaInteractionRequestSnapshot, GeaInteractionRequestStatus, GeaSessionResponse, GeaToolCallRequest,
+    GeaToolCallResponse, GeaToolInfo, SetGeaAuthSessionRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

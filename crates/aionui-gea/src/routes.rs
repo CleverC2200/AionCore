@@ -1,5 +1,6 @@
 use aionui_api_types::{
-    ApiResponse, CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallRequest,
+    ApiResponse, CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand,
+    GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallRequest,
     GeaToolCallResponse, GeaToolInfo, SetGeaAuthSessionRequest,
 };
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
@@ -19,6 +20,14 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
         )
         .route("/api/gea/conversations/{conversation_id}/session", post(create_session))
         .route("/api/gea/conversations/{conversation_id}/tools", get(list_tools))
+        .route(
+            "/api/gea/conversations/{conversation_id}/interaction-requests",
+            get(list_interaction_requests),
+        )
+        .route(
+            "/api/gea/conversations/{conversation_id}/interaction-requests/{request_id}/actions",
+            post(act_on_interaction_request),
+        )
         .route(
             "/api/gea/conversations/{conversation_id}/tools/{tool_name}",
             post(call_tool),
@@ -95,6 +104,35 @@ async fn call_tool(
         .call_tool(&user.id, &conversation_id, &tool_name, request.arguments)
         .await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn list_interaction_requests(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> Result<Json<ApiResponse<GeaInteractionRequestSnapshot>>, GeaError> {
+    enforce_runtime_conversation_scope(&headers, &conversation_id)?;
+    let snapshot = state
+        .service
+        .list_interaction_requests(&user.id, &conversation_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(snapshot)))
+}
+
+async fn act_on_interaction_request(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Path((conversation_id, request_id)): Path<(String, String)>,
+    Json(command): Json<GeaInteractionRequestActionCommand>,
+) -> Result<Json<ApiResponse<GeaInteractionRequestReceipt>>, GeaError> {
+    enforce_runtime_conversation_scope(&headers, &conversation_id)?;
+    let receipt = state
+        .service
+        .act_on_interaction_request(&user.id, &conversation_id, &request_id, command)
+        .await?;
+    Ok(Json(ApiResponse::ok(receipt)))
 }
 
 fn reject_runtime_auth_session_access(headers: &HeaderMap) -> Result<(), GeaError> {

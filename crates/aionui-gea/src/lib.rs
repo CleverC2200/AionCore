@@ -5,6 +5,7 @@
 //! the matching GEA session and adds gateway context at the outbound boundary.
 
 mod error;
+mod interaction_request;
 mod routes;
 mod service;
 mod state;
