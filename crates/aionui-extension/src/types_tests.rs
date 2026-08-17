@@ -460,6 +460,8 @@ fn test_hub_extension_with_status_roundtrip() {
         author: Some("Author".into()),
         icon: None,
         tags: vec!["productivity".into()],
+        hubs: vec!["acpAdapters".into()],
+        contributes: Some(serde_json::json!({"acpAdapters": ["cool"]})),
         bundled: false,
         status: HubExtensionStatus::Installed,
     };
@@ -478,6 +480,8 @@ fn test_hub_extension_bundled_status() {
         author: None,
         icon: None,
         tags: vec![],
+        hubs: vec![],
+        contributes: None,
         bundled: true,
         status: HubExtensionStatus::Installed,
     };
@@ -553,6 +557,9 @@ fn test_lifecycle_hooks_empty() {
 fn test_lifecycle_hooks_partial() {
     let raw = json!({"on_install": "scripts/install.sh"});
     let hooks: LifecycleHooks = serde_json::from_value(raw).unwrap();
-    assert_eq!(hooks.on_install.as_deref(), Some("scripts/install.sh"));
+    assert_eq!(
+        hooks.on_install,
+        Some(LifecycleHook::Script("scripts/install.sh".into()))
+    );
     assert!(hooks.on_activate.is_none());
 }

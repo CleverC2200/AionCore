@@ -157,7 +157,7 @@ async fn hm3_install_no_directory() {
     let result = h.installer.install("remote-ext").await;
     assert!(!result.success);
     assert!(result.msg.is_some());
-    assert!(result.msg.unwrap().contains("not found"));
+    assert!(result.msg.unwrap().contains("no package metadata"));
 }
 
 // ---------------------------------------------------------------------------

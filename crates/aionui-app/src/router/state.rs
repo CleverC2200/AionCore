@@ -940,7 +940,7 @@ pub async fn build_extension_states(
     let registry = ExtensionRegistry::new(state_store, services.event_bus.clone(), services.app_version.clone());
 
     let hub_dir = resolve_install_target_dir_for_data_dir(&skill_data_dir);
-    let index_manager = HubIndexManager::new(hub_dir, registry.clone());
+    let index_manager = HubIndexManager::with_default_sources(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
     let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&skill_data_dir).await);

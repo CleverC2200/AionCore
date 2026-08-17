@@ -114,6 +114,7 @@ impl From<ExtensionError> for ApiError {
             ExtensionError::Db(err) => ApiError::Internal(err.to_string()),
             ExtensionError::InvalidRequest(msg) => ApiError::BadRequest(msg),
             ExtensionError::Internal(msg) => ApiError::Internal(msg),
+            ExtensionError::Remote(msg) => ApiError::Internal(msg),
             ExtensionError::Io(e) => ApiError::Internal(e.to_string()),
             ExtensionError::JsonParse(e) => ApiError::BadRequest(e.to_string()),
         }

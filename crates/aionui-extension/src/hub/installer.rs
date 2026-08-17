@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::io::{Cursor, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::constants::EXTENSION_MANIFEST_FILE;
@@ -13,7 +15,10 @@ use crate::registry::ExtensionRegistry;
 use crate::resolvers::resolve_extension_contributions;
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
-use super::index_manager::HubIndexManager;
+use super::index_manager::{HubIndexEntry, HubIndexManager};
+
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -56,9 +61,9 @@ pub struct HubUpdateInfo {
 
 /// Handles extension installation, update, uninstall, and verification.
 ///
-/// For this phase, remote downloading is a stub — extensions must already
-/// be present in the Hub directory or have a bundled flag. The installer
-/// verifies the manifest and contributions, then triggers a hot reload.
+/// Remote packages are downloaded from the source configured by
+/// [`HubIndexManager`], verified, safely extracted, and then atomically moved
+/// into the extension directory before the registry is reloaded.
 #[derive(Clone)]
 pub struct HubInstaller {
     index_manager: HubIndexManager,
@@ -78,13 +83,18 @@ impl HubInstaller {
 
     /// Install an extension from the Hub by name.
     ///
-    /// Flow: look up in index → verify the extension directory exists →
-    /// validate manifest → verify contributions → trigger hot reload.
+    /// Flow: look up in index → stage package if needed → validate manifest →
+    /// verify contributions → trigger hot reload.
     pub async fn install(&self, name: &str) -> HubResult {
+        if let Err(error) = validate_hub_name(name) {
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
+        }
+
         info!(name, "hub: installing extension");
         self.broadcast_state_changed(name, "installing", None);
 
-        let entry = match self.index_manager.get_extension(name) {
+        let entry = match self.index_manager.get_extension(name).await {
             Some(e) => e,
             None => {
                 let error = format!("Extension '{name}' not found in hub index");
@@ -96,13 +106,10 @@ impl HubInstaller {
         let target_dir = self.index_manager.install_target_dir();
         let ext_dir = target_dir.join(&entry.name);
 
-        // For now, the extension directory must already exist (no remote download).
-        // Future: download from entry.download_url and extract.
-        if !ext_dir.exists() {
-            let error = format!(
-                "Extension directory not found: {}. Remote download not yet implemented.",
-                ext_dir.display()
-            );
+        if !ext_dir.exists()
+            && let Err(error) = self.stage_package(&entry, false).await
+        {
+            let error = format!("Installation failed: {error}");
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -129,13 +136,16 @@ impl HubInstaller {
 
     /// Update an installed extension to the latest version from the index.
     ///
-    /// For this phase, update is equivalent to re-verifying the existing
-    /// directory (which may have been updated externally) and hot-reloading.
     pub async fn update(&self, name: &str) -> HubResult {
+        if let Err(error) = validate_hub_name(name) {
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
+        }
+
         info!(name, "hub: updating extension");
         self.broadcast_state_changed(name, "updating", None);
 
-        let entry = match self.index_manager.get_extension(name) {
+        let entry = match self.index_manager.get_extension(name).await {
             Some(e) => e,
             None => {
                 let error = format!("Extension '{name}' not found in hub index");
@@ -153,8 +163,14 @@ impl HubInstaller {
             return HubResult::err(error);
         }
 
-        if let Err(e) = self.verify_installation(&ext_dir) {
-            let error = format!("Update verification failed: {e}");
+        if entry.dist.is_some()
+            && let Err(error) = self.stage_package(&entry, true).await
+        {
+            let error = format!("Update failed: {error}");
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
+        } else if let Err(error) = self.verify_installation(&ext_dir) {
+            let error = format!("Update verification failed: {error}");
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -271,6 +287,37 @@ impl HubInstaller {
         Ok(())
     }
 
+    async fn stage_package(&self, entry: &HubIndexEntry, replace_existing: bool) -> Result<(), ExtensionError> {
+        validate_hub_name(&entry.name).map_err(ExtensionError::ManifestValidation)?;
+        let package = self.index_manager.load_package(entry).await?;
+        let target_dir = self.index_manager.install_target_dir();
+        std::fs::create_dir_all(&target_dir)?;
+
+        let staging = tempfile::Builder::new()
+            .prefix(".hub-install-")
+            .tempdir_in(&target_dir)?;
+        let staged_extension = staging.path().join("extension");
+        std::fs::create_dir(&staged_extension)?;
+        extract_package(&package, &staged_extension)?;
+        verify_package_integrity(entry, &staged_extension)?;
+        self.verify_installation(&staged_extension)?;
+        verify_package_identity(entry, &staged_extension)?;
+
+        let extension_dir = target_dir.join(&entry.name);
+        if replace_existing {
+            let backup_dir = staging.path().join("previous");
+            std::fs::rename(&extension_dir, &backup_dir)?;
+            if let Err(error) = std::fs::rename(&staged_extension, &extension_dir) {
+                let _ = std::fs::rename(&backup_dir, &extension_dir);
+                return Err(error.into());
+            }
+        } else {
+            std::fs::rename(&staged_extension, &extension_dir)?;
+        }
+
+        Ok(())
+    }
+
     fn broadcast_state_changed(&self, name: &str, status: &str, error: Option<String>) {
         self.broadcaster.broadcast(WebSocketMessage::new(
             "hub.state-changed",
@@ -306,6 +353,142 @@ fn is_newer(index_version: &str, installed_version: &str) -> bool {
     idx > inst
 }
 
+fn extract_package(package: &[u8], destination: &Path) -> Result<(), ExtensionError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(package))
+        .map_err(|error| ExtensionError::ManifestValidation(format!("Invalid extension archive: {error}")))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(ExtensionError::ManifestValidation(
+            "Extension archive contains too many entries".into(),
+        ));
+    }
+
+    let mut extracted_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| ExtensionError::ManifestValidation(format!("Invalid extension archive: {error}")))?;
+        reject_archive_symlink(&entry)?;
+        let relative_path = safe_archive_path(entry.name())?;
+        let output_path = destination.join(relative_path);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output_path)?;
+            continue;
+        }
+
+        extracted_bytes = extracted_bytes.saturating_add(entry.size());
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err(ExtensionError::ManifestValidation(
+                "Extracted extension exceeds size limit".into(),
+            ));
+        }
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::File::create(&output_path)?;
+        std::io::copy(&mut entry, &mut output)?;
+        output.flush()?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
+    }
+    Ok(())
+}
+
+fn safe_archive_path(name: &str) -> Result<PathBuf, ExtensionError> {
+    if name.is_empty() || name.contains('\\') {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            _ => return Err(ExtensionError::PathTraversal(name.to_string())),
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(ExtensionError::PathTraversal(name.to_string()));
+    }
+    Ok(safe)
+}
+
+fn reject_archive_symlink(entry: &zip::read::ZipFile<'_>) -> Result<(), ExtensionError> {
+    if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+        return Err(ExtensionError::PathTraversal(entry.name().to_string()));
+    }
+    Ok(())
+}
+
+fn verify_package_integrity(entry: &HubIndexEntry, extension_dir: &Path) -> Result<(), ExtensionError> {
+    let integrity = entry
+        .dist
+        .as_ref()
+        .map(|dist| dist.integrity.as_str())
+        .ok_or_else(|| ExtensionError::ManifestValidation("Extension package integrity is missing".into()))?;
+    let expected = integrity
+        .strip_prefix("sha256-")
+        .ok_or_else(|| ExtensionError::ManifestValidation("Unsupported extension integrity algorithm".into()))?;
+    let actual = hash_extension_contents(extension_dir)?;
+    if !expected.eq_ignore_ascii_case(&actual) {
+        return Err(ExtensionError::ManifestValidation(format!(
+            "Extension package integrity mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn hash_extension_contents(extension_dir: &Path) -> Result<String, ExtensionError> {
+    let mut files = walkdir::WalkDir::new(extension_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    files.sort_by_key(|path| normalized_relative_path(extension_dir, path));
+
+    let mut hasher = Sha256::new();
+    for path in files {
+        let relative = normalized_relative_path(extension_dir, &path);
+        hasher.update(relative.as_bytes());
+        hasher.update(std::fs::read(path)?);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn verify_package_identity(entry: &HubIndexEntry, extension_dir: &Path) -> Result<(), ExtensionError> {
+    let bytes = std::fs::read(extension_dir.join(EXTENSION_MANIFEST_FILE))?;
+    let manifest = parse_manifest(&bytes)?;
+    if manifest.name != entry.name || manifest.version != entry.version {
+        return Err(ExtensionError::ManifestValidation(format!(
+            "Package manifest identity mismatch: expected {}@{}, got {}@{}",
+            entry.name, entry.version, manifest.name, manifest.version
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -313,6 +496,7 @@ fn is_newer(index_version: &str, installed_version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::index_manager::HubSourceConfig;
     use aionui_realtime::BroadcastEventBus;
 
     #[test]
@@ -462,5 +646,76 @@ mod tests {
         let second = rx.recv().await.unwrap();
         assert_eq!(second.name, "hub.state-changed");
         assert_eq!(second.data["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn installs_current_aionhub_zip_from_bundled_source() {
+        let target = tempfile::TempDir::new().unwrap();
+        let bundle = tempfile::TempDir::new().unwrap();
+        let manifest = br#"{"name":"test-hub-ext","version":"1.0.0"}"#;
+        let mut hasher = Sha256::new();
+        hasher.update(b"aion-extension.json");
+        hasher.update(manifest);
+        let integrity = format!("sha256-{}", hex::encode(hasher.finalize()));
+
+        let archive_file = std::fs::File::create(bundle.path().join("test-hub-ext.zip")).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .start_file("aion-extension.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(manifest).unwrap();
+        archive.finish().unwrap();
+
+        let index = serde_json::json!({
+            "schemaVersion": 1,
+            "extensions": {
+                "test-hub-ext": {
+                    "name": "test-hub-ext",
+                    "displayName": "Test Hub Extension",
+                    "version": "1.0.0",
+                    "hubs": ["acpAdapters"],
+                    "contributes": {"acpAdapters": ["test"]},
+                    "dist": {
+                        "tarball": "test-hub-ext.zip",
+                        "integrity": integrity,
+                        "unpackedSize": manifest.len()
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            bundle.path().join("index.json"),
+            serde_json::to_vec_pretty(&index).unwrap(),
+        )
+        .unwrap();
+
+        let store = crate::state::ExtensionStateStore::new(target.path().join("states.json"));
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
+        let index_mgr = HubIndexManager::with_source_config(
+            target.path().to_path_buf(),
+            registry.clone(),
+            HubSourceConfig {
+                base_url: None,
+                bundled_dir: Some(bundle.path().to_path_buf()),
+            },
+        );
+        let installer = HubInstaller::new(index_mgr, registry);
+
+        let result = installer.install("test-hub-ext").await;
+
+        assert!(result.success, "install should succeed: {:?}", result.msg);
+        assert!(target.path().join("test-hub-ext/aion-extension.json").is_file());
+    }
+
+    #[test]
+    fn archive_paths_reject_traversal_and_backslashes() {
+        assert!(safe_archive_path("../escape").is_err());
+        assert!(safe_archive_path("folder\\escape").is_err());
+        assert!(safe_archive_path("/absolute").is_err());
+        assert_eq!(
+            safe_archive_path("resources/icon.svg").unwrap(),
+            PathBuf::from("resources/icon.svg")
+        );
     }
 }

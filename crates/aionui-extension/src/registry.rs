@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::error::ExtensionError;
-use crate::lifecycle::{HookKind, execute_hook, needs_install_hook, resolve_hook_path};
+use crate::lifecycle::{HookKind, execute_lifecycle_hook, needs_install_hook, resolve_hook};
 use crate::loader::{ScanPath, resolve_scan_paths};
 use crate::registry_helpers::{
     build_state_map, load_and_validate, merge_persisted_states, run_deactivation_hooks, to_summary,
@@ -580,8 +580,8 @@ impl ExtensionRegistry {
                 let persisted_version = persisted.get(&ext_name).map(|s| s.version.as_str());
 
                 if needs_install_hook(&ext.manifest.version, persisted_version)
-                    && let Some(hook_path) = resolve_hook_path(hooks, HookKind::OnInstall)
-                    && let Err(e) = execute_hook(ext_dir, hook_path, HookKind::OnInstall, &ext_name).await
+                    && let Some(hook) = resolve_hook(hooks, HookKind::OnInstall)
+                    && let Err(e) = execute_lifecycle_hook(ext_dir, hook, HookKind::OnInstall, &ext_name).await
                 {
                     warn!(
                         extension = %ext_name,
@@ -591,8 +591,8 @@ impl ExtensionRegistry {
                 }
 
                 // Run onActivate
-                if let Some(hook_path) = resolve_hook_path(hooks, HookKind::OnActivate)
-                    && let Err(e) = execute_hook(ext_dir, hook_path, HookKind::OnActivate, &ext_name).await
+                if let Some(hook) = resolve_hook(hooks, HookKind::OnActivate)
+                    && let Err(e) = execute_lifecycle_hook(ext_dir, hook, HookKind::OnActivate, &ext_name).await
                 {
                     warn!(
                         extension = %ext_name,

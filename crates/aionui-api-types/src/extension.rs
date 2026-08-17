@@ -38,6 +38,10 @@ pub struct HubExtensionListItem {
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hubs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contributes: Option<serde_json::Value>,
     #[serde(default)]
     pub bundled: bool,
     pub status: String,
@@ -153,12 +157,16 @@ mod tests {
             author: Some("Author".into()),
             icon: None,
             tags: vec!["tools".into()],
+            hubs: vec!["acpAdapters".into()],
+            contributes: Some(json!({"acpAdapters": ["cool"]})),
             bundled: false,
             status: "installed".into(),
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["status"], "installed");
         assert_eq!(json["tags"], json!(["tools"]));
+        assert_eq!(json["hubs"], json!(["acpAdapters"]));
+        assert_eq!(json["contributes"], json!({"acpAdapters": ["cool"]}));
         assert!(json.get("display_name").is_none());
     }
 
