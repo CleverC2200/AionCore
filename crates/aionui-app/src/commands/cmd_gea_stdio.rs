@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -26,6 +27,8 @@ const ENV_USER_ID: &str = "AIONUI_USER_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 const ENV_AGENT_CODE: &str = "AIONUI_GEA_AGENT_CODE";
 const DEFAULT_AGENT_CODE: &str = "sales_forecast";
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(125);
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const GEA_IDENTITY_BOOTSTRAP_TOOL: &str = "gateway.session.currentUser.resolve";
 
@@ -37,8 +40,19 @@ pub async fn run_gea_stdio() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let client = match reqwest::Client::builder()
+        .connect_timeout(BACKEND_CONNECT_TIMEOUT)
+        .timeout(BACKEND_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("GEA_MCP_CLIENT_INIT_FAILED");
+            return ExitCode::FAILURE;
+        }
+    };
     let server = GeaStdioServer {
-        client: reqwest::Client::new(),
+        client,
         env,
         session_ready: Arc::new(Mutex::new(false)),
         tools: Arc::new(RwLock::new(HashMap::new())),

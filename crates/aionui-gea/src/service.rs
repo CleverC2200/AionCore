@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aionui_api_types::{
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallResponse, GeaToolInfo,
@@ -15,6 +15,8 @@ use uuid::Uuid;
 use crate::error::GeaError;
 
 const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
+const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GEA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const GEA_CONTEXT_FIELDS: &[&str] = &[
     "agentcode",
     "auditid",
@@ -63,7 +65,18 @@ pub struct GeaService {
 impl GeaService {
     pub fn from_env() -> Result<Self, GeaError> {
         let base_url = std::env::var("AIONUI_GEA_BASE_URL").unwrap_or_else(|_| DEFAULT_GEA_BASE_URL.to_owned());
-        Self::new(reqwest::Client::new(), base_url)
+        let client = reqwest::Client::builder()
+            .connect_timeout(GEA_CONNECT_TIMEOUT)
+            .timeout(GEA_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| {
+                GeaError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "GEA_CLIENT_INIT_FAILED",
+                    "GEA 客户端初始化失败",
+                )
+            })?;
+        Self::new(client, base_url)
     }
 
     pub fn new(client: reqwest::Client, base_url: impl Into<String>) -> Result<Self, GeaError> {
@@ -163,6 +176,13 @@ impl GeaService {
         let result = value
             .get("result")
             .ok_or_else(|| invalid_upstream("GEA Session 响应缺少 result"))?;
+        let allowed = result
+            .pointer("/accessDecision/allowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !allowed {
+            return Err(access_denied_error(&value));
+        }
         let context = result
             .get("gatewayContext")
             .ok_or_else(|| invalid_upstream("GEA Session 响应缺少 gatewayContext"))?;
@@ -178,13 +198,6 @@ impl GeaService {
             .unwrap_or(consumer_code);
         if returned_agent_code != consumer_code {
             return Err(invalid_upstream("GEA Session 返回了不匹配的 consumerCode"));
-        }
-        let allowed = result
-            .pointer("/accessDecision/allowed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !allowed {
-            return Err(upstream_business_error(&value, StatusCode::FORBIDDEN));
         }
         let delegation_token = required_string(result, "delegationToken")?;
         let effective_capability_codes = result
@@ -480,6 +493,17 @@ fn is_gea_context_field(name: &str) -> bool {
 
 fn invalid_upstream(message: impl Into<String>) -> GeaError {
     GeaError::new(StatusCode::BAD_GATEWAY, "GEA_INVALID_RESPONSE", message)
+}
+
+fn access_denied_error(value: &Value) -> GeaError {
+    let mut error = upstream_business_error(value, StatusCode::FORBIDDEN);
+    if error.body.code == "GEA_UPSTREAM_ERROR" {
+        error.body.code = value
+            .pointer("/result/accessDecision/code")
+            .and_then(value_as_string)
+            .unwrap_or_else(|| "GEA_ACCESS_DENIED".to_owned());
+    }
+    error
 }
 
 fn upstream_business_error(value: &Value, fallback_status: StatusCode) -> GeaError {
@@ -792,6 +816,42 @@ mod tests {
         assert_eq!(error.body.code, "AI_GATEWAY_DATA_PERMISSION_DENIED");
         assert_eq!(error.body.request_id.as_deref(), Some("request-1"));
         assert!(service.auth_status("user-1").await.authenticated);
+    }
+
+    #[tokio::test]
+    async fn denied_access_decision_returns_forbidden_without_session_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": {
+                        "allowed": false,
+                        "code": "AI_GATEWAY_AGENT_NOT_ALLOWED"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let service = authenticated_service(&server).await;
+
+        let error = service
+            .create_session(
+                "user-1",
+                "conversation-1",
+                CreateGeaSessionRequest {
+                    consumer_code: "agent-sales".to_owned(),
+                    preparation_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "AI_GATEWAY_AGENT_NOT_ALLOWED");
+        assert_eq!(error.body.category, "AUTHORIZATION");
     }
 
     #[tokio::test]
