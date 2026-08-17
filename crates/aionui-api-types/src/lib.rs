@@ -34,6 +34,8 @@ mod system;
 mod team;
 mod team_mcp;
 mod team_tools;
+mod team_work;
+mod voice;
 mod websocket;
 
 pub use acp::{
@@ -143,8 +145,8 @@ pub use project::{
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,
-    ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelOpenAiApiMode, ModelSettings, ModelType,
-    MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
+    ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelInitialToolChoice, ModelOpenAiApiMode, ModelSettings,
+    ModelType, MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
     ProviderHealthCheckResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
 };
 pub use remote_agent::{
@@ -195,6 +197,19 @@ pub use team_tools::{
     TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
     TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+};
+pub use team_work::{
+    CreateTeamWorkTaskRequest, TeamWorkAction, TeamWorkActor, TeamWorkActorKind, TeamWorkApprovalState,
+    TeamWorkAttentionItem, TeamWorkCommand, TeamWorkCommandEnvelope, TeamWorkCommandReceipt, TeamWorkErrorCode,
+    TeamWorkEvent, TeamWorkEventBatch, TeamWorkLease, TeamWorkNextActionOwner, TeamWorkPriority, TeamWorkQueueReason,
+    TeamWorkRun, TeamWorkRunError, TeamWorkRunStatus, TeamWorkRunUsage, TeamWorkSnapshot, TeamWorkTask,
+    TeamWorkTaskStatus, TeamWorkVerificationCheck, TeamWorkVerificationReceipt,
+};
+pub use voice::{
+    ManagedVoiceCapability, ManagedVoiceConfigurationResponse, ManagedVoiceConfigurationSource,
+    ManagedVoiceHealthResponse, ManagedVoiceHealthStatus, ManagedVoiceProvider, ManagedVoiceSessionMode,
+    SetManagedVoiceConfigurationEnabledRequest, UpdateManagedVoiceConfigurationRequest, VoiceSessionCreateRequest,
+    VoiceSessionCreateResponse, VoiceSessionRtcCredentials, VoiceTurnRequest, VoiceTurnResponse,
 };
 pub use websocket::WebSocketMessage;
 

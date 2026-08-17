@@ -1,7 +1,7 @@
 //! Top-level router assembly: middleware stack + module route merges.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
@@ -20,8 +20,9 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, SystemDefaultFilesystemAdopter,
-    auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RateLimiter, SystemDefaultFilesystemAdopter,
+    auth_middleware, auth_routes, authenticated_action_rate_limit_middleware, csrf_middleware,
+    security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -39,6 +40,7 @@ use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
+use aionui_voice::{voice_capability_routes, voice_configuration_action_routes, voice_session_routes};
 
 use crate::services::AppServices;
 
@@ -206,6 +208,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             let channel_session_manager = states.channel.session_manager.clone();
             let office_watch_manager = states.office.watch_manager.clone();
             let gea_service = states.gea.service.clone();
+            let voice_service = states.voice.service.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
                 let stopped_team_sessions = team_service.stop_sessions_for_user(user_id);
@@ -222,10 +225,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 let channel_session_manager = channel_session_manager.clone();
                 let office_watch_manager = office_watch_manager.clone();
                 let gea_service = gea_service.clone();
+                let voice_service = voice_service.clone();
                 tokio::spawn(async move {
                     gea_service.clear_auth_session(&user_id).await;
                     channel_manager.shutdown_for_user(&user_id).await;
                     office_watch_manager.stop_all_for_user(&user_id);
+                    voice_service.stop_sessions_for_user(&user_id).await;
                     if let Err(err) = channel_session_manager.clear_all_sessions(&user_id).await {
                         tracing::warn!(
                             user_id = %user_id,
@@ -336,6 +341,25 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let gea_authenticated =
         gea_routes(states.gea).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Voice configuration health checks and session creation reach metered
+    // upstream APIs, so rate-limit the authenticated voice surface.
+    let voice_limiter = Arc::new(RateLimiter::authenticated_action());
+    voice_limiter.start_cleanup_task(Duration::from_secs(60));
+    let voice_capability_authenticated = voice_capability_routes(states.voice.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let voice_configuration_action_authenticated = voice_configuration_action_routes(states.voice.clone())
+        .route_layer(from_fn_with_state(
+            voice_limiter.clone(),
+            authenticated_action_rate_limit_middleware,
+        ))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let voice_session_authenticated = voice_session_routes(states.voice)
+        .route_layer(from_fn_with_state(
+            voice_limiter,
+            authenticated_action_rate_limit_middleware,
+        ))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
     let office_proxy =
@@ -383,7 +407,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
-        .merge(gea_authenticated);
+        .merge(gea_authenticated)
+        .merge(voice_capability_authenticated)
+        .merge(voice_configuration_action_authenticated)
+        .merge(voice_session_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]

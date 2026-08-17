@@ -21,7 +21,7 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteVoiceConfigurationRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -48,10 +48,12 @@ use aionui_team::{
     TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
     TeamSessionService,
 };
+use aionui_voice::{VoiceProviderRegistry, VoiceRouterState};
 
 use crate::config::{IdentityMode, derive_encryption_key};
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
+use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -142,6 +144,7 @@ pub struct ModuleStates {
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
     pub gea: GeaRouterState,
+    pub voice: VoiceRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -329,6 +332,7 @@ pub async fn build_module_states(
             .map_err(|error| {
                 RouterBuildError::new("router.gea", "failed to build GEA gateway state").with_source(error)
             })?,
+        voice: build_module_state_phase(&boot, "voice", || build_voice_state(services)),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -341,6 +345,22 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+fn build_voice_state(services: &AppServices) -> VoiceRouterState {
+    let agent = Arc::new(ConversationVoiceAgent::new(
+        services.conversation_service.clone(),
+        services.worker_task_manager.clone(),
+        services.event_bus.clone(),
+    ));
+    let repo = Arc::new(SqliteVoiceConfigurationRepository::new(
+        services.database.pool().clone(),
+    ));
+    let registry = Arc::new(VoiceProviderRegistry::new(
+        repo,
+        derive_encryption_key(&services.jwt_secret_raw),
+    ));
+    VoiceRouterState::with_registry(registry, agent)
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -732,6 +752,10 @@ pub fn build_team_state(
 
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
+    let work_service = aionui_team::TeamWorkService::new(
+        Arc::new(aionui_db::SqliteTeamWorkRepository::new(pool.clone())),
+        services.event_bus.clone(),
+    );
     let conv_service = services.conversation_service.clone();
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
     let adapters = Arc::new(TeamConversationAdapters::new(
@@ -769,8 +793,10 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    service.with_team_work_service(work_service.clone());
     TeamRouterState {
         service,
+        work_service,
         active_leases: services.active_lease_registry.clone(),
     }
 }

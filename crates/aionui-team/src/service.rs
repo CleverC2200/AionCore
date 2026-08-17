@@ -51,6 +51,7 @@ use crate::runtime_tools::{
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::work_service::TeamWorkService;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -144,6 +145,7 @@ pub struct TeamSessionService {
     /// Project-bind side branch (optional). `None` → team binding is a no-op,
     /// so team create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
+    team_work_service: Arc<RwLock<Option<Arc<TeamWorkService>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -268,6 +270,7 @@ impl TeamSessionService {
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
+            team_work_service: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -289,6 +292,16 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
         }
+    }
+
+    pub fn with_team_work_service(&self, work_service: Arc<TeamWorkService>) {
+        if let Ok(mut guard) = self.team_work_service.write() {
+            *guard = Some(work_service);
+        }
+    }
+
+    pub(crate) fn team_work_service(&self) -> Option<Arc<TeamWorkService>> {
+        self.team_work_service.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
@@ -647,6 +660,7 @@ impl TeamSessionService {
             id: team_id,
             name: req.name,
             workspace: team_workspace,
+            session_mode: None,
             agents,
             lead_agent_id,
             created_at: now,

@@ -147,6 +147,7 @@ pub struct Team {
     pub id: String,
     pub name: String,
     pub workspace: String,
+    pub session_mode: Option<String>,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
@@ -279,6 +280,7 @@ impl Team {
             id: row.id.clone(),
             name: row.name.clone(),
             workspace: row.workspace.clone(),
+            session_mode: row.session_mode.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
             created_at: row.created_at,
@@ -291,6 +293,7 @@ impl Team {
             id: self.id.clone(),
             name: self.name.clone(),
             workspace: self.workspace.clone(),
+            session_mode: self.session_mode.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
             created_at: self.created_at,
@@ -659,6 +662,7 @@ mod tests {
             id: "t1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team".into(),
+            session_mode: Some("default".into()),
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),
@@ -678,6 +682,7 @@ mod tests {
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
         assert_eq!(resp.name, "Alpha");
+        assert_eq!(resp.session_mode.as_deref(), Some("default"));
         assert_eq!(resp.assistants.len(), 1);
         assert_eq!(resp.assistants[0].slot_id, "s1");
         assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));

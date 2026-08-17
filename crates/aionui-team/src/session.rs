@@ -2224,6 +2224,7 @@ mod tests {
             id: "t1".into(),
             name: "Test Team".into(),
             workspace: "/tmp/test-team".into(),
+            session_mode: None,
             agents: vec![
                 TeamAgent {
                     slot_id: "lead-1".into(),

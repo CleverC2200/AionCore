@@ -97,6 +97,7 @@ impl ProviderHealthCheckService {
             max_turns: Some(1),
             max_tool_call_malformed_turns: Some(1),
             max_tool_call_failure_turns: Some(1),
+            initial_tool_choice: None,
             compat_overrides,
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
@@ -410,6 +411,18 @@ mod tests {
 
         assert_eq!(config.max_tokens, Some(HEALTH_CHECK_MAX_TOKENS));
         assert_eq!(config.max_turns, Some(1));
+    }
+
+    #[test]
+    fn provider_health_ignores_required_initial_tool_choice() {
+        let mut provider = test_provider();
+        provider.model_settings = r#"{"claude-sonnet-4-20250514":{"initial_tool_choice":"required"}}"#.to_owned();
+
+        let config = test_service()
+            .resolve_probe_config(&provider, "claude-sonnet-4-20250514")
+            .unwrap();
+
+        assert_eq!(config.initial_tool_choice, None);
     }
 
     #[test]

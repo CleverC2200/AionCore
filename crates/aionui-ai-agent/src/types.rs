@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use aion_config::compat::OpenAiApiMode;
+use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +150,8 @@ pub struct AionrsResolvedConfig {
     pub max_tool_call_malformed_turns: Option<usize>,
     /// Max repeated tool-call failure turns before stopping.
     pub max_tool_call_failure_turns: Option<usize>,
+    /// Tool selection policy for the first model turn of each user run.
+    pub initial_tool_choice: Option<ToolChoice>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
     /// Directory for aionrs session persistence files.

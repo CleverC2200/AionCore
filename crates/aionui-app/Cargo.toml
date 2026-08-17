@@ -40,6 +40,7 @@ aionui-cron.workspace = true
 aionui-project.workspace = true
 aionui-assistant.workspace = true
 aionui-gea.workspace = true
+aionui-voice.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
 aion-config.workspace = true

@@ -619,6 +619,7 @@ mod aionrs_config_option_tests {
             max_turns: None,
             max_tool_call_malformed_turns: None,
             max_tool_call_failure_turns: None,
+            initial_tool_choice: Default::default(),
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-agent-task-test-sessions"),
             session_mode: None,

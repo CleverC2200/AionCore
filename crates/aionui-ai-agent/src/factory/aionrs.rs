@@ -5,10 +5,11 @@ use std::sync::Arc;
 use aion_agent::session::{ForkBoundary, Session, SessionManager};
 use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
+use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelInitialToolChoice, ModelOpenAiApiMode, ModelSettings,
+    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -166,6 +167,7 @@ pub(super) async fn build(
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
+        initial_tool_choice: model_overrides.initial_tool_choice,
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
@@ -464,6 +466,7 @@ fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
 pub(crate) struct ModelCompatOverrides {
     pub(crate) image_input: Option<ImageInputCapability>,
     pub(crate) openai_api_mode: Option<OpenAiApiMode>,
+    pub(crate) initial_tool_choice: Option<ToolChoice>,
 }
 
 pub(crate) fn resolve_model_compat_overrides(
@@ -485,6 +488,10 @@ pub(crate) fn resolve_model_compat_overrides(
         openai_api_mode: settings.openai_api_mode.map(|value| match value {
             ModelOpenAiApiMode::ChatCompletions => OpenAiApiMode::ChatCompletions,
             ModelOpenAiApiMode::Responses => OpenAiApiMode::Responses,
+        }),
+        initial_tool_choice: settings.initial_tool_choice.map(|value| match value {
+            ModelInitialToolChoice::Auto => ToolChoice::Auto,
+            ModelInitialToolChoice::Required => ToolChoice::Required,
         }),
     })
 }

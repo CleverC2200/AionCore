@@ -14,6 +14,7 @@ use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
+use aion_types::llm::ToolChoice;
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
@@ -159,6 +160,7 @@ impl AionrsAgentManager {
             conversation_id = %conversation_id,
             provider = %config_extra.provider,
             model = %config_extra.model,
+            initial_tool_choice = config_extra.initial_tool_choice.map(ToolChoice::as_str).unwrap_or("provider_default"),
             image_input_capability = ?image_input_capability,
             image_input_source = if image_input_override.is_some() { "provider_settings" } else { "catalog" },
             "Resolved image input capability for Aionrs model"
@@ -220,6 +222,9 @@ impl AionrsAgentManager {
         let provider_label = config.provider_label.clone();
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        if let Some(tool_choice) = config_extra.initial_tool_choice {
+            bootstrap = bootstrap.initial_tool_choice(tool_choice);
+        }
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,

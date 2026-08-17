@@ -164,6 +164,13 @@ fn status_for_error(code: TeamToolErrorCode) -> StatusCode {
         | TeamToolErrorCode::TeamNotFound
         | TeamToolErrorCode::AgentNotFound => StatusCode::NOT_FOUND,
         TeamToolErrorCode::UnknownTool | TeamToolErrorCode::SchemaValidationFailed => StatusCode::BAD_REQUEST,
-        TeamToolErrorCode::TransportUnavailable | TeamToolErrorCode::RuntimeContextMissing => StatusCode::CONFLICT,
+        TeamToolErrorCode::TransportUnavailable
+        | TeamToolErrorCode::RuntimeContextMissing
+        | TeamToolErrorCode::VersionConflict
+        | TeamToolErrorCode::LeaseConflict
+        | TeamToolErrorCode::InvalidTransition
+        | TeamToolErrorCode::IdempotencyConflict
+        | TeamToolErrorCode::DependencyBlocked
+        | TeamToolErrorCode::RetryLimitReached => StatusCode::CONFLICT,
     }
 }
