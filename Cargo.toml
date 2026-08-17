@@ -24,12 +24,13 @@ members = [
     "crates/aionui-project",
     "crates/aionui-cron",
     "crates/aionui-assistant",
+    "crates/aionui-gea",
     "crates/aionui-voice",
     "crates/aionui-app",
 ]
 
 [workspace.package]
-version = "0.1.62"
+version = "0.1.67"
 edition = "2024"
 license = "MIT"
 
@@ -58,15 +59,16 @@ aionui-team = { path = "crates/aionui-team" }
 aionui-project = { path = "crates/aionui-project" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
+aionui-gea = { path = "crates/aionui-gea" }
 aionui-voice = { path = "crates/aionui-voice" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
-aion-providers = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
-aion-types = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
-aion-protocol = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
-aion-config = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
-aion-mcp = { git = "https://github.com/CleverC2200/aionrs.git", rev = "7f7d62473768a469df7e2c33cf9432fe015860f3" }
+aion-agent = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-providers = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-types = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-protocol = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-config = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-mcp = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -138,7 +140,7 @@ notify = "8"
 walkdir = "2"
 ignore = "0.4"
 zip = "2"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 # Source-control discard sends untracked files to the platform trash instead of
 # unlinking them (mac/win/linux, x64 + arm64).
 trash = "5"
@@ -158,6 +160,12 @@ iana-time-zone = "0.1"
 # Shell
 open = "5"
 which = "7"
+# Text-only clipboard. default-features off: `image-data` pulls `image`/`zune-jpeg`
+# which we don't use and currently fails to build. No `wayland-data-control` either:
+# it pulls wl-clipboard-rs → wayland-scanner (build-time) → the vulnerable quick-xml
+# 0.39 (RUSTSEC-2026-0194/0195). Without it, arboard uses its unconditional x11rb
+# backend on Linux (works under X11/XWayland); macOS/Windows unaffected.
+arboard = { version = "3", default-features = false }
 
 # Office
 calamine = "0.36"

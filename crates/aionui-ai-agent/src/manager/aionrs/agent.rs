@@ -19,7 +19,9 @@ use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
 };
-use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
+use aionui_common::{
+    AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, generate_short_id, now_ms,
+};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio::time::timeout;
@@ -145,6 +147,7 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
+        let is_resume = resume_session.is_some();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
             resolve_image_input_capability(
@@ -216,7 +219,6 @@ impl AionrsAgentManager {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
 
-        let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
@@ -409,7 +411,22 @@ impl IAgentTask for AionrsAgentManager {
             "Built structured Aionrs content blocks"
         );
 
+        // One anchor for both history stores: the conversation-layer turn id
+        // is stamped onto this turn's DB message rows (BackendTurnBound →
+        // stream persistence, mirroring the codex reader) AND onto the
+        // engine's session messages, so an at-turn fork can cut both at the
+        // same point.
+        let turn_anchor = data
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| format!("turn_{}", generate_short_id()));
+        let _ = self
+            .runtime
+            .event_sender()
+            .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
+
         let mut engine = self.engine.lock().await;
+        engine.set_next_turn_id(Some(turn_anchor));
 
         let result = tokio::select! {
             res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),

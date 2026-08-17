@@ -29,6 +29,7 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_gea::{GeaRouterState, GeaService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -50,6 +51,7 @@ use aionui_team::{
 use aionui_voice::{VoiceProviderRegistry, VoiceRouterState};
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
@@ -141,6 +143,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub gea: GeaRouterState,
     pub voice: VoiceRouterState,
 }
 
@@ -265,12 +268,7 @@ pub async fn build_module_states(
     .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
-    let backend_binary_path = Arc::new(
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("aioncore")),
-    );
+    let backend_binary_path = services.backend_binary_path();
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: backend binary path resolved"
@@ -329,6 +327,11 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
+            .map(GeaRouterState::new)
+            .map_err(|error| {
+                RouterBuildError::new("router.gea", "failed to build GEA gateway state").with_source(error)
+            })?,
         voice: build_module_state_phase(&boot, "voice", || build_voice_state(services)),
     };
     tracing::info!(
@@ -500,13 +503,18 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     )));
     let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
     let system_opener: aionui_file::SystemFileOpenerRef =
-        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell));
+        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell.clone()));
+    // Clipboard capability for `/api/fs/copy-absolute-path`: the backend resolves
+    // the path and writes it to the clipboard itself, so the abs never returns.
+    let clipboard: aionui_file::ClipboardWriterRef =
+        Arc::new(super::clipboard_writer::ShellClipboardWriter::new(shell));
     Ok(FileRouterState {
         file_service,
         snapshot_service,
         project: Arc::new(services.project_service.clone()),
         revealer,
         system_opener,
+        clipboard,
         allowed_roots,
     })
 }
@@ -694,9 +702,9 @@ pub async fn build_channel_state(
 
 /// Build the default `TeamRouterState` from application services.
 ///
-/// `backend_binary_path` is resolved once in `build_module_states` via
-/// `std::env::current_exe()` and cloned into each builder that needs it,
-/// per `docs/teams/phase1/interface-contracts.md` §10.
+/// `backend_binary_path` is resolved once while constructing `AppServices` and
+/// cloned into each builder that needs it, per
+/// `docs/teams/phase1/interface-contracts.md` §10.
 pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
@@ -761,6 +769,9 @@ pub fn build_team_state(
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
+    let capability_port: Arc<dyn aionui_team::TeamToolCapabilityPort> = Arc::new(TeamCapabilityResolver::new(
+        Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+    ));
     let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
@@ -777,6 +788,7 @@ pub fn build_team_state(
         turn_port,
         cancellation_port,
         slash_command_port,
+        capability_port,
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );

@@ -61,6 +61,58 @@ fn assistant_text(text: &str) -> Message {
     Message::new(Role::Assistant, vec![ContentBlock::Text { text: text.to_owned() }])
 }
 
+fn assistant_thinking(thinking: &str) -> Message {
+    Message::new(
+        Role::Assistant,
+        vec![ContentBlock::Thinking {
+            thinking: thinking.to_owned(),
+            signature: None,
+        }],
+    )
+}
+
+#[test]
+fn drops_stale_tool_search_miss_after_mcp_reconnect() {
+    let mut messages = vec![
+        user_text("call query_business_data"),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "call_search".to_owned(),
+                name: "ToolSearch".to_owned(),
+                input: json!({"query": "query_business_data"}),
+                extra: None,
+            }],
+        ),
+        Message::new(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "call_search".to_owned(),
+                content: "No deferred tools matching \"query_business_data\" found.".to_owned(),
+                is_error: false,
+            }],
+        ),
+        assistant_thinking("query_business_data is not available in my current environment"),
+        user_text("try query_business_data again"),
+        assistant_thinking("query_business_data is still not loaded"),
+        assistant_text("an unrelated durable answer"),
+    ];
+
+    let removed = sanitize_stale_tool_discovery_messages(&mut messages);
+
+    assert_eq!(removed, 4);
+    assert_eq!(messages.len(), 3);
+    assert!(
+        matches!(messages[0].content.as_slice(), [ContentBlock::Text { text }] if text == "call query_business_data")
+    );
+    assert!(
+        matches!(messages[1].content.as_slice(), [ContentBlock::Text { text }] if text == "try query_business_data again")
+    );
+    assert!(
+        matches!(messages[2].content.as_slice(), [ContentBlock::Text { text }] if text == "an unrelated durable answer")
+    );
+}
+
 #[test]
 fn drops_orphaned_assistant_tool_call_with_no_matching_result() {
     // user → assistant(tool_use, no text) — Stop pressed before tool_result

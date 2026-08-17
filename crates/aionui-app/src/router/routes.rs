@@ -32,6 +32,7 @@ use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
+use aionui_gea::gea_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
@@ -206,6 +207,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             let channel_manager = states.channel.manager.clone();
             let channel_session_manager = states.channel.session_manager.clone();
             let office_watch_manager = states.office.watch_manager.clone();
+            let gea_service = states.gea.service.clone();
             let voice_service = states.voice.service.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
@@ -222,8 +224,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 let channel_manager = channel_manager.clone();
                 let channel_session_manager = channel_session_manager.clone();
                 let office_watch_manager = office_watch_manager.clone();
+                let gea_service = gea_service.clone();
                 let voice_service = voice_service.clone();
                 tokio::spawn(async move {
+                    gea_service.clear_auth_session(&user_id).await;
                     channel_manager.shutdown_for_user(&user_id).await;
                     office_watch_manager.stop_all_for_user(&user_id);
                     voice_service.stop_sessions_for_user(&user_id).await;
@@ -332,6 +336,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // GEA credentials and gateway sessions are scoped to the authenticated
+    // AionCore user and never exposed to renderer or agent processes.
+    let gea_authenticated =
+        gea_routes(states.gea).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Voice configuration health checks and session creation reach metered
     // upstream APIs, so rate-limit the authenticated voice surface.
     let voice_limiter = Arc::new(RateLimiter::authenticated_action());
@@ -398,6 +407,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
+        .merge(gea_authenticated)
         .merge(voice_capability_authenticated)
         .merge(voice_configuration_action_authenticated)
         .merge(voice_session_authenticated);

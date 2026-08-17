@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.1.67](https://github.com/iOfficeAI/AionCore/compare/v0.1.66...v0.1.67) (2026-08-14)
+
+
+### Features
+
+* **session:** report a deferred mode switch as pending instead of observed ([#846](https://github.com/iOfficeAI/AionCore/issues/846)) ([9700f88](https://github.com/iOfficeAI/AionCore/commit/9700f88306aa9c2d51d257e865866253db002bd6))
+
+
+### Bug Fixes
+
+* restore direct CLI Team MCP capabilities ([#853](https://github.com/iOfficeAI/AionCore/issues/853)) ([fe99ff6](https://github.com/iOfficeAI/AionCore/commit/fe99ff6051cf5d0a766332e56ffa66e9d8c61234))
+
+## [0.1.66](https://github.com/iOfficeAI/AionCore/compare/v0.1.65...v0.1.66) (2026-08-13)
+
+
+### Features
+
+* **conversation:** support forking aionrs conversations ([6e04e74](https://github.com/iOfficeAI/AionCore/commit/6e04e741c42425072a8296fdacd95e5d1261d4d7))
+* **conversation:** support forking aionrs conversations ([4b09341](https://github.com/iOfficeAI/AionCore/commit/4b0934145b46f208d75f63e14dfb190dd4fb06b8))
+
+
+### Bug Fixes
+
+* **session:** retry claude session-title generation with timeout and observability ([#843](https://github.com/iOfficeAI/AionCore/issues/843)) ([c59e937](https://github.com/iOfficeAI/AionCore/commit/c59e937a0cc49327a6756c32fb77213e1abe2224))
+
+## [0.1.65](https://github.com/iOfficeAI/AionCore/compare/v0.1.64...v0.1.65) (2026-08-12)
+
+
+### Features
+
+* **db:** dedicated startup stage for database created by a newer app (downgrade) ([#834](https://github.com/iOfficeAI/AionCore/issues/834)) ([db7ce9a](https://github.com/iOfficeAI/AionCore/commit/db7ce9ae2fe25081bd2485aae53bae665eb7ca10))
+
+
+### Bug Fixes
+
+* **antigravity:** parse TSV output from `agy models` ([#797](https://github.com/iOfficeAI/AionCore/issues/797)) ([240e7f4](https://github.com/iOfficeAI/AionCore/commit/240e7f45f91584474f818e306f3d2186e74aced1))
+* **conversation:** tell the client when a turn is cancelled before its agent exists ([#827](https://github.com/iOfficeAI/AionCore/issues/827)) ([86eff2f](https://github.com/iOfficeAI/AionCore/commit/86eff2fa1dff988860aece3d5879bc10618dbb3a))
+
+## [0.1.64](https://github.com/iOfficeAI/AionCore/compare/v0.1.63...v0.1.64) (2026-08-11)
+
+
+### Features
+
+* **channel:** add Discord Gateway plugin ([#813](https://github.com/iOfficeAI/AionCore/issues/813)) ([f711607](https://github.com/iOfficeAI/AionCore/commit/f71160760266f8f5507ff355e484b9f11bc336b0))
+* **sidebar:** add user_order ordering base and sidebar grouping API ([#820](https://github.com/iOfficeAI/AionCore/issues/820)) ([d2f9f8c](https://github.com/iOfficeAI/AionCore/commit/d2f9f8ce9e8793a350835fdf36f2973f3cc95b3d))
+
+
+### Bug Fixes
+
+* **cli-version:** deliver the version-drift notice, and stop it reading as an error ([#817](https://github.com/iOfficeAI/AionCore/issues/817)) ([c0e9e9d](https://github.com/iOfficeAI/AionCore/commit/c0e9e9d44572a588e3ad79b6ac435fbe53f71b99))
+
+## [0.1.63](https://github.com/iOfficeAI/AionCore/compare/v0.1.62...v0.1.63) (2026-08-10)
+
+
+### Features
+
+* **channel:** add Slack Socket Mode plugin ([#806](https://github.com/iOfficeAI/AionCore/issues/806)) ([ff887f1](https://github.com/iOfficeAI/AionCore/commit/ff887f1fd6ff787d59448a8353e4ac1d98f73081))
+* **fs:** add copy-absolute-path endpoint that writes the clipboard server-side ([#803](https://github.com/iOfficeAI/AionCore/issues/803)) ([a621ed8](https://github.com/iOfficeAI/AionCore/commit/a621ed888c662bce2deaf16b30a9ccf8ab588804))
+* **scm:** one-level repository discovery for workspace roots ([#800](https://github.com/iOfficeAI/AionCore/issues/800)) ([3d0e276](https://github.com/iOfficeAI/AionCore/commit/3d0e276078fe95180c9267bdbde548096459becb))
+
+
+### Bug Fixes
+
+* **agent:** stop the idle scanner from killing agents with live background tasks ([#811](https://github.com/iOfficeAI/AionCore/issues/811)) ([50b6570](https://github.com/iOfficeAI/AionCore/commit/50b6570b95b69564037ee89901c8709f889f60b7))
+* **project:** emit real-case absolute path to agents, not folded canonical ([#809](https://github.com/iOfficeAI/AionCore/issues/809)) ([f0f4fbd](https://github.com/iOfficeAI/AionCore/commit/f0f4fbd1234a039861f2b3e857cd821337c37672))
+
+
+### Code Refactoring
+
+* **session:** run the user's own claude/codex, with one shared version-drift path ([#799](https://github.com/iOfficeAI/AionCore/issues/799)) ([ae817e3](https://github.com/iOfficeAI/AionCore/commit/ae817e32d7f7f24246fcb0001e334a344d59f351))
+
 ## [0.1.62](https://github.com/iOfficeAI/AionCore/compare/v0.1.61...v0.1.62) (2026-08-06)
 
 

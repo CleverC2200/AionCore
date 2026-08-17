@@ -236,6 +236,14 @@ fn build_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Vec<Value> {
 pub fn acp_capabilities() -> Capabilities {
     Capabilities {
         tier: CapabilityTier::Parsed,
+        // ACP's schema explicitly allows `session/set_mode` "at any time during a session,
+        // whether the Agent is idle or actively generating a response"
+        // (agent-client-protocol-schema-1.5.0/src/v1/agent.rs). It says nothing about WHEN
+        // the new mode starts governing, and the `SetSessionModeResponse` is empty, so
+        // there is nothing to read either way. This path is not the one the ACP manager
+        // uses for confirmation — that one waits for an observed value — so `Immediate`
+        // here only reflects "the request is not deferred by us".
+        mode_switch_effect: crate::capability::ModeSwitchEffect::Immediate,
         emits: SignalSet {
             // ACP has no liveness heartbeat notification; the turn terminal is the
             // prompt response (no idle-timeout in AionCore anyway, post-007).
@@ -1181,6 +1189,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {

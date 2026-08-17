@@ -123,6 +123,8 @@ pub(crate) enum Command {
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
+    /// MCP stdio server that forwards the current conversation to GEA through AionCore.
+    McpGeaStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
     /// and print a per-agent availability table. Useful when the user
     /// reports "no agent works" — running this from the same shell the
@@ -143,6 +145,7 @@ impl Command {
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
+            Self::McpGeaStdio => "mcp-gea-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
         }

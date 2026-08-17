@@ -1,6 +1,7 @@
 //! HTTP router assembly for the application.
 
 mod antigravity_hook;
+mod clipboard_writer;
 mod fs_monitor;
 mod health;
 mod item_revealer;
@@ -9,6 +10,7 @@ mod runtime_team_tools;
 mod scm_monitor;
 mod state;
 mod system_file_opener;
+mod team_capability_resolver;
 mod team_conversation_adapters;
 mod trace;
 mod voice_conversation_adapter;
