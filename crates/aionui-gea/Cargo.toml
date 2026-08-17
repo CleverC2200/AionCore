@@ -7,11 +7,15 @@ license.workspace = true
 [dependencies]
 aionui-api-types.workspace = true
 aionui-auth.workspace = true
+aionui-common.workspace = true
+aionui-db.workspace = true
+aionui-realtime.workspace = true
 axum.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

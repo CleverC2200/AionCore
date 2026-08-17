@@ -1,13 +1,15 @@
 use aionui_api_types::{
     ApiResponse, CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand,
     GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, SetGeaAuthSessionRequest,
+    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
+    InteractionRequestReceipt, SetGeaAuthSessionRequest,
 };
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 use axum::Router;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
+use serde::Deserialize;
 
 use crate::error::GeaError;
 use crate::state::GeaRouterState;
@@ -28,11 +30,51 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
             "/api/gea/conversations/{conversation_id}/interaction-requests/{request_id}/actions",
             post(act_on_interaction_request),
         )
+        .route("/api/interaction-requests", get(list_all_interaction_requests))
+        .route(
+            "/api/interaction-requests/{request_id}/actions",
+            post(act_on_global_interaction_request),
+        )
         .route(
             "/api/gea/conversations/{conversation_id}/tools/{tool_name}",
             post(call_tool),
         )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct InteractionRequestListQuery {
+    #[serde(default = "pending_status")]
+    status: String,
+}
+
+fn pending_status() -> String {
+    "pending".to_owned()
+}
+
+async fn list_all_interaction_requests(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<InteractionRequestListQuery>,
+) -> Result<Json<ApiResponse<InteractionRequestList>>, GeaError> {
+    if query.status != "pending" {
+        return Err(GeaError::invalid_request("当前只支持 status=pending"));
+    }
+    let snapshot = state.service.list_all_interaction_requests(&user.id).await?;
+    Ok(Json(ApiResponse::ok(snapshot)))
+}
+
+async fn act_on_global_interaction_request(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(request_id): Path<String>,
+    Json(command): Json<InteractionRequestActionCommand>,
+) -> Result<Json<ApiResponse<InteractionRequestReceipt>>, GeaError> {
+    let receipt = state
+        .service
+        .act_on_global_interaction_request(&user.id, &request_id, command)
+        .await?;
+    Ok(Json(ApiResponse::ok(receipt)))
 }
 
 async fn set_auth_session(

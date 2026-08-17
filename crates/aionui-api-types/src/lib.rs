@@ -128,7 +128,8 @@ pub use gea::{
     GeaInteractionQuestion, GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand,
     GeaInteractionRequestKind, GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus,
     GeaInteractionRequestSnapshot, GeaInteractionRequestStatus, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, SetGeaAuthSessionRequest,
+    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
+    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView, SetGeaAuthSessionRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

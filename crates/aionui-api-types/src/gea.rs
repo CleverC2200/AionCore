@@ -187,3 +187,68 @@ pub struct GeaInteractionRequestReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<GeaInteractionRequest>,
 }
+
+/// AionCore's recoverable, user-scoped projection returned to AionUi.
+///
+/// The GEA-owned request above deliberately contains only source data. This
+/// view adds local navigation anchors without sending those anchors upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionRequestSource {
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionRequestView {
+    pub id: String,
+    pub version: String,
+    pub kind: GeaInteractionRequestKind,
+    pub status: GeaInteractionRequestStatus,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub source: InteractionRequestSource,
+    pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub allowed_actions: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionRequestList {
+    pub revision: String,
+    pub items: Vec<InteractionRequestView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractionRequestActionCommand {
+    pub expected_version: String,
+    pub idempotency_key: String,
+    pub action_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractionRequestReceipt {
+    pub receipt_id: String,
+    pub request_id: String,
+    pub version: String,
+    pub status: GeaInteractionRequestReceiptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<InteractionRequestView>,
+}

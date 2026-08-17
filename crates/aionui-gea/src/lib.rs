@@ -6,6 +6,7 @@
 
 mod error;
 mod interaction_request;
+mod projection;
 mod routes;
 mod service;
 mod state;
@@ -14,3 +15,5 @@ pub use error::{GeaError, GeaErrorBody};
 pub use routes::gea_routes;
 pub use service::GeaService;
 pub use state::GeaRouterState;
+
+pub type InteractionTurnResolver = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;

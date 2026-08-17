@@ -328,6 +328,17 @@ pub async fn build_module_states(
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
         gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
+            .map(|service| {
+                service.with_interaction_request_projection(
+                    services.database.pool().clone(),
+                    services.conversation_repo.clone(),
+                    services.event_bus.clone(),
+                    Some({
+                        let runtime_state = services.conversation_runtime_state.clone();
+                        Arc::new(move |conversation_id: &str| runtime_state.active_turn_id_for(conversation_id))
+                    }),
+                )
+            })
             .map(GeaRouterState::new)
             .map_err(|error| {
                 RouterBuildError::new("router.gea", "failed to build GEA gateway state").with_source(error)

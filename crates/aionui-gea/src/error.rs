@@ -74,6 +74,18 @@ impl GeaError {
         Self::new(StatusCode::BAD_REQUEST, "GEA_INVALID_REQUEST", message)
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "GEA_INTERACTION_REQUEST_NOT_FOUND", message)
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "GEA_INTERACTION_REQUEST_STORAGE_ERROR",
+            message,
+        )
+    }
+
     pub fn session_required() -> Self {
         Self::new(
             StatusCode::CONFLICT,
