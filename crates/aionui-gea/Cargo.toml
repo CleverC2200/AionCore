@@ -1,0 +1,20 @@
+[package]
+name = "aionui-gea"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-auth.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

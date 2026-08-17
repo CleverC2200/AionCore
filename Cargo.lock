@@ -411,6 +411,7 @@ dependencies = [
  "aionui-db",
  "aionui-extension",
  "aionui-file",
+ "aionui-gea",
  "aionui-mcp",
  "aionui-office",
  "aionui-process",
@@ -706,6 +707,23 @@ dependencies = [
  "tracing",
  "walkdir",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "aionui-gea"
+version = "0.1.67"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

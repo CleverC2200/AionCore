@@ -19,6 +19,7 @@ mod cron;
 mod custom_agent;
 mod extension;
 mod file;
+mod gea;
 mod lifecycle;
 mod mcp;
 mod office;
@@ -119,6 +120,10 @@ pub use file::{
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
+};
+pub use gea::{
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse,
+    GeaToolInfo, SetGeaAuthSessionRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

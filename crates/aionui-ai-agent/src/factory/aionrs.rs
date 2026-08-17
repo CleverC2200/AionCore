@@ -22,10 +22,14 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
-use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
+use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages, sanitize_stale_tool_discovery_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+
+const INTERNAL_GEA_MCP_SERVER_NAME: &str = "gea-gateway";
+const LEGACY_GEA_MCP_SERVER_NAME: &str = "gea";
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -133,12 +137,24 @@ pub(super) async fn build(
 
     let session_directory = deps.data_dir.join("aionrs-sessions");
 
-    let resume_session = resolve_build_session(
+    let mut resume_session = resolve_build_session(
         &session_directory,
         &ctx.workspace,
         &ctx.conversation_id,
         overrides.fork.as_ref(),
     )?;
+    if !extra_mcp_servers.is_empty()
+        && let Some(session) = resume_session.as_mut()
+    {
+        let stale_tool_messages_removed = sanitize_stale_tool_discovery_messages(&mut session.messages);
+        if stale_tool_messages_removed > 0 {
+            info!(
+                conversation_id = %ctx.conversation_id,
+                stale_tool_messages_removed,
+                "Removed stale tool-discovery observations before MCP reconnect"
+            );
+        }
+    }
 
     let config = AionrsResolvedConfig {
         provider,
@@ -738,7 +754,23 @@ async fn merge_session_snapshot_mcp_servers(
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) {
+    let has_internal_gea_gateway = extra_mcp_servers
+        .keys()
+        .map(String::as_str)
+        .chain(session_mcp_servers.iter().map(|server| server.name.as_str()))
+        .any(|name| name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME));
+
+    if has_internal_gea_gateway {
+        extra_mcp_servers.retain(|name, _| !name.trim().eq_ignore_ascii_case(LEGACY_GEA_MCP_SERVER_NAME));
+    }
+
     for server in session_mcp_servers {
+        // Existing conversations can retain the retired GEA SSE server in their
+        // frozen snapshot. The internal gateway replaces it and exposes the same
+        // tools, so loading both makes the provider reject the entire request.
+        if has_internal_gea_gateway && server.name.trim().eq_ignore_ascii_case(LEGACY_GEA_MCP_SERVER_NAME) {
+            continue;
+        }
         match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
@@ -1924,6 +1956,53 @@ mod tests {
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
             Some(&"abc".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_gea_sources_are_ignored_when_internal_gateway_is_present() {
+        let gateway_config = McpServerConfig {
+            transport: TransportType::Stdio,
+            command: Some("aioncore".into()),
+            args: Some(vec!["mcp-gea-stdio".into()]),
+            env: Some(HashMap::new()),
+            url: None,
+            headers: None,
+            deferred: Some(false),
+            startup_timeout_ms: None,
+        };
+        let legacy_config = McpServerConfig {
+            transport: TransportType::Sse,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://gea.example.test/mcp".into()),
+            headers: Some(HashMap::new()),
+            deferred: Some(false),
+            startup_timeout_ms: None,
+        };
+        let mut servers = HashMap::from([
+            ("gea-gateway".to_owned(), gateway_config),
+            ("gea".to_owned(), legacy_config),
+        ]);
+        let snapshot = vec![SessionMcpServer {
+            id: "legacy-gea".into(),
+            name: "gea".into(),
+            transport: SessionMcpTransport::Sse {
+                url: "https://gea.example.test/mcp".into(),
+                headers: HashMap::new(),
+            },
+        }];
+
+        merge_session_snapshot_mcp_servers(
+            &mut servers,
+            &snapshot,
+            "user-legacy-gea",
+            "conv-legacy-gea",
+            test_broadcaster(),
+        )
+        .await;
+
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec!["gea-gateway"]);
     }
 
     fn seeded_parent_session(dir: &Path, conversation_id: &str) -> Session {

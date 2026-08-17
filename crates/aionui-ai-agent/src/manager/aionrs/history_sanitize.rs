@@ -63,6 +63,85 @@ pub fn sanitize_session_messages(messages: &mut Vec<Message>) -> usize {
     removed
 }
 
+/// Drop cached negative ToolSearch observations before reconnecting MCP tools.
+///
+/// Tool availability is runtime state. A resumed conversation can otherwise
+/// replay an old `No deferred tools matching ... found.` result and keep
+/// refusing a tool that the freshly connected registry now advertises. User
+/// requests and unrelated assistant answers are preserved.
+pub fn sanitize_stale_tool_discovery_messages(messages: &mut Vec<Message>) -> usize {
+    const MISS_PREFIX: &str = "No deferred tools matching \"";
+    const MISS_SUFFIX: &str = "\" found.";
+
+    let mut stale_tool_use_ids = HashSet::new();
+    let mut stale_tool_names = HashSet::new();
+
+    for message in messages.iter() {
+        for block in &message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id, content, ..
+            } = block
+                && let Some(tool_name) = content
+                    .strip_prefix(MISS_PREFIX)
+                    .and_then(|value| value.strip_suffix(MISS_SUFFIX))
+                && !tool_name.trim().is_empty()
+            {
+                stale_tool_use_ids.insert(tool_use_id.clone());
+                stale_tool_names.insert(tool_name.trim().to_lowercase());
+            }
+        }
+    }
+
+    if stale_tool_use_ids.is_empty() {
+        return 0;
+    }
+
+    let original_len = messages.len();
+    messages.retain(|message| {
+        let belongs_to_stale_search = message.content.iter().any(|block| match block {
+            ContentBlock::ToolUse { id, .. } => stale_tool_use_ids.contains(id),
+            ContentBlock::ToolResult { tool_use_id, .. } => stale_tool_use_ids.contains(tool_use_id),
+            _ => false,
+        });
+        if belongs_to_stale_search {
+            return false;
+        }
+
+        if message.role != Role::Assistant {
+            return true;
+        }
+
+        let replay_text = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let mentions_stale_tool = stale_tool_names.iter().any(|name| replay_text.contains(name));
+        let repeats_stale_miss = [
+            "not available",
+            "doesn't exist",
+            "does not exist",
+            "not loaded",
+            "no schema",
+            "不存在",
+            "未加载",
+            "无 schema",
+        ]
+        .iter()
+        .any(|marker| replay_text.contains(marker));
+
+        !(mentions_stale_tool && repeats_stale_miss)
+    });
+
+    original_len - messages.len()
+}
+
 fn strip_malformed_tool_calls(messages: &mut Vec<Message>) -> usize {
     let malformed_tool_use_ids: HashSet<String> = messages
         .iter()

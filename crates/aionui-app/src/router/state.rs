@@ -29,6 +29,7 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_gea::{GeaRouterState, GeaService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -140,6 +141,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub gea: GeaRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -322,6 +324,11 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
+            .map(GeaRouterState::new)
+            .map_err(|error| {
+                RouterBuildError::new("router.gea", "failed to build GEA gateway state").with_source(error)
+            })?,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

@@ -146,6 +146,7 @@ impl AionrsAgentManager {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
+        let is_resume = resume_session.is_some();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
             resolve_image_input_capability(
@@ -216,7 +217,6 @@ impl AionrsAgentManager {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
 
-        let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
