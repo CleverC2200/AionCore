@@ -6,7 +6,6 @@
 
 mod error;
 mod interaction_request;
-mod projection;
 mod routes;
 mod service;
 mod state;
@@ -17,3 +16,13 @@ pub use service::GeaService;
 pub use state::GeaRouterState;
 
 pub type InteractionTurnResolver = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+pub type InteractionTurnResumer = std::sync::Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+            aionui_api_types::InteractionRequestReceipt,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;

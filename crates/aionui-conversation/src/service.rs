@@ -21,10 +21,11 @@ use aionui_api_types::{
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    GeaInteractionTurnContinuation, InteractionRequestReceipt, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -54,7 +55,9 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
-use crate::skill_resolver::SkillResolver;
+use crate::skill_resolver::{
+    ManagedSkillExecutionReport, ManagedSkillExecutionReporter, SkillResolver, managed_skill_snapshots_from_extra,
+};
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
@@ -309,6 +312,7 @@ pub struct ConversationService {
     workspace_root: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
+    managed_skill_execution_reporter: Arc<RwLock<Option<Arc<dyn ManagedSkillExecutionReporter>>>>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
@@ -383,6 +387,111 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    /// Deliver an accepted external interaction result into the same live Turn
+    /// that originally paused for the human decision. This never creates a new
+    /// conversation, message, or Turn.
+    pub async fn resume_interaction_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        receipt: &InteractionRequestReceipt,
+    ) -> Result<(), ConversationError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
+        let is_aionrs = parse_agent_type_from_row(&conversation) == Some(AgentType::Aionrs);
+        let original_tool_call_released =
+            receipt.turn_continuation == Some(GeaInteractionTurnContinuation::OriginalToolCallReleased);
+        if active_turn_id.as_deref() != Some(turn_id) {
+            // The receipt explicitly confirms that GEA released the original
+            // MCP call, so the Turn may finish before the action response gets
+            // here. For the pinned first-party runtime,
+            // CleverC2200/aionrs@c02065b8 crates/aion-mcp/src/manager.rs:
+            // 233-276 awaits the transport response and
+            // crates/aion-agent/src/orchestration.rs:317-342 awaits execution
+            // before emitting that result. Our bridge awaits the HTTP response in
+            // crates/aionui-app/src/commands/cmd_gea_stdio.rs:314-334.
+            if is_aionrs && active_turn_id.is_none() && original_tool_call_released {
+                info!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    request_id = %receipt.request_id,
+                    receipt_id = %receipt.receipt_id,
+                    "accepted Interaction Request already released its completed Aionrs tool call"
+                );
+                return Ok(());
+            }
+            return Err(ConversationError::Busy {
+                reason: "the interaction request no longer belongs to the active turn".to_owned(),
+            });
+        }
+        if is_aionrs {
+            if !original_tool_call_released {
+                return Err(ConversationError::Busy {
+                    reason: "GEA receipt did not confirm release of the original tool call".to_owned(),
+                });
+            }
+            // The explicit continuation receipt and synchronous MCP path mean
+            // a second mid-turn injection would duplicate the tool result.
+            info!(
+                user_id,
+                conversation_id,
+                turn_id,
+                request_id = %receipt.request_id,
+                receipt_id = %receipt.receipt_id,
+                "accepted Interaction Request released its original Aionrs tool call"
+            );
+            return Ok(());
+        }
+        let agent =
+            self.task_manager
+                .get_task(conversation_id)
+                .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                    conversation_id: conversation_id.to_owned(),
+                })?;
+        if !agent.supports_midturn_delivery() {
+            return Err(ConversationError::Busy {
+                reason: "the active agent cannot resume an interaction request in place".to_owned(),
+            });
+        }
+        let content = serde_json::json!({
+            "type": "interaction_request_result",
+            "requestId": receipt.request_id,
+            "receiptId": receipt.receipt_id,
+            "version": receipt.version,
+            "status": receipt.status,
+        })
+        .to_string();
+        agent
+            .deliver_midturn(aionui_ai_agent::types::SendMessageData {
+                content,
+                msg_id: format!("interaction-request:{}", receipt.receipt_id),
+                turn_id: Some(turn_id.to_owned()),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            })
+            .await
+            .map_err(|error| ConversationError::BadGateway {
+                reason: error.to_string(),
+            })?;
+        info!(
+            user_id,
+            conversation_id,
+            turn_id,
+            request_id = %receipt.request_id,
+            receipt_id = %receipt.receipt_id,
+            "accepted Interaction Request resumed its original turn"
+        );
+        Ok(())
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -397,6 +506,7 @@ impl ConversationService {
             workspace_root,
             broadcaster,
             skill_resolver,
+            managed_skill_execution_reporter: Arc::new(RwLock::new(None)),
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
@@ -444,6 +554,26 @@ impl ConversationService {
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    pub fn with_managed_skill_execution_reporter(&self, reporter: Arc<dyn ManagedSkillExecutionReporter>) {
+        if let Ok(mut guard) = self.managed_skill_execution_reporter.write() {
+            *guard = Some(reporter);
+        }
+    }
+
+    pub(crate) async fn report_managed_skill_execution(&self, user_id: &str, report: ManagedSkillExecutionReport) {
+        let reporter = self
+            .managed_skill_execution_reporter
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(reporter) = reporter else {
+            return;
+        };
+        if let Err(error) = reporter.report_execution(user_id, report).await {
+            warn!(user_id, error, "failed to report managed Skill execution to GEA");
         }
     }
 
@@ -1209,6 +1339,17 @@ impl ConversationService {
 
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
+        let managed_skill_snapshots = self
+            .skill_resolver
+            .snapshot_managed_skills_for_user(user_id, &initial_skills)
+            .await;
+
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "managed_skill_snapshots".to_owned(),
+                serde_json::to_value(&managed_skill_snapshots).unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
+        }
 
         // Wire skill links into the runtime workspace so the agent CLI picks
         // them up via its native skills dir (e.g. `.claude/skills/`). This
@@ -1232,7 +1373,7 @@ impl ConversationService {
         {
             let resolved = self
                 .skill_resolver
-                .resolve_skills_for_user(user_id, &initial_skills)
+                .resolve_skills_for_user_at_snapshot(user_id, &initial_skills, &managed_skill_snapshots)
                 .await;
             if !resolved.is_empty() {
                 let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
@@ -2192,13 +2333,14 @@ impl ConversationService {
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
             && (incoming.get("skills").is_some()
+                || incoming.get("managed_skill_snapshots").is_some()
                 || incoming.get("mcp_server_ids").is_some()
                 || incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "Skill and MCP snapshots are immutable post-creation".into(),
             });
         }
 
@@ -4585,7 +4727,11 @@ impl ConversationService {
 
         let resolved = self
             .skill_resolver
-            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .resolve_skills_for_user_at_snapshot(
+                &context.conversation.user_id,
+                &skill_names,
+                &managed_skill_snapshots_from_extra(&row.extra),
+            )
             .await;
         if resolved.is_empty() {
             return;

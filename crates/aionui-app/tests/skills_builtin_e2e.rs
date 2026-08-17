@@ -77,6 +77,7 @@ async fn fixture_embedded() -> Fixture {
     states.skill = SkillRouterState {
         skill_paths,
         skill_repo: skill_repo.clone(),
+        managed_skill_repo: Some(services.gea_resource_repo.clone()),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
     };

@@ -3,12 +3,17 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     GeaInteractionPresentation, GeaInteractionRequest, GeaInteractionRequestKind, GeaInteractionRequestReceiptStatus,
-    GeaInteractionRequestSnapshot, GeaInteractionRequestStatus, InteractionRequestList, InteractionRequestReceipt,
-    InteractionRequestSource, InteractionRequestView, MessageStatusChangedPayload, WebSocketMessage,
+    GeaInteractionRequestSnapshot, GeaInteractionRequestStatus, InteractionRequestChangedPayload,
+    InteractionRequestList, InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView,
+    MessageStatusChangedPayload, WebSocketMessage,
 };
 use aionui_common::{fnv1a_hex8, now_ms};
 use aionui_db::models::MessageRow;
-use aionui_db::{IConversationRepository, SqlitePool};
+use aionui_db::{
+    IConversationRepository, IInteractionRequestRepository, ReceiptResumeClaim, StoreInteractionRequestReceiptParams,
+    StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt,
+    StoredUnfinalizedInteractionRequestReceipt, UpsertGeaSessionBootstrapParams, UpsertInteractionRequestParams,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -17,51 +22,27 @@ use uuid::Uuid;
 use crate::InteractionTurnResolver;
 use crate::error::GeaError;
 
-const CHANGED_EVENT: &str = "interaction_request.changed";
+const CHANGED_EVENT: &str = "interactionRequest.changed";
+pub(super) const RESUME_CLAIM_LEASE_MS: i64 = 30_000;
 
 #[derive(Clone)]
-pub(crate) struct InteractionRequestProjection {
-    pool: SqlitePool,
+pub(super) struct InteractionRequestProjection {
+    interaction_repo: Arc<dyn IInteractionRequestRepository>,
     conversation_repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     turn_resolver: Option<InteractionTurnResolver>,
     action_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct ProjectionRow {
-    request_id: String,
-    conversation_id: String,
-    version: String,
-    status: String,
-    kind: String,
-    title: String,
-    summary: Option<String>,
-    source_label: Option<String>,
-    allowed_actions: String,
-    expires_at: Option<String>,
-    updated_at: String,
-    presentation: String,
-    turn_id: Option<String>,
-    message_id: String,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub(crate) struct StoredReceipt {
-    pub expected_version: String,
-    pub action_id: String,
-    pub receipt: String,
-}
-
 impl InteractionRequestProjection {
-    pub(crate) fn new(
-        pool: SqlitePool,
+    pub(super) fn new(
+        interaction_repo: Arc<dyn IInteractionRequestRepository>,
         conversation_repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         turn_resolver: Option<InteractionTurnResolver>,
     ) -> Self {
         Self {
-            pool,
+            interaction_repo,
             conversation_repo,
             broadcaster,
             turn_resolver,
@@ -69,30 +50,54 @@ impl InteractionRequestProjection {
         }
     }
 
-    pub(crate) async fn action_lock(&self, user_id: &str, request_id: &str, idempotency_key: &str) -> Arc<Mutex<()>> {
-        let key = format!("{user_id}\0{request_id}\0{idempotency_key}");
+    pub(super) async fn action_lock(&self, user_id: &str, request_id: &str) -> Arc<Mutex<()>> {
+        let key = format!("{user_id}\0{request_id}");
         let mut locks = self.action_locks.lock().await;
         locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 
-    pub(crate) async fn reconcile_snapshot(
+    pub(super) async fn store_session_bootstrap(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        consumer_code: &str,
+        preparation_id: Option<String>,
+    ) -> Result<(), GeaError> {
+        self.interaction_repo
+            .upsert_session_bootstrap(&UpsertGeaSessionBootstrapParams {
+                user_id: user_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                consumer_code: consumer_code.to_owned(),
+                preparation_id,
+                updated_at: now_ms(),
+            })
+            .await
+            .map_err(storage_error)
+    }
+
+    pub(super) async fn pending_session_bootstraps(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<StoredGeaSessionBootstrap>, GeaError> {
+        self.interaction_repo
+            .list_pending_session_bootstraps(user_id)
+            .await
+            .map_err(storage_error)
+    }
+
+    pub(super) async fn reconcile_snapshot(
         &self,
         user_id: &str,
         conversation_id: &str,
         snapshot: &GeaInteractionRequestSnapshot,
     ) -> Result<(), GeaError> {
         self.ensure_conversation_owner(user_id, conversation_id).await?;
-        let existing = sqlx::query_as::<_, ProjectionRow>(
-            "SELECT request_id, conversation_id, version, status, kind, title, summary, source_label, \
-                    allowed_actions, expires_at, updated_at, presentation, turn_id, message_id \
-             FROM gea_interaction_requests WHERE user_id = ? AND conversation_id = ?",
-        )
-        .bind(user_id)
-        .bind(conversation_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        let existing_by_id: HashMap<&str, &ProjectionRow> =
+        let existing = self
+            .interaction_repo
+            .list_for_conversation(user_id, conversation_id)
+            .await
+            .map_err(storage_error)?;
+        let existing_by_id: HashMap<&str, &StoredInteractionRequest> =
             existing.iter().map(|row| (row.request_id.as_str(), row)).collect();
         let incoming_ids: HashSet<&str> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
         let active_turn_id = self.turn_resolver.as_ref().and_then(|resolve| resolve(conversation_id));
@@ -121,78 +126,38 @@ impl InteractionRequestProjection {
                     || row.presentation != presentation
             });
 
-            sqlx::query(
-                "INSERT INTO gea_interaction_requests \
-                    (user_id, request_id, conversation_id, version, status, kind, title, summary, source_label, \
-                     allowed_actions, expires_at, updated_at, presentation, upstream_revision, turn_id, message_id, changed_at) \
-                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(user_id, request_id) DO UPDATE SET \
-                    version = excluded.version, status = 'pending', kind = excluded.kind, title = excluded.title, \
-                    summary = excluded.summary, source_label = excluded.source_label, \
-                    allowed_actions = excluded.allowed_actions, expires_at = excluded.expires_at, \
-                    updated_at = excluded.updated_at, presentation = excluded.presentation, \
-                    upstream_revision = excluded.upstream_revision, \
-                    turn_id = COALESCE(gea_interaction_requests.turn_id, excluded.turn_id), \
-                    changed_at = excluded.changed_at",
-            )
-            .bind(user_id)
-            .bind(&request.id)
-            .bind(conversation_id)
-            .bind(&request.version)
-            .bind(kind_name(request.kind))
-            .bind(&request.title)
-            .bind(&request.summary)
-            .bind(&request.source_label)
-            .bind(&allowed_actions)
-            .bind(&request.expires_at)
-            .bind(&request.updated_at)
-            .bind(&presentation)
-            .bind(&snapshot.revision)
-            .bind(&active_turn_id)
-            .bind(&message_id)
-            .bind(now_ms())
-            .execute(&self.pool)
-            .await
-            .map_err(storage_error)?;
+            self.interaction_repo
+                .upsert(&UpsertInteractionRequestParams {
+                    user_id: user_id.to_owned(),
+                    request_id: request.id.clone(),
+                    conversation_id: conversation_id.to_owned(),
+                    version: request.version.clone(),
+                    status: "pending".to_owned(),
+                    kind: kind_name(request.kind).to_owned(),
+                    title: request.title.clone(),
+                    summary: request.summary.clone(),
+                    source_label: request.source_label.clone(),
+                    allowed_actions,
+                    expires_at: request.expires_at.clone(),
+                    updated_at: request.updated_at.clone(),
+                    presentation,
+                    upstream_revision: snapshot.revision.clone(),
+                    turn_id: active_turn_id.clone(),
+                    message_id: message_id.clone(),
+                    changed_at: now_ms(),
+                })
+                .await
+                .map_err(storage_error)?;
 
             messages.push(message_row(conversation_id, &message_id, request)?);
         }
 
-        if !incoming_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", incoming_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let statement = format!(
-                "UPDATE gea_interaction_requests SET status = 'resolved', changed_at = ? \
-                 WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND request_id NOT IN ({placeholders})"
-            );
-            let mut query = sqlx::query(&statement)
-                .bind(now_ms())
-                .bind(user_id)
-                .bind(conversation_id);
-            for request_id in &incoming_ids {
-                query = query.bind(request_id);
-            }
-            query.execute(&self.pool).await.map_err(storage_error)?;
-        } else {
-            sqlx::query(
-                "UPDATE gea_interaction_requests SET status = 'resolved', changed_at = ? \
-                 WHERE user_id = ? AND conversation_id = ? AND status = 'pending'",
-            )
-            .bind(now_ms())
-            .bind(user_id)
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await
-            .map_err(storage_error)?;
-        }
-
-        if changed {
-            for message in messages {
-                self.conversation_repo
-                    .upsert_message(user_id, &message)
-                    .await
-                    .map_err(storage_error)?;
+        for message in messages {
+            self.conversation_repo
+                .upsert_message(user_id, &message)
+                .await
+                .map_err(storage_error)?;
+            if changed {
                 self.broadcast_message(user_id, &message);
             }
         }
@@ -202,52 +167,69 @@ impl InteractionRequestProjection {
         {
             self.finish_message(user_id, row).await?;
         }
+        let incoming_request_ids = snapshot.items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        self.interaction_repo
+            .resolve_missing(user_id, conversation_id, &incoming_request_ids, now_ms())
+            .await
+            .map_err(storage_error)?;
         if changed {
             self.broadcast_changed(user_id).await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn list_pending(&self, user_id: &str) -> Result<InteractionRequestList, GeaError> {
-        let rows = sqlx::query_as::<_, ProjectionRow>(
-            "SELECT request_id, conversation_id, version, status, kind, title, summary, source_label, \
-                    allowed_actions, expires_at, updated_at, presentation, turn_id, message_id \
-             FROM gea_interaction_requests WHERE user_id = ? AND status = 'pending' \
-             ORDER BY updated_at DESC, request_id ASC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?;
+    pub(super) async fn list_pending(&self, user_id: &str) -> Result<InteractionRequestList, GeaError> {
+        let rows = self
+            .interaction_repo
+            .list_pending(user_id)
+            .await
+            .map_err(storage_error)?;
         let items = rows.iter().map(row_to_view).collect::<Result<Vec<_>, _>>()?;
         let revision = revision_for(&items)?;
         Ok(InteractionRequestList { revision, items })
     }
 
-    pub(crate) async fn find(&self, user_id: &str, request_id: &str) -> Result<InteractionRequestView, GeaError> {
+    pub(super) async fn find(&self, user_id: &str, request_id: &str) -> Result<InteractionRequestView, GeaError> {
         let row = self.find_row(user_id, request_id).await?;
         row_to_view(&row)
     }
 
-    pub(crate) async fn load_receipt(
+    pub(super) async fn load_receipt(
         &self,
         user_id: &str,
         request_id: &str,
         idempotency_key: &str,
-    ) -> Result<Option<StoredReceipt>, GeaError> {
-        sqlx::query_as::<_, StoredReceipt>(
-            "SELECT expected_version, action_id, receipt FROM gea_interaction_request_receipts \
-             WHERE user_id = ? AND request_id = ? AND idempotency_key = ?",
-        )
-        .bind(user_id)
-        .bind(request_id)
-        .bind(idempotency_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)
+    ) -> Result<Option<StoredInteractionRequestReceipt>, GeaError> {
+        self.interaction_repo
+            .load_receipt(user_id, request_id, idempotency_key)
+            .await
+            .map_err(storage_error)
     }
 
-    pub(crate) async fn store_receipt(
+    pub(super) async fn load_equivalent_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        expected_version: &str,
+        action_id: &str,
+    ) -> Result<Option<StoredInteractionRequestReceipt>, GeaError> {
+        self.interaction_repo
+            .load_equivalent_receipt(user_id, request_id, expected_version, action_id)
+            .await
+            .map_err(storage_error)
+    }
+
+    pub(super) async fn list_unfinalized_receipts(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<StoredUnfinalizedInteractionRequestReceipt>, GeaError> {
+        self.interaction_repo
+            .list_unfinalized_receipts(user_id)
+            .await
+            .map_err(storage_error)
+    }
+
+    pub(super) async fn store_receipt(
         &self,
         user_id: &str,
         request_id: &str,
@@ -256,52 +238,127 @@ impl InteractionRequestProjection {
         action_id: &str,
         receipt: &InteractionRequestReceipt,
     ) -> Result<(), GeaError> {
+        let encoded = serde_json::to_string(receipt).map_err(storage_json_error)?;
+        self.interaction_repo
+            .store_receipt(&StoreInteractionRequestReceiptParams {
+                user_id: user_id.to_owned(),
+                request_id: request_id.to_owned(),
+                idempotency_key: idempotency_key.to_owned(),
+                expected_version: expected_version.to_owned(),
+                action_id: action_id.to_owned(),
+                receipt: encoded,
+                created_at: now_ms(),
+            })
+            .await
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub(super) async fn claim_receipt_resume(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+        claim_owner: &str,
+    ) -> Result<ReceiptResumeClaim, GeaError> {
+        let claimed_at = now_ms();
+        self.interaction_repo
+            .claim_receipt_resume(
+                user_id,
+                request_id,
+                idempotency_key,
+                claim_owner,
+                claimed_at,
+                claimed_at.saturating_sub(RESUME_CLAIM_LEASE_MS),
+            )
+            .await
+            .map_err(storage_error)
+    }
+
+    pub(super) async fn mark_receipt_resume_started(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+        claim_owner: &str,
+    ) -> Result<(), GeaError> {
+        let marked = self
+            .interaction_repo
+            .mark_receipt_resume_started(user_id, request_id, idempotency_key, claim_owner, now_ms())
+            .await
+            .map_err(storage_error)?;
+        if !marked {
+            return Err(GeaError::conflict(
+                "GEA_INTERACTION_RESUME_CLAIM_LOST",
+                "待办结果恢复租约已失效，请稍后重试",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn mark_receipt_resume_delivered(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+        claim_owner: &str,
+    ) -> Result<(), GeaError> {
+        let marked = self
+            .interaction_repo
+            .mark_receipt_resume_delivered(user_id, request_id, idempotency_key, claim_owner, now_ms())
+            .await
+            .map_err(storage_error)?;
+        if !marked {
+            return Err(GeaError::conflict(
+                "GEA_INTERACTION_RESUME_CLAIM_LOST",
+                "待办结果恢复租约已失效，请稍后重试",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finalize_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+        receipt: &InteractionRequestReceipt,
+        require_resume_delivered: bool,
+    ) -> Result<(), GeaError> {
         let status = match receipt.status {
             GeaInteractionRequestReceiptStatus::Accepted | GeaInteractionRequestReceiptStatus::AlreadyResolved => {
-                "resolved"
+                Some("resolved")
             }
-            GeaInteractionRequestReceiptStatus::Expired => "expired",
-            GeaInteractionRequestReceiptStatus::Forbidden => "pending",
-            GeaInteractionRequestReceiptStatus::Conflict => "pending",
-            GeaInteractionRequestReceiptStatus::UnknownExternalWrite => "verification_required",
+            GeaInteractionRequestReceiptStatus::Expired => Some("expired"),
+            GeaInteractionRequestReceiptStatus::Forbidden | GeaInteractionRequestReceiptStatus::Conflict => None,
+            GeaInteractionRequestReceiptStatus::UnknownExternalWrite => Some("verification_required"),
         };
-        sqlx::query(
-            "UPDATE gea_interaction_requests SET status = ?, version = ?, changed_at = ? \
-             WHERE user_id = ? AND request_id = ?",
-        )
-        .bind(status)
-        .bind(&receipt.version)
-        .bind(now_ms())
-        .bind(user_id)
-        .bind(request_id)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        let encoded = serde_json::to_string(receipt).map_err(storage_json_error)?;
-        sqlx::query(
-            "INSERT INTO gea_interaction_request_receipts \
-                (user_id, request_id, idempotency_key, expected_version, action_id, receipt, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(request_id)
-        .bind(idempotency_key)
-        .bind(expected_version)
-        .bind(action_id)
-        .bind(encoded)
-        .bind(now_ms())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        if !matches!(status, "pending") {
+        if let Some(status) = status {
+            self.interaction_repo
+                .update_status(user_id, request_id, status, &receipt.version, now_ms())
+                .await
+                .map_err(storage_error)?;
+        }
+        if status.is_some_and(|status| status != "pending") {
             let row = self.find_row(user_id, request_id).await?;
             self.finish_message(user_id, &row).await?;
+        }
+        let finalized = self
+            .interaction_repo
+            .mark_receipt_finalized(user_id, request_id, idempotency_key, require_resume_delivered, now_ms())
+            .await
+            .map_err(storage_error)?;
+        if !finalized {
+            return Err(GeaError::conflict(
+                "GEA_INTERACTION_RESUME_NOT_DELIVERED",
+                "待办结果尚未恢复原 Turn，请稍后重试",
+            ));
         }
         self.broadcast_changed(user_id).await?;
         Ok(())
     }
 
-    pub(crate) async fn apply_authoritative_request(
+    pub(super) async fn apply_authoritative_request(
         &self,
         user_id: &str,
         request: &GeaInteractionRequest,
@@ -309,27 +366,32 @@ impl InteractionRequestProjection {
         let row = self.find_row(user_id, &request.id).await?;
         let allowed_actions = serde_json::to_string(&request.allowed_actions).map_err(storage_json_error)?;
         let presentation = serde_json::to_string(&request.presentation).map_err(storage_json_error)?;
-        sqlx::query(
-            "UPDATE gea_interaction_requests SET version = ?, status = ?, kind = ?, title = ?, summary = ?, \
-                    source_label = ?, allowed_actions = ?, expires_at = ?, updated_at = ?, presentation = ?, changed_at = ? \
-             WHERE user_id = ? AND request_id = ?",
-        )
-        .bind(&request.version)
-        .bind(status_name(request.status))
-        .bind(kind_name(request.kind))
-        .bind(&request.title)
-        .bind(&request.summary)
-        .bind(&request.source_label)
-        .bind(&allowed_actions)
-        .bind(&request.expires_at)
-        .bind(&request.updated_at)
-        .bind(&presentation)
-        .bind(now_ms())
-        .bind(user_id)
-        .bind(&request.id)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        self.interaction_repo
+            .update_authoritative(
+                user_id,
+                &request.id,
+                &UpsertInteractionRequestParams {
+                    user_id: user_id.to_owned(),
+                    request_id: request.id.clone(),
+                    conversation_id: row.conversation_id.clone(),
+                    version: request.version.clone(),
+                    status: status_name(request.status).to_owned(),
+                    kind: kind_name(request.kind).to_owned(),
+                    title: request.title.clone(),
+                    summary: request.summary.clone(),
+                    source_label: request.source_label.clone(),
+                    allowed_actions,
+                    expires_at: request.expires_at.clone(),
+                    updated_at: request.updated_at.clone(),
+                    presentation,
+                    upstream_revision: String::new(),
+                    turn_id: row.turn_id.clone(),
+                    message_id: row.message_id.clone(),
+                    changed_at: now_ms(),
+                },
+            )
+            .await
+            .map_err(storage_error)?;
         let message = message_row(&row.conversation_id, &row.message_id, request)?;
         self.conversation_repo
             .upsert_message(user_id, &message)
@@ -343,25 +405,18 @@ impl InteractionRequestProjection {
         self.find(user_id, &request.id).await
     }
 
-    async fn find_row(&self, user_id: &str, request_id: &str) -> Result<ProjectionRow, GeaError> {
-        sqlx::query_as::<_, ProjectionRow>(
-            "SELECT request_id, conversation_id, version, status, kind, title, summary, source_label, \
-                    allowed_actions, expires_at, updated_at, presentation, turn_id, message_id \
-             FROM gea_interaction_requests WHERE user_id = ? AND request_id = ?",
-        )
-        .bind(user_id)
-        .bind(request_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .ok_or_else(|| GeaError::not_found("Interaction Request 不存在"))
+    async fn find_row(&self, user_id: &str, request_id: &str) -> Result<StoredInteractionRequest, GeaError> {
+        self.interaction_repo
+            .find(user_id, request_id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| GeaError::not_found("Interaction Request 不存在"))
     }
 
     async fn ensure_conversation_owner(&self, user_id: &str, conversation_id: &str) -> Result<(), GeaError> {
-        let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM conversations WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(conversation_id)
-            .fetch_one(&self.pool)
+        let exists = self
+            .interaction_repo
+            .conversation_exists(user_id, conversation_id)
             .await
             .map_err(storage_error)?;
         if !exists {
@@ -370,7 +425,7 @@ impl InteractionRequestProjection {
         Ok(())
     }
 
-    async fn finish_message(&self, user_id: &str, row: &ProjectionRow) -> Result<(), GeaError> {
+    async fn finish_message(&self, user_id: &str, row: &StoredInteractionRequest) -> Result<(), GeaError> {
         self.conversation_repo
             .update_message(
                 user_id,
@@ -416,10 +471,12 @@ impl InteractionRequestProjection {
 
     async fn broadcast_changed(&self, user_id: &str) -> Result<(), GeaError> {
         let revision = self.list_pending(user_id).await?.revision;
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            CHANGED_EVENT,
-            json!({ "user_id": user_id, "revision": revision }),
-        ));
+        let payload = InteractionRequestChangedPayload {
+            user_id: user_id.to_owned(),
+            revision,
+        };
+        let value = serde_json::to_value(payload).map_err(storage_json_error)?;
+        self.broadcaster.broadcast(WebSocketMessage::new(CHANGED_EVENT, value));
         Ok(())
     }
 }
@@ -472,7 +529,7 @@ fn message_row(
     })
 }
 
-fn row_to_view(row: &ProjectionRow) -> Result<InteractionRequestView, GeaError> {
+fn row_to_view(row: &StoredInteractionRequest) -> Result<InteractionRequestView, GeaError> {
     let kind = match row.kind.as_str() {
         "question" => GeaInteractionRequestKind::Question,
         "permission" => GeaInteractionRequestKind::Permission,
@@ -536,11 +593,13 @@ fn status_name(status: GeaInteractionRequestStatus) -> &'static str {
 }
 
 fn storage_error(error: impl std::fmt::Display) -> GeaError {
-    GeaError::internal(format!("Interaction Request 存储失败: {error}"))
+    tracing::error!(error = %error, "Interaction Request storage operation failed");
+    GeaError::internal("Interaction Request 存储失败")
 }
 
 fn storage_json_error(error: impl std::fmt::Display) -> GeaError {
-    storage_corrupt(format!("Interaction Request JSON 无效: {error}"))
+    tracing::error!(error = %error, "Interaction Request JSON operation failed");
+    storage_corrupt("Interaction Request 数据无效")
 }
 
 fn storage_corrupt(message: impl Into<String>) -> GeaError {
@@ -555,7 +614,7 @@ mod tests {
         GeaInteractionPresentation, GeaInteractionQuestion, GeaInteractionQuestionOption, GeaInteractionRequest,
         GeaInteractionRequestKind, GeaInteractionRequestSnapshot, GeaInteractionRequestStatus,
     };
-    use aionui_db::{SqliteConversationRepository, init_database_memory};
+    use aionui_db::{SqliteConversationRepository, SqliteInteractionRequestRepository, init_database_memory};
     use aionui_realtime::BroadcastEventBus;
 
     use super::InteractionRequestProjection;
@@ -574,9 +633,10 @@ mod tests {
         .execute(database.pool())
         .await
         .unwrap();
-        let repo = Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let conversation_repo = Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let interaction_repo = Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone()));
         let bus = Arc::new(BroadcastEventBus::new(32));
-        let projection = InteractionRequestProjection::new(database.pool().clone(), repo, bus.clone(), None);
+        let projection = InteractionRequestProjection::new(interaction_repo, conversation_repo, bus.clone(), None);
         (projection, database, bus)
     }
 
@@ -629,7 +689,7 @@ mod tests {
             .unwrap();
         assert_eq!(message_count, 1);
         assert_eq!(events.recv().await.unwrap().name, "message.stream");
-        assert_eq!(events.recv().await.unwrap().name, "interaction_request.changed");
+        assert_eq!(events.recv().await.unwrap().name, "interactionRequest.changed");
 
         projection
             .reconcile_snapshot("system_default_user", "conversation-1", &snapshot)
@@ -644,6 +704,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(message_count, 1);
+
+        sqlx::query("DELETE FROM messages WHERE type = 'ask'")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        projection
+            .reconcile_snapshot("system_default_user", "conversation-1", &snapshot)
+            .await
+            .unwrap();
+        let healed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE type = 'ask'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(healed_count, 1, "an unchanged snapshot must heal a missing message row");
+        assert!(
+            events.try_recv().is_err(),
+            "self-healing must not emit a duplicate event"
+        );
     }
 
     #[tokio::test]
@@ -673,7 +751,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.recv().await.unwrap().name, "message.statusChanged");
-        assert_eq!(events.recv().await.unwrap().name, "interaction_request.changed");
+        assert_eq!(events.recv().await.unwrap().name, "interactionRequest.changed");
         assert!(
             projection
                 .list_pending("system_default_user")
@@ -689,7 +767,7 @@ mod tests {
         assert_eq!(status, "finish");
 
         let restarted = InteractionRequestProjection::new(
-            database.pool().clone(),
+            Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone())),
             Arc::new(SqliteConversationRepository::new(database.pool().clone())),
             Arc::new(BroadcastEventBus::new(8)),
             None,
@@ -705,10 +783,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_message_finalization_retries_after_a_storage_failure() {
+        let (projection, database, _bus) = fixture().await;
+        projection
+            .reconcile_snapshot(
+                "system_default_user",
+                "conversation-1",
+                &GeaInteractionRequestSnapshot {
+                    revision: "r1".to_owned(),
+                    items: vec![question("v1")],
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_interaction_message_finish \
+             BEFORE UPDATE OF status ON messages WHEN NEW.status = 'finish' \
+             BEGIN SELECT RAISE(FAIL, 'simulated message finish failure'); END",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let empty = GeaInteractionRequestSnapshot {
+            revision: "r2".to_owned(),
+            items: vec![],
+        };
+
+        projection
+            .reconcile_snapshot("system_default_user", "conversation-1", &empty)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            projection
+                .list_pending("system_default_user")
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        sqlx::query("DROP TRIGGER fail_interaction_message_finish")
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        projection
+            .reconcile_snapshot("system_default_user", "conversation-1", &empty)
+            .await
+            .unwrap();
+        assert!(
+            projection
+                .list_pending("system_default_user")
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let message_status: String = sqlx::query_scalar("SELECT status FROM messages WHERE type = 'ask'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(message_status, "finish");
+    }
+
+    #[tokio::test]
     async fn projection_captures_the_active_turn_anchor() {
         let (_projection, database, bus) = fixture().await;
         let projection = InteractionRequestProjection::new(
-            database.pool().clone(),
+            Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone())),
             Arc::new(SqliteConversationRepository::new(database.pool().clone())),
             bus,
             Some(Arc::new(|conversation_id| {
@@ -729,5 +871,32 @@ mod tests {
 
         let list = projection.list_pending("system_default_user").await.unwrap();
         assert_eq!(list.items[0].turn_id.as_deref(), Some("turn-active-1"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_request_replaces_the_current_projection() {
+        let (projection, _database, _bus) = fixture().await;
+        projection
+            .reconcile_snapshot(
+                "system_default_user",
+                "conversation-1",
+                &GeaInteractionRequestSnapshot {
+                    revision: "r1".to_owned(),
+                    items: vec![question("v1")],
+                },
+            )
+            .await
+            .unwrap();
+        let mut authoritative = question("v2");
+        authoritative.title = "Choose the corrected cost center".to_owned();
+
+        let view = projection
+            .apply_authoritative_request("system_default_user", &authoritative)
+            .await
+            .unwrap();
+
+        assert_eq!(view.version, "v2");
+        assert_eq!(view.title, "Choose the corrected cost center");
+        assert_eq!(view.status, GeaInteractionRequestStatus::Pending);
     }
 }

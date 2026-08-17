@@ -20,8 +20,9 @@ use aionui_ai_agent::{
 
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
-    ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse,
+    ConversationResponse, GeaInteractionRequestReceiptStatus, GeaInteractionTurnContinuation, GetConfigOptionsResponse,
+    GetModelInfoResponse, InteractionRequestReceipt, ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest,
+    SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
@@ -51,7 +52,10 @@ use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
-use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+use crate::skill_resolver::{
+    FixedSkillResolver, LoadedAgentSkill, ManagedSkillExecutionReport, ManagedSkillExecutionReporter,
+    ManagedSkillSnapshot, ResolvedAgentSkill, SkillResolver,
+};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
@@ -67,6 +71,69 @@ struct SkillLinkCall {
 struct RecordingSkillResolver {
     names: Vec<String>,
     links: Arc<Mutex<Vec<SkillLinkCall>>>,
+}
+
+struct ManagedConversationSkillResolver {
+    snapshot: ManagedSkillSnapshot,
+}
+
+#[async_trait::async_trait]
+impl SkillResolver for ManagedConversationSkillResolver {
+    async fn auto_inject_names(&self) -> Vec<String> {
+        vec![self.snapshot.skill_code.clone()]
+    }
+
+    async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
+        Vec::new()
+    }
+
+    async fn snapshot_managed_skills_for_user(&self, _user_id: &str, names: &[String]) -> Vec<ManagedSkillSnapshot> {
+        names
+            .iter()
+            .any(|name| name == &self.snapshot.skill_code)
+            .then(|| self.snapshot.clone())
+            .into_iter()
+            .collect()
+    }
+
+    async fn load_skill_bodies_for_user_at_snapshot(
+        &self,
+        _user_id: &str,
+        names: &[String],
+        managed: &[ManagedSkillSnapshot],
+    ) -> Vec<LoadedAgentSkill> {
+        if names.iter().any(|name| name == &self.snapshot.skill_code) && managed.contains(&self.snapshot) {
+            vec![LoadedAgentSkill {
+                name: self.snapshot.skill_code.clone(),
+                body: "Use governed forecast data.".to_owned(),
+                managed: Some(self.snapshot.clone()),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn link_workspace_skills(
+        &self,
+        _workspace: &Path,
+        _rel_dirs: &[&str],
+        _skills: &[ResolvedAgentSkill],
+    ) -> usize {
+        0
+    }
+}
+
+#[derive(Default)]
+struct RecordingManagedSkillReporter {
+    reports: Mutex<Vec<(String, ManagedSkillExecutionReport)>>,
+}
+
+#[async_trait::async_trait]
+impl ManagedSkillExecutionReporter for RecordingManagedSkillReporter {
+    async fn report_execution(&self, user_id: &str, report: ManagedSkillExecutionReport) -> Result<(), String> {
+        self.reports.lock().unwrap().push((user_id.to_owned(), report));
+        Ok(())
+    }
 }
 
 struct StaticAssistantDispatcher {
@@ -3904,6 +3971,7 @@ async fn send_message_returns_accepted() {
 /// the steer write, so the fallback's fresh claim succeeds deterministically.
 struct MidturnMockAgent {
     conversation_id: String,
+    agent_type: AgentType,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     delivered: Mutex<Vec<SendMessageData>>,
     scripted_error: Mutex<Option<AgentSendError>>,
@@ -3918,6 +3986,7 @@ impl MidturnMockAgent {
         let (event_tx, _) = broadcast::channel(16);
         Self {
             conversation_id: conversation_id.to_owned(),
+            agent_type: AgentType::Acp,
             event_tx,
             delivered: Mutex::new(Vec::new()),
             scripted_error: Mutex::new(None),
@@ -3925,12 +3994,17 @@ impl MidturnMockAgent {
             confirmations: Mutex::new(Vec::new()),
         }
     }
+
+    fn with_aionrs_type(mut self) -> Self {
+        self.agent_type = AgentType::Aionrs;
+        self
+    }
 }
 
 #[async_trait::async_trait]
 impl IAgentTask for MidturnMockAgent {
     fn agent_type(&self) -> AgentType {
-        AgentType::Acp
+        self.agent_type
     }
     fn conversation_id(&self) -> &str {
         &self.conversation_id
@@ -4037,6 +4111,159 @@ async fn midturn_send_delivers_into_the_active_turn() {
         .collect();
     assert_eq!(rows.len(), 1, "persisted exactly once");
     assert_eq!(rows[0].status.as_deref(), Some("pending"));
+}
+
+#[tokio::test]
+async fn accepted_interaction_request_resumes_exactly_the_original_turn() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let receipt = InteractionRequestReceipt {
+        receipt_id: "receipt-1".to_owned(),
+        request_id: "request-1".to_owned(),
+        version: "v2".to_owned(),
+        status: GeaInteractionRequestReceiptStatus::Accepted,
+        turn_continuation: None,
+        resolved_at: None,
+        resolved_by: None,
+        request: None,
+    };
+
+    svc.resume_interaction_turn("user_1", &conv.id, "turn_active", &receipt)
+        .await
+        .expect("the accepted receipt should steer the active turn");
+
+    let delivered = agent.delivered.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].turn_id.as_deref(), Some("turn_active"));
+    let content: serde_json::Value = serde_json::from_str(&delivered[0].content).unwrap();
+    assert_eq!(content["type"], "interaction_request_result");
+    assert_eq!(content["requestId"], "request-1");
+    assert_eq!(content["receiptId"], "receipt-1");
+
+    let error = svc
+        .resume_interaction_turn("user_1", &conv.id, "turn_stale", &receipt)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert_eq!(agent.delivered.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_interaction_request_releases_the_original_aionrs_tool_call_without_injection() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc
+        .create(
+            "user_1",
+            CreateConversationRequest {
+                r#type: Some(AgentType::Aionrs),
+                ..make_create_req()
+            },
+        )
+        .await
+        .unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_active")
+        .expect("claim the active turn");
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id).with_aionrs_type());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let mut receipt = InteractionRequestReceipt {
+        receipt_id: "receipt-aionrs".to_owned(),
+        request_id: "request-aionrs".to_owned(),
+        version: "v2".to_owned(),
+        status: GeaInteractionRequestReceiptStatus::Accepted,
+        turn_continuation: Some(GeaInteractionTurnContinuation::OriginalToolCallReleased),
+        resolved_at: None,
+        resolved_by: None,
+        request: None,
+    };
+
+    svc.resume_interaction_turn("user_1", &conv.id, "turn_active", &receipt)
+        .await
+        .expect("GEA acceptance should release the original Aionrs tool call");
+
+    assert!(agent.delivered.lock().unwrap().is_empty());
+
+    receipt.turn_continuation = None;
+    let error = svc
+        .resume_interaction_turn("user_1", &conv.id, "turn_active", &receipt)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+}
+
+#[tokio::test]
+async fn accepted_interaction_request_tolerates_an_aionrs_turn_that_already_completed() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr);
+    let conv = svc
+        .create(
+            "user_1",
+            CreateConversationRequest {
+                r#type: Some(AgentType::Aionrs),
+                ..make_create_req()
+            },
+        )
+        .await
+        .unwrap();
+    let receipt = InteractionRequestReceipt {
+        receipt_id: "receipt-completed-aionrs".to_owned(),
+        request_id: "request-completed-aionrs".to_owned(),
+        version: "v2".to_owned(),
+        status: GeaInteractionRequestReceiptStatus::Accepted,
+        turn_continuation: Some(GeaInteractionTurnContinuation::OriginalToolCallReleased),
+        resolved_at: None,
+        resolved_by: None,
+        request: None,
+    };
+
+    svc.resume_interaction_turn("user_1", &conv.id, "turn_already_completed", &receipt)
+        .await
+        .expect("the released Aionrs tool call may finish before receipt finalization");
+}
+
+#[tokio::test]
+async fn accepted_interaction_request_rejects_an_aionrs_request_from_a_replaced_turn() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr);
+    let conv = svc
+        .create(
+            "user_1",
+            CreateConversationRequest {
+                r#type: Some(AgentType::Aionrs),
+                ..make_create_req()
+            },
+        )
+        .await
+        .unwrap();
+    let _claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn_replacement")
+        .expect("claim the replacement turn");
+    let receipt = InteractionRequestReceipt {
+        receipt_id: "receipt-stale-aionrs".to_owned(),
+        request_id: "request-stale-aionrs".to_owned(),
+        version: "v2".to_owned(),
+        status: GeaInteractionRequestReceiptStatus::Accepted,
+        turn_continuation: Some(GeaInteractionTurnContinuation::OriginalToolCallReleased),
+        resolved_at: None,
+        resolved_by: None,
+        request: None,
+    };
+
+    let error = svc
+        .resume_interaction_turn("user_1", &conv.id, "turn_original", &receipt)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
 }
 
 /// B5 fallback (spec §6甲.1): codex rejected the steer because the turn ended
@@ -6044,6 +6271,55 @@ async fn send_message_keeps_acp_task_after_normal_finish() {
 
     assert_eq!(task_mgr.kill_count(), 0);
     assert_eq!(task_mgr.active_count(), 1);
+}
+
+#[tokio::test]
+async fn managed_skill_load_in_a_real_turn_is_reported_after_completion() {
+    let snapshot = ManagedSkillSnapshot {
+        skill_code: "sales-forecast".to_owned(),
+        version: "1.0.0".to_owned(),
+        digest: "abcd".to_owned(),
+        risk_level: Some("LOW".to_owned()),
+    };
+    let resolver = Arc::new(ManagedConversationSkillResolver {
+        snapshot: snapshot.clone(),
+    });
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver(resolver);
+    let reporter = Arc::new(RecordingManagedSkillReporter::default());
+    svc.with_managed_skill_execution_reporter(reporter.clone());
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![
+            vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "Need [LOAD_SKILL: sales-forecast]".to_owned(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ],
+            vec![AgentStreamEvent::Finish(FinishEventData::default())],
+        ],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent.clone()));
+
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(
+        scripted_agent.sent_contents().len(),
+        2,
+        "the Skill body should continue the same Turn"
+    );
+    let reports = reporter.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].0, "user_1");
+    assert_eq!(reports[0].1.skill, snapshot);
+    assert!(reports[0].1.success);
 }
 
 #[tokio::test]
@@ -8311,7 +8587,9 @@ async fn update_rejects_extra_skills() {
     let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
 
     match err {
-        ConversationError::BadRequest { reason: msg } => assert!(msg.contains("skills"), "msg = {msg:?}"),
+        ConversationError::BadRequest { reason } => {
+            assert_eq!(reason, "Skill and MCP snapshots are immutable post-creation")
+        }
         other => panic!("expected BadRequest, got {other:?}"),
     }
 }

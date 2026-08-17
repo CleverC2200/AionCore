@@ -27,11 +27,12 @@ pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
-    ExternalUserProjection, FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow,
-    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserStatus,
-    UserType,
+    ExternalUserProjection, FolderRow, GeaManagedSkillRow, GeaResourceCatalogRow, ProjectExplorerRow, ProjectKind,
+    ProjectRow, Role, SkillImportRecordRow, SkillRow, StoredGeaSessionBootstrap, StoredInteractionRequest,
+    StoredInteractionRequestReceipt, StoredUnfinalizedInteractionRequestReceipt, UpdateAgentAvailabilitySnapshotParams,
+    UpdateAgentHandshakeParams, UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
+    UpsertOverrideParams, UserStatus, UserType,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -40,6 +41,13 @@ pub use repository::conversation::{
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
+};
+pub use repository::gea_resource::{
+    IGeaResourceRepository, ReplaceGeaResourceCatalogParams, UpsertGeaManagedSkillParams,
+};
+pub use repository::interaction_request::{
+    IInteractionRequestRepository, ReceiptResumeClaim, StoreInteractionRequestReceiptParams,
+    UpsertGeaSessionBootstrapParams, UpsertInteractionRequestParams,
 };
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
@@ -63,9 +71,10 @@ pub use repository::{
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository, SqliteInteractionRequestRepository,
+    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteTeamRepository,
+    SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

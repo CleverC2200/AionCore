@@ -1,11 +1,12 @@
 use aionui_api_types::{
-    ApiResponse, CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand,
-    GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
-    InteractionRequestReceipt, SetGeaAuthSessionRequest,
+    ApiResponse, CreateGeaSessionRequest, GeaAuthSessionStatus, GeaClientResourceSyncResult,
+    GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot,
+    GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand,
+    InteractionRequestList, InteractionRequestReceipt, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -22,6 +23,7 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
         )
         .route("/api/gea/conversations/{conversation_id}/session", post(create_session))
         .route("/api/gea/conversations/{conversation_id}/tools", get(list_tools))
+        .route("/api/gea/mcp/test", post(test_mcp_connection))
         .route(
             "/api/gea/conversations/{conversation_id}/interaction-requests",
             get(list_interaction_requests),
@@ -35,11 +37,24 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
             "/api/interaction-requests/{request_id}/actions",
             post(act_on_global_interaction_request),
         )
+        .route("/api/client-resources/sync", post(sync_client_resources))
         .route(
             "/api/gea/conversations/{conversation_id}/tools/{tool_name}",
             post(call_tool),
         )
         .with_state(state)
+}
+
+async fn sync_client_resources(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<SyncGeaClientResourcesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<GeaClientResourceSyncResult>>, GeaError> {
+    reject_runtime_auth_session_access(&headers)?;
+    let Json(request) = body.map_err(|_| GeaError::invalid_request("GEA 资源同步参数无效"))?;
+    let result = state.service.sync_client_resources(&user.id, request).await?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,8 +83,9 @@ async fn act_on_global_interaction_request(
     State(state): State<GeaRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(request_id): Path<String>,
-    Json(command): Json<InteractionRequestActionCommand>,
+    body: Result<Json<InteractionRequestActionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<InteractionRequestReceipt>>, GeaError> {
+    let Json(command) = body.map_err(|_| GeaError::invalid_request("Interaction Request 动作参数无效"))?;
     let receipt = state
         .service
         .act_on_global_interaction_request(&user.id, &request_id, command)
@@ -133,6 +149,21 @@ async fn list_tools(
     Ok(Json(ApiResponse::ok(tools)))
 }
 
+async fn test_mcp_connection(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<CreateGeaSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<Vec<GeaToolInfo>>>, GeaError> {
+    reject_runtime_auth_session_access(&headers)?;
+    let Json(request) = body.map_err(|_| GeaError::invalid_request("GEA MCP 测试参数无效"))?;
+    let tools = state
+        .service
+        .test_mcp_connection(&user.id, request.consumer_code)
+        .await?;
+    Ok(Json(ApiResponse::ok(tools)))
+}
+
 async fn call_tool(
     State(state): State<GeaRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -167,9 +198,10 @@ async fn act_on_interaction_request(
     Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     Path((conversation_id, request_id)): Path<(String, String)>,
-    Json(command): Json<GeaInteractionRequestActionCommand>,
+    body: Result<Json<GeaInteractionRequestActionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<GeaInteractionRequestReceipt>>, GeaError> {
     enforce_runtime_conversation_scope(&headers, &conversation_id)?;
+    let Json(command) = body.map_err(|_| GeaError::invalid_request("Interaction Request 动作参数无效"))?;
     let receipt = state
         .service
         .act_on_interaction_request(&user.id, &conversation_id, &request_id, command)

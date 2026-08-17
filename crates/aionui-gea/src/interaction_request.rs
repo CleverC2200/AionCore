@@ -180,7 +180,7 @@ fn reject_sensitive_fields(value: &Value) -> Result<(), GeaError> {
 }
 
 fn invalid_upstream(message: impl Into<String>) -> GeaError {
-    GeaError::new(axum::http::StatusCode::BAD_GATEWAY, "GEA_INVALID_RESPONSE", message)
+    GeaError::bad_gateway("GEA_INVALID_RESPONSE", message)
 }
 
 #[cfg(test)]

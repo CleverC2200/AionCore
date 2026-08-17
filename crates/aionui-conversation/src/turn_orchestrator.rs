@@ -15,6 +15,7 @@ use crate::runtime_state::TurnClaim;
 use crate::service::{
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
+use crate::skill_resolver::{ManagedSkillExecutionReport, ManagedSkillSnapshot, managed_skill_snapshots_from_extra};
 use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
@@ -70,6 +71,7 @@ struct TurnAttemptInput {
     send: SendMessageData,
     msg_id: String,
     allowed_skill_names: Vec<String>,
+    managed_skill_snapshots: Vec<ManagedSkillSnapshot>,
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
@@ -259,6 +261,7 @@ impl ConversationTurnOrchestrator {
         let continuation_policy = TurnContinuationPolicy::new(MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN);
         let mut last_outcome = None;
         let mut aggregate_summary = TurnAttemptSummary::default();
+        let mut loaded_managed_skills = Vec::new();
 
         while let Some((current_send, msg_id)) = pending_send.take() {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
@@ -276,6 +279,7 @@ impl ConversationTurnOrchestrator {
             )
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())
+            .with_managed_skill_snapshots(input.managed_skill_snapshots.clone())
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_turn_completion(false)
@@ -402,6 +406,15 @@ impl ConversationTurnOrchestrator {
 
             let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
             aggregate_summary.merge(&outcome.attempt);
+            for skill in &outcome.loaded_managed_skills {
+                if !loaded_managed_skills.iter().any(|existing: &ManagedSkillSnapshot| {
+                    existing.skill_code == skill.skill_code
+                        && existing.version == skill.version
+                        && existing.digest == skill.digest
+                }) {
+                    loaded_managed_skills.push(skill.clone());
+                }
+            }
 
             if let Some(session_key) = agent.get_session_key() {
                 persist_session_key(
@@ -436,8 +449,10 @@ impl ConversationTurnOrchestrator {
             }
         }
 
+        let mut outcome = last_outcome.unwrap_or_default();
+        outcome.loaded_managed_skills = loaded_managed_skills;
         Ok(TurnAttemptResult {
-            outcome: last_outcome.unwrap_or_default(),
+            outcome,
             summary: aggregate_summary,
             agent_type: agent.agent_type(),
             backend,
@@ -450,6 +465,7 @@ impl ConversationTurnOrchestrator {
         let turn_id = input.turn_id.clone();
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
+        let managed_skill_snapshots = managed_skill_snapshots_from_extra(&input.conversation.extra);
         let first_turn_msg_id = ConversationService::mint_msg_id();
         let initial_send = SendMessageData {
             content: input.content,
@@ -463,6 +479,8 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let turn_started_at = now_ms();
+        let mut executed_managed_skills = Vec::new();
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -478,6 +496,7 @@ impl ConversationTurnOrchestrator {
                     send: initial_send.clone(),
                     msg_id: first_turn_msg_id.clone(),
                     allowed_skill_names: allowed_skill_names.clone(),
+                    managed_skill_snapshots: managed_skill_snapshots.clone(),
                     required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
@@ -495,6 +514,15 @@ impl ConversationTurnOrchestrator {
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
+            for skill in &attempt_result.outcome.loaded_managed_skills {
+                if !executed_managed_skills.iter().any(|existing: &ManagedSkillSnapshot| {
+                    existing.skill_code == skill.skill_code
+                        && existing.version == skill.version
+                        && existing.digest == skill.digest
+                }) {
+                    executed_managed_skills.push(skill.clone());
+                }
+            }
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -603,6 +631,25 @@ impl ConversationTurnOrchestrator {
                 }
             }
         };
+
+        let executed_at = chrono::Utc::now().to_rfc3339();
+        let duration_ms = u64::try_from(now_ms().saturating_sub(turn_started_at)).unwrap_or_default();
+        for skill in executed_managed_skills {
+            self.service
+                .report_managed_skill_execution(
+                    &input.user_id,
+                    ManagedSkillExecutionReport {
+                        skill,
+                        success: !final_failed,
+                        executed_at: executed_at.clone(),
+                        duration_ms,
+                        result_size: 0,
+                        error_code: final_failed.then(|| "SKILL_EXECUTION_FAILED".to_owned()),
+                        error_message: final_failed.then(|| "managed Skill 对话执行失败".to_owned()),
+                    },
+                )
+                .await;
+        }
 
         if auth_failure {
             // The agent connected (detection saw it online) but a real turn hit
@@ -851,6 +898,7 @@ mod tests {
     fn finish_outcome(needs_auth: bool) -> RelayOutcome {
         RelayOutcome {
             system_responses: vec![],
+            loaded_managed_skills: vec![],
             terminal: RelayTerminal::Finish,
             attempt: TurnAttemptSummary {
                 needs_auth,
@@ -862,6 +910,7 @@ mod tests {
     fn error_outcome(code: AgentErrorCode) -> RelayOutcome {
         RelayOutcome {
             system_responses: vec![],
+            loaded_managed_skills: vec![],
             terminal: RelayTerminal::Error {
                 code: Some(code),
                 retryable: None,

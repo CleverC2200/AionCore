@@ -19,7 +19,7 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_db::ISkillRepository;
+use aionui_db::{IGeaResourceRepository, ISkillRepository};
 
 use crate::classifier::AssistantRuleDispatcher;
 use crate::error::ExtensionError;
@@ -48,6 +48,7 @@ fn is_auto_inject_builtin_skill(source: SkillSource, relative_location: Option<&
 pub struct SkillRouterState {
     pub skill_paths: SkillPaths,
     pub skill_repo: Arc<dyn ISkillRepository>,
+    pub managed_skill_repo: Option<Arc<dyn IGeaResourceRepository>>,
     pub external_paths_manager: Arc<ExternalPathsManager>,
     /// Optional dispatcher that routes assistant-rule / assistant-skill
     /// read/write/delete by source (builtin / extension / user). When
@@ -120,9 +121,11 @@ async fn list_skills(
         &current_user.id,
     )
     .await?;
-    let resp: Vec<SkillListItemResponse> = items
+    let mut resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| SkillListItemResponse {
+            skill_id: None,
+            version: None,
             is_auto_inject: is_auto_inject_builtin_skill(s.source, s.relative_location.as_deref()),
             name: s.name,
             description: s.description,
@@ -130,8 +133,30 @@ async fn list_skills(
             relative_location: s.relative_location,
             is_custom: s.is_custom,
             source: to_source_response(s.source),
+            state: None,
         })
         .collect();
+    if let Some(repo) = &state.managed_skill_repo {
+        let managed = repo
+            .list_managed_skills_for_user(&current_user.id)
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, user_id = %current_user.id, "managed Skill catalog lookup failed");
+                ApiError::Internal("managed Skill catalog unavailable".to_owned())
+            })?;
+        resp.extend(managed.into_iter().map(|skill| SkillListItemResponse {
+            skill_id: Some(skill.skill_code.clone()),
+            version: Some(skill.version),
+            name: skill.skill_code,
+            description: skill.description,
+            location: Path::new(&skill.path).join("SKILL.md").to_string_lossy().into_owned(),
+            relative_location: None,
+            is_auto_inject: false,
+            is_custom: false,
+            source: SkillSourceResponse::Managed,
+            state: Some(skill.state),
+        }));
+    }
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -641,6 +666,7 @@ mod tests {
         SkillRouterState {
             skill_paths: paths,
             skill_repo,
+            managed_skill_repo: None,
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
         }

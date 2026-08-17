@@ -124,12 +124,15 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use gea::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionPermissionOption, GeaInteractionPresentation,
-    GeaInteractionQuestion, GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand,
-    GeaInteractionRequestKind, GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus,
-    GeaInteractionRequestSnapshot, GeaInteractionRequestStatus, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
-    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView, SetGeaAuthSessionRequest,
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaCatalogSkill, GeaClientResourceKind, GeaClientResourceSyncResult,
+    GeaClientResourceSyncStatus, GeaInteractionPermissionOption, GeaInteractionPresentation, GeaInteractionQuestion,
+    GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
+    GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot,
+    GeaInteractionRequestStatus, GeaInteractionTurnContinuation, GeaLocalizedText, GeaResourceCatalogEnvelope,
+    GeaResourceCatalogSnapshot, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
+    InteractionRequestActionCommand, InteractionRequestChangedPayload, InteractionRequestList,
+    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView, ReportGeaSkillExecutionRequest,
+    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

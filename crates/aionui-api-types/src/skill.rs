@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // A. Skill list & info
 // ---------------------------------------------------------------------------
 
-/// Origin of a listed skill — `builtin`, `custom`, `cron`, or `extension`.
+/// Origin of a listed skill.
 ///
 /// Matches the renderer contract in
 /// `src/common/adapter/ipcBridge.ts::listAvailableSkills`.
@@ -15,6 +15,7 @@ pub enum SkillSourceResponse {
     Custom,
     Cron,
     Extension,
+    Managed,
 }
 
 /// Single item in the available skills list (`GET /api/skills`).
@@ -30,6 +31,10 @@ pub enum SkillSourceResponse {
 /// path strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillListItemResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub name: String,
     pub description: String,
     pub location: String,
@@ -39,6 +44,8 @@ pub struct SkillListItemResponse {
     pub is_auto_inject: bool,
     pub is_custom: bool,
     pub source: SkillSourceResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// Request body for `POST /api/skills/info`.
@@ -289,6 +296,8 @@ mod tests {
     #[test]
     fn test_skill_list_item_serde() {
         let item = SkillListItemResponse {
+            skill_id: None,
+            version: None,
             name: "my-skill".into(),
             description: "Does things".into(),
             location: "/home/user/.aionui/skills/my-skill".into(),
@@ -296,6 +305,7 @@ mod tests {
             is_auto_inject: false,
             is_custom: true,
             source: SkillSourceResponse::Custom,
+            state: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
@@ -313,6 +323,8 @@ mod tests {
     #[test]
     fn test_skill_list_item_builtin_with_relative_location() {
         let item = SkillListItemResponse {
+            skill_id: None,
+            version: None,
             name: "cron".into(),
             description: "Schedule recurring tasks".into(),
             location: "/home/user/.aionui/builtin-skills-view/cron/SKILL.md".into(),
@@ -320,6 +332,7 @@ mod tests {
             is_auto_inject: true,
             is_custom: false,
             source: SkillSourceResponse::Builtin,
+            state: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         // Project-wide wire contract: relative_location stays snake_case.

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 aionui-api-types.workspace = true
 aionui-auth.workspace = true
@@ -15,6 +18,7 @@ chrono.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -22,4 +26,5 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 wiremock.workspace = true

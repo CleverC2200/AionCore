@@ -171,6 +171,7 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
     let state = SkillRouterState {
         skill_paths: paths,
         skill_repo,
+        managed_skill_repo: None,
         external_paths_manager: ext_mgr,
         assistant_dispatcher: Some(dispatcher),
     };

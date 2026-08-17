@@ -31,6 +31,7 @@ const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(125);
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const GEA_IDENTITY_BOOTSTRAP_TOOL: &str = "gateway.session.currentUser.resolve";
+const BUSINESS_DATA_TOOL_NAME: &str = "query_business_data";
 
 pub async fn run_gea_stdio() -> ExitCode {
     let env = match GeaStdioEnv::from_env() {
@@ -136,6 +137,13 @@ struct ApiErrorBody {
     details: Option<Value>,
 }
 
+#[derive(Deserialize)]
+struct StandardApiErrorBody {
+    error: String,
+    code: String,
+    details: Option<Value>,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolInfo {
@@ -152,6 +160,87 @@ struct ToolInfo {
 #[serde(rename_all = "camelCase")]
 struct ToolCallResponse {
     result: Value,
+}
+
+fn uses_legacy_business_data_arguments(tool: &ToolInfo) -> bool {
+    tool.name == BUSINESS_DATA_TOOL_NAME
+        && tool
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("queries"))
+            .and_then(|queries| queries.get("type"))
+            .and_then(Value::as_str)
+            == Some("string")
+}
+
+fn exposed_input_schema(tool: &ToolInfo) -> Value {
+    if !uses_legacy_business_data_arguments(tool) {
+        return tool.input_schema.clone();
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["inspect", "query"],
+                "description": "inspect reads the semantic-model catalog; query executes one to eight named Cube queries."
+            },
+            "queries": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "Use an empty array for inspect. For query, provide one to eight named query objects.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "query"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Stable name for this query in the returned result."
+                        },
+                        "query": {
+                            "type": "object",
+                            "additionalProperties": true,
+                            "description": "Cube JSON Query. Put all query fields inside this object.",
+                            "properties": {
+                                "measures": { "type": "array", "items": { "type": "string" } },
+                                "dimensions": { "type": "array", "items": { "type": "string" } },
+                                "filters": { "type": "array", "items": { "type": "object" } },
+                                "timeDimensions": { "type": "array", "items": { "type": "object" } },
+                                "segments": { "type": "array", "items": { "type": "string" } },
+                                "limit": { "type": "integer", "minimum": 0 },
+                                "order": {
+                                    "oneOf": [
+                                        { "type": "object", "additionalProperties": { "type": "string", "enum": ["asc", "desc"] } },
+                                        { "type": "array", "items": { "type": "object" } }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "required": ["action", "queries"]
+    })
+}
+
+fn gateway_arguments(tool: &ToolInfo, mut arguments: Value) -> Value {
+    if !uses_legacy_business_data_arguments(tool) {
+        return arguments;
+    }
+    let Some(queries) = arguments.get("queries").filter(|queries| queries.is_array()) else {
+        return arguments;
+    };
+    let Ok(serialized) = serde_json::to_string(queries) else {
+        return arguments;
+    };
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.insert("queries".to_owned(), Value::String(serialized));
+    }
+    arguments
 }
 
 impl GeaStdioServer {
@@ -240,7 +329,27 @@ impl GeaStdioServer {
 }
 
 fn backend_mcp_error(status: reqwest::StatusCode, body: &[u8]) -> McpError {
-    let Ok(error) = serde_json::from_slice::<ApiErrorBody>(body) else {
+    let error = serde_json::from_slice::<ApiErrorBody>(body).or_else(|_| {
+        serde_json::from_slice::<StandardApiErrorBody>(body).map(|standard| {
+            let details = standard.details.unwrap_or(Value::Null);
+            ApiErrorBody {
+                code: standard.code,
+                message: standard.error,
+                category: details
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .unwrap_or("INTERNAL")
+                    .to_owned(),
+                retryable: details.get("retryable").and_then(Value::as_bool).unwrap_or(false),
+                retry_after_ms: details.get("retryAfterMs").and_then(Value::as_u64),
+                request_id: details.get("requestId").and_then(Value::as_str).map(str::to_owned),
+                trace_id: details.get("traceId").and_then(Value::as_str).map(str::to_owned),
+                audit_id: details.get("auditId").and_then(Value::as_str).map(str::to_owned),
+                details: details.get("upstream").cloned(),
+            }
+        })
+    });
+    let Ok(error) = error else {
         return McpError::internal_error(format!("GEA_MCP_BACKEND_HTTP_{}", status.as_u16()), None);
     };
     let message = format!(
@@ -273,22 +382,22 @@ impl ServerHandler for GeaStdioServer {
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools =
-            self.load_tools()
-                .await?
-                .into_iter()
-                .map(|(exposed_name, tool)| {
-                    let input_schema =
-                        tool.input_schema.as_object().cloned().unwrap_or_else(|| {
-                            Map::from_iter([("type".to_owned(), Value::String("object".to_owned()))])
-                        });
-                    Tool::new_with_raw(
-                        exposed_name,
-                        (!tool.description.is_empty()).then_some(Cow::Owned(tool.description)),
-                        Arc::new(input_schema),
-                    )
-                })
-                .collect();
+        let tools = self
+            .load_tools()
+            .await?
+            .into_iter()
+            .map(|(exposed_name, tool)| {
+                let input_schema = exposed_input_schema(&tool)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_else(|| Map::from_iter([("type".to_owned(), Value::String("object".to_owned()))]));
+                Tool::new_with_raw(
+                    exposed_name,
+                    (!tool.description.is_empty()).then_some(Cow::Owned(tool.description)),
+                    Arc::new(input_schema),
+                )
+            })
+            .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -310,7 +419,7 @@ impl ServerHandler for GeaStdioServer {
             encode_path_segment(&self.env.conversation_id),
             encode_path_segment(&tool.name)
         );
-        let arguments = Value::Object(request.arguments.unwrap_or_default());
+        let arguments = gateway_arguments(&tool, Value::Object(request.arguments.unwrap_or_default()));
         let response: ToolCallResponse = match self
             .request(reqwest::Method::POST, &path, Some(json!({ "arguments": arguments })))
             .await
@@ -396,9 +505,60 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GeaStdioEnv, GeaStdioServer, backend_mcp_error, compatible_tool_name, should_expose_tool_to_agent,
-        should_reset_session_after_error,
+        GeaStdioEnv, GeaStdioServer, ToolInfo, backend_mcp_error, compatible_tool_name, exposed_input_schema,
+        gateway_arguments, should_expose_tool_to_agent, should_reset_session_after_error,
     };
+
+    fn legacy_business_data_tool() -> ToolInfo {
+        ToolInfo {
+            name: "query_business_data".to_owned(),
+            source_code: "cube".to_owned(),
+            description: "Query business data".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" },
+                    "queries": { "type": "string" }
+                },
+                "required": ["action", "queries"]
+            }),
+        }
+    }
+
+    #[test]
+    fn legacy_business_data_tool_exposes_named_query_schema() {
+        let schema = exposed_input_schema(&legacy_business_data_tool());
+
+        assert_eq!(schema["properties"]["action"]["enum"], json!(["inspect", "query"]));
+        assert_eq!(schema["properties"]["queries"]["type"], "array");
+        assert_eq!(schema["properties"]["queries"]["maxItems"], 8);
+        assert_eq!(
+            schema["properties"]["queries"]["items"]["required"],
+            json!(["name", "query"])
+        );
+    }
+
+    #[test]
+    fn legacy_business_data_tool_serializes_named_queries_for_gea() {
+        let queries = json!([{
+            "name": "sales_forecast_probe",
+            "query": {
+                "measures": ["agents_sales_forecast_detail.row_count"],
+                "limit": 1
+            }
+        }]);
+
+        let adapted = gateway_arguments(
+            &legacy_business_data_tool(),
+            json!({ "action": "query", "queries": queries }),
+        );
+
+        assert_eq!(adapted["action"], "query");
+        assert_eq!(
+            adapted["queries"],
+            serde_json::to_string(&queries).expect("serialize named queries")
+        );
+    }
 
     #[test]
     fn agent_projection_excludes_gateway_identity_bootstrap_tool() {
@@ -536,6 +696,34 @@ mod tests {
         assert_eq!(value["data"]["retryable"], false);
         assert_eq!(value["data"]["requestId"], "request-1");
         assert_eq!(value["data"]["traceId"], "trace-1");
+    }
+
+    #[test]
+    fn backend_error_reads_the_standard_api_error_envelope() {
+        let error = backend_mcp_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{
+                "success":false,
+                "error":"GEA 会话创建失败",
+                "code":"GEA_SESSION_UPSTREAM_FAILED",
+                "details":{
+                    "category":"UPSTREAM",
+                    "retryable":true,
+                    "requestId":"request-2",
+                    "traceId":"trace-2"
+                }
+            }"#
+            .as_bytes(),
+        );
+        let value = serde_json::to_value(&error).expect("serialize MCP error");
+
+        assert_eq!(
+            value["message"],
+            "GEA_SESSION_UPSTREAM_FAILED: GEA 会话创建失败 [category=UPSTREAM retryable=true]"
+        );
+        assert_eq!(value["data"]["code"], "GEA_SESSION_UPSTREAM_FAILED");
+        assert_eq!(value["data"]["requestId"], "request-2");
+        assert_eq!(value["data"]["traceId"], "trace-2");
     }
 
     #[test]
