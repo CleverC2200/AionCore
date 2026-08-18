@@ -298,6 +298,9 @@ mod tests {
         // Sanity-check a couple of known ids from the committed manifest.
         assert!(reg.has("word-creator"));
         assert!(reg.has("cowork"));
+        let butler = reg.get("aionui-assistant").expect("shipped GEA butler");
+        assert_eq!(butler.name, "GEA Butler");
+        assert_eq!(butler.name_i18n.get("zh-CN").map(String::as_str), Some("GEA管家"));
     }
 
     #[test]
