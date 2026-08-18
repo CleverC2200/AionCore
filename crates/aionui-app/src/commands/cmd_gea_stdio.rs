@@ -21,6 +21,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
+use super::gea_result_projection::{BusinessDataAction, project_business_data_result};
+
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
@@ -221,6 +223,11 @@ fn exposed_input_schema(tool: &ToolInfo) -> Value {
                         }
                     }
                 }
+            },
+            "model": {
+                "type": "string",
+                "minLength": 1,
+                "description": "For inspect, omit this field to list the complete model catalog, then set it to one exact model name to retrieve that model schema. Ignored for query."
             }
         },
         "required": ["action", "queries"]
@@ -230,6 +237,9 @@ fn exposed_input_schema(tool: &ToolInfo) -> Value {
 fn gateway_arguments(tool: &ToolInfo, mut arguments: Value) -> Value {
     if !uses_legacy_business_data_arguments(tool) {
         return arguments;
+    }
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.remove("model");
     }
     let Some(queries) = arguments.get("queries").filter(|queries| queries.is_array()) else {
         return arguments;
@@ -241,6 +251,30 @@ fn gateway_arguments(tool: &ToolInfo, mut arguments: Value) -> Value {
         arguments.insert("queries".to_owned(), Value::String(serialized));
     }
     arguments
+}
+
+fn adapt_business_data_result(tool: &ToolInfo, arguments: &Value, result: Value) -> Result<Value, McpError> {
+    if !uses_legacy_business_data_arguments(tool) {
+        return Ok(result);
+    }
+    let action = match arguments.get("action").and_then(Value::as_str) {
+        Some("inspect") => BusinessDataAction::Inspect {
+            model: arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        },
+        Some("query") => BusinessDataAction::Query,
+        _ => BusinessDataAction::Other,
+    };
+    project_business_data_result(action, result).map_err(|error| {
+        if error.code == "GEA_MCP_SEMANTIC_MODEL_NOT_FOUND" {
+            McpError::invalid_params(error.code, error.details)
+        } else {
+            McpError::internal_error(error.code, error.details)
+        }
+    })
 }
 
 impl GeaStdioServer {
@@ -419,9 +453,14 @@ impl ServerHandler for GeaStdioServer {
             encode_path_segment(&self.env.conversation_id),
             encode_path_segment(&tool.name)
         );
-        let arguments = gateway_arguments(&tool, Value::Object(request.arguments.unwrap_or_default()));
+        let arguments = Value::Object(request.arguments.unwrap_or_default());
+        let gateway_arguments = gateway_arguments(&tool, arguments.clone());
         let response: ToolCallResponse = match self
-            .request(reqwest::Method::POST, &path, Some(json!({ "arguments": arguments })))
+            .request(
+                reqwest::Method::POST,
+                &path,
+                Some(json!({ "arguments": gateway_arguments })),
+            )
             .await
         {
             Ok(response) => response,
@@ -432,13 +471,14 @@ impl ServerHandler for GeaStdioServer {
                 return Err(error);
             }
         };
-        let text = match &response.result {
+        let result_value = adapt_business_data_result(&tool, &arguments, response.result)?;
+        let text = match &result_value {
             Value::String(value) => value.clone(),
             value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
         };
         let mut result = CallToolResult::success(vec![Content::text(text)]);
-        if response.result.is_object() {
-            result.structured_content = Some(response.result);
+        if result_value.is_object() {
+            result.structured_content = Some(result_value);
         }
         Ok(result)
     }
@@ -532,6 +572,7 @@ mod tests {
         assert_eq!(schema["properties"]["action"]["enum"], json!(["inspect", "query"]));
         assert_eq!(schema["properties"]["queries"]["type"], "array");
         assert_eq!(schema["properties"]["queries"]["maxItems"], 8);
+        assert_eq!(schema["properties"]["model"]["type"], "string");
         assert_eq!(
             schema["properties"]["queries"]["items"]["required"],
             json!(["name", "query"])
@@ -550,7 +591,7 @@ mod tests {
 
         let adapted = gateway_arguments(
             &legacy_business_data_tool(),
-            json!({ "action": "query", "queries": queries }),
+            json!({ "action": "query", "queries": queries, "model": "ignored-for-query" }),
         );
 
         assert_eq!(adapted["action"], "query");
@@ -558,6 +599,7 @@ mod tests {
             adapted["queries"],
             serde_json::to_string(&queries).expect("serialize named queries")
         );
+        assert!(adapted.get("model").is_none());
     }
 
     #[test]
