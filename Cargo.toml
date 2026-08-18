@@ -63,12 +63,12 @@ aionui-gea = { path = "crates/aionui-gea" }
 aionui-voice = { path = "crates/aionui-voice" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
-aion-providers = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
-aion-types = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
-aion-protocol = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
-aion-config = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
-aion-mcp = { git = "https://github.com/CleverC2200/aionrs.git", rev = "c02065b8ebe69b668b524ced4e09497269ef16bd" }
+aion-agent = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
+aion-providers = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
+aion-types = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
+aion-protocol = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
+aion-config = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
+aion-mcp = { git = "https://github.com/CleverC2200/aionrs.git", rev = "125d1e2e9d23b5e4052b921b7472453545788ec4" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }

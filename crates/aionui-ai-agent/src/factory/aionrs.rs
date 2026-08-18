@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aion_agent::session::{ForkBoundary, Session, SessionManager};
-use aion_config::compat::OpenAiApiMode;
+use aion_config::compat::{AssistantToolCallContent, OpenAiApiMode};
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
@@ -371,6 +371,9 @@ pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
     openai_api_mode_override: Option<OpenAiApiMode>,
 ) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
+    if mapped_provider == "openai" && requires_empty_tool_call_content(model_id) {
+        compat.assistant_tool_call_content = Some(AssistantToolCallContent::EmptyString);
+    }
     let openai_api_mode = resolve_openai_api_mode(platform, mapped_provider, model_id, openai_api_mode_override);
     let use_responses = openai_api_mode == Some(OpenAiApiMode::Responses);
 
@@ -447,6 +450,11 @@ fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &s
 
     let model = model_id.to_ascii_lowercase();
     model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+fn requires_empty_tool_call_content(model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+    model == "deepseek" || model.starts_with("deepseek-")
 }
 
 fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {

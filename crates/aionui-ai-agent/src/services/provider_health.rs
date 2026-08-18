@@ -241,6 +241,9 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     if let Some(path) = config_extra.compat_overrides.api_path {
         config.compat.transport.api_path = Some(path);
     }
+    if let Some(content) = config_extra.compat_overrides.assistant_tool_call_content {
+        config.compat.messages.assistant_tool_call_content = Some(content);
+    }
 
     AgentBootstrap::new(config, workspace, sink)
         .runtime_env(config_extra.runtime_env)

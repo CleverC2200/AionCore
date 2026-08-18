@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use aion_config::compat::OpenAiApiMode;
+use aion_config::compat::{AssistantToolCallContent, OpenAiApiMode};
 use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,7 @@ impl RuntimeCapabilities {
 pub struct AionrsCompatOverrides {
     pub(crate) openai_api_mode: Option<OpenAiApiMode>,
     pub(crate) image_input: Option<ImageInputCapability>,
+    pub(crate) assistant_tool_call_content: Option<AssistantToolCallContent>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
 }

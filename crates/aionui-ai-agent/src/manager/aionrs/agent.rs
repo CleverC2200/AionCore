@@ -214,6 +214,9 @@ impl AionrsAgentManager {
         if let Some(path) = config_extra.compat_overrides.api_path {
             config.compat.transport.api_path = Some(path);
         }
+        if let Some(content) = config_extra.compat_overrides.assistant_tool_call_content {
+            config.compat.messages.assistant_tool_call_content = Some(content);
+        }
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
