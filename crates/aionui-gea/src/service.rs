@@ -30,7 +30,7 @@ mod resource_catalog_service;
 use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
 use crate::{InteractionTurnResolver, InteractionTurnResumer};
 
-const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
+const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn:4443/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GEA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(not(test))]

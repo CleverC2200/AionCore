@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +61,11 @@ pub struct GeaResourceCatalogEnvelope {
     pub revision: Option<String>,
     #[serde(default, alias = "last_good_revision")]
     pub last_good_revision: Option<String>,
-    #[serde(default, alias = "server_time")]
+    #[serde(
+        default,
+        alias = "server_time",
+        deserialize_with = "deserialize_optional_string_or_number"
+    )]
     pub server_time: Option<String>,
     #[serde(default)]
     pub snapshot: Option<GeaResourceCatalogSnapshot>,
@@ -118,6 +122,18 @@ pub enum GeaLocalizedText {
 impl Default for GeaLocalizedText {
     fn default() -> Self {
         Self::Plain(String::new())
+    }
+}
+
+fn deserialize_optional_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(D::Error::custom("expected a string or number")),
     }
 }
 

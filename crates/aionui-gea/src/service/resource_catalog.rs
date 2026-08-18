@@ -111,7 +111,14 @@ impl GeaService {
             .snapshot
             .ok_or_else(|| invalid_upstream("GEA Resource Catalog 缺少 snapshot"))?;
         validate_snapshot(&snapshot)?;
-        if snapshot.tenant_id.as_deref().unwrap_or("").trim() != tenant_id {
+        let credential_tenant_id = tenant_id.trim();
+        if snapshot
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|snapshot_tenant_id| snapshot_tenant_id != credential_tenant_id)
+        {
             return Err(invalid_upstream("GEA Resource Catalog tenantId 与当前登录租户不一致"));
         }
         if envelope
@@ -583,10 +590,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "ok",
                 "revision": "resource-r1",
+                "serverTime": 1787018026,
                 "snapshot": {
                     "schemaVersion": 1,
                     "revision": "resource-r1",
-                    "tenantId": "tenant-a",
                     "skills": [{
                         "id": "sales-forecast",
                         "version": "1.0.0",
@@ -648,14 +655,13 @@ mod tests {
         assert_eq!(rows[0].skill_code, "sales-forecast");
         let cached_file = Path::new(&rows[0].path).join("SKILL.md");
         assert!(cached_file.is_file());
-        assert_eq!(
-            repo.load_catalog("system_default_user", "tenant-a", &server.uri())
-                .await
-                .unwrap()
-                .unwrap()
-                .revision,
-            "resource-r1"
-        );
+        let stored_catalog = repo
+            .load_catalog("system_default_user", "tenant-a", &server.uri())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_catalog.revision, "resource-r1");
+        assert_eq!(stored_catalog.server_time.as_deref(), Some("1787018026"));
 
         tokio::fs::write(&cached_file, b"tampered").await.unwrap();
         let repaired = service
