@@ -248,6 +248,13 @@ impl GeaService {
             }
             return Err(error);
         }
+        if value.get("success").and_then(Value::as_bool) == Some(false) {
+            let error = upstream_business_error(&value, status.as_u16());
+            if error.is_unauthorized() {
+                self.invalidate_auth_session(user_id).await;
+            }
+            return Err(error);
+        }
         let payload = value.get("result").cloned().unwrap_or(value);
         serde_json::from_value(payload).map_err(|_| invalid_upstream("GEA Resource Catalog 结构无效"))
     }
@@ -716,6 +723,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_business_error_in_a_successful_http_response_is_preserved() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/aidata/client-resource-catalog/my"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "message": "Resource catalog endpoint is unavailable",
+                "code": 404,
+                "result": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = GeaService::new(reqwest::Client::new(), server.uri()).unwrap();
+        service
+            .set_auth_session(
+                "system_default_user",
+                SetGeaAuthSessionRequest {
+                    access_token: "token".into(),
+                    tenant_id: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let credential = service
+            .credentials
+            .read()
+            .await
+            .get("system_default_user")
+            .cloned()
+            .unwrap();
+
+        let error = service
+            .fetch_resource_catalog("system_default_user", &credential, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.body.code, "404");
+        assert_eq!(error.body.message, "Resource catalog endpoint is unavailable");
     }
 
     #[tokio::test]
