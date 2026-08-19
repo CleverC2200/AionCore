@@ -567,7 +567,10 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        let is_internal_gea_gateway = row.name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME);
+        let is_legacy_gea = row.name.trim().eq_ignore_ascii_case(LEGACY_GEA_MCP_SERVER_NAME);
+        let explicitly_selected_internal_gea_gateway = is_internal_gea_gateway && selected_ids.is_some();
+        if !selected || is_legacy_gea || (row.builtin && !explicitly_selected_internal_gea_gateway) {
             continue;
         }
 
@@ -1102,6 +1105,62 @@ mod tests {
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
+    }
+
+    #[tokio::test]
+    async fn selected_internal_gea_gateway_replaces_legacy_gea_server() {
+        let legacy = make_row(
+            LEGACY_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://legacy-gea.example.test/mcp"}"#,
+            false,
+            false,
+        );
+        let gateway = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://gea-gateway.example.test/mcp"}"#,
+            true,
+            true,
+        );
+        let selected = vec![legacy.id.clone(), gateway.id.clone()];
+        let repo = MockMcpRepo {
+            rows: vec![legacy, gateway],
+        };
+
+        let servers = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-gea-migration",
+            test_broadcaster(),
+        )
+        .await;
+
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec![INTERNAL_GEA_MCP_SERVER_NAME]);
+    }
+
+    #[tokio::test]
+    async fn internal_gea_gateway_is_not_implicitly_injected_without_a_selection() {
+        let gateway = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://gea-gateway.example.test/mcp"}"#,
+            true,
+            true,
+        );
+        let repo = MockMcpRepo { rows: vec![gateway] };
+
+        let servers = load_user_mcp_servers(
+            &repo,
+            None,
+            TEST_USER_ID,
+            "conv-without-gea-selection",
+            test_broadcaster(),
+        )
+        .await;
+
+        assert!(servers.is_empty());
     }
 
     #[cfg(unix)]
