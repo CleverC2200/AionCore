@@ -1,4 +1,4 @@
-use aion_config::compat::OpenAiApiMode;
+use aion_config::compat::{AssistantToolCallContent, OpenAiApiMode};
 use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
 
@@ -86,6 +86,40 @@ fn explicit_chat_completions_overrides_gpt_5_6_responses_default() {
     assert_eq!(base_url.as_deref(), Some("https://api.openai.com/v1"));
     assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
     assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::ChatCompletions));
+}
+
+#[test]
+fn deepseek_models_enable_strict_tool_call_content() {
+    for model in ["deepseek", "deepseek-chat", "DeepSeek-V4-Flash"] {
+        let (_, compat) = resolve_aionrs_url_and_compat_with_mode(
+            "openai",
+            "https://proxy.example.com/v1",
+            "openai",
+            model,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            compat.assistant_tool_call_content,
+            Some(AssistantToolCallContent::EmptyString),
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn non_deepseek_models_keep_default_tool_call_content() {
+    let (_, compat) = resolve_aionrs_url_and_compat_with_mode(
+        "openai",
+        "https://proxy.example.com/v1",
+        "openai",
+        "gpt-4o",
+        false,
+        None,
+    );
+
+    assert_eq!(compat.assistant_tool_call_content, None);
 }
 
 #[test]

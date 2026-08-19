@@ -1,22 +1,45 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aionui_api_types::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallResponse, GeaToolInfo,
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
+    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallResponse,
+    GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt,
     SetGeaAuthSessionRequest,
 };
-use axum::http::StatusCode;
+use aionui_db::{
+    IConversationRepository, IGeaResourceRepository, IInteractionRequestRepository, ReceiptResumeClaim,
+    StoredInteractionRequestReceipt,
+};
+use aionui_realtime::EventBroadcaster;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::GeaError;
+use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command, validate_question_answers};
 
-const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
+#[path = "service/interaction_request.rs"]
+mod projection_service;
+#[path = "service/resource_catalog.rs"]
+mod resource_catalog_service;
+
+use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
+use crate::{InteractionTurnResolver, InteractionTurnResumer};
+
+const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn:4443/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GEA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(not(test))]
+const INTERACTION_RESUME_TIMEOUT_MS: u64 = 10_000;
+#[cfg(test)]
+const INTERACTION_RESUME_TIMEOUT_MS: u64 = 100;
+// The callback is cancelled before a foreign process can take over its DB
+// claim, so two owners cannot concurrently deliver the same receipt.
+const _: () = assert!(INTERACTION_RESUME_TIMEOUT_MS < RESUME_CLAIM_LEASE_MS as u64);
 const GEA_CONTEXT_FIELDS: &[&str] = &[
     "agentcode",
     "auditid",
@@ -37,6 +60,10 @@ const GEA_CONTEXT_FIELDS: &[&str] = &[
     "userid",
 ];
 
+type InteractionScope = (String, String);
+type InteractionMutex = Arc<tokio::sync::Mutex<()>>;
+type InteractionLockMap = Arc<tokio::sync::Mutex<HashMap<InteractionScope, InteractionMutex>>>;
+
 #[derive(Clone)]
 struct GeaCredential {
     access_token: Arc<str>,
@@ -54,12 +81,20 @@ struct GeaConversationSession {
 
 /// A per-process GEA gateway. Credentials and delegation tokens deliberately
 /// remain private and are indexed by the authenticated AionCore user.
+#[derive(Clone)]
 pub struct GeaService {
     client: reqwest::Client,
     base_url: String,
-    credentials: RwLock<HashMap<String, GeaCredential>>,
-    reauth_required: RwLock<HashSet<String>>,
-    sessions: RwLock<HashMap<(String, String), GeaConversationSession>>,
+    credentials: Arc<RwLock<HashMap<String, GeaCredential>>>,
+    reauth_required: Arc<RwLock<HashSet<String>>>,
+    sessions: Arc<RwLock<HashMap<(String, String), GeaConversationSession>>>,
+    interaction_locks: InteractionLockMap,
+    projection: Option<InteractionRequestProjection>,
+    turn_resumer: Option<InteractionTurnResumer>,
+    resume_claim_owner: Arc<str>,
+    interaction_poll_interval: Option<Duration>,
+    resource_repo: Option<Arc<dyn IGeaResourceRepository>>,
+    managed_skill_root: Option<Arc<PathBuf>>,
 }
 
 impl GeaService {
@@ -69,28 +104,65 @@ impl GeaService {
             .connect_timeout(GEA_CONNECT_TIMEOUT)
             .timeout(GEA_REQUEST_TIMEOUT)
             .build()
-            .map_err(|_| {
-                GeaError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "GEA_CLIENT_INIT_FAILED",
-                    "GEA 客户端初始化失败",
-                )
-            })?;
-        Self::new(client, base_url)
+            .map_err(|_| GeaError::server_error("GEA_CLIENT_INIT_FAILED", "GEA 客户端初始化失败"))?;
+        Self::new(client, base_url).map(|mut service| {
+            service.interaction_poll_interval = Some(Duration::from_secs(3));
+            service
+        })
     }
 
     pub fn new(client: reqwest::Client, base_url: impl Into<String>) -> Result<Self, GeaError> {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        if !(base_url.starts_with("https://") || cfg!(test) && base_url.starts_with("http://")) {
+        if !(base_url.starts_with("https://")
+            || cfg!(any(test, feature = "test-support")) && base_url.starts_with("http://"))
+        {
             return Err(GeaError::invalid_request("GEA 地址必须使用 HTTPS"));
         }
         Ok(Self {
             client,
             base_url,
-            credentials: RwLock::new(HashMap::new()),
-            reauth_required: RwLock::new(HashSet::new()),
-            sessions: RwLock::new(HashMap::new()),
+            credentials: Arc::new(RwLock::new(HashMap::new())),
+            reauth_required: Arc::new(RwLock::new(HashSet::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            interaction_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            projection: None,
+            turn_resumer: None,
+            resume_claim_owner: Arc::from(Uuid::now_v7().to_string()),
+            interaction_poll_interval: None,
+            resource_repo: None,
+            managed_skill_root: None,
         })
+    }
+
+    pub fn with_resource_catalog(
+        mut self,
+        resource_repo: Arc<dyn IGeaResourceRepository>,
+        managed_skill_root: PathBuf,
+    ) -> Self {
+        self.resource_repo = Some(resource_repo);
+        self.managed_skill_root = Some(Arc::new(managed_skill_root));
+        self
+    }
+
+    pub fn with_interaction_request_projection(
+        mut self,
+        interaction_repo: Arc<dyn IInteractionRequestRepository>,
+        conversation_repo: Arc<dyn IConversationRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        turn_resolver: Option<InteractionTurnResolver>,
+    ) -> Self {
+        self.projection = Some(InteractionRequestProjection::new(
+            interaction_repo,
+            conversation_repo,
+            broadcaster,
+            turn_resolver,
+        ));
+        self
+    }
+
+    pub fn with_interaction_turn_resumer(mut self, turn_resumer: InteractionTurnResumer) -> Self {
+        self.turn_resumer = Some(turn_resumer);
+        self
     }
 
     pub async fn set_auth_session(
@@ -103,6 +175,14 @@ impl GeaService {
             return Err(GeaError::invalid_request("GEA access token 不能为空"));
         }
         let tenant_id = request.tenant_id.and_then(non_empty);
+        if let Some(repo) = &self.resource_repo {
+            repo.set_active_scope(user_id, tenant_id.as_deref().unwrap_or(""), &self.base_url)
+                .await
+                .map_err(|error| {
+                    tracing::error!(error = %error, user_id, "failed to activate GEA Resource Catalog scope");
+                    GeaError::server_error("GEA_RESOURCE_STORAGE_ERROR", "GEA 资源缓存不可用")
+                })?;
+        }
         self.credentials.write().await.insert(
             user_id.to_owned(),
             GeaCredential {
@@ -112,6 +192,10 @@ impl GeaService {
         );
         self.reauth_required.write().await.remove(user_id);
         self.clear_sessions(user_id).await;
+        self.recover_interaction_sessions(user_id).await;
+        if self.projection.is_some() {
+            self.recover_unfinalized_receipts(user_id).await?;
+        }
         Ok(GeaAuthSessionStatus {
             authenticated: true,
             reauth_required: false,
@@ -139,12 +223,22 @@ impl GeaService {
         self.credentials.write().await.remove(user_id);
         self.reauth_required.write().await.remove(user_id);
         self.clear_sessions(user_id).await;
+        self.clear_resource_scope(user_id).await;
     }
 
     async fn invalidate_auth_session(&self, user_id: &str) {
         self.credentials.write().await.remove(user_id);
         self.reauth_required.write().await.insert(user_id.to_owned());
         self.clear_sessions(user_id).await;
+        self.clear_resource_scope(user_id).await;
+    }
+
+    async fn clear_resource_scope(&self, user_id: &str) {
+        if let Some(repo) = &self.resource_repo
+            && let Err(error) = repo.clear_active_scope(user_id).await
+        {
+            tracing::error!(error = %error, user_id, "failed to clear GEA Resource Catalog scope");
+        }
     }
 
     pub async fn create_session(
@@ -152,6 +246,16 @@ impl GeaService {
         user_id: &str,
         conversation_id: &str,
         request: CreateGeaSessionRequest,
+    ) -> Result<GeaSessionResponse, GeaError> {
+        self.create_session_inner(user_id, conversation_id, request, true).await
+    }
+
+    async fn create_session_inner(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: CreateGeaSessionRequest,
+        persist_for_conversation: bool,
     ) -> Result<GeaSessionResponse, GeaError> {
         let consumer_code = request.consumer_code.trim();
         if consumer_code.is_empty() || conversation_id.trim().is_empty() {
@@ -166,13 +270,35 @@ impl GeaService {
             "conversationId": conversation_id,
             "channel": "AION_CORE"
         });
-        if let Some(preparation_id) = request.preparation_id.and_then(non_empty) {
-            body["preparationId"] = Value::String(preparation_id);
+        let preparation_id = request.preparation_id.and_then(non_empty);
+        if let Some(preparation_id) = preparation_id.as_ref() {
+            body["preparationId"] = Value::String(preparation_id.clone());
         }
 
-        let value = self
+        let (value, legacy_session) = match self
             .post_for_user(user_id, &credential, "/ai/gateway/session", &body)
-            .await?;
+            .await
+        {
+            Ok(value) => (value, false),
+            Err(error) if error.body.code == "404" => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    consumer_code,
+                    "GEA unified session endpoint is unavailable; falling back to the deployed agent session endpoint"
+                );
+                let legacy_body = json!({
+                    "agentCode": consumer_code,
+                    "channel": "CS_CLIENT"
+                });
+                (
+                    self.post_for_user(user_id, &credential, "/ai/gateway/agent/session", &legacy_body)
+                        .await?,
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         let result = value
             .get("result")
             .ok_or_else(|| invalid_upstream("GEA Session 响应缺少 result"))?;
@@ -188,7 +314,7 @@ impl GeaService {
             .ok_or_else(|| invalid_upstream("GEA Session 响应缺少 gatewayContext"))?;
         let session_id = required_string(context, "sessionId")?;
         let returned_conversation_id = required_string(context, "conversationId")?;
-        if returned_conversation_id != conversation_id {
+        if !legacy_session && returned_conversation_id != conversation_id {
             return Err(invalid_upstream("GEA Session 返回了不匹配的 conversationId"));
         }
         let returned_agent_code = context
@@ -206,6 +332,8 @@ impl GeaService {
             .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
             .unwrap_or_default();
 
+        let interaction_lock = self.interaction_lock(user_id, conversation_id).await;
+        let _interaction_guard = interaction_lock.lock().await;
         self.sessions.write().await.insert(
             (user_id.to_owned(), conversation_id.to_owned()),
             GeaConversationSession {
@@ -216,6 +344,14 @@ impl GeaService {
                 tools: HashMap::new(),
             },
         );
+        if persist_for_conversation && let Some(projection) = self.projection.as_ref() {
+            projection
+                .store_session_bootstrap(user_id, conversation_id, consumer_code, preparation_id)
+                .await?;
+        }
+        if persist_for_conversation {
+            self.spawn_interaction_request_poll(user_id, conversation_id, &session_id);
+        }
         tracing::info!(
             user_id,
             conversation_id,
@@ -229,6 +365,40 @@ impl GeaService {
             consumer_code: consumer_code.to_owned(),
             effective_capability_codes,
         })
+    }
+
+    pub async fn test_mcp_connection(
+        &self,
+        user_id: &str,
+        consumer_code: String,
+    ) -> Result<Vec<GeaToolInfo>, GeaError> {
+        let conversation_id = format!("gea-mcp-test-{}", Uuid::now_v7());
+        self.test_mcp_connection_with_id(user_id, consumer_code, conversation_id)
+            .await
+    }
+
+    async fn test_mcp_connection_with_id(
+        &self,
+        user_id: &str,
+        consumer_code: String,
+        conversation_id: String,
+    ) -> Result<Vec<GeaToolInfo>, GeaError> {
+        self.create_session_inner(
+            user_id,
+            &conversation_id,
+            CreateGeaSessionRequest {
+                consumer_code,
+                preparation_id: None,
+            },
+            false,
+        )
+        .await?;
+        let result = self.list_tools(user_id, &conversation_id).await;
+        self.sessions
+            .write()
+            .await
+            .remove(&(user_id.to_owned(), conversation_id));
+        result
     }
 
     pub async fn list_tools(&self, user_id: &str, conversation_id: &str) -> Result<Vec<GeaToolInfo>, GeaError> {
@@ -344,6 +514,480 @@ impl GeaService {
         })
     }
 
+    pub async fn list_interaction_requests(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<GeaInteractionRequestSnapshot, GeaError> {
+        let interaction_lock = self.interaction_lock(user_id, conversation_id).await;
+        let _interaction_guard = interaction_lock.lock().await;
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        self.list_interaction_requests_unlocked(user_id, conversation_id, &credential, &session)
+            .await
+    }
+
+    async fn list_interaction_requests_unlocked(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        credential: &GeaCredential,
+        session: &GeaConversationSession,
+    ) -> Result<GeaInteractionRequestSnapshot, GeaError> {
+        let value = self
+            .get_for_conversation(user_id, conversation_id, credential, session)
+            .await?;
+        let snapshot = parse_snapshot(&value)?;
+        if let Some(projection) = &self.projection {
+            projection
+                .reconcile_snapshot(user_id, conversation_id, &snapshot)
+                .await?;
+        }
+        tracing::info!(
+            user_id,
+            conversation_id,
+            revision = snapshot.revision,
+            pending_count = snapshot.items.len(),
+            "GEA interaction request snapshot loaded"
+        );
+        Ok(snapshot)
+    }
+
+    pub async fn list_all_interaction_requests(&self, user_id: &str) -> Result<InteractionRequestList, GeaError> {
+        let projection = self.projection()?;
+        self.recover_interaction_sessions(user_id).await;
+        self.recover_unfinalized_receipts(user_id).await?;
+        let conversation_ids = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .filter(|(owner, _)| owner == user_id)
+            .map(|(_, conversation_id)| conversation_id.clone())
+            .collect::<Vec<_>>();
+        for conversation_id in conversation_ids {
+            if let Err(error) = self.list_interaction_requests(user_id, &conversation_id).await {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    code = %error.body.code,
+                    "GEA interaction request refresh failed; returning the last durable projection"
+                );
+            }
+        }
+        projection.list_pending(user_id).await
+    }
+
+    async fn recover_unfinalized_receipts(&self, user_id: &str) -> Result<(), GeaError> {
+        let projection = self.projection()?;
+        for stored in projection.list_unfinalized_receipts(user_id).await? {
+            let request_id = stored.request_id;
+            let idempotency_key = stored.idempotency_key;
+            let receipt = match serde_json::from_str::<InteractionRequestReceipt>(&stored.receipt) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    tracing::error!(
+                        user_id,
+                        request_id,
+                        error = %error,
+                        "stored unfinalized Interaction Request receipt is invalid"
+                    );
+                    continue;
+                }
+            };
+            let action_lock = projection.action_lock(user_id, &request_id).await;
+            let _guard = action_lock.lock().await;
+            if let Err(error) = self
+                .finalize_interaction_receipt(user_id, &request_id, &idempotency_key, &receipt)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    request_id,
+                    code = %error.body.code,
+                    "unfinalized Interaction Request receipt recovery is still pending"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover_interaction_sessions(&self, user_id: &str) {
+        if !self.credentials.read().await.contains_key(user_id) {
+            return;
+        }
+        let Some(projection) = self.projection.as_ref() else {
+            return;
+        };
+        let bootstraps = match projection.pending_session_bootstraps(user_id).await {
+            Ok(bootstraps) => bootstraps,
+            Err(error) => {
+                tracing::warn!(user_id, code = %error.body.code, "could not load GEA session recovery records");
+                return;
+            }
+        };
+        for bootstrap in bootstraps {
+            let key = (user_id.to_owned(), bootstrap.conversation_id.clone());
+            if self.sessions.read().await.contains_key(&key) {
+                continue;
+            }
+            if let Err(error) = self
+                .create_session(
+                    user_id,
+                    &bootstrap.conversation_id,
+                    CreateGeaSessionRequest {
+                        consumer_code: bootstrap.consumer_code,
+                        preparation_id: bootstrap.preparation_id,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    conversation_id = %bootstrap.conversation_id,
+                    code = %error.body.code,
+                    "GEA session recovery failed; keeping the durable Interaction Request projection"
+                );
+            }
+        }
+    }
+
+    pub async fn act_on_global_interaction_request(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        command: InteractionRequestActionCommand,
+    ) -> Result<InteractionRequestReceipt, GeaError> {
+        let gea_command = GeaInteractionRequestActionCommand {
+            expected_version: command.expected_version.clone(),
+            idempotency_key: command.idempotency_key.clone(),
+            action_id: command.action_id.clone(),
+            payload: command.payload.clone(),
+        };
+        validate_action_command(request_id, &gea_command)?;
+        let projection = self.projection()?;
+        let action_lock = projection.action_lock(user_id, request_id).await;
+        let _guard = action_lock.lock().await;
+        if let Some(stored) = projection
+            .load_receipt(user_id, request_id, &command.idempotency_key)
+            .await?
+        {
+            if stored.expected_version != command.expected_version || stored.action_id != command.action_id {
+                return Err(GeaError::invalid_request("同一 idempotencyKey 不能用于不同版本或动作"));
+            }
+            let receipt = serde_json::from_str(&stored.receipt).map_err(|error| {
+                tracing::error!(error = %error, request_id, "stored Interaction Request receipt is invalid");
+                GeaError::internal("Interaction Request 回执无效")
+            })?;
+            return self.finalize_stored_receipt(user_id, request_id, stored, receipt).await;
+        }
+        if let Some(stored) = projection
+            .load_equivalent_receipt(user_id, request_id, &command.expected_version, &command.action_id)
+            .await?
+        {
+            let receipt = serde_json::from_str(&stored.receipt).map_err(|error| {
+                tracing::error!(error = %error, request_id, "stored equivalent Interaction Request receipt is invalid");
+                GeaError::internal("Interaction Request 回执无效")
+            })?;
+            return self.finalize_stored_receipt(user_id, request_id, stored, receipt).await;
+        }
+
+        let current = projection.find(user_id, request_id).await?;
+        let local_status = if current.version != command.expected_version {
+            Some(GeaInteractionRequestReceiptStatus::Conflict)
+        } else if !current
+            .allowed_actions
+            .iter()
+            .any(|action| action == &command.action_id)
+        {
+            Some(GeaInteractionRequestReceiptStatus::Forbidden)
+        } else if current.expires_at.as_deref().is_some_and(is_expired) {
+            Some(GeaInteractionRequestReceiptStatus::Expired)
+        } else {
+            None
+        };
+        let receipt = if let Some(status) = local_status {
+            InteractionRequestReceipt {
+                receipt_id: format!("local_{}", Uuid::now_v7()),
+                request_id: request_id.to_owned(),
+                version: current.version.clone(),
+                status,
+                turn_continuation: None,
+                resolved_at: None,
+                resolved_by: None,
+                request: Some(current),
+            }
+        } else {
+            let conversation_id = current.conversation_id.clone();
+            let interaction_lock = self.interaction_lock(user_id, &conversation_id).await;
+            let _interaction_guard = interaction_lock.lock().await;
+            let credential = self.credential(user_id).await?;
+            let session = self.session(user_id, &conversation_id).await?;
+            let upstream = self
+                .act_on_interaction_request_unlocked(
+                    user_id,
+                    &conversation_id,
+                    request_id,
+                    gea_command,
+                    &credential,
+                    &session,
+                )
+                .await?;
+            let needs_authoritative_refresh = upstream.request.is_none()
+                && matches!(
+                    upstream.status,
+                    GeaInteractionRequestReceiptStatus::Conflict
+                        | GeaInteractionRequestReceiptStatus::Forbidden
+                        | GeaInteractionRequestReceiptStatus::Expired
+                );
+            let mut request = if let Some(authoritative) = upstream.request.as_ref() {
+                Some(projection.apply_authoritative_request(user_id, authoritative).await?)
+            } else if needs_authoritative_refresh {
+                match self
+                    .list_interaction_requests_unlocked(user_id, &conversation_id, &credential, &session)
+                    .await
+                {
+                    Ok(_) => projection.find(user_id, request_id).await.ok(),
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id,
+                            request_id,
+                            code = %error.body.code,
+                            "authoritative refresh failed after GEA returned a durable action receipt"
+                        );
+                        None
+                    }
+                }
+            } else {
+                Some(current)
+            };
+            if !needs_authoritative_refresh && let Some(request) = request.as_mut() {
+                request.version = upstream.version.clone();
+                request.status = match upstream.status {
+                    GeaInteractionRequestReceiptStatus::Accepted
+                    | GeaInteractionRequestReceiptStatus::AlreadyResolved => {
+                        aionui_api_types::GeaInteractionRequestStatus::Resolved
+                    }
+                    GeaInteractionRequestReceiptStatus::Expired => {
+                        aionui_api_types::GeaInteractionRequestStatus::Expired
+                    }
+                    GeaInteractionRequestReceiptStatus::Cancelled => {
+                        aionui_api_types::GeaInteractionRequestStatus::Cancelled
+                    }
+                    GeaInteractionRequestReceiptStatus::UnknownExternalWrite => {
+                        aionui_api_types::GeaInteractionRequestStatus::VerificationRequired
+                    }
+                    GeaInteractionRequestReceiptStatus::Conflict | GeaInteractionRequestReceiptStatus::Forbidden => {
+                        aionui_api_types::GeaInteractionRequestStatus::Pending
+                    }
+                };
+            }
+            let receipt = InteractionRequestReceipt {
+                receipt_id: upstream.receipt_id,
+                request_id: upstream.request_id,
+                version: upstream.version,
+                status: upstream.status,
+                turn_continuation: upstream.turn_continuation,
+                resolved_at: upstream.resolved_at,
+                resolved_by: upstream.resolved_by,
+                request,
+            };
+            projection
+                .store_receipt(
+                    user_id,
+                    request_id,
+                    &command.idempotency_key,
+                    &command.expected_version,
+                    &command.action_id,
+                    &receipt,
+                )
+                .await?;
+            self.finalize_interaction_receipt(user_id, request_id, &command.idempotency_key, &receipt)
+                .await?;
+            return Ok(receipt);
+        };
+        projection
+            .store_receipt(
+                user_id,
+                request_id,
+                &command.idempotency_key,
+                &command.expected_version,
+                &command.action_id,
+                &receipt,
+            )
+            .await?;
+        self.finalize_interaction_receipt(user_id, request_id, &command.idempotency_key, &receipt)
+            .await?;
+        Ok(receipt)
+    }
+
+    async fn finalize_stored_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        stored: StoredInteractionRequestReceipt,
+        receipt: InteractionRequestReceipt,
+    ) -> Result<InteractionRequestReceipt, GeaError> {
+        if stored.finalized_at.is_none() {
+            self.finalize_interaction_receipt(user_id, request_id, &stored.idempotency_key, &receipt)
+                .await?;
+        }
+        Ok(receipt)
+    }
+
+    async fn finalize_interaction_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        idempotency_key: &str,
+        receipt: &InteractionRequestReceipt,
+    ) -> Result<(), GeaError> {
+        let require_resume_delivered = matches!(
+            receipt.status,
+            GeaInteractionRequestReceiptStatus::Accepted | GeaInteractionRequestReceiptStatus::AlreadyResolved
+        );
+        if require_resume_delivered {
+            let projection = self.projection()?;
+            let claim = projection
+                .claim_receipt_resume(user_id, request_id, idempotency_key, &self.resume_claim_owner)
+                .await?;
+            match claim {
+                ReceiptResumeClaim::Acquired => {
+                    projection
+                        .mark_receipt_resume_started(user_id, request_id, idempotency_key, &self.resume_claim_owner)
+                        .await?;
+                    let resume_result = match tokio::time::timeout(
+                        Duration::from_millis(INTERACTION_RESUME_TIMEOUT_MS),
+                        self.resume_interaction_turn(user_id, receipt),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(resume_delivery_unknown()),
+                    };
+                    if let Err(error) = resume_result {
+                        tracing::warn!(
+                            user_id,
+                            request_id,
+                            code = %error.body.code,
+                            "Interaction Request Turn delivery outcome is unknown; automatic replay is disabled"
+                        );
+                        return Err(resume_delivery_unknown());
+                    }
+                    projection
+                        .mark_receipt_resume_delivered(user_id, request_id, idempotency_key, &self.resume_claim_owner)
+                        .await?;
+                }
+                ReceiptResumeClaim::Delivered => {}
+                ReceiptResumeClaim::Unknown => return Err(resume_delivery_unknown()),
+                ReceiptResumeClaim::Busy => {
+                    return Err(GeaError::conflict(
+                        "GEA_INTERACTION_RESUME_IN_PROGRESS",
+                        "待办结果正在恢复原 Turn，请稍后重试",
+                    ));
+                }
+            }
+        }
+        self.projection()?
+            .finalize_receipt(user_id, request_id, idempotency_key, receipt, require_resume_delivered)
+            .await
+    }
+
+    async fn resume_interaction_turn(
+        &self,
+        user_id: &str,
+        receipt: &InteractionRequestReceipt,
+    ) -> Result<(), GeaError> {
+        let Some(request) = receipt.request.as_ref() else {
+            return Err(GeaError::internal("Interaction Request 成功回执缺少本地关联"));
+        };
+        let Some(turn_id) = request.turn_id.as_ref() else {
+            return Err(GeaError::conflict(
+                "GEA_INTERACTION_TURN_UNAVAILABLE",
+                "原 Turn 已不可恢复，请回到原会话重试",
+            ));
+        };
+        let Some(resumer) = self.turn_resumer.as_ref() else {
+            return Err(GeaError::internal("Interaction Request Turn 恢复通道未配置"));
+        };
+        resumer(
+            user_id.to_owned(),
+            request.conversation_id.clone(),
+            turn_id.clone(),
+            receipt.clone(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                user_id,
+                request_id = %receipt.request_id,
+                conversation_id = %request.conversation_id,
+                turn_id,
+                error,
+                "accepted Interaction Request could not resume its original turn"
+            );
+            GeaError::conflict(
+                "GEA_INTERACTION_TURN_UNAVAILABLE",
+                "原 Turn 已不可恢复，请回到原会话重试",
+            )
+        })
+    }
+
+    pub async fn act_on_interaction_request(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        command: GeaInteractionRequestActionCommand,
+    ) -> Result<GeaInteractionRequestReceipt, GeaError> {
+        validate_action_command(request_id, &command)?;
+        let interaction_lock = self.interaction_lock(user_id, conversation_id).await;
+        let _interaction_guard = interaction_lock.lock().await;
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        self.act_on_interaction_request_unlocked(user_id, conversation_id, request_id, command, &credential, &session)
+            .await
+    }
+
+    async fn act_on_interaction_request_unlocked(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request_id: &str,
+        command: GeaInteractionRequestActionCommand,
+        credential: &GeaCredential,
+        session: &GeaConversationSession,
+    ) -> Result<GeaInteractionRequestReceipt, GeaError> {
+        if command.action_id == "answer" {
+            validate_question_answers(command.payload.as_ref())?;
+        }
+        let mut body = session.gateway_body();
+        body["expectedVersion"] = Value::String(command.expected_version.trim().to_owned());
+        body["idempotencyKey"] = Value::String(command.idempotency_key.trim().to_owned());
+        body["actionId"] = Value::String(command.action_id.trim().to_owned());
+        if let Some(payload) = command.payload {
+            body["payload"] = payload;
+        }
+        let path = format!(
+            "/ai/gateway/interaction-requests/{}/actions",
+            encode_path_segment(request_id.trim())
+        );
+        let value = self
+            .post_for_conversation(user_id, conversation_id, credential, &path, &body)
+            .await?;
+        let receipt = parse_receipt(&value, request_id)?;
+        tracing::info!(
+            user_id,
+            conversation_id,
+            request_id,
+            version = receipt.version,
+            status = ?receipt.status,
+            audit_id = receipt.audit_id,
+            "GEA interaction request action completed"
+        );
+        Ok(receipt)
+    }
+
     async fn credential(&self, user_id: &str) -> Result<GeaCredential, GeaError> {
         self.credentials
             .read()
@@ -364,6 +1008,70 @@ impl GeaService {
 
     async fn clear_sessions(&self, user_id: &str) {
         self.sessions.write().await.retain(|(owner, _), _| owner != user_id);
+        self.interaction_locks
+            .lock()
+            .await
+            .retain(|(owner, _), _| owner != user_id);
+    }
+
+    async fn interaction_lock(&self, user_id: &str, conversation_id: &str) -> InteractionMutex {
+        let key = (user_id.to_owned(), conversation_id.to_owned());
+        let mut locks = self.interaction_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn projection(&self) -> Result<&InteractionRequestProjection, GeaError> {
+        self.projection
+            .as_ref()
+            .ok_or_else(|| GeaError::internal("Interaction Request 投影未配置"))
+    }
+
+    fn spawn_interaction_request_poll(&self, user_id: &str, conversation_id: &str, session_id: &str) {
+        let Some(interval) = self.interaction_poll_interval else {
+            return;
+        };
+        if self.projection.is_none() {
+            return;
+        }
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        let session_id = session_id.to_owned();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let active = service
+                    .sessions
+                    .read()
+                    .await
+                    .get(&(user_id.clone(), conversation_id.clone()))
+                    .is_some_and(|session| session.session_id == session_id);
+                if !active {
+                    break;
+                }
+                if let Err(error) = service.recover_unfinalized_receipts(&user_id).await {
+                    tracing::warn!(
+                        user_id,
+                        code = %error.body.code,
+                        "GEA unfinalized Interaction Request receipt background recovery failed"
+                    );
+                }
+                if let Err(error) = service.list_interaction_requests(&user_id, &conversation_id).await {
+                    tracing::warn!(
+                        user_id,
+                        conversation_id,
+                        code = %error.body.code,
+                        "GEA interaction request background refresh failed"
+                    );
+                }
+            }
+        });
     }
 
     async fn post_for_user(
@@ -377,7 +1085,7 @@ impl GeaService {
             ensure_success(&value)?;
             Ok(value)
         });
-        if matches!(&result, Err(error) if error.status == StatusCode::UNAUTHORIZED) {
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
             self.invalidate_auth_session(user_id).await;
         }
         result
@@ -421,7 +1129,7 @@ impl GeaService {
             .json(body)
             .send()
             .await
-            .map_err(|_| GeaError::new(StatusCode::BAD_GATEWAY, "GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
+            .map_err(|_| GeaError::bad_gateway("GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
         let status = response.status();
         let retry_after_ms = parse_retry_after_ms(response.headers());
         let value = response
@@ -429,7 +1137,75 @@ impl GeaService {
             .await
             .map_err(|_| invalid_upstream("GEA 返回了无效 JSON"))?;
         if !status.is_success() {
-            let mut error = upstream_business_error(&value, status);
+            let mut error = upstream_business_error(&value, status.as_u16());
+            error.body.retry_after_ms = retry_after_ms;
+            return Err(error);
+        }
+        Ok(value)
+    }
+
+    async fn get_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        credential: &GeaCredential,
+        session: &GeaConversationSession,
+    ) -> Result<Value, GeaError> {
+        let result = self.get(credential, session).await.and_then(|value| {
+            ensure_success(&value)?;
+            Ok(value)
+        });
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
+            self.invalidate_auth_session(user_id).await;
+        }
+        if matches!(&result, Err(error) if error.body.category == "SESSION") {
+            self.sessions
+                .write()
+                .await
+                .remove(&(user_id.to_owned(), conversation_id.to_owned()));
+        }
+        result
+    }
+
+    async fn get(&self, credential: &GeaCredential, session: &GeaConversationSession) -> Result<Value, GeaError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-access-token",
+            HeaderValue::from_str(credential.access_token.as_ref())
+                .map_err(|_| GeaError::invalid_request("GEA access token 格式无效"))?,
+        );
+        if let Some(tenant_id) = credential.tenant_id.as_deref() {
+            headers.insert(
+                "x-tenant-id",
+                HeaderValue::from_str(tenant_id).map_err(|_| GeaError::invalid_request("GEA tenantId 格式无效"))?,
+            );
+        }
+        headers.insert(
+            "x-delegation-token",
+            HeaderValue::from_str(session.delegation_token.as_ref())
+                .map_err(|_| GeaError::invalid_request("GEA delegationToken 格式无效"))?,
+        );
+        let response = self
+            .client
+            .get(format!("{}/ai/gateway/interaction-requests", self.base_url))
+            .headers(headers)
+            .query(&[
+                ("agentCode", session.agent_code.as_str()),
+                ("sessionId", session.session_id.as_str()),
+                ("conversationId", session.conversation_id.as_str()),
+                ("status", "pending"),
+            ])
+            .send()
+            .await
+            .map_err(|_| GeaError::bad_gateway("GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
+        let status = response.status();
+        let retry_after_ms = parse_retry_after_ms(response.headers());
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|_| invalid_upstream("GEA 返回了无效 JSON"))?;
+        if !status.is_success() {
+            let mut error = upstream_business_error(&value, status.as_u16());
             error.body.retry_after_ms = retry_after_ms;
             return Err(error);
         }
@@ -448,9 +1224,26 @@ impl GeaConversationSession {
     }
 }
 
+fn encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
 fn non_empty(value: impl AsRef<str>) -> Option<String> {
     let value = value.as_ref().trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn is_expired(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|expires_at| expires_at < chrono::Utc::now())
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, GeaError> {
@@ -465,7 +1258,7 @@ fn ensure_success(value: &Value) -> Result<(), GeaError> {
     if value.get("success").and_then(Value::as_bool) == Some(true) {
         Ok(())
     } else {
-        Err(upstream_business_error(value, StatusCode::OK))
+        Err(upstream_business_error(value, 200))
     }
 }
 
@@ -492,11 +1285,18 @@ fn is_gea_context_field(name: &str) -> bool {
 }
 
 fn invalid_upstream(message: impl Into<String>) -> GeaError {
-    GeaError::new(StatusCode::BAD_GATEWAY, "GEA_INVALID_RESPONSE", message)
+    GeaError::bad_gateway("GEA_INVALID_RESPONSE", message)
+}
+
+fn resume_delivery_unknown() -> GeaError {
+    GeaError::conflict(
+        "GEA_INTERACTION_RESUME_UNKNOWN",
+        "原 Turn 恢复结果未知，已禁止自动重试，请回到原会话核验",
+    )
 }
 
 fn access_denied_error(value: &Value) -> GeaError {
-    let mut error = upstream_business_error(value, StatusCode::FORBIDDEN);
+    let mut error = upstream_business_error(value, 403);
     if error.body.code == "GEA_UPSTREAM_ERROR" {
         error.body.code = value
             .pointer("/result/accessDecision/code")
@@ -506,7 +1306,7 @@ fn access_denied_error(value: &Value) -> GeaError {
     error
 }
 
-fn upstream_business_error(value: &Value, fallback_status: StatusCode) -> GeaError {
+fn upstream_business_error(value: &Value, fallback_status: u16) -> GeaError {
     let code = value
         .get("code")
         .and_then(value_as_string)
@@ -517,12 +1317,12 @@ fn upstream_business_error(value: &Value, fallback_status: StatusCode) -> GeaErr
         .and_then(non_empty)
         .unwrap_or_else(|| "GEA 请求未完成".to_owned());
     let category = value.get("category").and_then(Value::as_str).and_then(non_empty);
-    let status = if fallback_status.is_success() {
+    let status = if (200..300).contains(&fallback_status) {
         status_for_category(category.as_deref())
     } else {
         fallback_status
     };
-    let mut error = GeaError::new(status, code, message);
+    let mut error = GeaError::from_http_status(status, code, message);
     if let Some(category) = category {
         error.body.category = category;
     }
@@ -538,15 +1338,15 @@ fn upstream_business_error(value: &Value, fallback_status: StatusCode) -> GeaErr
     error
 }
 
-fn status_for_category(category: Option<&str>) -> StatusCode {
+fn status_for_category(category: Option<&str>) -> u16 {
     match category {
-        Some("AUTHENTICATION") => StatusCode::UNAUTHORIZED,
-        Some("AUTHORIZATION") => StatusCode::FORBIDDEN,
-        Some("SESSION") | Some("CONFLICT") => StatusCode::CONFLICT,
-        Some("VALIDATION") => StatusCode::UNPROCESSABLE_ENTITY,
-        Some("RATE_LIMIT") => StatusCode::TOO_MANY_REQUESTS,
-        Some("UPSTREAM") => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::BAD_GATEWAY,
+        Some("AUTHENTICATION") => 401,
+        Some("AUTHORIZATION") => 403,
+        Some("SESSION") | Some("CONFLICT") => 409,
+        Some("VALIDATION") => 422,
+        Some("RATE_LIMIT") => 429,
+        Some("UPSTREAM") => 502,
+        _ => 502,
     }
 }
 
@@ -568,9 +1368,21 @@ fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use aionui_api_types::{CreateGeaSessionRequest, SetGeaAuthSessionRequest};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use aionui_api_types::{
+        CreateGeaSessionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
+        GeaInteractionRequestReceiptStatus, GeaInteractionRequestStatus, InteractionRequestActionCommand,
+        InteractionRequestReceipt, SetGeaAuthSessionRequest,
+    };
+    use aionui_db::{SqliteConversationRepository, SqliteInteractionRequestRepository, init_database_memory};
+    use aionui_realtime::BroadcastEventBus;
     use serde_json::json;
-    use wiremock::matchers::{body_json, body_partial_json, header, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::GeaService;
@@ -588,6 +1400,101 @@ mod tests {
             .await
             .unwrap();
         service
+    }
+
+    async fn projected_service(server: &MockServer) -> (GeaService, aionui_db::Database) {
+        let database = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES ('user-1', 'gea-test-user', 'not-used', 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, user_id, name, type, extra, status, pinned, created_at, updated_at) \
+             VALUES ('conversation-1', 'user-1', 'GEA fixture', 'aionrs', '{}', 'running', 0, 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let service = authenticated_service(server)
+            .await
+            .with_interaction_request_projection(
+                Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone())),
+                Arc::new(SqliteConversationRepository::new(database.pool().clone())),
+                Arc::new(BroadcastEventBus::new(32)),
+                Some(Arc::new(|_| Some("turn-1".to_owned()))),
+            )
+            .with_interaction_turn_resumer(Arc::new(|_, _, _, _| Box::pin(async { Ok(()) })));
+        (service, database)
+    }
+
+    async fn mount_question_snapshot(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "pending-r1",
+                    "items": [{
+                        "id": "request-question-1",
+                        "version": "v1",
+                        "status": "pending",
+                        "kind": "question",
+                        "title": "Choose a cost center",
+                        "sourceLabel": "ERP",
+                        "allowedActions": ["answer", "decline"],
+                        "updatedAt": "2026-08-17T10:00:10+08:00",
+                        "presentation": {
+                            "type": "question",
+                            "questions": [{
+                                "header": "Cost center",
+                                "question": "Which cost center?",
+                                "multiSelect": false,
+                                "options": [{ "label": "CC-100" }]
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_permission_snapshot(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "permission-r1",
+                    "items": [{
+                        "id": "request-permission-1",
+                        "version": "v3",
+                        "status": "pending",
+                        "kind": "permission",
+                        "title": "Confirm production submission",
+                        "sourceLabel": "OA",
+                        "allowedActions": ["proceed_once", "reject_once"],
+                        "updatedAt": "2026-08-17T10:02:00+08:00",
+                        "presentation": {
+                            "type": "permission",
+                            "title": "Confirm production submission",
+                            "description": "Submit the reviewed request once.",
+                            "operation": "execute",
+                            "detail": "test-environment",
+                            "options": [
+                                { "label": "Allow once", "value": "proceed_once" },
+                                { "label": "Reject", "value": "reject_once" }
+                            ]
+                        }
+                    }]
+                }
+            })))
+            .mount(server)
+            .await;
     }
 
     async fn mount_session(server: &MockServer) {
@@ -620,6 +1527,32 @@ mod tests {
             .await;
     }
 
+    async fn mount_recoverable_session(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .and(header("x-access-token", "test-access-token"))
+            .and(body_partial_json(json!({
+                "consumerCode": "agent-sales",
+                "conversationId": "conversation-1",
+                "preparationId": "preparation-1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": { "allowed": true },
+                    "delegationToken": "delegation-secret",
+                    "gatewayContext": {
+                        "consumerCode": "agent-sales",
+                        "sessionId": "gea-session-recovered",
+                        "conversationId": "conversation-1"
+                    }
+                }
+            })))
+            .expect(2)
+            .mount(server)
+            .await;
+    }
+
     async fn create_session(service: &GeaService) {
         service
             .create_session(
@@ -632,6 +1565,810 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rehydrated_auth_recovers_pending_sessions_from_non_secret_bootstrap_data() {
+        let server = MockServer::start().await;
+        mount_recoverable_session(&server).await;
+        mount_question_snapshot(&server).await;
+        let (service, database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        drop(service);
+
+        let restarted = GeaService::new(reqwest::Client::new(), server.uri())
+            .unwrap()
+            .with_interaction_request_projection(
+                Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone())),
+                Arc::new(SqliteConversationRepository::new(database.pool().clone())),
+                Arc::new(BroadcastEventBus::new(32)),
+                Some(Arc::new(|_| Some("turn-1".to_owned()))),
+            )
+            .with_interaction_turn_resumer(Arc::new(|_, _, _, _| Box::pin(async { Ok(()) })));
+        restarted
+            .set_auth_session(
+                "user-1",
+                SetGeaAuthSessionRequest {
+                    access_token: "test-access-token".to_owned(),
+                    tenant_id: Some("tenant-1".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let pending = restarted.list_all_interaction_requests("user-1").await.unwrap();
+        assert_eq!(pending.items.len(), 1);
+        assert_eq!(pending.items[0].id, "request-question-1");
+    }
+
+    #[tokio::test]
+    async fn global_action_replay_returns_one_persisted_receipt_and_one_upstream_write() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "v1",
+                "idempotencyKey": "interaction:request-question-1:v1:answer",
+                "actionId": "answer"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-1",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "accepted",
+                    "resolvedAt": "2026-08-17T10:01:00+08:00"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        let resumed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = service.with_interaction_turn_resumer({
+            let resumed = Arc::clone(&resumed);
+            Arc::new(move |user_id, conversation_id, turn_id, receipt| {
+                let resumed = Arc::clone(&resumed);
+                Box::pin(async move {
+                    resumed
+                        .lock()
+                        .unwrap()
+                        .push((user_id, conversation_id, turn_id, receipt.receipt_id));
+                    Ok(())
+                })
+            })
+        });
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "interaction:request-question-1:v1:answer".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap();
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(first.status, GeaInteractionRequestReceiptStatus::Accepted);
+        assert_eq!(
+            resumed.lock().unwrap().as_slice(),
+            &[(
+                "user-1".to_owned(),
+                "conversation-1".to_owned(),
+                "turn-1".to_owned(),
+                "receipt-1".to_owned(),
+            )]
+        );
+        assert!(
+            service
+                .projection()
+                .unwrap()
+                .list_pending("user-1")
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_equivalent_actions_with_different_keys_share_one_upstream_write() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(30))
+                    .set_body_json(json!({
+                        "success": true,
+                        "result": {
+                            "receiptId": "receipt-concurrent",
+                            "requestId": "request-question-1",
+                            "version": "v2",
+                            "status": "accepted"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let command = |key: &str| InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: key.to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let (first, second) = tokio::join!(
+            service.act_on_global_interaction_request("user-1", "request-question-1", command("command-a")),
+            service.act_on_global_interaction_request("user-1", "request-question-1", command("command-b"))
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.receipt_id, "receipt-concurrent");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn failed_turn_delivery_becomes_unknown_and_is_not_automatically_replayed() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-resume-retry",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "accepted"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let service = service.with_interaction_turn_resumer({
+            let resume_attempts = Arc::clone(&resume_attempts);
+            Arc::new(move |_, _, _, _| {
+                resume_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Err("turn delivery result unavailable".to_owned()) })
+            })
+        });
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "resume-retry".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(first.body.code, "GEA_INTERACTION_RESUME_UNKNOWN");
+        assert_eq!(
+            service
+                .projection()
+                .unwrap()
+                .list_pending("user-1")
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap_err();
+        assert_eq!(replay.body.code, "GEA_INTERACTION_RESUME_UNKNOWN");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_turn_resume_becomes_unknown_before_the_claim_lease_and_is_not_replayed() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-resume-timeout",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "accepted"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, database) = projected_service(&server).await;
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let service = service.with_interaction_turn_resumer({
+            let resume_attempts = Arc::clone(&resume_attempts);
+            Arc::new(move |_, _, _, _| {
+                resume_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Ok(())
+                })
+            })
+        });
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+
+        let error = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-question-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v1".to_owned(),
+                    idempotency_key: "resume-timeout".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.body.code, "GEA_INTERACTION_RESUME_UNKNOWN");
+        let state: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT resume_claim_owner IS NOT NULL, resume_started_at IS NOT NULL, \
+                    resume_delivered_at IS NOT NULL, finalized_at IS NOT NULL \
+             FROM gea_interaction_request_receipts WHERE idempotency_key = 'resume-timeout'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, (1, 1, 0, 0));
+        let replay = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-question-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v1".to_owned(),
+                    idempotency_key: "resume-timeout".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(replay.body.code, "GEA_INTERACTION_RESUME_UNKNOWN");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn delivered_marker_failure_never_replays_the_turn_callback() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-marker-failure",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "accepted"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, database) = projected_service(&server).await;
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let service = service.with_interaction_turn_resumer({
+            let resume_attempts = Arc::clone(&resume_attempts);
+            Arc::new(move |_, _, _, _| {
+                resume_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_interaction_resume_delivered \
+             BEFORE UPDATE OF resume_delivered_at ON gea_interaction_request_receipts \
+             WHEN NEW.resume_delivered_at IS NOT NULL \
+             BEGIN SELECT RAISE(FAIL, 'simulated delivered marker failure'); END",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "marker-failure".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(first.body.code, "GEA_INTERACTION_REQUEST_STORAGE_ERROR");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+        sqlx::query("DROP TRIGGER fail_interaction_resume_delivered")
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap_err();
+        assert_eq!(replay.body.code, "GEA_INTERACTION_RESUME_UNKNOWN");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_storage_failure_replays_without_delivering_the_turn_twice() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-finalize-retry",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "accepted"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, database) = projected_service(&server).await;
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let service = service.with_interaction_turn_resumer({
+            let resume_attempts = Arc::clone(&resume_attempts);
+            Arc::new(move |_, _, _, _| {
+                resume_attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_interaction_receipt_finalize \
+             BEFORE UPDATE OF finalized_at ON gea_interaction_request_receipts \
+             WHEN NEW.finalized_at IS NOT NULL \
+             BEGIN SELECT RAISE(FAIL, 'simulated finalize failure'); END",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "finalize-retry".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(first.body.code, "GEA_INTERACTION_REQUEST_STORAGE_ERROR");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+        sqlx::query("DROP TRIGGER fail_interaction_receipt_finalize")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE gea_interaction_request_receipts SET resume_claimed_at = 1 \
+             WHERE idempotency_key = 'finalize-retry'",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap();
+        assert_eq!(replay.receipt_id, "receipt-finalize-retry");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_service_owner_automatically_recovers_a_claim_left_before_turn_delivery() {
+        let server = MockServer::start().await;
+        mount_recoverable_session(&server).await;
+        mount_question_snapshot(&server).await;
+        let (service, database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let request = service
+            .projection()
+            .unwrap()
+            .find("user-1", "request-question-1")
+            .await
+            .unwrap();
+        let receipt = InteractionRequestReceipt {
+            receipt_id: "receipt-crashed-owner".to_owned(),
+            request_id: "request-question-1".to_owned(),
+            version: "v2".to_owned(),
+            status: GeaInteractionRequestReceiptStatus::Accepted,
+            turn_continuation: Some(aionui_api_types::GeaInteractionTurnContinuation::OriginalToolCallReleased),
+            resolved_at: None,
+            resolved_by: None,
+            request: Some(request),
+        };
+        sqlx::query(
+            "INSERT INTO gea_interaction_request_receipts \
+                (user_id, request_id, idempotency_key, expected_version, action_id, receipt, created_at, \
+                 resume_claim_owner, resume_claimed_at) \
+             VALUES ('user-1', 'request-question-1', 'crashed-owner', 'v1', 'answer', ?, 1, 'dead-process', ?)",
+        )
+        .bind(serde_json::to_string(&receipt).unwrap())
+        .bind(1_i64)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let restarted = GeaService::new(reqwest::Client::new(), server.uri())
+            .unwrap()
+            .with_interaction_request_projection(
+                Arc::new(SqliteInteractionRequestRepository::new(database.pool().clone())),
+                Arc::new(SqliteConversationRepository::new(database.pool().clone())),
+                Arc::new(BroadcastEventBus::new(32)),
+                Some(Arc::new(|_| Some("turn-1".to_owned()))),
+            )
+            .with_interaction_turn_resumer({
+                let resume_attempts = Arc::clone(&resume_attempts);
+                Arc::new(move |_, _, _, _| {
+                    resume_attempts.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                })
+            });
+        restarted
+            .set_auth_session(
+                "user-1",
+                SetGeaAuthSessionRequest {
+                    access_token: "test-access-token".to_owned(),
+                    tenant_id: Some("tenant-1".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
+        let finalized_at: Option<i64> = sqlx::query_scalar(
+            "SELECT finalized_at FROM gea_interaction_request_receipts \
+             WHERE idempotency_key = 'crashed-owner'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(finalized_at.is_some());
+        assert!(
+            restarted
+                .projection()
+                .unwrap()
+                .list_pending("user-1")
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_global_action_is_blocked_before_the_upstream_write() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        let (service, _database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+
+        let receipt = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-question-1",
+                InteractionRequestActionCommand {
+                    expected_version: "stale-v0".to_owned(),
+                    idempotency_key: "stale-command".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, GeaInteractionRequestReceiptStatus::Conflict);
+        assert_eq!(receipt.request.unwrap().version, "v1");
+    }
+
+    #[tokio::test]
+    async fn authoritative_refresh_failure_preserves_and_replays_the_upstream_conflict_receipt() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "pending-r1",
+                    "items": [{
+                        "id": "request-question-1",
+                        "version": "v1",
+                        "status": "pending",
+                        "kind": "question",
+                        "title": "Choose a cost center",
+                        "allowedActions": ["answer", "decline"],
+                        "updatedAt": "2026-08-17T10:00:10+08:00",
+                        "presentation": {
+                            "type": "question",
+                            "questions": [{
+                                "question": "Which cost center?",
+                                "multiSelect": false,
+                                "options": [{ "label": "CC-100" }]
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "code": "GEA_REFRESH_UNAVAILABLE",
+                "message": "refresh unavailable",
+                "category": "UPSTREAM"
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-conflict-refresh-failed",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "conflict"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "conflict-refresh-failed".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.status, GeaInteractionRequestReceiptStatus::Conflict);
+        assert!(first.request.is_none());
+
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+    }
+
+    #[tokio::test]
+    async fn active_session_poll_discovers_a_new_request_without_client_polling() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        let (mut service, _database) = projected_service(&server).await;
+        service.interaction_poll_interval = Some(Duration::from_millis(10));
+        create_session(&service).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !service
+                    .projection()
+                    .unwrap()
+                    .list_pending("user-1")
+                    .await
+                    .unwrap()
+                    .items
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background poll should project the pending request");
+        service.clear_auth_session("user-1").await;
+    }
+
+    #[tokio::test]
+    async fn permission_accepts_only_the_current_allowed_action() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_permission_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-permission-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "v3",
+                "idempotencyKey": "permission-allowed",
+                "actionId": "proceed_once"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "permission-receipt-1",
+                    "requestId": "request-permission-1",
+                    "version": "v4",
+                    "status": "already_resolved",
+                    "resolvedAt": "2026-08-17T10:03:00+08:00"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+
+        let forbidden = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-permission-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v3".to_owned(),
+                    idempotency_key: "permission-forbidden".to_owned(),
+                    action_id: "proceed_always".to_owned(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status, GeaInteractionRequestReceiptStatus::Forbidden);
+
+        let accepted = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-permission-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v3".to_owned(),
+                    idempotency_key: "permission-allowed".to_owned(),
+                    action_id: "proceed_once".to_owned(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status, GeaInteractionRequestReceiptStatus::AlreadyResolved);
+    }
+
+    #[tokio::test]
+    async fn unknown_external_write_is_terminal_and_never_auto_retried() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "unknown-receipt-1",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "unknown_external_write"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, _database) = projected_service(&server).await;
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        let command = InteractionRequestActionCommand {
+            expected_version: "v1".to_owned(),
+            idempotency_key: "unknown-command".to_owned(),
+            action_id: "answer".to_owned(),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
+        };
+
+        let first = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command.clone())
+            .await
+            .unwrap();
+        let replay = service
+            .act_on_global_interaction_request("user-1", "request-question-1", command)
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(first.status, GeaInteractionRequestReceiptStatus::UnknownExternalWrite);
+        assert_eq!(
+            first.request.unwrap().status,
+            GeaInteractionRequestStatus::VerificationRequired
+        );
+        assert!(
+            service
+                .projection()
+                .unwrap()
+                .list_pending("user-1")
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     async fn mount_query_tool(server: &MockServer) {
@@ -677,6 +2414,62 @@ mod tests {
 
         assert_eq!(response.session_id, "gea-session-1");
         assert_eq!(response.conversation_id, "conversation-1");
+        assert_eq!(response.consumer_code, "agent-sales");
+    }
+
+    #[tokio::test]
+    async fn session_falls_back_to_the_deployed_agent_endpoint_when_unified_path_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": false,
+                "code": "404",
+                "message": "路径不存在，请检查路径是否正确",
+                "category": "UPSTREAM",
+                "retryable": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/agent/session"))
+            .and(body_json(json!({
+                "agentCode": "agent-sales",
+                "channel": "CS_CLIENT"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": { "allowed": true },
+                    "delegationToken": "delegation-secret",
+                    "effectiveCapabilityCodes": ["MCP_TOOL:cube:query_business_data"],
+                    "gatewayContext": {
+                        "agentId": "agent-sales",
+                        "sessionId": "gea-session-legacy",
+                        "conversationId": "gea-conversation-legacy"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let service = authenticated_service(&server).await;
+
+        let response = service
+            .create_session(
+                "user-1",
+                "conversation-local",
+                CreateGeaSessionRequest {
+                    consumer_code: "agent-sales".to_owned(),
+                    preparation_id: None,
+                },
+            )
+            .await
+            .expect("fallback session");
+
+        assert_eq!(response.session_id, "gea-session-legacy");
+        assert_eq!(response.conversation_id, "gea-conversation-legacy");
         assert_eq!(response.consumer_code, "agent-sales");
     }
 
@@ -761,6 +2554,70 @@ mod tests {
 
         assert_eq!(response.audit_id.as_deref(), Some("audit-1"));
         assert_eq!(response.result, json!({ "rows": [] }));
+    }
+
+    #[tokio::test]
+    async fn mcp_connection_test_creates_a_temporary_session_and_lists_real_tools() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .and(body_partial_json(json!({
+                "consumerCode": "agent-sales",
+                "conversationId": "gea-probe-1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": { "allowed": true },
+                    "delegationToken": "delegation-secret",
+                    "gatewayContext": {
+                        "consumerCode": "agent-sales",
+                        "sessionId": "gea-session-probe",
+                        "conversationId": "gea-probe-1"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/list"))
+            .and(body_json(json!({
+                "agentCode": "agent-sales",
+                "sessionId": "gea-session-probe",
+                "conversationId": "gea-probe-1",
+                "delegationToken": "delegation-secret"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "tools": [{
+                    "name": "query_business_data",
+                    "sourceCode": "cube",
+                    "description": "Query business data",
+                    "inputSchema": { "type": "object" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let service = authenticated_service(&server).await;
+
+        let tools = service
+            .test_mcp_connection_with_id("user-1", "agent-sales".to_owned(), "gea-probe-1".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "query_business_data");
+        assert!(
+            service
+                .sessions
+                .read()
+                .await
+                .get(&("user-1".to_owned(), "gea-probe-1".to_owned()))
+                .is_none(),
+            "connection tests must not retain a conversation session"
+        );
     }
 
     #[test]
@@ -1080,5 +2937,123 @@ mod tests {
         assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
         assert_eq!(error.body.category, "CONFLICT");
         assert!(service.session("user-1", "conversation-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn interaction_snapshot_uses_the_existing_gateway_session_context() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .and(query_param("agentCode", "agent-sales"))
+            .and(query_param("sessionId", "gea-session-1"))
+            .and(query_param("conversationId", "conversation-1"))
+            .and(query_param("status", "pending"))
+            .and(header("x-delegation-token", "delegation-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "pending-r1",
+                    "items": [{
+                        "id": "erp:cost-center:payment-1",
+                        "version": "v1",
+                        "status": "pending",
+                        "kind": "question",
+                        "title": "补充成本中心",
+                        "sourceLabel": "ERP 财务系统",
+                        "allowedActions": ["answer", "decline"],
+                        "updatedAt": "2026-08-17T10:00:10+08:00",
+                        "presentation": {
+                            "type": "question",
+                            "questions": [{
+                                "question": "本次付款申请应归属哪个成本中心？",
+                                "multiSelect": false,
+                                "options": [{ "label": "华东业务中心" }]
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = authenticated_service(&server).await;
+        create_session(&service).await;
+        let snapshot = service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.revision, "pending-r1");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].kind, GeaInteractionRequestKind::Question);
+        assert_eq!(snapshot.items[0].status, GeaInteractionRequestStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn interaction_action_injects_gateway_context_and_preserves_the_receipt() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/ai/gateway/interaction-requests/erp%3Acost-center%3Apayment-1/actions",
+            ))
+            .and(body_json(json!({
+                "agentCode": "agent-sales",
+                "sessionId": "gea-session-1",
+                "conversationId": "conversation-1",
+                "delegationToken": "delegation-secret",
+                "expectedVersion": "v1",
+                "idempotencyKey": "interaction:erp:cost-center:payment-1:v1:answer",
+                "actionId": "answer",
+                "payload": {
+                    "answers": [{
+                        "question": "本次付款申请应归属哪个成本中心？",
+                        "labels": ["华东业务中心"]
+                    }]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "receipt-1",
+                    "requestId": "erp:cost-center:payment-1",
+                    "version": "v1",
+                    "status": "accepted",
+                    "resolvedAt": "2026-08-17T10:03:00+08:00",
+                    "resolvedBy": "user-opaque-id",
+                    "auditId": "audit-2"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = authenticated_service(&server).await;
+        create_session(&service).await;
+        let receipt = service
+            .act_on_interaction_request(
+                "user-1",
+                "conversation-1",
+                "erp:cost-center:payment-1",
+                GeaInteractionRequestActionCommand {
+                    expected_version: "v1".to_owned(),
+                    idempotency_key: "interaction:erp:cost-center:payment-1:v1:answer".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: Some(json!({
+                        "answers": [{
+                            "question": "本次付款申请应归属哪个成本中心？",
+                            "labels": ["华东业务中心"]
+                        }]
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.receipt_id, "receipt-1");
+        assert_eq!(receipt.status, GeaInteractionRequestReceiptStatus::Accepted);
+        assert_eq!(receipt.audit_id.as_deref(), Some("audit-2"));
     }
 }

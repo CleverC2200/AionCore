@@ -20,6 +20,44 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+pub async fn build_app_with_gea_base_url(base_url: String) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
+    let gea = aionui_gea::GeaService::new(reqwest::Client::new(), base_url)
+        .unwrap()
+        .with_resource_catalog(
+            services.gea_resource_repo.clone(),
+            services.data_dir.join("managed-skills"),
+        )
+        .with_interaction_request_projection(
+            std::sync::Arc::new(aionui_db::SqliteInteractionRequestRepository::new(
+                services.database.pool().clone(),
+            )),
+            services.conversation_repo.clone(),
+            services.event_bus.clone(),
+            Some({
+                let runtime_state = services.conversation_runtime_state.clone();
+                std::sync::Arc::new(move |conversation_id: &str| runtime_state.active_turn_id_for(conversation_id))
+            }),
+        )
+        .with_interaction_turn_resumer({
+            let conversation_service = services.conversation_service.clone();
+            std::sync::Arc::new(move |user_id, conversation_id, turn_id, receipt| {
+                let conversation_service = conversation_service.clone();
+                Box::pin(async move {
+                    conversation_service
+                        .resume_interaction_turn(&user_id, &conversation_id, &turn_id, &receipt)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            })
+        });
+    states.gea = aionui_gea::GeaRouterState::new(gea);
+    let router = create_router_with_states(&services, states);
+    (router, services)
+}
+
 /// Build an app whose skill router uses the given temp directories.
 ///
 /// Use for HTTP integration tests that need deterministic on-disk layouts
@@ -71,6 +109,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
     states.skill = SkillRouterState {
         skill_paths: paths.clone(),
         skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
+        managed_skill_repo: Some(services.gea_resource_repo.clone()),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
     };

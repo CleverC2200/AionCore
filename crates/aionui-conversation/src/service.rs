@@ -21,10 +21,11 @@ use aionui_api_types::{
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    GeaInteractionTurnContinuation, InteractionRequestReceipt, ListConversationsQuery, ListMessagesQuery,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -54,7 +55,9 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
-use crate::skill_resolver::SkillResolver;
+use crate::skill_resolver::{
+    ManagedSkillExecutionReport, ManagedSkillExecutionReporter, SkillResolver, managed_skill_snapshots_from_extra,
+};
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
@@ -309,6 +312,7 @@ pub struct ConversationService {
     workspace_root: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
+    managed_skill_execution_reporter: Arc<RwLock<Option<Arc<dyn ManagedSkillExecutionReporter>>>>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
@@ -383,6 +387,111 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    /// Deliver an accepted external interaction result into the same live Turn
+    /// that originally paused for the human decision. This never creates a new
+    /// conversation, message, or Turn.
+    pub async fn resume_interaction_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        receipt: &InteractionRequestReceipt,
+    ) -> Result<(), ConversationError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
+        let is_aionrs = parse_agent_type_from_row(&conversation) == Some(AgentType::Aionrs);
+        let original_tool_call_released =
+            receipt.turn_continuation == Some(GeaInteractionTurnContinuation::OriginalToolCallReleased);
+        if active_turn_id.as_deref() != Some(turn_id) {
+            // The receipt explicitly confirms that GEA released the original
+            // MCP call, so the Turn may finish before the action response gets
+            // here. For the pinned first-party runtime,
+            // CleverC2200/aionrs@c02065b8 crates/aion-mcp/src/manager.rs:
+            // 233-276 awaits the transport response and
+            // crates/aion-agent/src/orchestration.rs:317-342 awaits execution
+            // before emitting that result. Our bridge awaits the HTTP response in
+            // crates/aionui-app/src/commands/cmd_gea_stdio.rs:314-334.
+            if is_aionrs && active_turn_id.is_none() && original_tool_call_released {
+                info!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    request_id = %receipt.request_id,
+                    receipt_id = %receipt.receipt_id,
+                    "accepted Interaction Request already released its completed Aionrs tool call"
+                );
+                return Ok(());
+            }
+            return Err(ConversationError::Busy {
+                reason: "the interaction request no longer belongs to the active turn".to_owned(),
+            });
+        }
+        if is_aionrs {
+            if !original_tool_call_released {
+                return Err(ConversationError::Busy {
+                    reason: "GEA receipt did not confirm release of the original tool call".to_owned(),
+                });
+            }
+            // The explicit continuation receipt and synchronous MCP path mean
+            // a second mid-turn injection would duplicate the tool result.
+            info!(
+                user_id,
+                conversation_id,
+                turn_id,
+                request_id = %receipt.request_id,
+                receipt_id = %receipt.receipt_id,
+                "accepted Interaction Request released its original Aionrs tool call"
+            );
+            return Ok(());
+        }
+        let agent =
+            self.task_manager
+                .get_task(conversation_id)
+                .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                    conversation_id: conversation_id.to_owned(),
+                })?;
+        if !agent.supports_midturn_delivery() {
+            return Err(ConversationError::Busy {
+                reason: "the active agent cannot resume an interaction request in place".to_owned(),
+            });
+        }
+        let content = serde_json::json!({
+            "type": "interaction_request_result",
+            "requestId": receipt.request_id,
+            "receiptId": receipt.receipt_id,
+            "version": receipt.version,
+            "status": receipt.status,
+        })
+        .to_string();
+        agent
+            .deliver_midturn(aionui_ai_agent::types::SendMessageData {
+                content,
+                msg_id: format!("interaction-request:{}", receipt.receipt_id),
+                turn_id: Some(turn_id.to_owned()),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            })
+            .await
+            .map_err(|error| ConversationError::BadGateway {
+                reason: error.to_string(),
+            })?;
+        info!(
+            user_id,
+            conversation_id,
+            turn_id,
+            request_id = %receipt.request_id,
+            receipt_id = %receipt.receipt_id,
+            "accepted Interaction Request resumed its original turn"
+        );
+        Ok(())
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -397,6 +506,7 @@ impl ConversationService {
             workspace_root,
             broadcaster,
             skill_resolver,
+            managed_skill_execution_reporter: Arc::new(RwLock::new(None)),
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
@@ -444,6 +554,26 @@ impl ConversationService {
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    pub fn with_managed_skill_execution_reporter(&self, reporter: Arc<dyn ManagedSkillExecutionReporter>) {
+        if let Ok(mut guard) = self.managed_skill_execution_reporter.write() {
+            *guard = Some(reporter);
+        }
+    }
+
+    pub(crate) async fn report_managed_skill_execution(&self, user_id: &str, report: ManagedSkillExecutionReport) {
+        let reporter = self
+            .managed_skill_execution_reporter
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(reporter) = reporter else {
+            return;
+        };
+        if let Err(error) = reporter.report_execution(user_id, report).await {
+            warn!(user_id, error, "failed to report managed Skill execution to GEA");
         }
     }
 
@@ -630,6 +760,7 @@ impl ConversationService {
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
+            pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
@@ -732,9 +863,49 @@ impl ConversationService {
         let has_task = agent.is_some();
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
+        // `supports_midturn_delivery` is a STATIC property of the backend TYPE:
+        // a live agent reads it from its capabilities (authoritative), and
+        // without one it MUST come from the conversation's backend identity —
+        // hardcoding false here made a fresh (pre-ensure) or dormant claude
+        // conversation report false, so the frontend hydrate fetch raced the
+        // send accept and gated the whole first turn into the queue panel.
+        let supports_midturn_delivery = match agent.as_ref() {
+            Some(agent) => agent.supports_midturn_delivery(),
+            None => self.static_supports_midturn_delivery(conversation_id).await,
+        };
 
-        self.runtime_state
-            .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
+        self.runtime_state.summary_from_parts(
+            conversation_id,
+            task_status,
+            has_task,
+            pending_confirmations,
+            supports_midturn_delivery,
+        )
+    }
+
+    /// Backend-static `supports_midturn_delivery` for a conversation with no
+    /// live agent task, resolved from the persisted backend identity
+    /// (`extra.backend` — the same string create() persists from the assistant
+    /// snapshot and the session factories dispatch on) through the session
+    /// layer's static table. Any resolution failure (missing row, unparsable
+    /// extra, unknown backend) conservatively reports `false`.
+    ///
+    /// Perf note: the DB load only fires when no live agent exists, and
+    /// `runtime_summary_for` is only invoked on single-conversation paths
+    /// (detail GET, send/turn responses) — `list()` never embeds a runtime
+    /// summary — so this adds no per-row N+1.
+    async fn static_supports_midturn_delivery(&self, conversation_id: &str) -> bool {
+        let Ok(Some(user_id)) = self.conversation_repo.owner_user_id(conversation_id).await else {
+            return false;
+        };
+        let Ok(Some(row)) = self.conversation_repo.get(&user_id, conversation_id).await else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .as_ref()
+            .and_then(|extra| extra.get("backend").and_then(serde_json::Value::as_str))
+            .is_some_and(aionui_ai_agent::backend_supports_midturn_delivery)
     }
 
     pub async fn active_count_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {
@@ -791,6 +962,7 @@ impl ConversationService {
         SendMessageResponse {
             msg_id,
             turn_id,
+            delivered_midturn: false,
             runtime: self.runtime_summary_for(conversation_id).await,
         }
     }
@@ -1167,6 +1339,17 @@ impl ConversationService {
 
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
+        let managed_skill_snapshots = self
+            .skill_resolver
+            .snapshot_managed_skills_for_user(user_id, &initial_skills)
+            .await;
+
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                "managed_skill_snapshots".to_owned(),
+                serde_json::to_value(&managed_skill_snapshots).unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
+        }
 
         // Wire skill links into the runtime workspace so the agent CLI picks
         // them up via its native skills dir (e.g. `.claude/skills/`). This
@@ -1190,7 +1373,7 @@ impl ConversationService {
         {
             let resolved = self
                 .skill_resolver
-                .resolve_skills_for_user(user_id, &initial_skills)
+                .resolve_skills_for_user_at_snapshot(user_id, &initial_skills, &managed_skill_snapshots)
                 .await;
             if !resolved.is_empty() {
                 let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
@@ -2150,13 +2333,14 @@ impl ConversationService {
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
             && (incoming.get("skills").is_some()
+                || incoming.get("managed_skill_snapshots").is_some()
                 || incoming.get("mcp_server_ids").is_some()
                 || incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "Skill and MCP snapshots are immutable post-creation".into(),
             });
         }
 
@@ -3340,7 +3524,250 @@ impl ConversationService {
 
 // ── Message Flow (send / stop / warmup) ─────────────────────────────
 
+/// A mid-turn user message's persisted `status` while the CLI holds it but has
+/// not yet consumed it into a turn (待接收). Flipped to
+/// [`MIDTURN_STATUS_RECEIVED`] on the agent's receipt signal.
+///
+/// `"pending"` because the messages table CHECK constraint only admits
+/// ('finish','pending','error','work') (002_legacy_data_normalize.sql:170),
+/// and the stale-runtime startup cleanup only touches `position='left'` rows —
+/// a pending USER (right) row is never swept.
+pub(crate) const MIDTURN_STATUS_QUEUED: &str = "pending";
+/// The terminal user-message status (已接收) — same value ordinary user
+/// messages are persisted with, so downstream consumers need no new case.
+pub(crate) const MIDTURN_STATUS_RECEIVED: &str = "finish";
+
+/// Outcome of a mid-turn delivery attempt (B5).
+enum MidturnOutcome {
+    /// The message rides the ACTIVE turn (or failed terminally and was
+    /// surfaced as a failure tip — mirroring the normal path's build-failure
+    /// contract; the tip response has `delivered_midturn=false`, so the route
+    /// returns the ordinary 202 for it, 200 only for a real delivery). The
+    /// caller returns this response.
+    Delivered(SendMessageResponse),
+    /// codex rejected the steer with "no active turn to steer" (§6甲.1): the
+    /// turn ended between our read and the write. The caller opens a NEW turn
+    /// through the normal path, reusing the already-persisted message row
+    /// (`Some`) or persisting normally (`None` when runtime persistence
+    /// disallowed the write).
+    TurnEnded { user_msg_id: Option<String> },
+}
+
+/// Is this delivery error codex's "the turn already ended" steer rejection?
+/// codex returns a bare -32600 for both steer rejections; the message text is
+/// the ONLY discriminator (verified 0.144.6, design spec §6甲.1). Locked by
+/// test so a codex wording change fails here instead of silently degrading.
+/// (The different-turn-active rejection is retried INSIDE the codex backend
+/// and never surfaces here unless the retry also failed.)
+pub(crate) fn steer_rejection_is_turn_ended(err: &AgentSendError) -> bool {
+    // `AgentSendError` classifies a BadGateway into a generic user-facing
+    // `message` and moves the raw backend text into `detail` — check both, or
+    // the classification silently degrades into a hard error (caught by
+    // `steer_rejection_classifier_matches_only_the_turn_ended_text`).
+    let stream = err.stream_error();
+    stream.message.contains("no active turn to steer")
+        || stream
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("no active turn to steer"))
+}
+
+/// Update a persisted message's `status` and broadcast the
+/// `message.statusChanged` event (B5 receipt badge). With `only_if_queued`,
+/// the flip applies ONLY to a row currently in [`MIDTURN_STATUS_QUEUED`] —
+/// the lifecycle-echo consumers use this so an unrelated echo can never touch
+/// an ordinary message.
+pub(crate) async fn apply_message_receipt(
+    repo: &Arc<dyn IConversationRepository>,
+    broadcaster: &Arc<dyn EventBroadcaster>,
+    user_id: &str,
+    conversation_id: &str,
+    msg_id: &str,
+    status: &str,
+    only_if_queued: bool,
+) {
+    if only_if_queued {
+        match repo
+            .get_message_by_msg_id(user_id, conversation_id, msg_id, "text")
+            .await
+        {
+            Ok(Some(row)) if row.status.as_deref() == Some(MIDTURN_STATUS_QUEUED) => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!(msg_id = %msg_id, error = %ErrorChain(&e), "message receipt lookup failed");
+                return;
+            }
+        }
+    }
+    if let Err(e) = repo
+        .update_message(
+            user_id,
+            conversation_id,
+            msg_id,
+            &aionui_db::MessageRowUpdate {
+                content: None,
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            },
+        )
+        .await
+    {
+        warn!(msg_id = %msg_id, error = %ErrorChain(&e), "message receipt status update failed");
+        return;
+    }
+    let payload = aionui_api_types::MessageStatusChangedPayload {
+        user_id: user_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        msg_id: msg_id.to_owned(),
+        status: status.to_owned(),
+    };
+    match serde_json::to_value(&payload) {
+        Ok(value) => broadcaster.broadcast(WebSocketMessage::new("message.statusChanged", value)),
+        Err(e) => warn!(msg_id = %msg_id, error = %ErrorChain(&e), "statusChanged payload serialize failed"),
+    }
+}
+
 impl ConversationService {
+    /// B5: deliver a message into the RUNNING turn (no claim, no new turn id).
+    ///
+    /// Persists the user message with the pending-receipt status
+    /// ([`MIDTURN_STATUS_QUEUED`]) and broadcasts `message.userCreated`
+    /// carrying `client_msg_id` — the correlation id (== `msg_id`) that claude
+    /// echoes via `command_lifecycle` and codex round-trips as
+    /// `clientUserMessageId` — so the frontend can key the receipt badge
+    /// without text/time guessing (spec §4.5). The receipt flip to
+    /// [`MIDTURN_STATUS_RECEIVED`] arrives via `MessageLifecycle` echoes
+    /// (background watcher) for both backends.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_midturn_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        resolved: &ResolvedChatMessage,
+        hidden: bool,
+        agent: AgentInstance,
+        active_turn_id: String,
+        inject_skills: Vec<String>,
+    ) -> Result<MidturnOutcome, ConversationError> {
+        let user_msg_id = Self::mint_msg_id();
+        let persisted = self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::UserMessage);
+        if persisted {
+            let user_msg = aionui_db::models::MessageRow {
+                id: user_msg_id.clone(),
+                conversation_id: conversation_id.to_owned(),
+                msg_id: Some(user_msg_id.clone()),
+                r#type: "text".into(),
+                content: serde_json::json!({ "content": resolved.content }).to_string(),
+                position: Some("right".into()),
+                status: Some(MIDTURN_STATUS_QUEUED.into()),
+                hidden,
+                created_at: now_ms(),
+                backend_turn_id: None,
+            };
+            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert mid-turn user message");
+                return Err(e.into());
+            }
+            info!(msg_id = %user_msg_id, "Mid-turn user message persisted");
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    // Present ⇔ the message was delivered mid-turn; equals the
+                    // correlation id echoed on message.statusChanged.
+                    "client_msg_id": &user_msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": MIDTURN_STATUS_QUEUED,
+                    "hidden": hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ));
+        }
+        let data = aionui_ai_agent::types::SendMessageData {
+            content: resolved.content.clone(),
+            msg_id: user_msg_id.clone(),
+            turn_id: Some(active_turn_id.clone()),
+            files: resolved.files.clone(),
+            inject_skills,
+        };
+        match agent.deliver_midturn(data).await {
+            Ok(()) => {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "midturn_delivery",
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    "mid-turn message delivered into the active turn"
+                );
+                let mut response = self
+                    .send_message_response(conversation_id, user_msg_id, active_turn_id)
+                    .await;
+                response.delivered_midturn = true;
+                Ok(MidturnOutcome::Delivered(response))
+            }
+            Err(e) if steer_rejection_is_turn_ended(&e) => {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "new_turn",
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    "mid-turn delivery rejected (turn ended); opening a new turn"
+                );
+                if persisted {
+                    // The message now opens its own turn — it is no longer
+                    // waiting on a mid-turn receipt.
+                    apply_message_receipt(
+                        &self.conversation_repo,
+                        &self.broadcaster,
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        MIDTURN_STATUS_RECEIVED,
+                        false,
+                    )
+                    .await;
+                }
+                Ok(MidturnOutcome::TurnEnded {
+                    user_msg_id: persisted.then_some(user_msg_id),
+                })
+            }
+            Err(e) => {
+                // Terminal delivery failure: mirror the normal path's
+                // build-failure contract — surface a failure tip, mark the
+                // message errored, and return the 200-with-tip response.
+                error!(
+                    conversation_id = %conversation_id,
+                    active_turn_id = %active_turn_id,
+                    msg_id = %user_msg_id,
+                    error = %e,
+                    "mid-turn delivery failed"
+                );
+                if persisted {
+                    apply_message_receipt(
+                        &self.conversation_repo,
+                        &self.broadcaster,
+                        user_id,
+                        conversation_id,
+                        &user_msg_id,
+                        "error",
+                        false,
+                    )
+                    .await;
+                }
+                self.persist_and_broadcast_send_failure_tip(user_id, conversation_id, &active_turn_id, &e, None)
+                    .await;
+                Ok(MidturnOutcome::Delivered(
+                    self.send_message_response(conversation_id, user_msg_id, active_turn_id)
+                        .await,
+                ))
+            }
+        }
+    }
     /// Send a user message to the conversation.
     ///
     /// 1. Validates the conversation belongs to the user
@@ -3394,14 +3821,68 @@ impl ConversationService {
             .resolve_message_attachments(user_id, &req.content, &req.files)
             .await?;
 
-        let turn_id = Self::mint_turn_id();
-        let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+        // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
+        // An ACTIVE turn + a backend that supports mid-turn delivery → the
+        // message rides the CURRENT turn: no claim, no new turn id, HTTP 200
+        // with the active turn's id. Every other case (including the 409 for
+        // non-supporting backends) is unchanged and handled by the claim below.
+        let mut fallback_user_msg: Option<String> = None;
+        if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
+            && let Some(agent) = task_manager.get_task(conversation_id)
+            && agent.supports_midturn_delivery()
+        {
+            // §4.6: a turn blocked on a permission confirmation / question card
+            // must NOT be steered into — the card is the required answer
+            // channel, not a new instruction on the stream. Falling through to
+            // the claim below restores the exact pre-B5 contract (409) at the
+            // HTTP layer, so a direct API client cannot bypass the frontend
+            // gate. Same authoritative source the runtime summary's
+            // `pending_confirmations` reads (`get_confirmations`).
+            if !agent.get_confirmations().is_empty() {
+                info!(
+                    conversation_id = %conversation_id,
+                    route = "rejected_requires_action",
+                    active_turn_id = %active_turn_id,
+                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                );
+            } else {
+                match self
+                    .deliver_midturn_message(
+                        user_id,
+                        conversation_id,
+                        &resolved,
+                        req.hidden,
+                        agent,
+                        active_turn_id,
+                        req.inject_skills.clone(),
+                    )
+                    .await?
+                {
+                    MidturnOutcome::Delivered(response) => return Ok(response),
+                    // codex rejected the steer because the turn just ended → fall
+                    // through and open a NEW turn for the already-persisted message.
+                    MidturnOutcome::TurnEnded { user_msg_id } => fallback_user_msg = user_msg_id,
+                }
+            }
+        }
+
+        // Open a NEW turn: mint the id only on this branch. The mid-turn
+        // delivery path above instead reuses the running turn's id — a
+        // phantom turn id minted outside an actual claim must never exist.
+        let (turn_id, turn_claim) = {
+            let turn_id = Self::mint_turn_id();
+            let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+            (turn_id, turn_claim)
+        };
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
         // key. We reuse the same value for `id` (primary key) and `msg_id`
         // to preserve legacy callers that still rely on `id == msg_id`.
-        let user_msg_id = Self::mint_msg_id();
+        // A mid-turn TurnEnded fallback already persisted + broadcast the
+        // message — reuse its id instead of writing a duplicate row.
+        let was_fallback = fallback_user_msg.is_some();
+        let user_msg_id = fallback_user_msg.unwrap_or_else(Self::mint_msg_id);
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
@@ -3424,26 +3905,31 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
-        if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
-            warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
-            return Err(e.into());
+        // The TurnEnded fallback already persisted + broadcast this message
+        // (with the statusChanged flip) — doing it again would duplicate the
+        // row and the live-view bubble.
+        if !was_fallback {
+            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
+                return Err(e.into());
+            }
+
+            info!(msg_id = %user_msg_id, "User message persisted");
+
+            self.broadcaster.broadcast(WebSocketMessage::new(
+                "message.userCreated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "msg_id": &user_msg_id,
+                    "content": &resolved.content,
+                    "position": "right",
+                    "status": "finish",
+                    "hidden": req.hidden,
+                    "created_at": user_msg.created_at,
+                }),
+            ));
         }
-
-        info!(msg_id = %user_msg_id, "User message persisted");
-
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "message.userCreated",
-            serde_json::json!({
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "msg_id": &user_msg_id,
-                "content": &resolved.content,
-                "position": "right",
-                "status": "finish",
-                "hidden": req.hidden,
-                "created_at": user_msg.created_at,
-            }),
-        ));
 
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
@@ -4241,7 +4727,11 @@ impl ConversationService {
 
         let resolved = self
             .skill_resolver
-            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .resolve_skills_for_user_at_snapshot(
+                &context.conversation.user_id,
+                &skill_names,
+                &managed_skill_snapshots_from_extra(&row.extra),
+            )
             .await;
         if resolved.is_empty() {
             return;

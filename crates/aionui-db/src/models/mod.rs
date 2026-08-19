@@ -6,6 +6,8 @@ mod client_preference;
 mod conversation;
 mod conversation_artifact;
 mod cron_job;
+mod gea_resource;
+mod interaction_request;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -32,6 +34,11 @@ pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
+pub use gea_resource::{GeaManagedSkillRow, GeaResourceCatalogRow};
+pub use interaction_request::{
+    StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt,
+    StoredUnfinalizedInteractionRequestReceipt,
+};
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;

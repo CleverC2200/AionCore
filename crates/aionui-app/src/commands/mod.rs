@@ -17,6 +17,7 @@ pub(crate) mod cmd_team_stdio;
 pub(crate) mod config_capabilities;
 pub(crate) mod diagnose_capabilities;
 pub(crate) mod error;
+mod gea_result_projection;
 pub(crate) mod team_capabilities;
 
 pub(crate) use cmd_antigravity_hook::run_antigravity_hook;

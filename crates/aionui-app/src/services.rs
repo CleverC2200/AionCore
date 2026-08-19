@@ -12,11 +12,12 @@ use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
-    SqliteSkillRepository, SqliteUserRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IGeaResourceRepository,
+    IMcpServerRepository, IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteGeaResourceRepository,
+    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSkillRepository,
+    SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -60,6 +61,8 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    /// GEA last-good catalogs and materialized managed Skill metadata.
+    pub gea_resource_repo: Arc<dyn IGeaResourceRepository>,
     backend_binary_path: Arc<PathBuf>,
     runtime_helper_bin: String,
     runtime_base_url: String,
@@ -91,6 +94,7 @@ impl AppServices {
             event_bus: self.event_bus.clone(),
             skill_paths: self.skill_paths.clone(),
             skill_repo: self.skill_repo.clone(),
+            gea_resource_repo: self.gea_resource_repo.clone(),
             worker_task_manager: self.worker_task_manager.clone(),
             conversation_runtime_state: self.conversation_runtime_state.clone(),
             conversation_repo: self.conversation_repo.clone(),
@@ -197,6 +201,8 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+        let gea_resource_repo: Arc<dyn IGeaResourceRepository> =
+            Arc::new(SqliteGeaResourceRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing
         // conversation temp-workspace root (`work_dir/conversations`) so
@@ -285,6 +291,7 @@ impl AppServices {
             event_bus: event_bus.clone(),
             skill_paths: skill_paths.clone(),
             skill_repo: skill_repo.clone(),
+            gea_resource_repo: gea_resource_repo.clone(),
             worker_task_manager: worker_task_manager.clone(),
             conversation_runtime_state: conversation_runtime_state.clone(),
             conversation_repo: conversation_repo.clone(),
@@ -324,6 +331,7 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            gea_resource_repo,
             backend_binary_path,
             runtime_helper_bin,
             runtime_base_url,
@@ -337,6 +345,7 @@ struct ConversationServiceDeps<'a> {
     event_bus: Arc<BroadcastEventBus>,
     skill_paths: Arc<aionui_extension::SkillPaths>,
     skill_repo: Arc<dyn ISkillRepository>,
+    gea_resource_repo: Arc<dyn IGeaResourceRepository>,
     worker_task_manager: Arc<dyn IWorkerTaskManager>,
     conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -348,10 +357,10 @@ struct ConversationServiceDeps<'a> {
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        deps.skill_paths,
-        deps.skill_repo,
-    ));
+    let skill_resolver = Arc::new(
+        aionui_conversation::skill_resolver::ExtensionSkillResolver::new(deps.skill_paths, deps.skill_repo)
+            .with_managed_repo(deps.gea_resource_repo),
+    );
     let service = ConversationService::new(
         deps.work_dir,
         deps.event_bus,

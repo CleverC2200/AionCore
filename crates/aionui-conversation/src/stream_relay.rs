@@ -4,7 +4,7 @@ use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
-use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
+use crate::skill_resolver::{LoadedAgentSkill, ManagedSkillSnapshot, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
@@ -119,6 +119,7 @@ impl TurnAttemptSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
+    pub loaded_managed_skills: Vec<ManagedSkillSnapshot>,
     pub terminal: RelayTerminal,
     pub attempt: TurnAttemptSummary,
 }
@@ -166,6 +167,7 @@ pub struct StreamRelay {
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Option<Arc<dyn SkillResolver>>,
     allowed_skill_names: Vec<String>,
+    managed_skill_snapshots: Vec<ManagedSkillSnapshot>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
     persistence: Option<RuntimePersistenceCoordinator>,
     adapter: StreamPersistenceAdapter,
@@ -193,6 +195,7 @@ impl StreamRelay {
             broadcaster,
             skill_resolver: None,
             allowed_skill_names: Vec::new(),
+            managed_skill_snapshots: Vec::new(),
             runtime_state: None,
             persistence: None,
             adapter,
@@ -214,6 +217,11 @@ impl StreamRelay {
 
     pub fn with_allowed_skill_names(mut self, skill_names: Vec<String>) -> Self {
         self.allowed_skill_names = skill_names;
+        self
+    }
+
+    pub fn with_managed_skill_snapshots(mut self, snapshots: Vec<ManagedSkillSnapshot>) -> Self {
+        self.managed_skill_snapshots = snapshots;
         self
     }
 
@@ -523,6 +531,7 @@ impl StreamRelay {
                                 );
                                 break RelayOutcome {
                                     system_responses: Vec::new(),
+                                    loaded_managed_skills: Vec::new(),
                                     terminal,
                                     attempt,
                                 };
@@ -550,6 +559,7 @@ impl StreamRelay {
                             let mut outcome = if deleting {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
+                                    loaded_managed_skills: Vec::new(),
                                     terminal,
                                     attempt: attempt.clone(),
                                 }
@@ -657,6 +667,12 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        AgentStreamEvent::MessageLifecycle(_) => {
+                            // Internal-only correlation frame (mid-turn interjection
+                            // Task 3): consumed by the BackgroundStreamWatcher between
+                            // turns; inside a turn it is pure bookkeeping. Never
+                            // forwarded to the WebSocket.
+                        }
                         // NOTE: AcpSessionInfo (agent session titles) is deliberately
                         // NOT consumed here. Titles arrive at session-open and at the
                         // turn's final instant (pi/omp race the relay's exit by ~1ms;
@@ -699,6 +715,7 @@ impl StreamRelay {
                     let mut outcome = if deleting {
                         RelayOutcome {
                             system_responses: Vec::new(),
+                            loaded_managed_skills: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
                             attempt: attempt.clone(),
                         }
@@ -769,6 +786,7 @@ impl StreamRelay {
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+            AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
         }
     }
 
@@ -835,6 +853,7 @@ impl StreamRelay {
     ) -> RelayOutcome {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
+            loaded_managed_skills: Vec::new(),
             terminal,
             attempt: TurnAttemptSummary::default(),
         };
@@ -859,6 +878,7 @@ impl StreamRelay {
 
             self.send_system_responses(&processed.system_responses);
             outcome.system_responses = processed.system_responses;
+            outcome.loaded_managed_skills = processed.loaded_managed_skills;
         } else if let AgentStreamEvent::Error(data) = event {
             self.adapter.persist_error_tip(data).await;
         }
@@ -908,6 +928,7 @@ impl StreamRelay {
                 resolver: Arc::clone(resolver),
                 user_id: self.user_id.clone(),
                 allowed_skill_names: self.allowed_skill_names.clone(),
+                managed_skill_snapshots: self.managed_skill_snapshots.clone(),
             }) as Box<dyn ISkillLoadService>
         }));
 
@@ -1001,6 +1022,7 @@ struct SharedSkillResolver {
     resolver: Arc<dyn SkillResolver>,
     user_id: String,
     allowed_skill_names: Vec<String>,
+    managed_skill_snapshots: Vec<ManagedSkillSnapshot>,
 }
 
 #[async_trait::async_trait]
@@ -1014,7 +1036,9 @@ impl ISkillLoadService for SharedSkillResolver {
             .filter(|name| self.allowed_skill_names.iter().any(|allowed| allowed == *name))
             .cloned()
             .collect();
-        self.resolver.load_skill_bodies_for_user(&self.user_id, &filtered).await
+        self.resolver
+            .load_skill_bodies_for_user_at_snapshot(&self.user_id, &filtered, &self.managed_skill_snapshots)
+            .await
     }
 }
 
@@ -1088,6 +1112,7 @@ mod tests {
                 .map(|name| LoadedAgentSkill {
                     name: name.clone(),
                     body: format!("{name} body"),
+                    managed: None,
                 })
                 .collect()
         }
@@ -1110,6 +1135,7 @@ mod tests {
             resolver,
             user_id: "system_default_user".into(),
             allowed_skill_names: vec!["cron".into()],
+            managed_skill_snapshots: Vec::new(),
         };
 
         let loaded = loader.load_skill_bodies(&["cron".to_owned(), "pdf".to_owned()]).await;

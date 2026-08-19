@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use aionui_api_types::ReportGeaSkillExecutionRequest;
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
+use aionui_conversation::skill_resolver::{ManagedSkillExecutionReport, ManagedSkillExecutionReporter};
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
@@ -55,6 +57,34 @@ use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
+
+struct GeaSkillExecutionReporter {
+    service: Arc<GeaService>,
+}
+
+#[async_trait::async_trait]
+impl ManagedSkillExecutionReporter for GeaSkillExecutionReporter {
+    async fn report_execution(&self, user_id: &str, report: ManagedSkillExecutionReport) -> Result<(), String> {
+        self.service
+            .report_skill_execution(
+                user_id,
+                ReportGeaSkillExecutionRequest {
+                    skill_code: report.skill.skill_code,
+                    version: report.skill.version,
+                    digest: report.skill.digest,
+                    success: report.success,
+                    executed_at: report.executed_at,
+                    duration_ms: report.duration_ms,
+                    result_size: report.result_size,
+                    risk_level: report.skill.risk_level,
+                    error_code: report.error_code,
+                    error_message: report.error_message,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug)]
 pub struct RouterBuildError {
@@ -328,6 +358,36 @@ pub async fn build_module_states(
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
         gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
+            .map(|service| {
+                service
+                    .with_resource_catalog(
+                        services.gea_resource_repo.clone(),
+                        services.data_dir.join("managed-skills"),
+                    )
+                    .with_interaction_request_projection(
+                        Arc::new(aionui_db::SqliteInteractionRequestRepository::new(
+                            services.database.pool().clone(),
+                        )),
+                        services.conversation_repo.clone(),
+                        services.event_bus.clone(),
+                        Some({
+                            let runtime_state = services.conversation_runtime_state.clone();
+                            Arc::new(move |conversation_id: &str| runtime_state.active_turn_id_for(conversation_id))
+                        }),
+                    )
+                    .with_interaction_turn_resumer({
+                        let conversation_service = services.conversation_service.clone();
+                        Arc::new(move |user_id, conversation_id, turn_id, receipt| {
+                            let conversation_service = conversation_service.clone();
+                            Box::pin(async move {
+                                conversation_service
+                                    .resume_interaction_turn(&user_id, &conversation_id, &turn_id, &receipt)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            })
+                        })
+                    })
+            })
             .map(GeaRouterState::new)
             .map_err(|error| {
                 RouterBuildError::new("router.gea", "failed to build GEA gateway state").with_source(error)
@@ -338,6 +398,17 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    let gea_skill_execution_reporter: Arc<dyn ManagedSkillExecutionReporter> = Arc::new(GeaSkillExecutionReporter {
+        service: states.gea.service.clone(),
+    });
+    states
+        .conversation
+        .service
+        .with_managed_skill_execution_reporter(gea_skill_execution_reporter.clone());
+    states
+        .cron
+        .conversation_service
+        .with_managed_skill_execution_reporter(gea_skill_execution_reporter);
     states
         .conversation
         .service
@@ -811,10 +882,13 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
         Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
     let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        services.skill_paths.clone(),
-        services.skill_repo.clone(),
-    ));
+    let skill_resolver = Arc::new(
+        aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
+            services.skill_paths.clone(),
+            services.skill_repo.clone(),
+        )
+        .with_managed_repo(services.gea_resource_repo.clone()),
+    );
     let conv_service = ConversationService::new(
         services.work_dir.clone(),
         services.event_bus.clone(),
@@ -957,6 +1031,7 @@ pub async fn build_extension_states(
     let skill_state = SkillRouterState {
         skill_paths: services.skill_paths.as_ref().clone(),
         skill_repo: services.skill_repo.clone(),
+        managed_skill_repo: Some(services.gea_resource_repo.clone()),
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
     };

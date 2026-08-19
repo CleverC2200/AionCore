@@ -1,3 +1,4 @@
+use aionui_api_types::ErrorResponse;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -74,6 +75,39 @@ impl GeaError {
         Self::new(StatusCode::BAD_REQUEST, "GEA_INVALID_REQUEST", message)
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "GEA_INTERACTION_REQUEST_NOT_FOUND", message)
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "GEA_INTERACTION_REQUEST_STORAGE_ERROR",
+            message,
+        )
+    }
+
+    pub fn server_error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, message)
+    }
+
+    pub fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
+    pub fn bad_gateway(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, code, message)
+    }
+
+    pub fn from_http_status(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        Self::new(status, code, message)
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.status == StatusCode::UNAUTHORIZED
+    }
+
     pub fn session_required() -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -93,6 +127,16 @@ impl GeaError {
 
 impl IntoResponse for GeaError {
     fn into_response(self) -> Response {
-        (self.status, Json(*self.body)).into_response()
+        let details = serde_json::json!({
+            "category": self.body.category,
+            "retryable": self.body.retryable,
+            "retryAfterMs": self.body.retry_after_ms,
+            "requestId": self.body.request_id,
+            "traceId": self.body.trace_id,
+            "auditId": self.body.audit_id,
+            "upstream": self.body.details,
+        });
+        let body = ErrorResponse::new_with_details(self.body.message, self.body.code, Some(details));
+        (self.status, Json(body)).into_response()
     }
 }

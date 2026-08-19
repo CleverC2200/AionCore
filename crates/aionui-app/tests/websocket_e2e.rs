@@ -401,6 +401,34 @@ async fn t4_1_scoped_event_reaches_only_matching_user() {
 }
 
 #[tokio::test]
+async fn interaction_request_changed_reaches_only_its_authenticated_user() {
+    let app = start_app().await;
+    let token_a = sign_token(&app, "user-a").await;
+    let token_b = sign_token(&app, "user-b").await;
+    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    wait_for_clients(&app, 2).await;
+
+    let payload = aionui_api_types::InteractionRequestChangedPayload {
+        user_id: "user-a".to_owned(),
+        revision: "r2".to_owned(),
+    };
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "interactionRequest.changed",
+        serde_json::to_value(payload).unwrap(),
+    ));
+
+    let msg_a = read_text(&mut rx_a).await;
+    assert_eq!(msg_a["name"], "interactionRequest.changed");
+    assert_eq!(msg_a["data"]["revision"], "r2");
+    let timeout_result = tokio::time::timeout(Duration::from_millis(200), rx_b.next()).await;
+    assert!(
+        timeout_result.is_err(),
+        "another user must not receive the invalidation"
+    );
+}
+
+#[tokio::test]
 async fn t4_1_unscoped_business_event_is_dropped_by_bridge() {
     let app = start_app().await;
     let token = sign_token(&app, "user-a").await;

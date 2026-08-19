@@ -97,8 +97,8 @@ pub use conversation::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -124,8 +124,15 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use gea::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse,
-    GeaToolInfo, SetGeaAuthSessionRequest,
+    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaCatalogSkill, GeaClientResourceKind, GeaClientResourceSyncResult,
+    GeaClientResourceSyncStatus, GeaInteractionPermissionOption, GeaInteractionPresentation, GeaInteractionQuestion,
+    GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
+    GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot,
+    GeaInteractionRequestStatus, GeaInteractionTurnContinuation, GeaLocalizedText, GeaResourceCatalogEnvelope,
+    GeaResourceCatalogSnapshot, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
+    InteractionRequestActionCommand, InteractionRequestChangedPayload, InteractionRequestList,
+    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView, ReportGeaSkillExecutionRequest,
+    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

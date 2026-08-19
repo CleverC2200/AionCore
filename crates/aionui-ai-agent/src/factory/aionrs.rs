@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aion_agent::session::{ForkBoundary, Session, SessionManager};
-use aion_config::compat::OpenAiApiMode;
+use aion_config::compat::{AssistantToolCallContent, OpenAiApiMode};
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_types::llm::ToolChoice;
 use aion_types::message::ImageInputCapability;
@@ -371,6 +371,9 @@ pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
     openai_api_mode_override: Option<OpenAiApiMode>,
 ) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
+    if mapped_provider == "openai" && requires_empty_tool_call_content(model_id) {
+        compat.assistant_tool_call_content = Some(AssistantToolCallContent::EmptyString);
+    }
     let openai_api_mode = resolve_openai_api_mode(platform, mapped_provider, model_id, openai_api_mode_override);
     let use_responses = openai_api_mode == Some(OpenAiApiMode::Responses);
 
@@ -447,6 +450,11 @@ fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &s
 
     let model = model_id.to_ascii_lowercase();
     model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+fn requires_empty_tool_call_content(model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+    model == "deepseek" || model.starts_with("deepseek-")
 }
 
 fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
@@ -559,7 +567,10 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        let is_internal_gea_gateway = row.name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME);
+        let is_legacy_gea = row.name.trim().eq_ignore_ascii_case(LEGACY_GEA_MCP_SERVER_NAME);
+        let explicitly_selected_internal_gea_gateway = is_internal_gea_gateway && selected_ids.is_some();
+        if !selected || is_legacy_gea || (row.builtin && !explicitly_selected_internal_gea_gateway) {
             continue;
         }
 
@@ -1094,6 +1105,62 @@ mod tests {
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
+    }
+
+    #[tokio::test]
+    async fn selected_internal_gea_gateway_replaces_legacy_gea_server() {
+        let legacy = make_row(
+            LEGACY_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://legacy-gea.example.test/mcp"}"#,
+            false,
+            false,
+        );
+        let gateway = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://gea-gateway.example.test/mcp"}"#,
+            true,
+            true,
+        );
+        let selected = vec![legacy.id.clone(), gateway.id.clone()];
+        let repo = MockMcpRepo {
+            rows: vec![legacy, gateway],
+        };
+
+        let servers = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-gea-migration",
+            test_broadcaster(),
+        )
+        .await;
+
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec![INTERNAL_GEA_MCP_SERVER_NAME]);
+    }
+
+    #[tokio::test]
+    async fn internal_gea_gateway_is_not_implicitly_injected_without_a_selection() {
+        let gateway = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://gea-gateway.example.test/mcp"}"#,
+            true,
+            true,
+        );
+        let repo = MockMcpRepo { rows: vec![gateway] };
+
+        let servers = load_user_mcp_servers(
+            &repo,
+            None,
+            TEST_USER_ID,
+            "conv-without-gea-selection",
+            test_broadcaster(),
+        )
+        .await;
+
+        assert!(servers.is_empty());
     }
 
     #[cfg(unix)]

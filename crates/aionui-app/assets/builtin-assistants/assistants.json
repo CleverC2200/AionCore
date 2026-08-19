@@ -1090,12 +1090,12 @@
       "id": "aionui-assistant",
       "sort_order": 0,
       "default_enabled": true,
-      "name": "AionUi Butler",
+      "name": "GEA Butler",
       "name_i18n": {
-        "en-US": "AionUi Butler",
-        "zh-CN": "AionUi管家",
-        "ru-RU": "Дворецкий AionUi",
-        "uk-UA": "Дворецький AionUi"
+        "en-US": "GEA Butler",
+        "zh-CN": "GEA管家",
+        "ru-RU": "Дворецкий GEA",
+        "uk-UA": "Дворецький GEA"
       },
       "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
       "description_i18n": {
