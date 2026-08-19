@@ -28,6 +28,34 @@ pub(crate) fn validate_action_command(
     Ok(())
 }
 
+pub(crate) fn validate_question_answers(payload: Option<&Value>) -> Result<(), GeaError> {
+    let answers = payload
+        .and_then(|value| value.get("answers"))
+        .and_then(Value::as_array)
+        .filter(|answers| !answers.is_empty())
+        .ok_or_else(|| GeaError::invalid_request("question 的 answers 必须是非空数组"))?;
+
+    for answer in answers {
+        let question = answer
+            .get("question")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| GeaError::invalid_request("question 的 answer 必须包含非空 question"))?;
+        let labels = answer
+            .get("labels")
+            .and_then(Value::as_array)
+            .filter(|labels| {
+                !labels.is_empty()
+                    && labels
+                        .iter()
+                        .all(|label| label.as_str().is_some_and(|v| !v.trim().is_empty()))
+            })
+            .ok_or_else(|| GeaError::invalid_request("question 的 answer 必须包含非空 labels 数组"))?;
+        let _ = (question, labels);
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_snapshot(value: &Value) -> Result<GeaInteractionRequestSnapshot, GeaError> {
     let result = value
         .get("result")

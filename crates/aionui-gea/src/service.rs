@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::GeaError;
-use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command};
+use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command, validate_question_answers};
 
 #[path = "service/interaction_request.rs"]
 mod projection_service;
@@ -534,16 +534,8 @@ impl GeaService {
         credential: &GeaCredential,
         session: &GeaConversationSession,
     ) -> Result<GeaInteractionRequestSnapshot, GeaError> {
-        let mut body = session.gateway_body();
-        body["status"] = Value::String("pending".to_owned());
         let value = self
-            .post_for_conversation(
-                user_id,
-                conversation_id,
-                credential,
-                "/ai/gateway/interaction-requests/list",
-                &body,
-            )
+            .get_for_conversation(user_id, conversation_id, credential, session)
             .await?;
         let snapshot = parse_snapshot(&value)?;
         if let Some(projection) = &self.projection {
@@ -779,6 +771,9 @@ impl GeaService {
                     GeaInteractionRequestReceiptStatus::Expired => {
                         aionui_api_types::GeaInteractionRequestStatus::Expired
                     }
+                    GeaInteractionRequestReceiptStatus::Cancelled => {
+                        aionui_api_types::GeaInteractionRequestStatus::Cancelled
+                    }
                     GeaInteractionRequestReceiptStatus::UnknownExternalWrite => {
                         aionui_api_types::GeaInteractionRequestStatus::VerificationRequired
                     }
@@ -963,22 +958,22 @@ impl GeaService {
         credential: &GeaCredential,
         session: &GeaConversationSession,
     ) -> Result<GeaInteractionRequestReceipt, GeaError> {
+        if command.action_id == "answer" {
+            validate_question_answers(command.payload.as_ref())?;
+        }
         let mut body = session.gateway_body();
-        body["requestId"] = Value::String(request_id.trim().to_owned());
         body["expectedVersion"] = Value::String(command.expected_version.trim().to_owned());
         body["idempotencyKey"] = Value::String(command.idempotency_key.trim().to_owned());
         body["actionId"] = Value::String(command.action_id.trim().to_owned());
         if let Some(payload) = command.payload {
             body["payload"] = payload;
         }
+        let path = format!(
+            "/ai/gateway/interaction-requests/{}/actions",
+            encode_path_segment(request_id.trim())
+        );
         let value = self
-            .post_for_conversation(
-                user_id,
-                conversation_id,
-                credential,
-                "/ai/gateway/interaction-requests/action",
-                &body,
-            )
+            .post_for_conversation(user_id, conversation_id, credential, &path, &body)
             .await?;
         let receipt = parse_receipt(&value, request_id)?;
         tracing::info!(
@@ -1148,6 +1143,74 @@ impl GeaService {
         }
         Ok(value)
     }
+
+    async fn get_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        credential: &GeaCredential,
+        session: &GeaConversationSession,
+    ) -> Result<Value, GeaError> {
+        let result = self.get(credential, session).await.and_then(|value| {
+            ensure_success(&value)?;
+            Ok(value)
+        });
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
+            self.invalidate_auth_session(user_id).await;
+        }
+        if matches!(&result, Err(error) if error.body.category == "SESSION") {
+            self.sessions
+                .write()
+                .await
+                .remove(&(user_id.to_owned(), conversation_id.to_owned()));
+        }
+        result
+    }
+
+    async fn get(&self, credential: &GeaCredential, session: &GeaConversationSession) -> Result<Value, GeaError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-access-token",
+            HeaderValue::from_str(credential.access_token.as_ref())
+                .map_err(|_| GeaError::invalid_request("GEA access token 格式无效"))?,
+        );
+        if let Some(tenant_id) = credential.tenant_id.as_deref() {
+            headers.insert(
+                "x-tenant-id",
+                HeaderValue::from_str(tenant_id).map_err(|_| GeaError::invalid_request("GEA tenantId 格式无效"))?,
+            );
+        }
+        headers.insert(
+            "x-delegation-token",
+            HeaderValue::from_str(session.delegation_token.as_ref())
+                .map_err(|_| GeaError::invalid_request("GEA delegationToken 格式无效"))?,
+        );
+        let response = self
+            .client
+            .get(format!("{}/ai/gateway/interaction-requests", self.base_url))
+            .headers(headers)
+            .query(&[
+                ("agentCode", session.agent_code.as_str()),
+                ("sessionId", session.session_id.as_str()),
+                ("conversationId", session.conversation_id.as_str()),
+                ("status", "pending"),
+            ])
+            .send()
+            .await
+            .map_err(|_| GeaError::bad_gateway("GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
+        let status = response.status();
+        let retry_after_ms = parse_retry_after_ms(response.headers());
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|_| invalid_upstream("GEA 返回了无效 JSON"))?;
+        if !status.is_success() {
+            let mut error = upstream_business_error(&value, status.as_u16());
+            error.body.retry_after_ms = retry_after_ms;
+            return Err(error);
+        }
+        Ok(value)
+    }
 }
 
 impl GeaConversationSession {
@@ -1159,6 +1222,19 @@ impl GeaConversationSession {
             "delegationToken": self.delegation_token.as_ref()
         })
     }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 fn non_empty(value: impl AsRef<str>) -> Option<String> {
@@ -1306,7 +1382,7 @@ mod tests {
     use aionui_db::{SqliteConversationRepository, SqliteInteractionRequestRepository, init_database_memory};
     use aionui_realtime::BroadcastEventBus;
     use serde_json::json;
-    use wiremock::matchers::{body_json, body_partial_json, header, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::GeaService;
@@ -1356,8 +1432,8 @@ mod tests {
     }
 
     async fn mount_question_snapshot(server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/list"))
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1388,8 +1464,8 @@ mod tests {
     }
 
     async fn mount_permission_snapshot(server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/list"))
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1535,9 +1611,8 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .and(body_partial_json(json!({
-                "requestId": "request-question-1",
                 "expectedVersion": "v1",
                 "idempotencyKey": "interaction:request-question-1:v1:answer",
                 "actionId": "answer"
@@ -1619,7 +1694,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_delay(Duration::from_millis(30))
@@ -1646,7 +1721,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: key.to_owned(),
             action_id: "answer".to_owned(),
-            payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let (first, second) = tokio::join!(
@@ -1665,7 +1740,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1696,7 +1771,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: "resume-retry".to_owned(),
             action_id: "answer".to_owned(),
-            payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let first = service
@@ -1730,7 +1805,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1769,7 +1844,7 @@ mod tests {
                     expected_version: "v1".to_owned(),
                     idempotency_key: "resume-timeout".to_owned(),
                     action_id: "answer".to_owned(),
-                    payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+                    payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
                 },
             )
             .await
@@ -1808,7 +1883,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1848,7 +1923,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: "marker-failure".to_owned(),
             action_id: "answer".to_owned(),
-            payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let first = service
@@ -1876,7 +1951,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -1916,7 +1991,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: "finalize-retry".to_owned(),
             action_id: "answer".to_owned(),
-            payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let first = service
@@ -2065,8 +2140,8 @@ mod tests {
     async fn authoritative_refresh_failure_preserves_and_replays_the_upstream_conflict_receipt() {
         let server = MockServer::start().await;
         mount_session(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/list"))
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -2094,8 +2169,8 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/list"))
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
             .respond_with(ResponseTemplate::new(502).set_body_json(json!({
                 "code": "GEA_REFRESH_UNAVAILABLE",
                 "message": "refresh unavailable",
@@ -2105,7 +2180,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -2128,7 +2203,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: "conflict-refresh-failed".to_owned(),
             action_id: "answer".to_owned(),
-            payload: Some(json!({ "answers": [{ "labels": ["CC-100"] }] })),
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let first = service
@@ -2181,9 +2256,8 @@ mod tests {
         mount_session(&server).await;
         mount_permission_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-permission-1/actions"))
             .and(body_partial_json(json!({
-                "requestId": "request-permission-1",
                 "expectedVersion": "v3",
                 "idempotencyKey": "permission-allowed",
                 "actionId": "proceed_once"
@@ -2245,7 +2319,7 @@ mod tests {
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -2268,7 +2342,7 @@ mod tests {
             expected_version: "v1".to_owned(),
             idempotency_key: "unknown-command".to_owned(),
             action_id: "answer".to_owned(),
-            payload: None,
+            payload: Some(json!({ "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] })),
         };
 
         let first = service
@@ -2869,15 +2943,13 @@ mod tests {
     async fn interaction_snapshot_uses_the_existing_gateway_session_context() {
         let server = MockServer::start().await;
         mount_session(&server).await;
-        Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/list"))
-            .and(body_json(json!({
-                "agentCode": "agent-sales",
-                "sessionId": "gea-session-1",
-                "conversationId": "conversation-1",
-                "delegationToken": "delegation-secret",
-                "status": "pending"
-            })))
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .and(query_param("agentCode", "agent-sales"))
+            .and(query_param("sessionId", "gea-session-1"))
+            .and(query_param("conversationId", "conversation-1"))
+            .and(query_param("status", "pending"))
+            .and(header("x-delegation-token", "delegation-secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -2924,13 +2996,14 @@ mod tests {
         let server = MockServer::start().await;
         mount_session(&server).await;
         Mock::given(method("POST"))
-            .and(path("/ai/gateway/interaction-requests/action"))
+            .and(path(
+                "/ai/gateway/interaction-requests/erp%3Acost-center%3Apayment-1/actions",
+            ))
             .and(body_json(json!({
                 "agentCode": "agent-sales",
                 "sessionId": "gea-session-1",
                 "conversationId": "conversation-1",
                 "delegationToken": "delegation-secret",
-                "requestId": "erp:cost-center:payment-1",
                 "expectedVersion": "v1",
                 "idempotencyKey": "interaction:erp:cost-center:payment-1:v1:answer",
                 "actionId": "answer",

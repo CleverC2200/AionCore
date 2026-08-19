@@ -331,6 +331,7 @@ impl InteractionRequestProjection {
             }
             GeaInteractionRequestReceiptStatus::Expired => Some("expired"),
             GeaInteractionRequestReceiptStatus::Forbidden | GeaInteractionRequestReceiptStatus::Conflict => None,
+            GeaInteractionRequestReceiptStatus::Cancelled => Some("cancelled"),
             GeaInteractionRequestReceiptStatus::UnknownExternalWrite => Some("verification_required"),
         };
         if let Some(status) = status {

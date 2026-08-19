@@ -313,6 +313,7 @@ pub enum GeaInteractionRequestReceiptStatus {
     Conflict,
     Expired,
     Forbidden,
+    Cancelled,
     UnknownExternalWrite,
 }
 

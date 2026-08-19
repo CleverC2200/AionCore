@@ -246,8 +246,8 @@ async fn global_action_completes_the_first_full_router_write_against_gea() {
         .expect(1)
         .mount(&gea)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/ai/gateway/interaction-requests/list"))
+    Mock::given(method("GET"))
+        .and(path("/ai/gateway/interaction-requests"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
@@ -275,7 +275,7 @@ async fn global_action_completes_the_first_full_router_write_against_gea() {
         .mount(&gea)
         .await;
     Mock::given(method("POST"))
-        .and(path("/ai/gateway/interaction-requests/action"))
+        .and(path("/ai/gateway/interaction-requests/request-first-write/actions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
@@ -344,7 +344,7 @@ async fn global_action_completes_the_first_full_router_write_against_gea() {
                 "expected_version": "v1",
                 "idempotency_key": "command-first-write",
                 "action_id": "answer",
-                "payload": { "answers": [{ "labels": ["CC-100"] }] }
+                "payload": { "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] }
             }),
             &token,
             &csrf,
