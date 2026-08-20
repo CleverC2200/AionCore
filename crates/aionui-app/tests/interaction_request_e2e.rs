@@ -83,7 +83,7 @@ async fn seed_finalized_receipt(
 async fn global_list_requires_authentication() {
     let (app, _services) = build_app().await;
     let response = app
-        .oneshot(get_request("/api/interaction-requests?status=pending"))
+        .oneshot(get_request("/api/interaction-requests?status=active"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -97,7 +97,7 @@ async fn global_list_returns_only_the_authenticated_users_projection() {
     seed_request(&services, "foreign-user", "request-foreign").await;
 
     let response = app
-        .oneshot(get_with_token("/api/interaction-requests?status=pending", &token))
+        .oneshot(get_with_token("/api/interaction-requests?status=active", &token))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -106,6 +106,10 @@ async fn global_list_returns_only_the_authenticated_users_projection() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "request-owned");
     assert_eq!(items[0]["turn_id"], "turn-1");
+    assert_eq!(items[0]["stale"], true);
+    assert_eq!(body["data"]["sync_state"], "failed");
+    assert_eq!(body["data"]["failed_session_count"], 1);
+    assert_eq!(body["data"]["failure_codes"], json!(["GEA_AUTH_REQUIRED"]));
 }
 
 #[tokio::test]
@@ -203,9 +207,85 @@ async fn global_action_replays_a_finalized_success_receipt_through_the_full_rout
 
 #[tokio::test]
 async fn global_action_returns_a_stable_business_conflict_receipt() {
-    let (mut app, services) = build_app().await;
+    let gea = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ai/gateway/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "result": {
+                "accessDecision": { "allowed": true },
+                "delegationToken": "delegation-test",
+                "gatewayContext": {
+                    "consumerCode": "agent-sales",
+                    "sessionId": "gea-session-conflict",
+                    "conversationId": "conversation-request-conflict"
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&gea)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ai/gateway/interaction-requests/request-conflict/actions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "result": {
+                "receiptId": "receipt-conflict",
+                "requestId": "request-conflict",
+                "version": "v1",
+                "status": "conflict"
+            }
+        })))
+        .expect(1)
+        .mount(&gea)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ai/gateway/interaction-requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "result": {
+                "revision": "conflict-r1",
+                "items": [{
+                    "requestId": "request-conflict",
+                    "version": "v1",
+                    "status": "pending",
+                    "kind": "question",
+                    "title": "Choose a cost center",
+                    "allowedActions": ["answer", "decline"],
+                    "presentation": "{\"type\":\"question\",\"questions\":[{\"question\":\"Which cost center?\",\"options\":[{\"label\":\"CC-100\"}]}]}"
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&gea)
+        .await;
+    let (mut app, services) = build_app_with_gea_base_url(gea.uri()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     seed_request(&services, "system_default_user", "request-conflict").await;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/gea/auth/session",
+            json!({ "accessToken": "access-test", "tenantId": "tenant-test" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/gea/conversations/conversation-request-conflict/session",
+            json!({ "consumerCode": "agent-sales" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let response = app
         .oneshot(json_with_token(
             "POST",
@@ -213,7 +293,8 @@ async fn global_action_returns_a_stable_business_conflict_receipt() {
             json!({
                 "expected_version": "stale-version",
                 "idempotency_key": "command-conflict",
-                "action_id": "answer"
+                "action_id": "answer",
+                "payload": { "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }] }
             }),
             &token,
             &csrf,

@@ -13,6 +13,7 @@ pub struct UpsertInteractionRequestParams {
     pub conversation_id: String,
     pub version: String,
     pub status: String,
+    pub active: bool,
     pub kind: String,
     pub title: String,
     pub summary: Option<String>,
@@ -58,21 +59,17 @@ pub enum ReceiptResumeClaim {
 #[async_trait::async_trait]
 pub trait IInteractionRequestRepository: Send + Sync {
     async fn upsert_session_bootstrap(&self, params: &UpsertGeaSessionBootstrapParams) -> Result<(), DbError>;
-    async fn list_pending_session_bootstraps(&self, user_id: &str) -> Result<Vec<StoredGeaSessionBootstrap>, DbError>;
+    async fn list_session_bootstraps(&self, user_id: &str) -> Result<Vec<StoredGeaSessionBootstrap>, DbError>;
     async fn conversation_exists(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
-    async fn list_for_conversation(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-    ) -> Result<Vec<StoredInteractionRequest>, DbError>;
-    async fn list_pending(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError>;
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError>;
+    async fn list_active(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError>;
     async fn find(&self, user_id: &str, request_id: &str) -> Result<Option<StoredInteractionRequest>, DbError>;
     async fn upsert(&self, params: &UpsertInteractionRequestParams) -> Result<(), DbError>;
-    async fn resolve_missing(
+    async fn deactivate_missing(
         &self,
         user_id: &str,
-        conversation_id: &str,
         incoming_request_ids: &[String],
+        source_revision: &str,
         changed_at: TimestampMs,
     ) -> Result<(), DbError>;
     async fn update_authoritative(
@@ -87,6 +84,7 @@ pub trait IInteractionRequestRepository: Send + Sync {
         request_id: &str,
         status: &str,
         version: &str,
+        active: bool,
         changed_at: TimestampMs,
     ) -> Result<(), DbError>;
     async fn load_receipt(

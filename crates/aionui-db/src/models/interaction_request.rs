@@ -6,6 +6,7 @@ pub struct StoredInteractionRequest {
     pub conversation_id: String,
     pub version: String,
     pub status: String,
+    pub active: bool,
     pub kind: String,
     pub title: String,
     pub summary: Option<String>,

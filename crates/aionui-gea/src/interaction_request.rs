@@ -57,18 +57,26 @@ pub(crate) fn validate_question_answers(payload: Option<&Value>) -> Result<(), G
 }
 
 pub(crate) fn parse_snapshot(value: &Value) -> Result<GeaInteractionRequestSnapshot, GeaError> {
-    let result = value
+    let mut result = value
         .get("result")
+        .cloned()
         .ok_or_else(|| invalid_upstream("GEA Interaction Request 响应缺少 result"))?;
-    reject_sensitive_fields(result)?;
-    let snapshot = serde_json::from_value::<GeaInteractionRequestSnapshot>(result.clone())
+    let items = result
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| invalid_upstream("GEA Interaction Request 快照缺少 items"))?;
+    for request in items {
+        normalize_request(request)?;
+    }
+    reject_sensitive_fields(&result)?;
+    let snapshot = serde_json::from_value::<GeaInteractionRequestSnapshot>(result)
         .map_err(|_| invalid_upstream("GEA Interaction Request 快照格式无效"))?;
     validate_identifier("revision", &snapshot.revision)?;
     let mut ids = HashSet::with_capacity(snapshot.items.len());
     for request in &snapshot.items {
         validate_request(request)?;
-        if request.status != GeaInteractionRequestStatus::Pending {
-            return Err(invalid_upstream("GEA pending 快照包含非 pending 请求"));
+        if request.status == GeaInteractionRequestStatus::Cancelled {
+            return Err(invalid_upstream("GEA 完整快照不应包含 cancelled 请求"));
         }
         if !ids.insert(request.id.as_str()) {
             return Err(invalid_upstream("GEA pending 快照包含重复 request ID"));
@@ -81,11 +89,15 @@ pub(crate) fn parse_receipt(
     value: &Value,
     expected_request_id: &str,
 ) -> Result<GeaInteractionRequestReceipt, GeaError> {
-    let result = value
+    let mut result = value
         .get("result")
+        .cloned()
         .ok_or_else(|| invalid_upstream("GEA Interaction Request 动作响应缺少 result"))?;
-    reject_sensitive_fields(result)?;
-    let receipt = serde_json::from_value::<GeaInteractionRequestReceipt>(result.clone())
+    if let Some(request) = result.get_mut("request") {
+        normalize_request(request)?;
+    }
+    reject_sensitive_fields(&result)?;
+    let receipt = serde_json::from_value::<GeaInteractionRequestReceipt>(result)
         .map_err(|_| invalid_upstream("GEA Interaction Request 回执格式无效"))?;
     validate_identifier("receiptId", &receipt.receipt_id)?;
     validate_identifier("requestId", &receipt.request_id)?;
@@ -109,7 +121,9 @@ fn validate_request(request: &GeaInteractionRequest) -> Result<(), GeaError> {
     validate_identifier("request.id", &request.id)?;
     validate_identifier("request.version", &request.version)?;
     validate_non_empty("request.title", &request.title)?;
-    validate_timestamp("request.updatedAt", &request.updated_at)?;
+    if !request.updated_at.trim().is_empty() {
+        validate_timestamp("request.updatedAt", &request.updated_at)?;
+    }
     if let Some(expires_at) = request.expires_at.as_deref() {
         validate_timestamp("request.expiresAt", expires_at)?;
     }
@@ -125,7 +139,7 @@ fn validate_request(request: &GeaInteractionRequest) -> Result<(), GeaError> {
     }
     match (&request.kind, &request.presentation) {
         (GeaInteractionRequestKind::Question, GeaInteractionPresentation::Question { questions }) => {
-            if questions.is_empty() || !actions.contains("answer") || !actions.contains("decline") {
+            if !questions.is_empty() && (!actions.contains("answer") || !actions.contains("decline")) {
                 return Err(invalid_upstream("GEA question 必须包含问题并允许 answer 和 decline"));
             }
             for question in questions {
@@ -139,9 +153,6 @@ fn validate_request(request: &GeaInteractionRequest) -> Result<(), GeaError> {
             }
         }
         (GeaInteractionRequestKind::Permission, GeaInteractionPresentation::Permission { options, .. }) => {
-            if options.is_empty() {
-                return Err(invalid_upstream("GEA permission options 不能为空"));
-            }
             for option in options {
                 validate_non_empty("presentation.option.label", &option.label)?;
                 validate_identifier("presentation.option.value", &option.value)?;
@@ -151,6 +162,40 @@ fn validate_request(request: &GeaInteractionRequest) -> Result<(), GeaError> {
             }
         }
         _ => return Err(invalid_upstream("GEA Interaction Request kind 与 presentation 不匹配")),
+    }
+    Ok(())
+}
+
+fn normalize_request(value: &mut Value) -> Result<(), GeaError> {
+    let request = value
+        .as_object_mut()
+        .ok_or_else(|| invalid_upstream("GEA Interaction Request 条目必须是 JSON object"))?;
+    let external_id = request.get("requestId").and_then(Value::as_str);
+    let legacy_id = request.get("id").and_then(Value::as_str);
+    if external_id.is_some() && legacy_id.is_some() && external_id != legacy_id {
+        return Err(invalid_upstream("GEA Interaction Request requestId 与 id 不匹配"));
+    }
+    if external_id.is_none()
+        && let Some(id) = request.remove("id")
+    {
+        request.insert("requestId".to_owned(), id);
+    }
+    if request.get("presentation").is_none_or(Value::is_null) {
+        let kind = request
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_upstream("GEA Interaction Request 缺少 kind"))?;
+        request.insert("presentation".to_owned(), serde_json::json!({ "type": kind }));
+    }
+    if let Some(Value::String(serialized)) = request.get("presentation") {
+        let presentation = serde_json::from_str::<Value>(serialized)
+            .map_err(|_| invalid_upstream("GEA Interaction Request presentation 不是有效 JSON"))?;
+        if !presentation.is_object() {
+            return Err(invalid_upstream(
+                "GEA Interaction Request presentation 必须是 JSON object",
+            ));
+        }
+        request.insert("presentation".to_owned(), presentation);
     }
     Ok(())
 }
@@ -218,6 +263,161 @@ mod tests {
     use super::{parse_receipt, parse_snapshot};
 
     #[test]
+    fn snapshot_normalizes_current_v1_1_request_shape() {
+        let snapshot = parse_snapshot(&json!({
+            "result": {
+                "revision": "gea-pending-3",
+                "items": [{
+                    "requestId": "request-001",
+                    "version": "v1",
+                    "kind": "question",
+                    "status": "pending",
+                    "title": "请确认报表数据范围",
+                    "summary": "用于生成本月销售分析",
+                    "sourceLabel": "sales-analysis",
+                    "allowedActions": ["answer", "decline"],
+                    "presentation": "{\"type\":\"question\"}",
+                    "expiresAt": "2026-08-21T12:00:00+08:00"
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.items[0].id, "request-001");
+        assert!(snapshot.items[0].updated_at.is_empty());
+        assert!(matches!(
+            snapshot.items[0].presentation,
+            aionui_api_types::GeaInteractionPresentation::Question { ref questions } if questions.is_empty()
+        ));
+    }
+
+    #[test]
+    fn snapshot_accepts_the_complete_non_cancelled_v1_1_status_set() {
+        let snapshot = parse_snapshot(&json!({
+            "result": {
+                "revision": "gea-all-4",
+                "items": [
+                    {
+                        "requestId": "request-processing",
+                        "version": "v2",
+                        "kind": "question",
+                        "status": "processing",
+                        "title": "正在提交",
+                        "allowedActions": ["answer", "decline"],
+                        "presentation": "{\"type\":\"question\"}"
+                    },
+                    {
+                        "requestId": "request-resolved",
+                        "version": "v3",
+                        "kind": "permission",
+                        "status": "resolved",
+                        "title": "已完成",
+                        "allowedActions": ["proceed_once"],
+                        "presentation": "{\"type\":\"permission\"}"
+                    },
+                    {
+                        "requestId": "request-expired",
+                        "version": "v2",
+                        "kind": "permission",
+                        "status": "expired",
+                        "title": "已过期",
+                        "allowedActions": ["proceed_once"]
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.items.len(), 3);
+        assert_eq!(
+            snapshot.items[0].status,
+            aionui_api_types::GeaInteractionRequestStatus::Processing
+        );
+    }
+
+    #[test]
+    fn snapshot_accepts_verification_required_as_active() {
+        let snapshot = parse_snapshot(&json!({
+            "result": {
+                "revision": "active-r2",
+                "items": [{
+                    "requestId": "request-1",
+                    "version": "v2",
+                    "status": "verification_required",
+                    "kind": "permission",
+                    "title": "Verify",
+                    "allowedActions": ["verify_succeeded", "verify_failed"],
+                    "presentation": {
+                        "type": "permission",
+                        "title": "Verify",
+                        "description": "Verify the external result.",
+                        "operation": "verify",
+                        "options": [
+                            { "label": "Succeeded", "value": "verify_succeeded" },
+                            { "label": "Failed", "value": "verify_failed" }
+                        ]
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            snapshot.items[0].status,
+            aionui_api_types::GeaInteractionRequestStatus::VerificationRequired
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_sensitive_fields_inside_string_presentation() {
+        let error = parse_snapshot(&json!({
+            "result": {
+                "revision": "pending-r1",
+                "items": [{
+                    "requestId": "request-1",
+                    "version": "v1",
+                    "status": "pending",
+                    "kind": "permission",
+                    "title": "Confirm",
+                    "allowedActions": ["proceed_once"],
+                    "presentation": "{\"type\":\"permission\",\"title\":\"Confirm\",\"description\":\"Execute once.\",\"operation\":\"execute\",\"accessToken\":\"secret\",\"options\":[{\"label\":\"Allow\",\"value\":\"proceed_once\"}]}"
+                }]
+            }
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("accessToken"));
+    }
+
+    #[test]
+    fn snapshot_rejects_mismatched_request_identifiers() {
+        let error = parse_snapshot(&json!({
+            "result": {
+                "revision": "pending-r1",
+                "items": [{
+                    "requestId": "request-1",
+                    "id": "request-2",
+                    "version": "v1",
+                    "status": "pending",
+                    "kind": "permission",
+                    "title": "Confirm",
+                    "allowedActions": ["proceed_once"],
+                    "presentation": {
+                        "type": "permission",
+                        "title": "Confirm",
+                        "description": "Execute once.",
+                        "operation": "execute",
+                        "options": [{ "label": "Allow", "value": "proceed_once" }]
+                    }
+                }]
+            }
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requestId 与 id 不匹配"));
+    }
+
+    #[test]
     fn snapshot_rejects_sensitive_unknown_fields() {
         let error = parse_snapshot(&json!({
             "result": {
@@ -265,5 +465,32 @@ mod tests {
 
         assert_eq!(error.body.code, "GEA_INVALID_RESPONSE");
         assert!(error.to_string().contains("requestId 不匹配"));
+    }
+
+    #[test]
+    fn receipt_accepts_v1_1_processing_and_failed_results() {
+        for status in ["processing", "failed"] {
+            let receipt = parse_receipt(
+                &json!({
+                    "result": {
+                        "receiptId": format!("receipt-{status}"),
+                        "requestId": "request-1",
+                        "version": "v2",
+                        "status": status
+                    }
+                }),
+                "request-1",
+            )
+            .unwrap();
+
+            assert_eq!(
+                receipt.status,
+                if status == "processing" {
+                    aionui_api_types::GeaInteractionRequestReceiptStatus::Processing
+                } else {
+                    aionui_api_types::GeaInteractionRequestReceiptStatus::Failed
+                }
+            );
+        }
     }
 }

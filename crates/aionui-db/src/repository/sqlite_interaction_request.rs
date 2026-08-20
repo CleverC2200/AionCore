@@ -21,7 +21,7 @@ impl SqliteInteractionRequestRepository {
     }
 }
 
-const SELECT_REQUEST: &str = "SELECT request_id, conversation_id, version, status, kind, title, summary, source_label, \
+const SELECT_REQUEST: &str = "SELECT request_id, conversation_id, version, status, active, kind, title, summary, source_label, \
      allowed_actions, expires_at, updated_at, presentation, turn_id, message_id \
      FROM gea_interaction_requests";
 
@@ -46,15 +46,11 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         Ok(())
     }
 
-    async fn list_pending_session_bootstraps(&self, user_id: &str) -> Result<Vec<StoredGeaSessionBootstrap>, DbError> {
+    async fn list_session_bootstraps(&self, user_id: &str) -> Result<Vec<StoredGeaSessionBootstrap>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT DISTINCT bootstrap.conversation_id, bootstrap.consumer_code, bootstrap.preparation_id \
-             FROM gea_interaction_session_bootstraps bootstrap \
-             JOIN gea_interaction_requests request \
-               ON request.user_id = bootstrap.user_id \
-              AND request.conversation_id = bootstrap.conversation_id \
-             WHERE bootstrap.user_id = ? AND request.status = 'pending' \
-             ORDER BY bootstrap.conversation_id",
+            "SELECT conversation_id, consumer_code, preparation_id \
+             FROM gea_interaction_session_bootstraps \
+             WHERE user_id = ? ORDER BY conversation_id",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -71,23 +67,20 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         )
     }
 
-    async fn list_for_conversation(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-    ) -> Result<Vec<StoredInteractionRequest>, DbError> {
-        Ok(sqlx::query_as::<_, StoredInteractionRequest>(&format!(
-            "{SELECT_REQUEST} WHERE user_id = ? AND conversation_id = ?"
-        ))
-        .bind(user_id)
-        .bind(conversation_id)
-        .fetch_all(&self.pool)
-        .await?)
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError> {
+        Ok(
+            sqlx::query_as::<_, StoredInteractionRequest>(&format!("{SELECT_REQUEST} WHERE user_id = ?"))
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
-    async fn list_pending(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError> {
+    async fn list_active(&self, user_id: &str) -> Result<Vec<StoredInteractionRequest>, DbError> {
         Ok(sqlx::query_as::<_, StoredInteractionRequest>(&format!(
-            "{SELECT_REQUEST} WHERE user_id = ? AND status = 'pending' ORDER BY updated_at DESC, request_id ASC"
+            "{SELECT_REQUEST} WHERE user_id = ? AND active = 1 \
+             AND status IN ('pending', 'verification_required') \
+             ORDER BY CASE WHEN updated_at = '' THEN 1 ELSE 0 END ASC, updated_at DESC, request_id ASC"
         ))
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -107,26 +100,29 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
     async fn upsert(&self, params: &UpsertInteractionRequestParams) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO gea_interaction_requests \
-                (user_id, request_id, conversation_id, version, status, kind, title, summary, source_label, \
+                (user_id, request_id, conversation_id, version, status, kind, title, summary, source_label, active, \
                  allowed_actions, expires_at, updated_at, presentation, upstream_revision, turn_id, message_id, changed_at) \
-             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(user_id, request_id) DO UPDATE SET \
-                version = excluded.version, status = 'pending', kind = excluded.kind, title = excluded.title, \
+                version = excluded.version, status = excluded.status, active = excluded.active, kind = excluded.kind, title = excluded.title, \
                 summary = excluded.summary, source_label = excluded.source_label, \
                 allowed_actions = excluded.allowed_actions, expires_at = excluded.expires_at, \
                 updated_at = excluded.updated_at, presentation = excluded.presentation, \
                 upstream_revision = excluded.upstream_revision, \
                 turn_id = COALESCE(gea_interaction_requests.turn_id, excluded.turn_id), \
+                message_id = excluded.message_id, \
                 changed_at = excluded.changed_at",
         )
         .bind(&params.user_id)
         .bind(&params.request_id)
         .bind(&params.conversation_id)
         .bind(&params.version)
+        .bind(&params.status)
         .bind(&params.kind)
         .bind(&params.title)
         .bind(&params.summary)
         .bind(&params.source_label)
+        .bind(params.active)
         .bind(&params.allowed_actions)
         .bind(&params.expires_at)
         .bind(&params.updated_at)
@@ -140,41 +136,71 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         Ok(())
     }
 
-    async fn resolve_missing(
+    async fn deactivate_missing(
         &self,
         user_id: &str,
-        conversation_id: &str,
         incoming_request_ids: &[String],
+        source_revision: &str,
         changed_at: i64,
     ) -> Result<(), DbError> {
+        let mut transaction = self.pool.begin().await?;
         if incoming_request_ids.is_empty() {
             sqlx::query(
-                "UPDATE gea_interaction_requests SET status = 'resolved', changed_at = ? \
-                 WHERE user_id = ? AND conversation_id = ? AND status = 'pending'",
+                "INSERT OR IGNORE INTO gea_interaction_request_projection_audit \
+                    (user_id, request_id, conversation_id, local_status, source_revision, disposition, recorded_at) \
+                 SELECT user_id, request_id, conversation_id, status, ?, \
+                        'absent_from_gea_active_snapshot', ? \
+                 FROM gea_interaction_requests \
+                 WHERE user_id = ? AND active = 1",
+            )
+            .bind(source_revision)
+            .bind(changed_at)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE gea_interaction_requests SET active = 0, changed_at = ? \
+                 WHERE user_id = ? AND active = 1",
             )
             .bind(changed_at)
             .bind(user_id)
-            .bind(conversation_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
             return Ok(());
         }
         let placeholders = std::iter::repeat_n("?", incoming_request_ids.len())
             .collect::<Vec<_>>()
             .join(",");
-        let statement = format!(
-            "UPDATE gea_interaction_requests SET status = 'resolved', changed_at = ? \
-             WHERE user_id = ? AND conversation_id = ? AND status = 'pending' \
+        let audit_statement = format!(
+            "INSERT OR IGNORE INTO gea_interaction_request_projection_audit \
+                (user_id, request_id, conversation_id, local_status, source_revision, disposition, recorded_at) \
+             SELECT user_id, request_id, conversation_id, status, ?, \
+                    'absent_from_gea_active_snapshot', ? \
+             FROM gea_interaction_requests \
+             WHERE user_id = ? AND active = 1 \
              AND request_id NOT IN ({placeholders})"
         );
-        let mut query = sqlx::query(&statement)
+        let mut audit_query = sqlx::query(&audit_statement)
+            .bind(source_revision)
             .bind(changed_at)
-            .bind(user_id)
-            .bind(conversation_id);
+            .bind(user_id);
+        for request_id in incoming_request_ids {
+            audit_query = audit_query.bind(request_id);
+        }
+        audit_query.execute(&mut *transaction).await?;
+
+        let update_statement = format!(
+            "UPDATE gea_interaction_requests SET active = 0, changed_at = ? \
+             WHERE user_id = ? AND active = 1 \
+             AND request_id NOT IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&update_statement).bind(changed_at).bind(user_id);
         for request_id in incoming_request_ids {
             query = query.bind(request_id);
         }
-        query.execute(&self.pool).await?;
+        query.execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -185,12 +211,14 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         update: &UpsertInteractionRequestParams,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE gea_interaction_requests SET version = ?, status = ?, kind = ?, title = ?, summary = ?, \
-                    source_label = ?, allowed_actions = ?, expires_at = ?, updated_at = ?, presentation = ?, changed_at = ? \
+            "UPDATE gea_interaction_requests SET version = ?, status = ?, active = ?, kind = ?, title = ?, summary = ?, \
+                    source_label = ?, allowed_actions = ?, expires_at = ?, updated_at = ?, presentation = ?, \
+                    message_id = ?, changed_at = ? \
              WHERE user_id = ? AND request_id = ?",
         )
         .bind(&update.version)
         .bind(&update.status)
+        .bind(update.active)
         .bind(&update.kind)
         .bind(&update.title)
         .bind(&update.summary)
@@ -199,6 +227,7 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         .bind(&update.expires_at)
         .bind(&update.updated_at)
         .bind(&update.presentation)
+        .bind(&update.message_id)
         .bind(update.changed_at)
         .bind(user_id)
         .bind(request_id)
@@ -213,14 +242,16 @@ impl IInteractionRequestRepository for SqliteInteractionRequestRepository {
         request_id: &str,
         status: &str,
         version: &str,
+        active: bool,
         changed_at: i64,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE gea_interaction_requests SET status = ?, version = ?, changed_at = ? \
+            "UPDATE gea_interaction_requests SET status = ?, version = ?, active = ?, changed_at = ? \
              WHERE user_id = ? AND request_id = ?",
         )
         .bind(status)
         .bind(version)
+        .bind(active)
         .bind(changed_at)
         .bind(user_id)
         .bind(request_id)
