@@ -131,8 +131,8 @@ pub use gea::{
     GeaInteractionRequestStatus, GeaInteractionTurnContinuation, GeaLocalizedText, GeaResourceCatalogEnvelope,
     GeaResourceCatalogSnapshot, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
     InteractionRequestActionCommand, InteractionRequestChangedPayload, InteractionRequestList,
-    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestView, ReportGeaSkillExecutionRequest,
-    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestSyncState, InteractionRequestView,
+    ReportGeaSkillExecutionRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

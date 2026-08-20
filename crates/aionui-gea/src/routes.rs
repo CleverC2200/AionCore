@@ -59,12 +59,12 @@ async fn sync_client_resources(
 
 #[derive(Debug, Deserialize)]
 struct InteractionRequestListQuery {
-    #[serde(default = "pending_status")]
+    #[serde(default = "active_status")]
     status: String,
 }
 
-fn pending_status() -> String {
-    "pending".to_owned()
+fn active_status() -> String {
+    "active".to_owned()
 }
 
 async fn list_all_interaction_requests(
@@ -72,8 +72,8 @@ async fn list_all_interaction_requests(
     Extension(user): Extension<CurrentUser>,
     Query(query): Query<InteractionRequestListQuery>,
 ) -> Result<Json<ApiResponse<InteractionRequestList>>, GeaError> {
-    if query.status != "pending" {
-        return Err(GeaError::invalid_request("当前只支持 status=pending"));
+    if !matches!(query.status.as_str(), "active" | "pending") {
+        return Err(GeaError::invalid_request("当前只支持 status=active"));
     }
     let snapshot = state.service.list_all_interaction_requests(&user.id).await?;
     Ok(Json(ApiResponse::ok(snapshot)))

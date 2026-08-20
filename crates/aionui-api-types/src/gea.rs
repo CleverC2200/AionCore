@@ -221,6 +221,7 @@ pub enum GeaInteractionRequestKind {
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionRequestStatus {
     Pending,
+    Processing,
     Resolved,
     Expired,
     Cancelled,
@@ -257,14 +258,19 @@ pub struct GeaInteractionPermissionOption {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GeaInteractionPresentation {
     Question {
+        #[serde(default)]
         questions: Vec<GeaInteractionQuestion>,
     },
     Permission {
+        #[serde(default)]
         title: String,
+        #[serde(default)]
         description: String,
+        #[serde(default)]
         operation: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        #[serde(default)]
         options: Vec<GeaInteractionPermissionOption>,
     },
 }
@@ -272,6 +278,7 @@ pub enum GeaInteractionPresentation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionRequest {
+    #[serde(rename = "requestId", alias = "id")]
     pub id: String,
     pub version: String,
     pub status: GeaInteractionRequestStatus,
@@ -284,6 +291,7 @@ pub struct GeaInteractionRequest {
     pub allowed_actions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default)]
     pub updated_at: String,
     pub presentation: GeaInteractionPresentation,
 }
@@ -308,7 +316,9 @@ pub struct GeaInteractionRequestActionCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionRequestReceiptStatus {
+    Processing,
     Accepted,
+    Failed,
     AlreadyResolved,
     Conflict,
     Expired,
@@ -375,13 +385,28 @@ pub struct InteractionRequestView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub allowed_actions: Vec<String>,
-    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionRequestSyncState {
+    Complete,
+    Partial,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionRequestList {
     pub revision: String,
     pub items: Vec<InteractionRequestView>,
+    pub sync_state: InteractionRequestSyncState,
+    pub failed_session_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_codes: Vec<String>,
 }
 
 /// User-scoped invalidation event for the recoverable interaction-request

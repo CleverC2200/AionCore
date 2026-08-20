@@ -7,7 +7,7 @@ use aionui_api_types::{
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
     GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallResponse,
     GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt,
-    SetGeaAuthSessionRequest,
+    InteractionRequestSyncState, SetGeaAuthSessionRequest,
 };
 use aionui_db::{
     IConversationRepository, IGeaResourceRepository, IInteractionRequestRepository, ReceiptResumeClaim,
@@ -534,30 +534,47 @@ impl GeaService {
         credential: &GeaCredential,
         session: &GeaConversationSession,
     ) -> Result<GeaInteractionRequestSnapshot, GeaError> {
+        let started = Instant::now();
         let value = self
             .get_for_conversation(user_id, conversation_id, credential, session)
             .await?;
         let snapshot = parse_snapshot(&value)?;
+        let mut projection_changed = None;
         if let Some(projection) = &self.projection {
-            projection
-                .reconcile_snapshot(user_id, conversation_id, &snapshot)
-                .await?;
+            projection_changed = Some(
+                projection
+                    .reconcile_snapshot(user_id, conversation_id, &snapshot)
+                    .await?,
+            );
         }
-        tracing::info!(
-            user_id,
-            conversation_id,
-            revision = snapshot.revision,
-            pending_count = snapshot.items.len(),
-            "GEA interaction request snapshot loaded"
-        );
+        if projection_changed != Some(false) {
+            tracing::info!(
+                user_id,
+                conversation_id,
+                revision = snapshot.revision,
+                snapshot_count = snapshot.items.len(),
+                duration_ms = started.elapsed().as_millis(),
+                "GEA interaction request snapshot changed"
+            );
+        } else {
+            tracing::debug!(
+                user_id,
+                conversation_id,
+                revision = snapshot.revision,
+                snapshot_count = snapshot.items.len(),
+                duration_ms = started.elapsed().as_millis(),
+                "GEA interaction request snapshot unchanged"
+            );
+        }
         Ok(snapshot)
     }
 
     pub async fn list_all_interaction_requests(&self, user_id: &str) -> Result<InteractionRequestList, GeaError> {
         let projection = self.projection()?;
-        self.recover_interaction_sessions(user_id).await;
+        let has_credential = self.credentials.read().await.contains_key(user_id);
+        let mut failures = self.recover_interaction_sessions(user_id).await;
         self.recover_unfinalized_receipts(user_id).await?;
-        let conversation_ids = self
+        let mut conversation_ids = self
             .sessions
             .read()
             .await
@@ -565,17 +582,52 @@ impl GeaService {
             .filter(|(owner, _)| owner == user_id)
             .map(|(_, conversation_id)| conversation_id.clone())
             .collect::<Vec<_>>();
+        conversation_ids.sort();
+        let mut synchronized = false;
         for conversation_id in conversation_ids {
-            if let Err(error) = self.list_interaction_requests(user_id, &conversation_id).await {
-                tracing::warn!(
-                    user_id,
-                    conversation_id,
-                    code = %error.body.code,
-                    "GEA interaction request refresh failed; returning the last durable projection"
-                );
+            let started = Instant::now();
+            match self.list_interaction_requests(user_id, &conversation_id).await {
+                Ok(_) => {
+                    synchronized = true;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        conversation_id,
+                        code = %error.body.code,
+                        duration_ms = started.elapsed().as_millis(),
+                        "GEA interaction request refresh failed"
+                    );
+                    failures.push((conversation_id, error.body.code.clone()));
+                }
             }
         }
-        projection.list_pending(user_id).await
+        let mut list = projection.list_active(user_id).await?;
+        if synchronized {
+            return Ok(list);
+        }
+        if failures.is_empty() {
+            let code = if has_credential {
+                "GEA_SESSION_REQUIRED"
+            } else {
+                "GEA_AUTH_REQUIRED"
+            };
+            failures.push((String::new(), code.to_owned()));
+        }
+        list.sync_state = InteractionRequestSyncState::Failed;
+        list.failed_session_count = failures.len();
+        list.failure_codes = failures
+            .iter()
+            .map(|(_, code)| code.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        list.failure_codes.sort();
+        for item in &mut list.items {
+            item.stale = true;
+        }
+        Ok(list)
     }
 
     async fn recover_unfinalized_receipts(&self, user_id: &str) -> Result<(), GeaError> {
@@ -612,18 +664,23 @@ impl GeaService {
         Ok(())
     }
 
-    async fn recover_interaction_sessions(&self, user_id: &str) {
+    async fn recover_interaction_sessions(&self, user_id: &str) -> Vec<(String, String)> {
+        let mut failures = Vec::new();
         if !self.credentials.read().await.contains_key(user_id) {
-            return;
+            return failures;
+        }
+        if self.sessions.read().await.keys().any(|(owner, _)| owner == user_id) {
+            return failures;
         }
         let Some(projection) = self.projection.as_ref() else {
-            return;
+            return failures;
         };
-        let bootstraps = match projection.pending_session_bootstraps(user_id).await {
+        let bootstraps = match projection.session_bootstraps(user_id).await {
             Ok(bootstraps) => bootstraps,
             Err(error) => {
                 tracing::warn!(user_id, code = %error.body.code, "could not load GEA session recovery records");
-                return;
+                failures.push((String::new(), error.body.code.clone()));
+                return failures;
             }
         };
         for bootstrap in bootstraps {
@@ -631,7 +688,7 @@ impl GeaService {
             if self.sessions.read().await.contains_key(&key) {
                 continue;
             }
-            if let Err(error) = self
+            match self
                 .create_session(
                     user_id,
                     &bootstrap.conversation_id,
@@ -642,14 +699,19 @@ impl GeaService {
                 )
                 .await
             {
-                tracing::warn!(
-                    user_id,
-                    conversation_id = %bootstrap.conversation_id,
-                    code = %error.body.code,
-                    "GEA session recovery failed; keeping the durable Interaction Request projection"
-                );
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        conversation_id = %bootstrap.conversation_id,
+                        code = %error.body.code,
+                        "GEA session recovery failed; keeping the durable Interaction Request projection"
+                    );
+                    failures.push((bootstrap.conversation_id, error.body.code.clone()));
+                }
             }
         }
+        failures
     }
 
     pub async fn act_on_global_interaction_request(
@@ -693,118 +755,103 @@ impl GeaService {
         }
 
         let current = projection.find(user_id, request_id).await?;
-        let local_status = if current.version != command.expected_version {
-            Some(GeaInteractionRequestReceiptStatus::Conflict)
-        } else if !current
-            .allowed_actions
-            .iter()
-            .any(|action| action == &command.action_id)
-        {
-            Some(GeaInteractionRequestReceiptStatus::Forbidden)
-        } else if current.expires_at.as_deref().is_some_and(is_expired) {
-            Some(GeaInteractionRequestReceiptStatus::Expired)
-        } else {
-            None
-        };
-        let receipt = if let Some(status) = local_status {
-            InteractionRequestReceipt {
-                receipt_id: format!("local_{}", Uuid::now_v7()),
-                request_id: request_id.to_owned(),
-                version: current.version.clone(),
-                status,
-                turn_continuation: None,
-                resolved_at: None,
-                resolved_by: None,
-                request: Some(current),
-            }
-        } else {
-            let conversation_id = current.conversation_id.clone();
-            let interaction_lock = self.interaction_lock(user_id, &conversation_id).await;
-            let _interaction_guard = interaction_lock.lock().await;
-            let credential = self.credential(user_id).await?;
-            let session = self.session(user_id, &conversation_id).await?;
-            let upstream = self
-                .act_on_interaction_request_unlocked(
-                    user_id,
-                    &conversation_id,
-                    request_id,
-                    gea_command,
-                    &credential,
-                    &session,
-                )
-                .await?;
-            let needs_authoritative_refresh = upstream.request.is_none()
-                && matches!(
-                    upstream.status,
-                    GeaInteractionRequestReceiptStatus::Conflict
-                        | GeaInteractionRequestReceiptStatus::Forbidden
-                        | GeaInteractionRequestReceiptStatus::Expired
-                );
-            let mut request = if let Some(authoritative) = upstream.request.as_ref() {
-                Some(projection.apply_authoritative_request(user_id, authoritative).await?)
-            } else if needs_authoritative_refresh {
-                match self
-                    .list_interaction_requests_unlocked(user_id, &conversation_id, &credential, &session)
-                    .await
-                {
-                    Ok(_) => projection.find(user_id, request_id).await.ok(),
-                    Err(error) => {
-                        tracing::warn!(
-                            user_id,
-                            request_id,
-                            code = %error.body.code,
-                            "authoritative refresh failed after GEA returned a durable action receipt"
-                        );
-                        None
-                    }
-                }
+        let conversation_id = {
+            let sessions = self.sessions.read().await;
+            if sessions.contains_key(&(user_id.to_owned(), current.conversation_id.clone())) {
+                current.conversation_id.clone()
             } else {
-                Some(current)
-            };
-            if !needs_authoritative_refresh && let Some(request) = request.as_mut() {
-                request.version = upstream.version.clone();
-                request.status = match upstream.status {
-                    GeaInteractionRequestReceiptStatus::Accepted
-                    | GeaInteractionRequestReceiptStatus::AlreadyResolved => {
-                        aionui_api_types::GeaInteractionRequestStatus::Resolved
-                    }
-                    GeaInteractionRequestReceiptStatus::Expired => {
-                        aionui_api_types::GeaInteractionRequestStatus::Expired
-                    }
-                    GeaInteractionRequestReceiptStatus::Cancelled => {
-                        aionui_api_types::GeaInteractionRequestStatus::Cancelled
-                    }
-                    GeaInteractionRequestReceiptStatus::UnknownExternalWrite => {
-                        aionui_api_types::GeaInteractionRequestStatus::VerificationRequired
-                    }
-                    GeaInteractionRequestReceiptStatus::Conflict | GeaInteractionRequestReceiptStatus::Forbidden => {
-                        aionui_api_types::GeaInteractionRequestStatus::Pending
-                    }
-                };
+                let mut conversation_ids = sessions
+                    .keys()
+                    .filter(|(owner, _)| owner == user_id)
+                    .map(|(_, conversation_id)| conversation_id.clone())
+                    .collect::<Vec<_>>();
+                conversation_ids.sort();
+                conversation_ids
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| GeaError::conflict("GEA_SESSION_REQUIRED", "待办操作需要先恢复有效的 GEA Session"))?
             }
-            let receipt = InteractionRequestReceipt {
-                receipt_id: upstream.receipt_id,
-                request_id: upstream.request_id,
-                version: upstream.version,
-                status: upstream.status,
-                turn_continuation: upstream.turn_continuation,
-                resolved_at: upstream.resolved_at,
-                resolved_by: upstream.resolved_by,
-                request,
+        };
+        let interaction_lock = self.interaction_lock(user_id, &conversation_id).await;
+        let _interaction_guard = interaction_lock.lock().await;
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, &conversation_id).await?;
+        let upstream = self
+            .act_on_interaction_request_unlocked(
+                user_id,
+                &conversation_id,
+                request_id,
+                gea_command,
+                &credential,
+                &session,
+            )
+            .await?;
+        let needs_authoritative_refresh = upstream.request.is_none()
+            && matches!(
+                upstream.status,
+                GeaInteractionRequestReceiptStatus::Conflict
+                    | GeaInteractionRequestReceiptStatus::Forbidden
+                    | GeaInteractionRequestReceiptStatus::Expired
+                    | GeaInteractionRequestReceiptStatus::UnknownExternalWrite
+            );
+        let mut request = if let Some(authoritative) = upstream.request.as_ref() {
+            Some(projection.apply_authoritative_request(user_id, authoritative).await?)
+        } else if needs_authoritative_refresh {
+            match self
+                .list_interaction_requests_unlocked(user_id, &conversation_id, &credential, &session)
+                .await
+            {
+                Ok(_) => projection
+                    .find(user_id, request_id)
+                    .await
+                    .ok()
+                    .or_else(|| Some(current.clone())),
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        request_id,
+                        code = %error.body.code,
+                        "authoritative refresh failed after GEA returned a durable action receipt"
+                    );
+                    Some(current.clone())
+                }
+            }
+        } else {
+            Some(current)
+        };
+        if upstream.request.is_none()
+            && let Some(request) = request.as_mut()
+        {
+            request.version = upstream.version.clone();
+            request.status = match upstream.status {
+                GeaInteractionRequestReceiptStatus::Accepted | GeaInteractionRequestReceiptStatus::AlreadyResolved => {
+                    aionui_api_types::GeaInteractionRequestStatus::Resolved
+                }
+                GeaInteractionRequestReceiptStatus::Processing => {
+                    aionui_api_types::GeaInteractionRequestStatus::Processing
+                }
+                GeaInteractionRequestReceiptStatus::Failed => aionui_api_types::GeaInteractionRequestStatus::Pending,
+                GeaInteractionRequestReceiptStatus::Expired => aionui_api_types::GeaInteractionRequestStatus::Expired,
+                GeaInteractionRequestReceiptStatus::Cancelled => {
+                    aionui_api_types::GeaInteractionRequestStatus::Cancelled
+                }
+                GeaInteractionRequestReceiptStatus::UnknownExternalWrite => {
+                    aionui_api_types::GeaInteractionRequestStatus::VerificationRequired
+                }
+                GeaInteractionRequestReceiptStatus::Conflict | GeaInteractionRequestReceiptStatus::Forbidden => {
+                    aionui_api_types::GeaInteractionRequestStatus::Pending
+                }
             };
-            projection
-                .store_receipt(
-                    user_id,
-                    request_id,
-                    &command.idempotency_key,
-                    &command.expected_version,
-                    &command.action_id,
-                    &receipt,
-                )
-                .await?;
-            self.finalize_interaction_receipt(user_id, request_id, &command.idempotency_key, &receipt)
-                .await?;
-            return Ok(receipt);
+        }
+        let receipt = InteractionRequestReceipt {
+            receipt_id: upstream.receipt_id,
+            request_id: upstream.request_id,
+            version: upstream.version,
+            status: upstream.status,
+            turn_continuation: upstream.turn_continuation,
+            resolved_at: upstream.resolved_at,
+            resolved_by: upstream.resolved_by,
+            request,
         };
         projection
             .store_receipt(
@@ -1193,7 +1240,6 @@ impl GeaService {
                 ("agentCode", session.agent_code.as_str()),
                 ("sessionId", session.session_id.as_str()),
                 ("conversationId", session.conversation_id.as_str()),
-                ("status", "pending"),
             ])
             .send()
             .await
@@ -1240,10 +1286,6 @@ fn encode_path_segment(value: &str) -> String {
 fn non_empty(value: impl AsRef<str>) -> Option<String> {
     let value = value.as_ref().trim();
     (!value.is_empty()).then(|| value.to_owned())
-}
-
-fn is_expired(value: &str) -> bool {
-    chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|expires_at| expires_at < chrono::Utc::now())
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, GeaError> {
@@ -1377,7 +1419,7 @@ mod tests {
     use aionui_api_types::{
         CreateGeaSessionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
         GeaInteractionRequestReceiptStatus, GeaInteractionRequestStatus, InteractionRequestActionCommand,
-        InteractionRequestReceipt, SetGeaAuthSessionRequest,
+        InteractionRequestReceipt, InteractionRequestSyncState, SetGeaAuthSessionRequest,
     };
     use aionui_db::{SqliteConversationRepository, SqliteInteractionRequestRepository, init_database_memory};
     use aionui_realtime::BroadcastEventBus;
@@ -1568,16 +1610,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rehydrated_auth_recovers_pending_sessions_from_non_secret_bootstrap_data() {
+    async fn rehydrated_auth_recovers_a_session_before_any_request_was_projected() {
         let server = MockServer::start().await;
         mount_recoverable_session(&server).await;
         mount_question_snapshot(&server).await;
         let (service, database) = projected_service(&server).await;
         create_session(&service).await;
-        service
-            .list_interaction_requests("user-1", "conversation-1")
-            .await
-            .unwrap();
         drop(service);
 
         let restarted = GeaService::new(reqwest::Client::new(), server.uri())
@@ -1680,7 +1718,7 @@ mod tests {
             service
                 .projection()
                 .unwrap()
-                .list_pending("user-1")
+                .list_active("user-1")
                 .await
                 .unwrap()
                 .items
@@ -1783,7 +1821,7 @@ mod tests {
             service
                 .projection()
                 .unwrap()
-                .list_pending("user-1")
+                .list_active("user-1")
                 .await
                 .unwrap()
                 .items
@@ -2099,7 +2137,7 @@ mod tests {
             restarted
                 .projection()
                 .unwrap()
-                .list_pending("user-1")
+                .list_active("user-1")
                 .await
                 .unwrap()
                 .items
@@ -2108,10 +2146,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_global_action_is_blocked_before_the_upstream_write() {
+    async fn stale_global_action_reaches_gea_and_uses_its_conflict_receipt() {
         let server = MockServer::start().await;
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "stale-v0",
+                "idempotencyKey": "stale-command",
+                "actionId": "answer"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "stale-conflict-receipt",
+                    "requestId": "request-question-1",
+                    "version": "v1",
+                    "status": "conflict"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         let (service, _database) = projected_service(&server).await;
         create_session(&service).await;
         service
@@ -2127,13 +2184,116 @@ mod tests {
                     expected_version: "stale-v0".to_owned(),
                     idempotency_key: "stale-command".to_owned(),
                     action_id: "answer".to_owned(),
-                    payload: None,
+                    payload: Some(json!({
+                        "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }]
+                    })),
                 },
             )
             .await
             .unwrap();
         assert_eq!(receipt.status, GeaInteractionRequestReceiptStatus::Conflict);
         assert_eq!(receipt.request.unwrap().version, "v1");
+    }
+
+    #[tokio::test]
+    async fn global_action_uses_another_valid_session_without_moving_the_navigation_anchor() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .and(body_partial_json(json!({
+                "consumerCode": "agent-sales",
+                "conversationId": "conversation-2"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": { "allowed": true },
+                    "delegationToken": "delegation-secret-2",
+                    "gatewayContext": {
+                        "consumerCode": "agent-sales",
+                        "sessionId": "gea-session-2",
+                        "conversationId": "conversation-2"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .and(body_partial_json(json!({
+                "sessionId": "gea-session-2",
+                "conversationId": "conversation-2",
+                "expectedVersion": "v1",
+                "idempotencyKey": "cross-session-action",
+                "actionId": "answer"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "cross-session-processing",
+                    "requestId": "request-question-1",
+                    "version": "v2",
+                    "status": "processing"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (service, database) = projected_service(&server).await;
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, user_id, name, type, extra, status, pinned, created_at, updated_at) \
+             VALUES ('conversation-2', 'user-1', 'GEA fixture 2', 'aionrs', '{}', 'running', 0, 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        create_session(&service).await;
+        service
+            .list_interaction_requests("user-1", "conversation-1")
+            .await
+            .unwrap();
+        service
+            .create_session(
+                "user-1",
+                "conversation-2",
+                CreateGeaSessionRequest {
+                    consumer_code: "agent-sales".to_owned(),
+                    preparation_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .sessions
+            .write()
+            .await
+            .remove(&("user-1".to_owned(), "conversation-1".to_owned()));
+
+        let receipt = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-question-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v1".to_owned(),
+                    idempotency_key: "cross-session-action".to_owned(),
+                    action_id: "answer".to_owned(),
+                    payload: Some(json!({
+                        "answers": [{ "question": "Which cost center?", "labels": ["CC-100"] }]
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.status, GeaInteractionRequestReceiptStatus::Processing);
+        let request = receipt.request.unwrap();
+        assert_eq!(request.conversation_id, "conversation-1");
+        assert_eq!(request.status, GeaInteractionRequestStatus::Processing);
     }
 
     #[tokio::test]
@@ -2211,7 +2371,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.status, GeaInteractionRequestReceiptStatus::Conflict);
-        assert!(first.request.is_none());
+        assert_eq!(first.request.as_ref().unwrap().conversation_id, "conversation-1");
 
         let replay = service
             .act_on_global_interaction_request("user-1", "request-question-1", command)
@@ -2234,7 +2394,7 @@ mod tests {
                 if !service
                     .projection()
                     .unwrap()
-                    .list_pending("user-1")
+                    .list_active("user-1")
                     .await
                     .unwrap()
                     .items
@@ -2251,10 +2411,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_list_uses_one_complete_snapshot_across_sessions() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/session"))
+            .and(body_partial_json(json!({
+                "consumerCode": "agent-finance",
+                "conversationId": "conversation-2"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "accessDecision": { "allowed": true },
+                    "delegationToken": "delegation-secret-2",
+                    "gatewayContext": {
+                        "consumerCode": "agent-finance",
+                        "sessionId": "gea-session-2",
+                        "conversationId": "conversation-2"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .and(query_param("conversationId", "conversation-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "principal-agent-r1",
+                    "items": [
+                        {
+                            "requestId": "request-pending",
+                            "version": "v1",
+                            "status": "pending",
+                            "kind": "question",
+                            "title": "Question from the complete snapshot",
+                            "allowedActions": ["answer", "decline"],
+                            "updatedAt": "2026-08-17T10:00:00+08:00",
+                            "presentation": "{\"type\":\"question\",\"questions\":[{\"question\":\"Continue?\",\"options\":[{\"label\":\"Yes\"}]}]}"
+                        },
+                        {
+                            "requestId": "request-processing",
+                            "version": "v2",
+                            "status": "processing",
+                            "kind": "permission",
+                            "title": "Processing from the complete snapshot",
+                            "allowedActions": ["proceed_once"],
+                            "updatedAt": "2026-08-17T09:00:00+08:00",
+                            "presentation": "{\"type\":\"permission\"}"
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (service, database) = projected_service(&server).await;
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, user_id, name, type, extra, status, pinned, created_at, updated_at) \
+             VALUES ('conversation-2', 'user-1', 'GEA fixture 2', 'aionrs', '{}', 'running', 0, 1, 1)",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        create_session(&service).await;
+        service
+            .create_session(
+                "user-1",
+                "conversation-2",
+                CreateGeaSessionRequest {
+                    consumer_code: "agent-finance".to_owned(),
+                    preparation_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let list = service.list_all_interaction_requests("user-1").await.unwrap();
+
+        assert_eq!(list.sync_state, InteractionRequestSyncState::Complete);
+        assert_eq!(list.failed_session_count, 0);
+        assert!(list.failure_codes.is_empty());
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].id, "request-pending");
+        assert!(!list.items[0].stale);
+        let processing_status: String =
+            sqlx::query_scalar("SELECT status FROM gea_interaction_requests WHERE request_id = 'request-processing'")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(processing_status, "processing");
+    }
+
+    #[tokio::test]
     async fn permission_accepts_only_the_current_allowed_action() {
         let server = MockServer::start().await;
         mount_session(&server).await;
         mount_permission_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-permission-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "v3",
+                "idempotencyKey": "permission-forbidden",
+                "actionId": "proceed_always"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "permission-forbidden-receipt",
+                    "requestId": "request-permission-1",
+                    "version": "v3",
+                    "status": "forbidden"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/ai/gateway/interaction-requests/request-permission-1/actions"))
             .and(body_partial_json(json!({
@@ -2314,12 +2590,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_external_write_is_terminal_and_never_auto_retried() {
+    async fn unknown_external_write_stays_active_for_authoritative_verification() {
         let server = MockServer::start().await;
         mount_session(&server).await;
-        mount_question_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "pending-r1",
+                    "items": [{
+                        "requestId": "request-question-1",
+                        "version": "v1",
+                        "status": "pending",
+                        "kind": "question",
+                        "title": "Choose a cost center",
+                        "allowedActions": ["answer", "decline"],
+                        "presentation": {
+                            "type": "question",
+                            "questions": [{
+                                "question": "Which cost center?",
+                                "options": [{ "label": "CC-100" }]
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ai/gateway/interaction-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "revision": "verification-r2",
+                    "items": [{
+                        "requestId": "request-question-1",
+                        "version": "v2",
+                        "status": "verification_required",
+                        "kind": "permission",
+                        "title": "Verify the external write",
+                        "allowedActions": ["verify_succeeded", "verify_failed"],
+                        "presentation": {
+                            "type": "permission",
+                            "title": "Verify the external write",
+                            "description": "Confirm the outcome before continuing.",
+                            "operation": "verify",
+                            "options": [
+                                { "label": "Succeeded", "value": "verify_succeeded" },
+                                { "label": "Failed", "value": "verify_failed" }
+                            ]
+                        }
+                    }]
+                }
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "v1",
+                "idempotencyKey": "unknown-command",
+                "actionId": "answer"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
                 "result": {
@@ -2332,7 +2668,26 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let (service, _database) = projected_service(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/interaction-requests/request-question-1/actions"))
+            .and(body_partial_json(json!({
+                "expectedVersion": "v2",
+                "idempotencyKey": "verify-command",
+                "actionId": "verify_succeeded"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {
+                    "receiptId": "verification-receipt-2",
+                    "requestId": "request-question-1",
+                    "version": "v3",
+                    "status": "accepted"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (service, database) = projected_service(&server).await;
         create_session(&service).await;
         service
             .list_interaction_requests("user-1", "conversation-1")
@@ -2359,11 +2714,42 @@ mod tests {
             first.request.unwrap().status,
             GeaInteractionRequestStatus::VerificationRequired
         );
+        let active = service.projection().unwrap().list_active("user-1").await.unwrap();
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(
+            active.items[0].status,
+            GeaInteractionRequestStatus::VerificationRequired
+        );
+        assert_eq!(active.items[0].allowed_actions, ["verify_succeeded", "verify_failed"]);
+        let active_message_type: String = sqlx::query_scalar(
+            "SELECT type FROM messages WHERE id = ( \
+                SELECT message_id FROM gea_interaction_requests WHERE request_id = 'request-question-1' \
+             )",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(active_message_type, "permission");
+
+        let verified = service
+            .act_on_global_interaction_request(
+                "user-1",
+                "request-question-1",
+                InteractionRequestActionCommand {
+                    expected_version: "v2".to_owned(),
+                    idempotency_key: "verify-command".to_owned(),
+                    action_id: "verify_succeeded".to_owned(),
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status, GeaInteractionRequestReceiptStatus::Accepted);
         assert!(
             service
                 .projection()
                 .unwrap()
-                .list_pending("user-1")
+                .list_active("user-1")
                 .await
                 .unwrap()
                 .items
@@ -2948,7 +3334,6 @@ mod tests {
             .and(query_param("agentCode", "agent-sales"))
             .and(query_param("sessionId", "gea-session-1"))
             .and(query_param("conversationId", "conversation-1"))
-            .and(query_param("status", "pending"))
             .and(header("x-delegation-token", "delegation-secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
