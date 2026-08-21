@@ -401,6 +401,7 @@ dependencies = [
  "aion-config",
  "aionui-ai-agent",
  "aionui-api-types",
+ "aionui-approval",
  "aionui-assets",
  "aionui-assistant",
  "aionui-auth",
@@ -453,6 +454,24 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "wiremock",
+]
+
+[[package]]
+name = "aionui-approval"
+version = "0.1.67"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-runtime",
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

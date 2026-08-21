@@ -33,6 +33,7 @@ use crate::{InteractionTurnResolver, InteractionTurnResumer};
 const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn:4443/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GEA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const INTERACTION_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const INTERACTION_RESUME_TIMEOUT_MS: u64 = 10_000;
 #[cfg(test)]
@@ -63,6 +64,14 @@ const GEA_CONTEXT_FIELDS: &[&str] = &[
 type InteractionScope = (String, String);
 type InteractionMutex = Arc<tokio::sync::Mutex<()>>;
 type InteractionLockMap = Arc<tokio::sync::Mutex<HashMap<InteractionScope, InteractionMutex>>>;
+type InteractionPollRegistry = Arc<tokio::sync::Mutex<HashMap<String, InteractionPollControl>>>;
+
+#[derive(Clone)]
+struct InteractionPollControl {
+    id: Uuid,
+    stop: tokio::sync::watch::Sender<bool>,
+    wake: Arc<tokio::sync::Notify>,
+}
 
 #[derive(Clone)]
 struct GeaCredential {
@@ -93,6 +102,7 @@ pub struct GeaService {
     turn_resumer: Option<InteractionTurnResumer>,
     resume_claim_owner: Arc<str>,
     interaction_poll_interval: Option<Duration>,
+    interaction_pollers: InteractionPollRegistry,
     resource_repo: Option<Arc<dyn IGeaResourceRepository>>,
     managed_skill_root: Option<Arc<PathBuf>>,
 }
@@ -129,6 +139,7 @@ impl GeaService {
             turn_resumer: None,
             resume_claim_owner: Arc::from(Uuid::now_v7().to_string()),
             interaction_poll_interval: None,
+            interaction_pollers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             resource_repo: None,
             managed_skill_root: None,
         })
@@ -183,6 +194,7 @@ impl GeaService {
                     GeaError::server_error("GEA_RESOURCE_STORAGE_ERROR", "GEA 资源缓存不可用")
                 })?;
         }
+        self.stop_interaction_request_poll(user_id).await;
         self.credentials.write().await.insert(
             user_id.to_owned(),
             GeaCredential {
@@ -193,6 +205,7 @@ impl GeaService {
         self.reauth_required.write().await.remove(user_id);
         self.clear_sessions(user_id).await;
         self.recover_interaction_sessions(user_id).await;
+        self.ensure_interaction_request_poll(user_id);
         if self.projection.is_some() {
             self.recover_unfinalized_receipts(user_id).await?;
         }
@@ -220,6 +233,7 @@ impl GeaService {
     }
 
     pub async fn clear_auth_session(&self, user_id: &str) {
+        self.stop_interaction_request_poll(user_id).await;
         self.credentials.write().await.remove(user_id);
         self.reauth_required.write().await.remove(user_id);
         self.clear_sessions(user_id).await;
@@ -227,6 +241,7 @@ impl GeaService {
     }
 
     async fn invalidate_auth_session(&self, user_id: &str) {
+        self.stop_interaction_request_poll(user_id).await;
         self.credentials.write().await.remove(user_id);
         self.reauth_required.write().await.insert(user_id.to_owned());
         self.clear_sessions(user_id).await;
@@ -350,7 +365,7 @@ impl GeaService {
                 .await?;
         }
         if persist_for_conversation {
-            self.spawn_interaction_request_poll(user_id, conversation_id, &session_id);
+            self.ensure_interaction_request_poll(user_id);
         }
         tracing::info!(
             user_id,
@@ -1076,7 +1091,7 @@ impl GeaService {
             .ok_or_else(|| GeaError::internal("Interaction Request 投影未配置"))
     }
 
-    fn spawn_interaction_request_poll(&self, user_id: &str, conversation_id: &str, session_id: &str) {
+    fn ensure_interaction_request_poll(&self, user_id: &str) {
         let Some(interval) = self.interaction_poll_interval else {
             return;
         };
@@ -1085,40 +1100,71 @@ impl GeaService {
         }
         let service = self.clone();
         let user_id = user_id.to_owned();
-        let conversation_id = conversation_id.to_owned();
-        let session_id = session_id.to_owned();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
+            let poll_id = Uuid::now_v7();
+            let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+            let wake = Arc::new(tokio::sync::Notify::new());
+            {
+                let mut pollers = service.interaction_pollers.lock().await;
+                if let Some(current) = pollers.get(&user_id) {
+                    current.wake.notify_one();
+                    return;
+                }
+                pollers.insert(
+                    user_id.clone(),
+                    InteractionPollControl {
+                        id: poll_id,
+                        stop,
+                        wake: wake.clone(),
+                    },
+                );
+            }
+            tracing::info!(user_id, "GEA Interaction Request user sync started");
+            let mut delay = Duration::ZERO;
             loop {
-                ticker.tick().await;
-                let active = service
-                    .sessions
-                    .read()
+                if !delay.is_zero() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = wake.notified() => {}
+                        _ = stop_rx.changed() => break,
+                    }
+                }
+                let owns_poll = service
+                    .interaction_pollers
+                    .lock()
                     .await
-                    .get(&(user_id.clone(), conversation_id.clone()))
-                    .is_some_and(|session| session.session_id == session_id);
-                if !active {
+                    .get(&user_id)
+                    .is_some_and(|current| current.id == poll_id);
+                if !owns_poll || !service.credentials.read().await.contains_key(&user_id) {
                     break;
                 }
-                if let Err(error) = service.recover_unfinalized_receipts(&user_id).await {
-                    tracing::warn!(
-                        user_id,
-                        code = %error.body.code,
-                        "GEA unfinalized Interaction Request receipt background recovery failed"
-                    );
-                }
-                if let Err(error) = service.list_interaction_requests(&user_id, &conversation_id).await {
-                    tracing::warn!(
-                        user_id,
-                        conversation_id,
-                        code = %error.body.code,
-                        "GEA interaction request background refresh failed"
-                    );
+                let synchronized = match service.list_all_interaction_requests(&user_id).await {
+                    Ok(list) => list.sync_state == InteractionRequestSyncState::Complete,
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id,
+                            code = %error.body.code,
+                            "GEA interaction request background refresh failed"
+                        );
+                        false
+                    }
+                };
+                delay = next_interaction_poll_delay(delay, interval, synchronized);
+            }
+            {
+                let mut pollers = service.interaction_pollers.lock().await;
+                if pollers.get(&user_id).is_some_and(|current| current.id == poll_id) {
+                    pollers.remove(&user_id);
                 }
             }
+            tracing::info!(user_id, "GEA Interaction Request user sync stopped");
         });
+    }
+
+    async fn stop_interaction_request_poll(&self, user_id: &str) {
+        if let Some(control) = self.interaction_pollers.lock().await.remove(user_id) {
+            let _ = control.stop.send(true);
+        }
     }
 
     async fn post_for_user(
@@ -1257,6 +1303,14 @@ impl GeaService {
         }
         Ok(value)
     }
+}
+
+fn next_interaction_poll_delay(current: Duration, base: Duration, synchronized: bool) -> Duration {
+    if synchronized {
+        return base;
+    }
+    let maximum = INTERACTION_POLL_MAX_BACKOFF.max(base);
+    current.max(base).saturating_mul(2).min(maximum)
 }
 
 impl GeaConversationSession {
@@ -2381,12 +2435,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_session_poll_discovers_a_new_request_without_client_polling() {
+    async fn active_session_poll_syncs_immediately_without_client_polling() {
         let server = MockServer::start().await;
         mount_session(&server).await;
         mount_question_snapshot(&server).await;
         let (mut service, _database) = projected_service(&server).await;
-        service.interaction_poll_interval = Some(Duration::from_millis(10));
+        service.interaction_poll_interval = Some(Duration::from_secs(60 * 60));
         create_session(&service).await;
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2406,8 +2460,75 @@ mod tests {
             }
         })
         .await
-        .expect("background poll should project the pending request");
+        .expect("background poll should project the pending request immediately");
         service.clear_auth_session("user-1").await;
+    }
+
+    #[tokio::test]
+    async fn interaction_request_poll_is_singleton_per_user_and_stops_on_logout() {
+        let server = MockServer::start().await;
+        let (mut service, _database) = projected_service(&server).await;
+        service.interaction_poll_interval = Some(Duration::from_secs(60 * 60));
+
+        service.ensure_interaction_request_poll("user-1");
+        service.ensure_interaction_request_poll("user-1");
+        tokio::task::yield_now().await;
+
+        assert_eq!(service.interaction_pollers.lock().await.len(), 1);
+        service.clear_auth_session("user-1").await;
+        assert!(service.interaction_pollers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_creation_wakes_an_existing_user_poll_immediately() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        mount_question_snapshot(&server).await;
+        let (mut service, _database) = projected_service(&server).await;
+        service.interaction_poll_interval = Some(Duration::from_secs(60 * 60));
+        service.ensure_interaction_request_poll("user-1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        create_session(&service).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !service
+                    .projection()
+                    .unwrap()
+                    .list_active("user-1")
+                    .await
+                    .unwrap()
+                    .items
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("session creation should wake the existing user poll");
+        service.clear_auth_session("user-1").await;
+    }
+
+    #[test]
+    fn interaction_request_poll_delay_resets_and_caps_after_failures() {
+        let base = Duration::from_secs(3);
+
+        assert_eq!(super::next_interaction_poll_delay(Duration::ZERO, base, true), base);
+        assert_eq!(
+            super::next_interaction_poll_delay(Duration::ZERO, base, false),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            super::next_interaction_poll_delay(Duration::from_secs(24), base, false),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::next_interaction_poll_delay(Duration::from_secs(30), base, true),
+            base
+        );
     }
 
     #[tokio::test]

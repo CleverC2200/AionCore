@@ -17,6 +17,7 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
 };
 use aionui_api_types::ErrorResponse;
+use aionui_approval::{approval_action_routes, approval_read_routes};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
@@ -336,6 +337,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let approval_limiter = Arc::new(RateLimiter::authenticated_action());
+    approval_limiter.start_cleanup_task(Duration::from_secs(60));
+    let approval_read_authenticated = approval_read_routes(states.approval.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let approval_action_authenticated = approval_action_routes(states.approval)
+        .route_layer(from_fn_with_state(
+            approval_limiter,
+            authenticated_action_rate_limit_middleware,
+        ))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // GEA credentials and gateway sessions are scoped to the authenticated
     // AionCore user and never exposed to renderer or agent processes.
     let gea_authenticated =
@@ -407,6 +419,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
+        .merge(approval_read_authenticated)
+        .merge(approval_action_authenticated)
         .merge(gea_authenticated)
         .merge(voice_capability_authenticated)
         .merge(voice_configuration_action_authenticated)

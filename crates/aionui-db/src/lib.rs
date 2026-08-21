@@ -34,6 +34,7 @@ pub use models::{
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
     UpsertOverrideParams, UserStatus, UserType,
 };
+pub use repository::approval_receipt::{CreateApprovalActionIntentParams, StoredApprovalActionReceipt};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
@@ -62,19 +63,19 @@ pub use repository::team_work::{
 pub use repository::{
     ActivityCursor, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAgentMetadataRepository, IApprovalReceiptRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository,
     IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository, IRemoteAgentRepository,
     ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository, IVoiceConfigurationRepository,
     PageDirection, PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository, SqliteInteractionRequestRepository,
-    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteTeamRepository,
-    SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
+    SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository,
+    SqliteInteractionRequestRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
+    SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

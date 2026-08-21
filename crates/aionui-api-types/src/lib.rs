@@ -7,6 +7,7 @@ mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
 mod antigravity_hook;
+mod approval;
 mod ask;
 mod assistant;
 mod auth;
@@ -61,6 +62,11 @@ pub use agent_error::{
 pub use antigravity_hook::{
     AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,
     AntigravityHookToolCall,
+};
+pub use approval::{
+    ApprovalActionReceipt, ApprovalActionReceiptStatus, ApprovalComment, ApprovalContact, ApprovalFormField,
+    ApprovalInstance, ApprovalInstanceTask, ApprovalList, ApprovalListTopic, ApprovalNode, ApprovalNodeApprover,
+    ApprovalOperation, ApprovalSummary, ApprovalTask, ApprovalTaskActionRequest, ApprovalTaskTransferRequest,
 };
 pub use ask::{AskAnswerRequest, AskQuestionAnswer};
 pub use assistant::{

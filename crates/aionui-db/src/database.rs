@@ -29,8 +29,11 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
-const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] =
-    &[(38, "voice configuration", 40), (39, "team work kernel", 41)];
+const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] = &[
+    (38, "voice configuration", 40),
+    (39, "team work kernel", 41),
+    (45, "approval action receipts", 46),
+];
 const LEGACY_PERSONAL_MIGRATION_PERMUTATION: &[(i64, i64)] = &[(38, 40), (39, 41), (40, 38), (41, 39)];
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 /// Stage reported when the database was created by a NEWER app version than

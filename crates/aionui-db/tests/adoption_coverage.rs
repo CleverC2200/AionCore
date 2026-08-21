@@ -36,6 +36,13 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
 /// Deliberately machine-global tables — adoption must NOT touch them.
 /// Every entry needs a rationale.
 const GLOBAL_TABLES: &[(&str, &str)] = &[
+    // Native Feishu approval writes are deliberately available only in local
+    // identity mode and are executed through the machine's lark-cli account.
+    // Their at-most-once receipts must therefore survive Core-user adoption.
+    (
+        "approval_action_receipts",
+        "machine-local Feishu approval idempotency ledger",
+    ),
     // Canonical filesystem-path registry shared by all users by design
     // (project-bind: folders are reused globally by resource_canonical).
     ("folders", "global canonical path registry"),
