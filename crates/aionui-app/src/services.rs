@@ -8,16 +8,17 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
+use aionui_approval::ApprovalService;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IGeaResourceRepository,
     IMcpServerRepository, IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteGeaResourceRepository,
-    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
+    SqliteGeaResourceRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -35,6 +36,7 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub approval_service: ApprovalService,
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
@@ -301,6 +303,10 @@ impl AppServices {
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
         });
+        let approval_service = ApprovalService::from_env(
+            Arc::new(SqliteApprovalReceiptRepository::new(database.pool().clone())),
+            identity_mode.is_local(),
+        );
 
         Ok(Self {
             database,
@@ -316,6 +322,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            approval_service,
             project_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,

@@ -1,0 +1,22 @@
+[package]
+name = "aionui-approval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-auth.workspace = true
+aionui-common.workspace = true
+aionui-db.workspace = true
+aionui-runtime.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

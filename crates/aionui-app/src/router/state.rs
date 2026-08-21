@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
 use aionui_api_types::ReportGeaSkillExecutionRequest;
+use aionui_approval::ApprovalRouterState;
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
@@ -173,6 +174,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub approval: ApprovalRouterState,
     pub gea: GeaRouterState,
     pub voice: VoiceRouterState,
 }
@@ -357,6 +359,9 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        approval: build_module_state_phase(&boot, "approval", || {
+            ApprovalRouterState::new(services.approval_service.clone())
+        }),
         gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
             .map(|service| {
                 service
