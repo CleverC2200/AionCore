@@ -1,7 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GeaClientResourceKind {
     Assistants,
@@ -9,13 +10,13 @@ pub enum GeaClientResourceKind {
     Mcps,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncGeaClientResourcesRequest {
     pub resources: Vec<GeaClientResourceKind>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum GeaClientResourceSyncStatus {
     Completed,
@@ -24,7 +25,7 @@ pub enum GeaClientResourceSyncStatus {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaClientResourceSyncResult {
     pub changed: usize,
@@ -149,7 +150,7 @@ impl GeaLocalizedText {
 /// Transfers an already authenticated GEA login session from the trusted
 /// desktop process into AionCore. The token is accepted only at this boundary
 /// and is never returned by any response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SetGeaAuthSessionRequest {
     pub access_token: String,
@@ -157,7 +158,7 @@ pub struct SetGeaAuthSessionRequest {
     pub tenant_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaAuthSessionStatus {
     pub authenticated: bool,
@@ -166,7 +167,7 @@ pub struct GeaAuthSessionStatus {
     pub tenant_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateGeaSessionRequest {
     pub consumer_code: String,
@@ -174,7 +175,7 @@ pub struct CreateGeaSessionRequest {
     pub preparation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaSessionResponse {
     pub session_id: String,
@@ -184,7 +185,7 @@ pub struct GeaSessionResponse {
     pub effective_capability_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaToolInfo {
     pub name: String,
@@ -195,14 +196,14 @@ pub struct GeaToolInfo {
     pub input_schema: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaToolCallRequest {
     #[serde(default)]
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaToolCallResponse {
     pub result: Value,
@@ -210,14 +211,14 @@ pub struct GeaToolCallResponse {
     pub audit_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionRequestKind {
     Question,
     Permission,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionRequestStatus {
     Pending,
@@ -228,7 +229,7 @@ pub enum GeaInteractionRequestStatus {
     VerificationRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionQuestionOption {
     pub label: String,
@@ -236,7 +237,7 @@ pub struct GeaInteractionQuestionOption {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionQuestion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,14 +248,14 @@ pub struct GeaInteractionQuestion {
     pub options: Vec<GeaInteractionQuestionOption>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionPermissionOption {
     pub label: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GeaInteractionPresentation {
     Question {
@@ -275,7 +276,7 @@ pub enum GeaInteractionPresentation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionRequest {
     #[serde(rename = "requestId", alias = "id")]
@@ -296,14 +297,14 @@ pub struct GeaInteractionRequest {
     pub presentation: GeaInteractionPresentation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionRequestSnapshot {
     pub revision: String,
     pub items: Vec<GeaInteractionRequest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionRequestActionCommand {
     pub expected_version: String,
@@ -313,7 +314,7 @@ pub struct GeaInteractionRequestActionCommand {
     pub payload: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionRequestReceiptStatus {
     Processing,
@@ -327,13 +328,13 @@ pub enum GeaInteractionRequestReceiptStatus {
     UnknownExternalWrite,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GeaInteractionTurnContinuation {
     OriginalToolCallReleased,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaInteractionRequestReceipt {
     pub receipt_id: String,
@@ -356,14 +357,14 @@ pub struct GeaInteractionRequestReceipt {
 ///
 /// The GEA-owned request above deliberately contains only source data. This
 /// view adds local navigation anchors without sending those anchors upstream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestSource {
     pub r#type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestView {
     pub id: String,
     pub version: String,
@@ -391,7 +392,7 @@ pub struct InteractionRequestView {
     pub stale: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionRequestSyncState {
     Complete,
@@ -399,7 +400,7 @@ pub enum InteractionRequestSyncState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestList {
     pub revision: String,
     pub items: Vec<InteractionRequestView>,
@@ -411,13 +412,13 @@ pub struct InteractionRequestList {
 
 /// User-scoped invalidation event for the recoverable interaction-request
 /// projection. Clients refetch the complete pending snapshot on receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestChangedPayload {
     pub user_id: String,
     pub revision: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestActionCommand {
     pub expected_version: String,
     pub idempotency_key: String,
@@ -426,7 +427,7 @@ pub struct InteractionRequestActionCommand {
     pub payload: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InteractionRequestReceipt {
     pub receipt_id: String,
     pub request_id: String,
