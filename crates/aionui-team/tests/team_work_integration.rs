@@ -123,11 +123,11 @@ async fn concurrent_claim_is_atomic_and_events_reconcile_to_snapshot() {
         service.apply_command(USER_ID, "team-work-test", "task-1", claim_b.clone()),
     );
     assert_eq!(usize::from(result_a.is_ok()) + usize::from(result_b.is_ok()), 1);
-    let rejected = if result_a.is_err() {
-        result_a.as_ref().unwrap_err()
-    } else {
-        result_b.as_ref().unwrap_err()
-    };
+    let rejected = result_a
+        .as_ref()
+        .err()
+        .or_else(|| result_b.as_ref().err())
+        .expect("exactly one concurrent claim must be rejected");
     assert!(matches!(rejected, TeamError::WorkState(_)));
 
     let (winning_envelope, first_receipt) = if let Ok(receipt) = result_a {

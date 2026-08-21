@@ -30,6 +30,7 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
 const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] = &[
+    (40, "sidebar ordering and archive", 47),
     (38, "voice configuration", 40),
     (39, "team work kernel", 41),
     (45, "approval action receipts", 46),
@@ -918,19 +919,18 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_personal_migrations_are_remapped_by_exact_checksum() {
-        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE _sqlx_migrations (\
-                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
-                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
-                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
-            )",
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
         for &(legacy_version, legacy_description, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
+            let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            sqlx::query(
+                "CREATE TABLE _sqlx_migrations (\
+                    version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                    success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+                )",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
             let current_migration = DB_MIGRATOR
                 .iter()
                 .find(|migration| migration.version == current_version)
@@ -945,11 +945,9 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        }
 
-        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+            remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
 
-        for &(legacy_version, _, current_version) in LEGACY_PERSONAL_MIGRATION_REMAPS {
             let legacy_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?")
                 .bind(legacy_version)
                 .fetch_one(&mut conn)
