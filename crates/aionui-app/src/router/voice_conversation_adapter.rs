@@ -58,6 +58,8 @@ impl VoiceConversationAgent for ConversationVoiceAgent {
                 SendMessageRequest {
                     content: text.to_owned(),
                     files: Vec::new(),
+                    // Voice input has no `@@` conversation picker.
+                    sessions: Vec::new(),
                     inject_skills: Vec::new(),
                     hidden: false,
                 },
