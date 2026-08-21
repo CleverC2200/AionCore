@@ -27,12 +27,13 @@ pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
-    ExternalUserProjection, FolderRow, GeaManagedSkillRow, GeaResourceCatalogRow, ProjectExplorerRow, ProjectKind,
-    ProjectRow, Role, SkillImportRecordRow, SkillRow, StoredGeaSessionBootstrap, StoredInteractionRequest,
-    StoredInteractionRequestReceipt, StoredUnfinalizedInteractionRequestReceipt, UpdateAgentAvailabilitySnapshotParams,
-    UpdateAgentHandshakeParams, UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    UpsertOverrideParams, UserStatus, UserType,
+    ExternalUserProjection, FolderRow, GeaManagedSkillRow, GeaResourceCatalogRow, OrderItemType, OrderScene,
+    ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow, SkillRow, StoredGeaSessionBootstrap,
+    StoredInteractionRequest, StoredInteractionRequestReceipt, StoredUnfinalizedInteractionRequestReceipt,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
+    UserStatus, UserType,
 };
 pub use repository::approval_receipt::{CreateApprovalActionIntentParams, StoredApprovalActionReceipt};
 pub use repository::channel::UpdatePluginStatusParams;
@@ -61,21 +62,24 @@ pub use repository::team_work::{
     StoredTeamWorkEvent, StoredTeamWorkRun, StoredTeamWorkTask,
 };
 pub use repository::{
-    ActivityCursor, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
+    ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
     IAgentMetadataRepository, IApprovalReceiptRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository,
     IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository, ISkillRepository, ITeamRepository, IUserRepository, IVoiceConfigurationRepository,
-    PageDirection, PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository,
-    SqliteInteractionRequestRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserRepository, SqliteVoiceConfigurationRepository,
+    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository,
+    IVoiceConfigurationRepository, MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome,
+    PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteChannelRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository, SqliteInteractionRequestRepository,
+    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository,
+    SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserOrderStore, SqliteUserRepository,
+    SqliteVoiceConfigurationRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

@@ -8,7 +8,7 @@ use aionui_api_types::{
 };
 use serde_json::{Value, json};
 
-use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand};
+use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand, TeamWorkCommand};
 use crate::commands::team_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -45,17 +45,26 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
             print_response(response).await
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
+        TeamCommand::ReadMessages => call_tool(vec!["read-messages"]).await,
         TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
+        TeamCommand::InterruptAgent => call_tool(vec!["interrupt-agent"]).await,
         TeamCommand::Task(task) => match task.command {
             TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
             TeamTaskCommand::Update => call_tool(vec!["task", "update"]).await,
             TeamTaskCommand::List => call_tool(vec!["task", "list"]).await,
             TeamTaskCommand::Unknown(path) => Err(unknown_command("team task", path, "unknown team task command")),
         },
+        TeamCommand::Work(work) => match work.command {
+            TeamWorkCommand::Create => call_tool(vec!["work", "create"]).await,
+            TeamWorkCommand::List => call_tool(vec!["work", "list"]).await,
+            TeamWorkCommand::Command => call_tool(vec!["work", "command"]).await,
+            TeamWorkCommand::Unknown(path) => Err(unknown_command("team work", path, "unknown team work command")),
+        },
         TeamCommand::ListAssistants => call_tool(vec!["list-assistants"]).await,
         TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
         TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,
         TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
+        TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"]).await,
         TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
         TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }
