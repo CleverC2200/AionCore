@@ -443,6 +443,199 @@ pub struct InteractionRequestReceipt {
     pub request: Option<InteractionRequestView>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Message,
+    Event,
+    Reminder,
+    ActionRequired,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSeverity {
+    Info,
+    Success,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationStatus {
+    Unread,
+    Read,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NotificationTarget {
+    Notification,
+    Conversation {
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+    },
+    Message {
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+        #[serde(rename = "messageId")]
+        message_id: String,
+    },
+    Team {
+        #[serde(rename = "teamId")]
+        team_id: String,
+    },
+    Slot {
+        #[serde(rename = "teamId")]
+        team_id: String,
+        #[serde(rename = "slotId")]
+        slot_id: String,
+    },
+    InteractionRequest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(default, rename = "conversationId", skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        #[serde(default, rename = "teamId", skip_serializing_if = "Option::is_none")]
+        team_id: Option<String>,
+        #[serde(default, rename = "slotId", skip_serializing_if = "Option::is_none")]
+        slot_id: Option<String>,
+    },
+}
+
+/// GEA-owned notification representation at the upstream seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeaNotification {
+    #[serde(rename = "notificationId", alias = "id")]
+    pub id: String,
+    pub version: String,
+    pub status: NotificationStatus,
+    pub kind: NotificationKind,
+    pub severity: NotificationSeverity,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub dismissible: bool,
+    pub source: String,
+    pub target: NotificationTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_request_id: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeaNotificationSnapshot {
+    pub revision: String,
+    pub items: Vec<GeaNotification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSyncState {
+    Idle,
+    Syncing,
+    Fresh,
+    Stale,
+    Partial,
+    Failed,
+}
+
+/// AionCore's tenant-scoped, recoverable projection returned to AionUi.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationView {
+    pub id: String,
+    pub version: String,
+    pub status: NotificationStatus,
+    pub kind: NotificationKind,
+    pub severity: NotificationSeverity,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub dismissible: bool,
+    pub source: String,
+    pub target: NotificationTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_request_id: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationList {
+    pub revision: String,
+    pub items: Vec<NotificationView>,
+    pub sync_state: NotificationSyncState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationChangedReason {
+    Snapshot,
+    Created,
+    Updated,
+    Read,
+    Dismissed,
+    Expired,
+    Recovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationChangedPayload {
+    pub user_id: String,
+    pub revision: String,
+    pub reason: NotificationChangedReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationActionCommand {
+    pub expected_version: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeaNotificationReceipt {
+    pub receipt_id: String,
+    pub notification_id: String,
+    pub version: String,
+    pub status: NotificationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<GeaNotification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NotificationReceipt {
+    pub receipt_id: String,
+    pub notification_id: String,
+    pub version: String,
+    pub status: NotificationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<NotificationView>,
+}
+
 #[cfg(test)]
 mod resource_catalog_tests {
     use super::*;

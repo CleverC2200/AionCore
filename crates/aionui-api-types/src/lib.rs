@@ -139,11 +139,14 @@ pub use gea::{
     GeaClientResourceSyncStatus, GeaInteractionPermissionOption, GeaInteractionPresentation, GeaInteractionQuestion,
     GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
     GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot,
-    GeaInteractionRequestStatus, GeaInteractionTurnContinuation, GeaLocalizedText, GeaResourceCatalogEnvelope,
-    GeaResourceCatalogSnapshot, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
-    InteractionRequestActionCommand, InteractionRequestChangedPayload, InteractionRequestList,
-    InteractionRequestReceipt, InteractionRequestSource, InteractionRequestSyncState, InteractionRequestView,
-    ReportGeaSkillExecutionRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    GeaInteractionRequestStatus, GeaInteractionTurnContinuation, GeaLocalizedText, GeaNotification,
+    GeaNotificationReceipt, GeaNotificationSnapshot, GeaResourceCatalogEnvelope, GeaResourceCatalogSnapshot,
+    GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand,
+    InteractionRequestChangedPayload, InteractionRequestList, InteractionRequestReceipt, InteractionRequestSource,
+    InteractionRequestSyncState, InteractionRequestView, NotificationActionCommand, NotificationChangedPayload,
+    NotificationChangedReason, NotificationKind, NotificationList, NotificationReceipt, NotificationSeverity,
+    NotificationStatus, NotificationSyncState, NotificationTarget, NotificationView, ReportGeaSkillExecutionRequest,
+    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

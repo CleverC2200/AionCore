@@ -11,6 +11,7 @@ mod gea_resource;
 mod interaction_request;
 mod mcp_server;
 mod message;
+mod notification;
 mod oauth_token;
 mod project;
 mod provider;
@@ -44,6 +45,7 @@ pub use interaction_request::{
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
+pub use notification::{StoredNotification, StoredNotificationReceipt, StoredNotificationScope};
 pub use oauth_token::OAuthTokenRow;
 pub use project::{FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role};
 pub use provider::Provider;

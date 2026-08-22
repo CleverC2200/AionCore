@@ -30,8 +30,9 @@ pub use models::{
     ExternalIdentityProvider, ExternalUserProjection, FolderRow, GeaManagedSkillRow, GeaResourceCatalogRow,
     OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow, SkillRow,
     StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt,
-    StoredUnfinalizedInteractionRequestReceipt, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    StoredNotification, StoredNotificationReceipt, StoredNotificationScope, StoredUnfinalizedInteractionRequestReceipt,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
     UserStatus, UserType,
 };
@@ -52,6 +53,10 @@ pub use repository::interaction_request::{
     UpsertGeaSessionBootstrapParams, UpsertInteractionRequestParams,
 };
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
+pub use repository::notification::{
+    INotificationRepository, ReplaceNotificationSnapshotParams, StoreNotificationReceiptParams,
+    UpsertNotificationParams,
+};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
@@ -77,7 +82,8 @@ pub use repository::{
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteChannelRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteExternalIdentityRepository, SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository,
-    SqliteInteractionRequestRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
+    SqliteInteractionRequestRepository, SqliteMcpServerRepository, SqliteNotificationRepository,
+    SqliteOAuthTokenRepository, SqliteProjectStore,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserOrderStore, SqliteUserRepository,
     SqliteVoiceConfigurationRepository,

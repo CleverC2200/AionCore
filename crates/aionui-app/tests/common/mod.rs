@@ -41,6 +41,12 @@ pub async fn build_app_with_gea_base_url(base_url: String) -> (axum::Router, App
                 std::sync::Arc::new(move |conversation_id: &str| runtime_state.active_turn_id_for(conversation_id))
             }),
         )
+        .with_notification_projection(
+            std::sync::Arc::new(aionui_db::SqliteNotificationRepository::new(
+                services.database.pool().clone(),
+            )),
+            services.event_bus.clone(),
+        )
         .with_interaction_turn_resumer({
             let conversation_service = services.conversation_service.clone();
             std::sync::Arc::new(move |user_id, conversation_id, turn_id, receipt| {

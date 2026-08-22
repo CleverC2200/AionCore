@@ -6,6 +6,7 @@
 
 mod error;
 mod interaction_request;
+mod notification;
 mod routes;
 mod service;
 mod state;

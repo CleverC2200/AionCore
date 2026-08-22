@@ -388,6 +388,12 @@ pub async fn build_module_states(
                             Arc::new(move |conversation_id: &str| runtime_state.active_turn_id_for(conversation_id))
                         }),
                     )
+                    .with_notification_projection(
+                        Arc::new(aionui_db::SqliteNotificationRepository::new(
+                            services.database.pool().clone(),
+                        )),
+                        services.event_bus.clone(),
+                    )
                     .with_interaction_turn_resumer({
                         let conversation_service = services.conversation_service.clone();
                         Arc::new(move |user_id, conversation_id, turn_id, receipt| {

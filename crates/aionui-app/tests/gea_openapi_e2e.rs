@@ -31,6 +31,9 @@ async fn authenticated_user_can_read_the_gea_openapi_document() {
     let document = body_json(response).await;
     assert_eq!(document["info"]["title"], "AionCore GEA API");
     assert!(document["paths"]["/api/gea/auth/session"].is_object());
+    assert!(document["paths"]["/api/notifications"].is_object());
+    assert!(document["paths"]["/api/notifications/{notification_id}/read"].is_object());
+    assert!(document["paths"]["/api/notifications/{notification_id}/dismiss"].is_object());
     assert!(document["components"]["securitySchemes"]["bearerAuth"].is_object());
     assert!(document["components"]["securitySchemes"]["sessionCookie"].is_object());
     assert!(document["components"]["securitySchemes"]["runtimeToken"].is_object());

@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 use aionui_api_types::{
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
-    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaSessionResponse, GeaToolCallResponse,
-    GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt,
-    InteractionRequestSyncState, SetGeaAuthSessionRequest,
+    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaNotificationSnapshot, GeaSessionResponse,
+    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
+    InteractionRequestReceipt, InteractionRequestSyncState, NotificationActionCommand, NotificationList,
+    NotificationReceipt, NotificationStatus, NotificationSyncState, SetGeaAuthSessionRequest,
 };
 use aionui_db::{
-    IConversationRepository, IGeaResourceRepository, IInteractionRequestRepository, ReceiptResumeClaim,
-    StoredInteractionRequestReceipt,
+    IConversationRepository, IGeaResourceRepository, IInteractionRequestRepository, INotificationRepository,
+    ReceiptResumeClaim, StoredInteractionRequestReceipt,
 };
 use aionui_realtime::EventBroadcaster;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
@@ -21,12 +22,16 @@ use uuid::Uuid;
 
 use crate::error::GeaError;
 use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command, validate_question_answers};
+use crate::notification::{parse_notification_receipt, parse_notification_snapshot, validate_notification_action};
 
+#[path = "service/notification.rs"]
+mod notification_service;
 #[path = "service/interaction_request.rs"]
 mod projection_service;
 #[path = "service/resource_catalog.rs"]
 mod resource_catalog_service;
 
+use self::notification_service::NotificationProjection;
 use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
 use crate::{InteractionTurnResolver, InteractionTurnResumer};
 
@@ -99,6 +104,7 @@ pub struct GeaService {
     sessions: Arc<RwLock<HashMap<(String, String), GeaConversationSession>>>,
     interaction_locks: InteractionLockMap,
     projection: Option<InteractionRequestProjection>,
+    notification_projection: Option<NotificationProjection>,
     turn_resumer: Option<InteractionTurnResumer>,
     resume_claim_owner: Arc<str>,
     interaction_poll_interval: Option<Duration>,
@@ -136,6 +142,7 @@ impl GeaService {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             interaction_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             projection: None,
+            notification_projection: None,
             turn_resumer: None,
             resume_claim_owner: Arc::from(Uuid::now_v7().to_string()),
             interaction_poll_interval: None,
@@ -168,6 +175,15 @@ impl GeaService {
             broadcaster,
             turn_resolver,
         ));
+        self
+    }
+
+    pub fn with_notification_projection(
+        mut self,
+        notification_repo: Arc<dyn INotificationRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+    ) -> Self {
+        self.notification_projection = Some(NotificationProjection::new(notification_repo, broadcaster));
         self
     }
 
@@ -645,6 +661,291 @@ impl GeaService {
         Ok(list)
     }
 
+    pub async fn list_notifications(&self, user_id: &str, status: Option<&str>) -> Result<NotificationList, GeaError> {
+        let started = Instant::now();
+        let trace_id = Uuid::now_v7().to_string();
+        let credential = self.credential(user_id).await?;
+        let tenant_id = credential.tenant_id.as_deref().unwrap_or("");
+        let projection = self.notification_projection()?;
+        let sync_lock = projection.sync_lock(user_id, tenant_id).await;
+        let _sync_guard = match sync_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let guard = sync_lock.lock().await;
+                drop(guard);
+                return projection.list(user_id, tenant_id, status).await;
+            }
+        };
+        tracing::info!(
+            event = "notification.sync.started",
+            trace_id,
+            trigger = "client_or_poll",
+            attempt = 1,
+            "GEA Notification sync started"
+        );
+        let result = self.fetch_notification_snapshot(user_id, &credential, &trace_id).await;
+        match result {
+            Ok(snapshot) => {
+                let changed = projection
+                    .reconcile_snapshot(user_id, tenant_id, &snapshot, &trace_id)
+                    .await?;
+                projection
+                    .set_sync_state(user_id, tenant_id, NotificationSyncState::Fresh, Vec::new())
+                    .await;
+                let list = projection.list(user_id, tenant_id, status).await?;
+                tracing::info!(
+                    trace_id,
+                    revision = snapshot.revision,
+                    item_count = snapshot.items.len(),
+                    changed,
+                    duration_ms = started.elapsed().as_millis(),
+                    event = "notification.sync.succeeded",
+                    sync_state = "fresh",
+                    result = "succeeded",
+                    "GEA Notification sync succeeded"
+                );
+                Ok(list)
+            }
+            Err((error, partial_page_count)) => {
+                let mut list = projection.list(user_id, tenant_id, status).await?;
+                list.sync_state = if partial_page_count > 0 && !list.revision.is_empty() {
+                    NotificationSyncState::Partial
+                } else if list.revision.is_empty() {
+                    NotificationSyncState::Failed
+                } else {
+                    NotificationSyncState::Stale
+                };
+                list.failure_codes = vec![error.body.code.clone()];
+                projection
+                    .set_sync_state(user_id, tenant_id, list.sync_state, list.failure_codes.clone())
+                    .await;
+                tracing::warn!(
+                    trace_id,
+                    code = %error.body.code,
+                    category = %error.body.category,
+                    retryable = error.body.retryable,
+                    partial_page_count,
+                    duration_ms = started.elapsed().as_millis(),
+                    event = "notification.sync.failed",
+                    sync_state = ?list.sync_state,
+                    result = "preserved_last_good",
+                    "GEA Notification sync failed; preserving last-good projection"
+                );
+                Ok(list)
+            }
+        }
+    }
+
+    async fn fetch_notification_snapshot(
+        &self,
+        user_id: &str,
+        credential: &GeaCredential,
+        trace_id: &str,
+    ) -> Result<GeaNotificationSnapshot, (GeaError, usize)> {
+        const PAGE_LIMIT: usize = 200;
+        const MAX_PAGES: usize = 100;
+        let mut revision: Option<String> = None;
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_ids = HashSet::new();
+        let mut items = Vec::new();
+        let mut page_count = 0;
+        loop {
+            let path = match cursor.as_deref() {
+                Some(cursor) => format!(
+                    "/ai/gateway/notifications?limit={PAGE_LIMIT}&cursor={}",
+                    encode_path_segment(cursor)
+                ),
+                None => format!("/ai/gateway/notifications?limit={PAGE_LIMIT}"),
+            };
+            let value = self
+                .get_for_user_path(user_id, credential, &path, trace_id)
+                .await
+                .map_err(|error| (error, page_count))?;
+            let page = parse_notification_snapshot(&value).map_err(|error| (error, page_count))?;
+            page_count += 1;
+            if revision.as_deref().is_some_and(|current| current != page.revision) {
+                return Err((
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 revision 不一致"),
+                    page_count,
+                ));
+            }
+            revision.get_or_insert_with(|| page.revision.clone());
+            for item in page.items {
+                if !seen_ids.insert(item.id.clone()) {
+                    return Err((
+                        GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页包含重复 notification ID"),
+                        page_count,
+                    ));
+                }
+                items.push(item);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if page_count >= MAX_PAGES || !seen_cursors.insert(next_cursor.clone()) {
+                return Err((
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 cursor 无效"),
+                    page_count,
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        Ok(GeaNotificationSnapshot {
+            revision: revision.unwrap_or_default(),
+            items,
+            next_cursor: None,
+        })
+    }
+
+    pub async fn get_notification(
+        &self,
+        user_id: &str,
+        notification_id: &str,
+    ) -> Result<aionui_api_types::NotificationView, GeaError> {
+        let credential = self.credential(user_id).await?;
+        self.notification_projection()?
+            .find(user_id, credential.tenant_id.as_deref().unwrap_or(""), notification_id)
+            .await
+    }
+
+    pub async fn mark_notification_read(
+        &self,
+        user_id: &str,
+        notification_id: &str,
+        command: NotificationActionCommand,
+    ) -> Result<NotificationReceipt, GeaError> {
+        self.act_on_notification(user_id, notification_id, "read", command)
+            .await
+    }
+
+    pub async fn dismiss_notification(
+        &self,
+        user_id: &str,
+        notification_id: &str,
+        command: NotificationActionCommand,
+    ) -> Result<NotificationReceipt, GeaError> {
+        self.act_on_notification(user_id, notification_id, "dismiss", command)
+            .await
+    }
+
+    async fn act_on_notification(
+        &self,
+        user_id: &str,
+        notification_id: &str,
+        action: &str,
+        command: NotificationActionCommand,
+    ) -> Result<NotificationReceipt, GeaError> {
+        validate_notification_action(notification_id, &command)?;
+        let started = Instant::now();
+        let trace_id = Uuid::now_v7().to_string();
+        let credential = self.credential(user_id).await?;
+        let tenant_id = credential.tenant_id.as_deref().unwrap_or("");
+        let projection = self.notification_projection()?;
+        let action_lock = projection.action_lock(user_id, tenant_id, notification_id).await;
+        let _guard = action_lock.lock().await;
+        let mutation_gate = projection.mutation_gate(user_id, tenant_id).await;
+        let _mutation_guard = mutation_gate.read().await;
+
+        if let Some(receipt) = projection
+            .load_receipt(
+                user_id,
+                tenant_id,
+                notification_id,
+                &command.idempotency_key,
+                &command.expected_version,
+                action,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        if let Some(receipt) = projection
+            .load_equivalent_receipt(user_id, tenant_id, notification_id, &command.expected_version, action)
+            .await?
+        {
+            return Ok(receipt);
+        }
+
+        let current = projection.find(user_id, tenant_id, notification_id).await?;
+        if current.version != command.expected_version {
+            return Err(GeaError::conflict(
+                "GEA_NOTIFICATION_VERSION_CONFLICT",
+                "Notification 版本已变化，请刷新后重试",
+            ));
+        }
+        if action == "dismiss" && !current.dismissible {
+            return Err(GeaError::conflict(
+                "GEA_NOTIFICATION_NOT_DISMISSIBLE",
+                "该 Notification 不允许关闭",
+            ));
+        }
+
+        tracing::info!(
+            event = "notification.action.started",
+            trace_id,
+            notification_id,
+            action,
+            expected_version = %command.expected_version,
+            "GEA Notification action started"
+        );
+        let path = format!(
+            "/ai/gateway/notifications/{}/{}",
+            encode_path_segment(notification_id.trim()),
+            action
+        );
+        let value = self
+            .post_for_user_with_trace(
+                user_id,
+                &credential,
+                &path,
+                &json!({
+                    "expectedVersion": command.expected_version,
+                    "idempotencyKey": command.idempotency_key,
+                }),
+                &trace_id,
+            )
+            .await?;
+        let upstream = parse_notification_receipt(&value, notification_id)?;
+        let expected_status = if action == "dismiss" {
+            NotificationStatus::Dismissed
+        } else {
+            NotificationStatus::Read
+        };
+        if upstream.status != expected_status {
+            return Err(invalid_upstream("GEA Notification 回执状态与动作不匹配"));
+        }
+        let receipt = NotificationReceipt {
+            receipt_id: upstream.receipt_id,
+            notification_id: upstream.notification_id,
+            version: upstream.version,
+            status: upstream.status,
+            notification: None,
+        };
+        projection
+            .store_receipt(
+                user_id,
+                tenant_id,
+                notification_id,
+                &command.expected_version,
+                &command.idempotency_key,
+                action,
+                &receipt,
+                &trace_id,
+            )
+            .await?;
+        tracing::info!(
+            event = "notification.action.completed",
+            trace_id,
+            notification_id,
+            action,
+            version = %receipt.version,
+            duration_ms = started.elapsed().as_millis(),
+            "GEA Notification action completed"
+        );
+        Ok(receipt)
+    }
+
     async fn recover_unfinalized_receipts(&self, user_id: &str) -> Result<(), GeaError> {
         let projection = self.projection()?;
         for stored in projection.list_unfinalized_receipts(user_id).await? {
@@ -1091,6 +1392,12 @@ impl GeaService {
             .ok_or_else(|| GeaError::internal("Interaction Request 投影未配置"))
     }
 
+    fn notification_projection(&self) -> Result<&NotificationProjection, GeaError> {
+        self.notification_projection
+            .as_ref()
+            .ok_or_else(|| GeaError::internal("Notification 投影未配置"))
+    }
+
     fn ensure_interaction_request_poll(&self, user_id: &str) {
         let Some(interval) = self.interaction_poll_interval else {
             return;
@@ -1149,6 +1456,17 @@ impl GeaService {
                         false
                     }
                 };
+                if service.notification_projection.is_some() {
+                    match service.list_notifications(&user_id, Some("active")).await {
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                code = %error.body.code,
+                                "GEA Notification background refresh failed"
+                            );
+                        }
+                    }
+                }
                 delay = next_interaction_poll_delay(delay, interval, synchronized);
             }
             {
@@ -1184,6 +1502,49 @@ impl GeaService {
         result
     }
 
+    async fn post_for_user_with_trace(
+        &self,
+        user_id: &str,
+        credential: &GeaCredential,
+        path: &str,
+        body: &Value,
+        trace_id: &str,
+    ) -> Result<Value, GeaError> {
+        let mut headers = self.user_headers(credential)?;
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(trace_id).map_err(|_| GeaError::invalid_request("traceId 格式无效"))?,
+        );
+        let result = async {
+            let response = self
+                .client
+                .post(format!("{}{}", self.base_url, path))
+                .headers(headers)
+                .json(body)
+                .send()
+                .await
+                .map_err(|_| GeaError::bad_gateway("GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
+            let status = response.status();
+            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let value = response
+                .json::<Value>()
+                .await
+                .map_err(|_| invalid_upstream("GEA 返回了无效 JSON"))?;
+            if !status.is_success() {
+                let mut error = upstream_business_error(&value, status.as_u16());
+                error.body.retry_after_ms = retry_after_ms;
+                return Err(error);
+            }
+            ensure_success(&value)?;
+            Ok(value)
+        }
+        .await;
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
+            self.invalidate_auth_session(user_id).await;
+        }
+        result
+    }
+
     async fn post_for_conversation(
         &self,
         user_id: &str,
@@ -1203,18 +1564,7 @@ impl GeaService {
     }
 
     async fn post(&self, credential: &GeaCredential, path: &str, body: &Value) -> Result<Value, GeaError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-access-token",
-            HeaderValue::from_str(credential.access_token.as_ref())
-                .map_err(|_| GeaError::invalid_request("GEA access token 格式无效"))?,
-        );
-        if let Some(tenant_id) = credential.tenant_id.as_deref() {
-            headers.insert(
-                "x-tenant-id",
-                HeaderValue::from_str(tenant_id).map_err(|_| GeaError::invalid_request("GEA tenantId 格式无效"))?,
-            );
-        }
+        let headers = self.user_headers(credential)?;
         let response = self
             .client
             .post(format!("{}{}", self.base_url, path))
@@ -1235,6 +1585,63 @@ impl GeaService {
             return Err(error);
         }
         Ok(value)
+    }
+
+    async fn get_for_user_path(
+        &self,
+        user_id: &str,
+        credential: &GeaCredential,
+        path: &str,
+        trace_id: &str,
+    ) -> Result<Value, GeaError> {
+        let mut headers = self.user_headers(credential)?;
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(trace_id).map_err(|_| GeaError::invalid_request("traceId 格式无效"))?,
+        );
+        let result = async {
+            let response = self
+                .client
+                .get(format!("{}{}", self.base_url, path))
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|_| GeaError::bad_gateway("GEA_NETWORK_ERROR", "无法连接 GEA 服务"))?;
+            let status = response.status();
+            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let value = response
+                .json::<Value>()
+                .await
+                .map_err(|_| invalid_upstream("GEA 返回了无效 JSON"))?;
+            if !status.is_success() {
+                let mut error = upstream_business_error(&value, status.as_u16());
+                error.body.retry_after_ms = retry_after_ms;
+                return Err(error);
+            }
+            ensure_success(&value)?;
+            Ok(value)
+        }
+        .await;
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
+            self.invalidate_auth_session(user_id).await;
+        }
+        result
+    }
+
+    fn user_headers(&self, credential: &GeaCredential) -> Result<HeaderMap, GeaError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-access-token",
+            HeaderValue::from_str(credential.access_token.as_ref())
+                .map_err(|_| GeaError::invalid_request("GEA access token 格式无效"))?,
+        );
+        if let Some(tenant_id) = credential.tenant_id.as_deref() {
+            headers.insert(
+                "x-tenant-id",
+                HeaderValue::from_str(tenant_id).map_err(|_| GeaError::invalid_request("GEA tenantId 格式无效"))?,
+            );
+        }
+        Ok(headers)
     }
 
     async fn get_for_conversation(

@@ -79,6 +79,10 @@ impl GeaError {
         Self::new(StatusCode::NOT_FOUND, "GEA_INTERACTION_REQUEST_NOT_FOUND", message)
     }
 
+    pub fn notification_not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "GEA_NOTIFICATION_NOT_FOUND", message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
