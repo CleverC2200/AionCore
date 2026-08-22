@@ -27,15 +27,11 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
         // Claim the writer lock before resolving the tuple. Concurrent
         // first-login requests then serialize instead of creating orphan Core
         // users during a deferred read-to-write transaction upgrade.
-        let mut connection = self.pool.acquire().await.map_err(DbError::from)?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(DbError::from)?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(DbError::from)?;
 
         let result: Result<ProvisionExternalIdentityResult, ProvisionExternalIdentityError> = async {
             let existing = find_on_connection(
-                &mut connection,
+                &mut transaction,
                 params.provider,
                 params.issuer,
                 params.tenant_id,
@@ -45,7 +41,7 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
             if let Some(identity) = existing {
                 let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
                     .bind(&identity.user_id)
-                    .fetch_optional(&mut *connection)
+                    .fetch_optional(&mut *transaction)
                     .await
                     .map_err(DbError::from)?
                     .ok_or_else(|| DbError::NotFound("Mapped Core user not found".to_owned()))?;
@@ -75,7 +71,7 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
             .bind(&user_id)
             .bind(now)
             .bind(now)
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut *transaction)
             .await
             .map_err(DbError::from)?;
             let identity = sqlx::query_as::<_, ExternalIdentity>(
@@ -91,7 +87,7 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
             .bind(params.subject)
             .bind(&user_id)
             .bind(now)
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut *transaction)
             .await
             .map_err(DbError::from)?;
 
@@ -105,16 +101,10 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
 
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
                 Ok(result)
             }
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -140,7 +130,7 @@ impl IExternalIdentityRepository for SqliteExternalIdentityRepository {
 }
 
 async fn find_on_connection(
-    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    connection: &mut sqlx::SqliteConnection,
     provider: ExternalIdentityProvider,
     issuer: &str,
     tenant_id: &str,
@@ -154,7 +144,7 @@ async fn find_on_connection(
     .bind(issuer)
     .bind(tenant_id)
     .bind(subject)
-    .fetch_optional(&mut **connection)
+    .fetch_optional(connection)
     .await
     .map_err(DbError::from)
 }
@@ -235,6 +225,26 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProvisionExternalIdentityError::Conflict));
+    }
+
+    #[tokio::test]
+    async fn failed_mapping_insert_rolls_back_user_and_releases_connection() {
+        let db = init_database_memory().await.unwrap();
+        let identities = SqliteExternalIdentityRepository::new(db.pool().clone());
+
+        let error = identities.provision(params("tenant-rollback", "")).await.unwrap_err();
+        assert!(matches!(error, ProvisionExternalIdentityError::Database(_)));
+        let orphan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_type = 'external'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(orphan_count, 0);
+
+        let recovered = identities
+            .provision(params("tenant-rollback", "subject-after-rollback"))
+            .await
+            .unwrap();
+        assert!(recovered.created);
     }
 
     #[tokio::test]
