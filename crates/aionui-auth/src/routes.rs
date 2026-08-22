@@ -25,7 +25,10 @@ use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{DbError, IExternalIdentityRepository, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
-use crate::external_identity::{ExternalIdentityMappingError, ExternalIdentityMappingService};
+use crate::external_identity::{
+    ExternalIdentityMappingError, ExternalIdentityMappingService, ExternalIdentitySessionError,
+    ExternalIdentitySessionService,
+};
 use crate::extract::extract_token_from_headers;
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
@@ -237,6 +240,35 @@ fn external_identity_error_to_api_error(err: ExternalIdentityMappingError) -> Ap
     }
 }
 
+fn external_identity_session_error_to_api_error(err: ExternalIdentitySessionError) -> ApiError {
+    match err {
+        ExternalIdentitySessionError::InvalidInput => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "EXTERNAL_IDENTITY_INVALID",
+            "External identity is invalid.",
+            None,
+        ),
+        ExternalIdentitySessionError::NotProvisioned => user_context_required(),
+        ExternalIdentitySessionError::CoreUserDisabled => {
+            ApiError::coded(StatusCode::FORBIDDEN, "CORE_USER_DISABLED", "Core user disabled.", None)
+        }
+        ExternalIdentitySessionError::Conflict => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_IDENTITY_CONFLICT",
+            "External identity conflict.",
+            None,
+        ),
+        ExternalIdentitySessionError::Database(_) => {
+            tracing::error!("external identity session persistence failed");
+            ApiError::Internal("External identity session unavailable".to_owned())
+        }
+        ExternalIdentitySessionError::Token(_) => {
+            tracing::error!("external identity Core session signing failed");
+            ApiError::Internal("External identity session unavailable".to_owned())
+        }
+    }
+}
+
 fn user_context_required() -> ApiError {
     ApiError::coded(
         StatusCode::UNAUTHORIZED,
@@ -258,6 +290,8 @@ fn user_context_required() -> ApiError {
 /// - `GET /api/ws-token`
 /// - `POST /api/auth/qr-login`
 /// - `PUT /api/auth/internal/external-identities` (trusted bootstrap only)
+/// - `POST /api/auth/internal/external-sessions` (trusted bootstrap only)
+/// - `POST /api/auth/internal/external-sessions/revoke` (trusted bootstrap only)
 /// - `GET /qr-login`
 /// - `POST /api/webui/change-password` (local-only)
 /// - `POST /api/webui/change-username` (local-only)
@@ -446,11 +480,18 @@ async fn create_external_session_handler(
 ) -> Result<Response, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
-    let exchange = service
-        .create_external_session(req)
-        .await
-        .map_err(provision_error_to_api_error)?;
+    let exchange = match req {
+        EnsureExternalSessionRequest::AionPro(subject) => AuthProvisionService::new(state.user_repo, state.jwt_service)
+            .create_external_session(subject)
+            .await
+            .map_err(provision_error_to_api_error)?,
+        EnsureExternalSessionRequest::ExternalIdentity(subject) => {
+            ExternalIdentitySessionService::new(state.external_identity_repo, state.user_repo, state.jwt_service)
+                .create_session(subject.identity)
+                .await
+                .map_err(external_identity_session_error_to_api_error)?
+        }
+    };
     tracing::info!(
         user_id = %exchange.response.user.id,
         "external core session exchange succeeded"
@@ -470,11 +511,18 @@ async fn revoke_external_session_handler(
 ) -> Result<Json<ApiResponse<RevokeExternalSessionResponse>>, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
-    let response = service
-        .revoke_external_session(req)
-        .await
-        .map_err(provision_error_to_api_error)?;
+    let response = match req {
+        RevokeExternalSessionRequest::AionPro(subject) => AuthProvisionService::new(state.user_repo, state.jwt_service)
+            .revoke_external_session(subject)
+            .await
+            .map_err(provision_error_to_api_error)?,
+        RevokeExternalSessionRequest::ExternalIdentity(subject) => {
+            ExternalIdentitySessionService::new(state.external_identity_repo, state.user_repo, state.jwt_service)
+                .revoke_sessions(subject.identity)
+                .await
+                .map_err(external_identity_session_error_to_api_error)?
+        }
+    };
     tracing::info!(
         user_id = %response.user_id,
         session_generation = response.session_generation,

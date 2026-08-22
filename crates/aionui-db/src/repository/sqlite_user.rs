@@ -432,24 +432,17 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError> {
         let now = aionui_common::now_ms();
-        let result = sqlx::query(
+        let generation = sqlx::query_scalar::<_, i64>(
             "UPDATE users \
              SET session_generation = session_generation + 1, updated_at = ? \
-             WHERE id = ?",
+             WHERE id = ? \
+             RETURNING session_generation",
         )
         .bind(now)
         .bind(user_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
-        }
-
-        let generation: i64 = sqlx::query_scalar("SELECT session_generation FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("User '{user_id}' not found")))?;
 
         Ok(generation)
     }
@@ -463,6 +456,8 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::init_database_memory;
 
@@ -794,6 +789,31 @@ mod tests {
         assert_eq!(generation, 1);
         let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
         assert_eq!(updated.session_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_generation_increments_return_distinct_committed_values() {
+        let (repo, _db) = setup().await;
+        let repo = Arc::new(repo);
+        let user = repo.create_user("concurrent-session-user", "h").await.unwrap();
+        let user_id = Arc::new(user.id);
+
+        let first = {
+            let repo = repo.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move { repo.increment_session_generation(&user_id).await.unwrap() })
+        };
+        let second = {
+            let repo = repo.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move { repo.increment_session_generation(&user_id).await.unwrap() })
+        };
+        let mut generations = vec![first.await.unwrap(), second.await.unwrap()];
+        generations.sort_unstable();
+
+        assert_eq!(generations, vec![1, 2]);
+        let updated = repo.find_by_id(&user_id).await.unwrap().unwrap();
+        assert_eq!(updated.session_generation, 2);
     }
 
     async fn seed_legacy_conversation(db: &crate::Database, id: &str) {

@@ -70,6 +70,7 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
         //   other — unexpected; surface as Internal so callers can log
         let result = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
+            .env_remove("AIONCORE_BOOTSTRAP_SECRET")
             .output();
 
         match result {

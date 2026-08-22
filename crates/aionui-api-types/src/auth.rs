@@ -115,11 +115,30 @@ pub struct EnsureExternalUserResponse {
     pub session_generation: i64,
 }
 
-/// Request body for `POST /api/auth/internal/external-sessions`.
+/// Existing AionPro subject accepted by the trusted session endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EnsureExternalSessionRequest {
+#[serde(deny_unknown_fields)]
+pub struct AionProExternalSessionSubject {
     pub user_type: ExternalUserType,
     pub external_user_id: String,
+}
+
+/// Exact external identity subject accepted by the trusted session endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIdentitySessionSubject {
+    pub identity: ExternalIdentityTuple,
+}
+
+/// Request body for `POST /api/auth/internal/external-sessions`.
+///
+/// The untagged variants preserve the existing AionPro JSON contract while
+/// allowing a trusted caller to exchange an exact external identity mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EnsureExternalSessionRequest {
+    AionPro(AionProExternalSessionSubject),
+    ExternalIdentity(ExternalIdentitySessionSubject),
 }
 
 /// Response for successful internal external-session exchange.
@@ -131,9 +150,10 @@ pub struct EnsureExternalSessionResponse {
 
 /// Request body for `POST /api/auth/internal/external-sessions/revoke`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RevokeExternalSessionRequest {
-    pub user_type: ExternalUserType,
-    pub external_user_id: String,
+#[serde(untagged)]
+pub enum RevokeExternalSessionRequest {
+    AionPro(AionProExternalSessionSubject),
+    ExternalIdentity(ExternalIdentitySessionSubject),
 }
 
 /// Response for successful internal external-session revocation.
@@ -372,10 +392,10 @@ mod tests {
 
     #[test]
     fn test_internal_external_session_revoke_contract_serialization() {
-        let req = RevokeExternalSessionRequest {
+        let req = RevokeExternalSessionRequest::AionPro(AionProExternalSessionSubject {
             user_type: ExternalUserType::Aionpro,
             external_user_id: "external_123".into(),
-        };
+        });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["user_type"], "aionpro");
         assert_eq!(json["external_user_id"], "external_123");
@@ -387,6 +407,35 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["user_id"], "user_123");
         assert_eq!(json["session_generation"], 3);
+    }
+
+    #[test]
+    fn external_identity_session_contract_is_strict_and_contains_no_credentials() {
+        let payload = r#"{
+            "identity": {
+                "provider": "lark",
+                "issuer": "https://open.feishu.cn",
+                "tenant_id": "tenant-1",
+                "subject": "subject-1"
+            }
+        }"#;
+        let request: EnsureExternalSessionRequest = serde_json::from_str(payload).unwrap();
+        assert!(matches!(request, EnsureExternalSessionRequest::ExternalIdentity(_)));
+        let revoke: RevokeExternalSessionRequest = serde_json::from_str(payload).unwrap();
+        assert!(matches!(revoke, RevokeExternalSessionRequest::ExternalIdentity(_)));
+
+        let credential_payload = payload.replace(
+            "\"subject\": \"subject-1\"",
+            "\"subject\": \"subject-1\", \"access_token\": \"provider-secret\"",
+        );
+        assert!(serde_json::from_str::<EnsureExternalSessionRequest>(&credential_payload).is_err());
+        assert!(serde_json::from_str::<RevokeExternalSessionRequest>(&credential_payload).is_err());
+
+        let caller_selected_user = payload.replace(
+            "\"identity\": {",
+            "\"core_user_id\": \"caller-selected\", \"identity\": {",
+        );
+        assert!(serde_json::from_str::<EnsureExternalSessionRequest>(&caller_selected_user).is_err());
     }
 
     #[test]

@@ -65,6 +65,7 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
         "NODE_INSPECT",
         "NODE_DEBUG",
         "CLAUDECODE",
+        "AIONCORE_BOOTSTRAP_SECRET",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     ] {
@@ -297,6 +298,7 @@ printf '%s\n' \
                 .env("AIONUI_OVERLAY", "from-current")
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
+                .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret")
                 .env("SSL_CERT_FILE", "/tmp/current-cert.pem")
                 .env("SSL_CERT_DIR", "/tmp/current-certs")
                 .env("NODE_EXTRA_CA_CERTS", "/tmp/current-node-extra.pem")
@@ -324,6 +326,7 @@ printf '%s\n' \
         assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-shell"));
         assert_eq!(value("NODE_OPTIONS"), None);
         assert_eq!(value("CLAUDECODE"), None);
+        assert_eq!(value("AIONCORE_BOOTSTRAP_SECRET"), None);
         assert_eq!(value("SSL_CERT_FILE"), None);
         assert_eq!(value("SSL_CERT_DIR"), None);
         assert_eq!(

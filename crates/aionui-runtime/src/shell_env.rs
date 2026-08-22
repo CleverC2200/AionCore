@@ -256,7 +256,9 @@ fn login_shell_path() -> (Option<String>, ShellProbeReport) {
     }
 
     let mut command = std::process::Command::new(&shell);
-    command.args(["-l", "-i", "-c", "printf %s \"$PATH\""]);
+    command
+        .args(["-l", "-i", "-c", "printf %s \"$PATH\""])
+        .env_remove("AIONCORE_BOOTSTRAP_SECRET");
 
     let (path, status) = probe_path_with_command(command, LOGIN_SHELL_PROBE_BUDGET);
     (path, report(status))
@@ -592,6 +594,42 @@ mod tests {
         let path = result.unwrap();
         assert!(!path.is_empty(), "login shell PATH should not be empty");
         assert_eq!(report.status, ShellProbeStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_does_not_inherit_bootstrap_secret() {
+        if std::env::var_os("AIONUI_RUNTIME_SHELL_ENV_SECRET_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let shell = temp.path().join("fake-shell");
+            std::fs::write(
+                &shell,
+                "#!/bin/sh\nif [ -n \"${AIONCORE_BOOTSTRAP_SECRET+x}\" ]; then printf leaked; else printf clean; fi\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("shell_env::tests::login_shell_path_does_not_inherit_bootstrap_secret")
+                .arg("--nocapture")
+                .env("AIONUI_RUNTIME_SHELL_ENV_SECRET_CHILD", "1")
+                .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret")
+                .env("SHELL", shell)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (result, report) = login_shell_path();
+        assert_eq!(report.status, ShellProbeStatus::Ok);
+        assert_eq!(result.as_deref(), Some("clean"));
     }
 
     /// AIONUI-150 regression. The child prints its PATH and exits at once, but

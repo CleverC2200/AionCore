@@ -15,7 +15,8 @@
 //! Both flavours:
 //! * set `kill_on_drop(true)` so a panicking / erroring caller cannot
 //!   leave orphaned children;
-//! * remove `NODE_OPTIONS`, `NODE_INSPECT`, `NODE_DEBUG`, `CLAUDECODE`
+//! * remove `NODE_OPTIONS`, `NODE_INSPECT`, `NODE_DEBUG`, `CLAUDECODE`, and
+//!   the trusted Core bootstrap secret
 //!   so the child doesn't inherit debug/agent state that belongs to the
 //!   parent (matches v1 `acpConnectors.ts::getCleanAgentEnv`).
 //!
@@ -211,11 +212,15 @@ impl Builder {
 
     /// Spawn the process and return the standard `tokio::process::Child`.
     pub fn spawn(mut self) -> io::Result<Child> {
+        // Re-apply after all caller configuration so even an inherited or
+        // accidentally forwarded trusted bootstrap secret cannot reach a child.
+        strip_pollution(&mut self.inner);
         self.inner.spawn()
     }
 
     /// Run to completion and collect stdout/stderr.
     pub async fn output(mut self) -> io::Result<std::process::Output> {
+        strip_pollution(&mut self.inner);
         self.inner.output().await
     }
 }
@@ -283,7 +288,8 @@ fn strip_pollution(cmd: &mut Command) {
     cmd.env_remove("NODE_OPTIONS")
         .env_remove("NODE_INSPECT")
         .env_remove("NODE_DEBUG")
-        .env_remove("CLAUDECODE");
+        .env_remove("CLAUDECODE")
+        .env_remove("AIONCORE_BOOTSTRAP_SECRET");
 }
 
 #[cfg(unix)]
@@ -373,7 +379,10 @@ mod tests {
         if !crate::test_support::run_in_env_child(
             "spawn::tests::clean_cli_captures_stdout_and_strips_env_pollution",
             |command| {
-                command.env("NODE_OPTIONS", "--inspect=9229").env("CLAUDECODE", "1");
+                command
+                    .env("NODE_OPTIONS", "--inspect=9229")
+                    .env("CLAUDECODE", "1")
+                    .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret");
             },
         ) {
             return;
@@ -382,13 +391,15 @@ mod tests {
         // Ask the child to print NODE_OPTIONS + CLAUDECODE; Builder must
         // have removed them.
         let mut b = Builder::clean_cli("sh");
-        b.arg("-c")
-            .arg("echo \"NO:${NODE_OPTIONS:-unset} CC:${CLAUDECODE:-unset}\"");
+        b.env("AIONCORE_BOOTSTRAP_SECRET", "forwarded-secret")
+            .arg("-c")
+            .arg("echo \"NO:${NODE_OPTIONS:-unset} CC:${CLAUDECODE:-unset} BS:${AIONCORE_BOOTSTRAP_SECRET:-unset}\"");
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("NO:unset"), "got: {stdout}");
         assert!(stdout.contains("CC:unset"), "got: {stdout}");
+        assert!(stdout.contains("BS:unset"), "got: {stdout}");
         assert!(output.status.success());
     }
 
@@ -482,6 +493,10 @@ mod tests {
             "missing -u NODE_OPTIONS: {preview}"
         );
         assert!(preview.contains("-u CLAUDECODE"), "missing -u CLAUDECODE: {preview}");
+        assert!(
+            preview.contains("-u AIONCORE_BOOTSTRAP_SECRET"),
+            "missing bootstrap-secret removal: {preview}"
+        );
         assert!(
             preview.contains(r#""/usr/local/bin/node""#),
             "program missing: {preview}"
