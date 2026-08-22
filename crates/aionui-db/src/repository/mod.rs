@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
+pub mod external_identity;
 pub mod gea_resource;
 pub mod interaction_request;
 pub mod mcp_server;
@@ -27,6 +28,7 @@ mod sqlite_client_preference;
 mod sqlite_conversation;
 mod sqlite_cron;
 mod sqlite_diagnostics;
+mod sqlite_external_identity;
 mod sqlite_gea_resource;
 mod sqlite_interaction_request;
 mod sqlite_mcp_server;
@@ -63,6 +65,7 @@ pub use diagnostics::{
     FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
 };
+pub use external_identity::{EnsureExternalIdentityParams, EnsureExternalIdentityResult, IExternalIdentityRepository};
 pub use mcp_server::IMcpServerRepository;
 pub use oauth_token::IOAuthTokenRepository;
 pub use project::IProjectStore;
@@ -83,6 +86,7 @@ pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;
+pub use sqlite_external_identity::SqliteExternalIdentityRepository;
 pub use sqlite_gea_resource::SqliteGeaResourceRepository;
 pub use sqlite_interaction_request::SqliteInteractionRequestRepository;
 pub use sqlite_mcp_server::SqliteMcpServerRepository;

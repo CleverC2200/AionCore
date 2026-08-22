@@ -225,7 +225,10 @@ impl IUserRepository for SqliteUserRepository {
 
         // Discover ownership tables from the live schema rather than a
         // hand-maintained list, so user-scoped tables added by future
-        // migrations are adopted automatically. Convention (root-scope
+        // migrations are adopted automatically. Authorization infrastructure
+        // (`external_identities`) is explicitly excluded: adoption may move
+        // user content, but it must never re-bind an authentication subject.
+        // Convention (root-scope
         // design): the ownership column is `user_id`, or `owner_user_id` on
         // tables that also carry an external platform user id (channel
         // bindings) or reference another root's `user_id` (project explorer).
@@ -238,6 +241,7 @@ impl IUserRepository for SqliteUserRepository {
                  WHERE m.type = 'table' \
                    AND m.name NOT LIKE 'sqlite_%' \
                    AND m.name != 'users' \
+                   AND m.name != 'external_identities' \
                    AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = ?)",
             )
             .bind(owner_column)
@@ -873,6 +877,7 @@ mod tests {
              WHERE m.type = 'table' \
                AND m.name NOT LIKE 'sqlite_%' \
                AND m.name != 'users' \
+               AND m.name != 'external_identities' \
                AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'user_id')",
         )
         .fetch_all(db.pool())
@@ -880,8 +885,9 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
 
-        // Sentinel: the discovery convention (`user_id` column == ownership)
-        // must keep matching the core scope tables. If this fails, either a
+        // Sentinel: the discovery convention (`user_id` column == ownership,
+        // excluding authorization infrastructure) must keep matching the core
+        // scope tables. If this fails, either a
         // migration renamed an ownership column or the convention broke —
         // both must be looked at before shipping.
         for expected in [

@@ -4,6 +4,7 @@
 mod cookie;
 mod csrf;
 mod error;
+mod external_identity;
 mod extract;
 mod jwt;
 pub mod middleware;
@@ -17,6 +18,7 @@ mod validation;
 
 // Error type
 pub use error::AuthError;
+pub use external_identity::{ExternalIdentityMappingError, ExternalIdentityMappingService};
 
 // JWT service
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};

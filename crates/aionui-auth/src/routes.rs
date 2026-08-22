@@ -13,7 +13,8 @@ use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
+    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalIdentityMappingRequest,
+    EnsureExternalIdentityMappingResponse, EnsureExternalSessionRequest, EnsureExternalUserRequest,
     EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
     RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
     WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
@@ -21,9 +22,10 @@ use aionui_api_types::{
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
-use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
+use aionui_db::{DbError, IExternalIdentityRepository, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
+use crate::external_identity::{ExternalIdentityMappingError, ExternalIdentityMappingService};
 use crate::extract::extract_token_from_headers;
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
@@ -69,6 +71,7 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
 pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub external_identity_repo: Arc<dyn IExternalIdentityRepository>,
     /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
@@ -210,6 +213,36 @@ fn provision_error_to_api_error(err: ProvisionError) -> ApiError {
     }
 }
 
+fn external_identity_error_to_api_error(err: ExternalIdentityMappingError) -> ApiError {
+    match err {
+        ExternalIdentityMappingError::InvalidInput => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "EXTERNAL_IDENTITY_INVALID",
+            "External identity is invalid.",
+            None,
+        ),
+        ExternalIdentityMappingError::CoreUserNotFound => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "CORE_USER_NOT_FOUND",
+            "Core user not found.",
+            None,
+        ),
+        ExternalIdentityMappingError::CoreUserDisabled => {
+            ApiError::coded(StatusCode::FORBIDDEN, "CORE_USER_DISABLED", "Core user disabled.", None)
+        }
+        ExternalIdentityMappingError::Conflict => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_IDENTITY_CONFLICT",
+            "External identity conflict.",
+            None,
+        ),
+        ExternalIdentityMappingError::Database(_) => {
+            tracing::error!("external identity mapping persistence failed");
+            ApiError::Internal("External identity mapping unavailable".to_owned())
+        }
+    }
+}
+
 fn user_context_required() -> ApiError {
     ApiError::coded(
         StatusCode::UNAUTHORIZED,
@@ -230,6 +263,7 @@ fn user_context_required() -> ApiError {
 /// - `POST /api/auth/refresh`
 /// - `GET /api/ws-token`
 /// - `POST /api/auth/qr-login`
+/// - `PUT /api/auth/internal/external-identities` (trusted bootstrap only)
 /// - `GET /qr-login`
 /// - `POST /api/webui/change-password` (local-only)
 /// - `POST /api/webui/change-username` (local-only)
@@ -272,6 +306,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route(
             "/api/auth/internal/external-users/{external_user_id}",
             put(ensure_external_user_handler),
+        )
+        .route(
+            "/api/auth/internal/external-identities",
+            put(ensure_external_identity_mapping_handler),
         )
         .route(
             "/api/auth/internal/external-sessions",
@@ -353,6 +391,26 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .merge(authenticated)
         .merge(api_action_limited)
         .merge(static_routes)
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/auth/internal/external-identities
+// ---------------------------------------------------------------------------
+
+async fn ensure_external_identity_mapping_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<EnsureExternalIdentityMappingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EnsureExternalIdentityMappingResponse>>, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    let Json(request) = body.map_err(ApiError::from)?;
+    let service = ExternalIdentityMappingService::new(state.external_identity_repo, state.user_repo);
+    let response = service
+        .ensure_mapping(request)
+        .await
+        .map_err(external_identity_error_to_api_error)?;
+    tracing::info!(created = response.created, "external identity mapping ensured");
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 // ---------------------------------------------------------------------------

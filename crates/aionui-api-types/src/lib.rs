@@ -82,11 +82,13 @@ pub use assistant::{
     is_local_avatar_value,
 };
 pub use auth::{
-    AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
-    EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType, InternalAuthErrorCode, LoginRequest,
-    LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
-    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    AuthStatusResponse, ChangePasswordRequest, EnsureExternalIdentityMappingRequest,
+    EnsureExternalIdentityMappingResponse, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
+    EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalIdentityMappingErrorCode, ExternalIdentityProvider,
+    ExternalIdentityTuple, ExternalUserType, InternalAuthErrorCode, LoginRequest, LoginResponse, PublicUser,
+    QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
+    UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse,
+    WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,

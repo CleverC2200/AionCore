@@ -213,6 +213,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        external_identity_repo: services.external_identity_repo.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),
             skill_repo: services.skill_repo.clone(),

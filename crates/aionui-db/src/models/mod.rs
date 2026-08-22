@@ -6,6 +6,7 @@ mod client_preference;
 mod conversation;
 mod conversation_artifact;
 mod cron_job;
+mod external_identity;
 mod gea_resource;
 mod interaction_request;
 mod mcp_server;
@@ -35,6 +36,7 @@ pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
+pub use external_identity::{ExternalIdentity, ExternalIdentityProvider};
 pub use gea_resource::{GeaManagedSkillRow, GeaResourceCatalogRow};
 pub use interaction_request::{
     StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt,
