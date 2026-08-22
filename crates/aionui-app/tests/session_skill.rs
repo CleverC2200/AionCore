@@ -64,6 +64,33 @@ fn the_skill_teaches_how_to_read_both_marker_blocks() {
         body.contains("[[AION_SESSION_MESSAGE]]"),
         "recipient-side block: {body}"
     );
+    assert_eq!(
+        body.matches("\nv2\n").count(),
+        2,
+        "both examples must be strict v2: {body}"
+    );
+    for field in [
+        "\"sessions\":",
+        "\"name\":",
+        "\"id\":",
+        "\"workspace\":",
+        "\"reply_to\":",
+    ] {
+        assert!(body.contains(field), "agent-visible field {field}: {body}");
+    }
+}
+
+#[test]
+fn the_skill_keeps_legacy_v1_read_compatibility_without_emitting_it() {
+    let body = skill_body();
+    assert!(body.contains("## Legacy v1 read compatibility"), "{body}");
+    assert!(body.contains("no `v2` line"), "{body}");
+    assert!(body.contains("never emit v1"), "{body}");
+    assert!(body.contains("name{TAB}id{TAB}workspace: value"), "{body}");
+    assert!(body.contains("from: name{TAB}id"), "{body}");
+    assert!(body.contains("reply_to: id{TAB}(reply hint)"), "{body}");
+    assert!(body.contains("read-only compatibility"), "{body}");
+    assert!(body.contains("all newly generated envelopes\nuse v2 JSON"), "{body}");
 }
 
 #[test]

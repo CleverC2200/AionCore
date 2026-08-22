@@ -11,11 +11,23 @@ pub const AIONUI_FILES_MARKER: &str = "[[AION_FILES]]";
 pub const AIONUI_SESSIONS_MARKER: &str = "[[AION_SESSIONS]]";
 pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
 
+/// Schema version written on the second line of both cross-session marker
+/// envelopes. Dynamic fields are serialized as JSON on the following line.
+pub const AIONUI_SESSION_MARKER_ENVELOPE_VERSION: &str = "v2";
+
 /// Recipient-side block prepended to a cross-session delivery. Tells the
 /// receiving agent who sent it, whether the sender's workspace matches, and
 /// the reply address.
 pub const AIONUI_SESSION_MESSAGE_MARKER: &str = "[[AION_SESSION_MESSAGE]]";
 pub const AIONUI_SESSION_MESSAGE_END_MARKER: &str = "[[/AION_SESSION_MESSAGE]]";
+
+/// Hide a structural marker inside a JSON string without changing its decoded
+/// value. The first `[` becomes a JSON Unicode escape, so a delimiter scanner
+/// cannot mistake user-controlled content for the envelope boundary.
+pub fn escape_json_envelope_marker(payload: &str, marker: &str) -> String {
+    let rest = marker.strip_prefix('[').expect("JSON envelope markers start with '['");
+    payload.replace(marker, &format!(r"\u005b{rest}"))
+}
 
 // --- WebSocket ---
 

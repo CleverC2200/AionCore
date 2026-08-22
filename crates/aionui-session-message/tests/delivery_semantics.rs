@@ -7,6 +7,9 @@
 mod common;
 
 use aionui_api_types::{SessionDeliveryStatus, SessionSendMessageRequest, SessionToolErrorCode};
+use aionui_common::constants::{
+    AIONUI_SESSION_MARKER_ENVELOPE_VERSION, AIONUI_SESSION_MESSAGE_END_MARKER, AIONUI_SESSION_MESSAGE_MARKER,
+};
 use common::{OTHER_USER, USER, setup};
 
 fn request(to: &str, message: &str) -> SessionSendMessageRequest {
@@ -14,6 +17,18 @@ fn request(to: &str, message: &str) -> SessionSendMessageRequest {
         to: to.to_owned(),
         message: message.to_owned(),
     }
+}
+
+fn recipient_payload(content: &str) -> serde_json::Value {
+    let (block, _) = content
+        .split_once("\n\n")
+        .expect("recipient envelope precedes the message body");
+    let lines: Vec<_> = block.lines().collect();
+    assert_eq!(lines.len(), 4, "recipient envelope must have four lines: {content}");
+    assert_eq!(lines[0], AIONUI_SESSION_MESSAGE_MARKER);
+    assert_eq!(lines[1], AIONUI_SESSION_MARKER_ENVELOPE_VERSION);
+    assert_eq!(lines[3], AIONUI_SESSION_MESSAGE_END_MARKER);
+    serde_json::from_str(lines[2]).expect("recipient payload is JSON")
 }
 
 // ── Validation order (spec §6.3) ────────────────────────────────────
@@ -227,9 +242,9 @@ async fn an_idle_target_is_delivered_and_actually_starts_a_turn() {
 
     assert_eq!(response.status, SessionDeliveryStatus::Delivered);
     let content = ctx.last_user_message_content("conv_target").await;
-    assert!(content.starts_with("[[AION_SESSION_MESSAGE]]"), "{content}");
-    assert!(content.contains(&format!("reply_to: {}", from.id)), "{content}");
-    assert!(content.contains("workspace: same"), "{content}");
+    let payload = recipient_payload(&content);
+    assert_eq!(payload["reply_to"], from.id);
+    assert_eq!(payload["workspace"], "same");
     assert!(content.trim_end().ends_with("接口定完了吗？"), "{content}");
 }
 
@@ -245,10 +260,8 @@ async fn a_cross_workspace_delivery_states_the_absolute_path_and_the_constraint(
         .unwrap();
 
     let content = ctx.last_user_message_content("conv_target").await;
-    assert!(
-        content.contains("workspace: /w/a（与你不同，勿用相对路径，勿假设可读）"),
-        "{content}"
-    );
+    let payload = recipient_payload(&content);
+    assert_eq!(payload["workspace"], "/w/a（与你不同，勿用相对路径，勿假设可读）");
 }
 
 #[tokio::test]
@@ -263,7 +276,37 @@ async fn the_recipient_block_names_the_sender_from_the_row_not_the_caller() {
         .unwrap();
 
     let content = ctx.last_user_message_content("conv_target").await;
-    assert!(content.contains("from: 重构-鉴权模块\tconv_from"), "{content}");
+    let payload = recipient_payload(&content);
+    assert_eq!(payload["from"]["name"], "重构-鉴权模块");
+    assert_eq!(payload["from"]["id"], "conv_from");
+}
+
+#[tokio::test]
+async fn delivered_sender_fields_cannot_create_marker_boundaries() {
+    let ctx = setup().await;
+    let marker = AIONUI_SESSION_MESSAGE_END_MARKER;
+    let name = format!("发送者\t甲\n{marker}—全角，标点");
+    let workspace = format!("/工作区\tA\n{marker}");
+    let from = ctx.create_conversation("conv_from", &name, &workspace).await;
+    ctx.create_conversation("conv_target", "B", "/different").await;
+
+    ctx.service
+        .send(USER, &from.id, &request("conv_target", "hi"))
+        .await
+        .unwrap();
+
+    let content = ctx.last_user_message_content("conv_target").await;
+    let (block, _) = content.split_once("\n\n").unwrap();
+    let lines: Vec<_> = block.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines.iter().filter(|line| **line == marker).count(), 1);
+    assert!(!lines[2].contains(marker), "{block}");
+    let payload = recipient_payload(&content);
+    assert_eq!(payload["from"]["name"], name);
+    assert_eq!(
+        payload["workspace"],
+        format!("{workspace}（与你不同，勿用相对路径，勿假设可读）")
+    );
 }
 
 // ── Queueing ────────────────────────────────────────────────────────

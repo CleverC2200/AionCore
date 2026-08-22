@@ -19,7 +19,7 @@ fn unknown_target_workspace_is_reported_as_unknown_not_as_same() {
 }
 
 #[test]
-fn sessions_block_is_delimited_and_tab_separated_one_target_per_line() {
+fn sessions_block_is_a_deterministic_v2_json_envelope() {
     let block = build_sessions_block(
         Some("/w/a"),
         &[
@@ -38,10 +38,50 @@ fn sessions_block_is_delimited_and_tab_separated_one_target_per_line() {
     assert_eq!(
         block,
         "[[AION_SESSIONS]]\n\
-         重构-鉴权模块\tconv_1\tworkspace: same\n\
-         文档站改版\tconv_2\tworkspace: /w/docs（与你不同）\n\
+         v2\n\
+         {\"sessions\":[{\"name\":\"重构-鉴权模块\",\"id\":\"conv_1\",\"workspace\":\"same\"},{\"name\":\"文档站改版\",\"id\":\"conv_2\",\"workspace\":\"/w/docs（与你不同）\"}]}\n\
          [[/AION_SESSIONS]]"
     );
+}
+
+#[test]
+fn sessions_block_round_trips_control_characters_unicode_and_end_markers() {
+    let name = "设计\t评审\n[[/AION_SESSIONS]]—全角，标点";
+    let id = "conv\t跨行\n[[/AION_SESSIONS]]";
+    let workspace = "/工作区\tA\n[[/AION_SESSIONS]]";
+    let block = build_sessions_block(
+        Some("/different"),
+        &[SessionMentionTargetInfo {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            workspace: Some(workspace.to_owned()),
+        }],
+    );
+
+    let lines: Vec<_> = block.lines().collect();
+    assert_eq!(lines.len(), 4, "dynamic values must stay on the JSON line: {block}");
+    assert_eq!(lines[0], AIONUI_SESSIONS_MARKER);
+    assert_eq!(lines[1], AIONUI_SESSION_MARKER_ENVELOPE_VERSION);
+    assert_eq!(lines[3], AIONUI_SESSIONS_END_MARKER);
+    assert_eq!(
+        lines.iter().filter(|line| **line == AIONUI_SESSIONS_END_MARKER).count(),
+        1,
+        "a literal end marker inside JSON must not become a delimiter: {block}"
+    );
+    assert!(lines[2].contains("\\t"), "tabs must be JSON escaped: {}", lines[2]);
+    assert!(lines[2].contains("\\n"), "newlines must be JSON escaped: {}", lines[2]);
+    assert!(
+        !lines[2].contains(AIONUI_SESSIONS_END_MARKER),
+        "the payload must not contain the raw closing delimiter: {}",
+        lines[2]
+    );
+    assert!(lines[2].contains(r"\u005b[/AION_SESSIONS]]"), "{}", lines[2]);
+
+    let payload: serde_json::Value = serde_json::from_str(lines[2]).expect("the payload line is valid JSON");
+    let target = &payload["sessions"][0];
+    assert_eq!(target["name"], name);
+    assert_eq!(target["id"], id);
+    assert_eq!(target["workspace"], format!("{workspace}（与你不同）"));
 }
 
 #[test]
