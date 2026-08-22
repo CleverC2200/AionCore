@@ -1,0 +1,212 @@
+# AionCore / GEA interface examples
+#
+# All values are placeholders. Never commit real access tokens, delegation
+# tokens, cookies, tenant identifiers, or business payloads to this file.
+# Swagger UI is intentionally read-only; execute write requests only against
+# an explicitly authorized environment.
+
+@aioncoreBaseUrl = http://127.0.0.1:8012
+@aioncoreJwt = <AIONCORE_JWT>
+@csrfToken = <AIONCORE_CSRF_TOKEN>
+@geaBaseUrl = https://gea.example.invalid
+@geaAccessToken = <GEA_ACCESS_TOKEN>
+@tenantId = tenant-example
+@conversationId = conversation-example
+@consumerCode = sales_forecast
+@sessionId = session-example
+@delegationToken = <GEA_DELEGATION_TOKEN>
+@toolName = query_business_data
+@mcpCode = cube
+@requestId = request-example
+
+### Read AionCore's GEA authentication status
+GET {{aioncoreBaseUrl}}/api/gea/auth/session
+Authorization: Bearer {{aioncoreJwt}}
+
+### Transfer an already-authenticated GEA session to AionCore
+PUT {{aioncoreBaseUrl}}/api/gea/auth/session
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "accessToken": "{{geaAccessToken}}",
+  "tenantId": "{{tenantId}}"
+}
+
+### Create an AionCore conversation-scoped GEA session
+POST {{aioncoreBaseUrl}}/api/gea/conversations/{{conversationId}}/session
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "consumerCode": "{{consumerCode}}"
+}
+
+### List tools authorized for the AionCore conversation
+GET {{aioncoreBaseUrl}}/api/gea/conversations/{{conversationId}}/tools
+Authorization: Bearer {{aioncoreJwt}}
+
+### Call an authorized tool through AionCore
+POST {{aioncoreBaseUrl}}/api/gea/conversations/{{conversationId}}/tools/{{toolName}}
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "arguments": {
+    "query": "example"
+  }
+}
+
+### Test GEA MCP discovery through a temporary AionCore session
+POST {{aioncoreBaseUrl}}/api/gea/mcp/test
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "consumerCode": "{{consumerCode}}"
+}
+
+### Read the user-scoped InteractionRequest projection
+GET {{aioncoreBaseUrl}}/api/interaction-requests?status=pending
+Authorization: Bearer {{aioncoreJwt}}
+
+### Submit an InteractionRequest action through AionCore
+POST {{aioncoreBaseUrl}}/api/interaction-requests/{{requestId}}/actions
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "expected_version": "v1",
+  "idempotency_key": "example-command-1",
+  "action_id": "answer",
+  "payload": {
+    "answers": [
+      {
+        "questionIndex": 0,
+        "selectedLabels": ["Example"]
+      }
+    ]
+  }
+}
+
+### Synchronize managed Skills through AionCore
+POST {{aioncoreBaseUrl}}/api/client-resources/sync
+Authorization: Bearer {{aioncoreJwt}}
+Cookie: aionui-csrf-token={{csrfToken}}
+x-csrf-token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "resources": ["skills"]
+}
+
+### GEA outbound: create Gateway Session
+POST {{geaBaseUrl}}/ai/gateway/session
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+Content-Type: application/json
+
+{
+  "consumerType": "AGENT",
+  "consumerCode": "{{consumerCode}}",
+  "requestId": "example-session-request-1",
+  "conversationId": "{{conversationId}}",
+  "channel": "AION_CORE"
+}
+
+### GEA outbound: list MCP tools
+POST {{geaBaseUrl}}/ai/gateway/mcp/proxy/list
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+Content-Type: application/json
+
+{
+  "agentCode": "{{consumerCode}}",
+  "sessionId": "{{sessionId}}",
+  "conversationId": "{{conversationId}}",
+  "delegationToken": "{{delegationToken}}"
+}
+
+### GEA outbound: call MCP tool
+POST {{geaBaseUrl}}/ai/gateway/mcp/proxy/call
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+Content-Type: application/json
+
+{
+  "agentCode": "{{consumerCode}}",
+  "sessionId": "{{sessionId}}",
+  "conversationId": "{{conversationId}}",
+  "delegationToken": "{{delegationToken}}",
+  "mcpCode": "{{mcpCode}}",
+  "toolName": "{{toolName}}",
+  "arguments": {
+    "query": "example"
+  }
+}
+
+### GEA outbound: list InteractionRequests
+GET {{geaBaseUrl}}/ai/gateway/interaction-requests?agentCode={{consumerCode}}&sessionId={{sessionId}}&conversationId={{conversationId}}
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+x-delegation-token: {{delegationToken}}
+
+### GEA outbound: submit an InteractionRequest action
+POST {{geaBaseUrl}}/ai/gateway/interaction-requests/{{requestId}}/actions
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+Content-Type: application/json
+
+{
+  "agentCode": "{{consumerCode}}",
+  "sessionId": "{{sessionId}}",
+  "conversationId": "{{conversationId}}",
+  "delegationToken": "{{delegationToken}}",
+  "expectedVersion": "v1",
+  "idempotencyKey": "example-command-1",
+  "actionId": "answer",
+  "payload": {
+    "answers": [
+      {
+        "questionIndex": 0,
+        "selectedLabels": ["Example"]
+      }
+    ]
+  }
+}
+
+### GEA outbound: read Resource Catalog
+GET {{geaBaseUrl}}/aidata/client-resource-catalog/my
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+
+### GEA outbound: download one Skill artifact
+GET {{geaBaseUrl}}/aidata/client-resource-catalog/skill-artifact?skillCode=sales-forecast&version=1.0.0&format=md
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+
+### GEA outbound: report a managed Skill execution
+POST {{geaBaseUrl}}/aidata/client-resource-catalog/skill-execute/report
+x-access-token: {{geaAccessToken}}
+x-tenant-id: {{tenantId}}
+Content-Type: application/json
+
+{
+  "skillCode": "sales-forecast",
+  "version": "1.0.0",
+  "digest": "sha256:<EXAMPLE_DIGEST>",
+  "success": true,
+  "executedAt": "2026-08-21T00:00:00Z",
+  "durationMs": 100,
+  "resultSize": 128
+}

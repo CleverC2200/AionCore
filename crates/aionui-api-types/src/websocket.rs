@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// WebSocket message envelope.
 ///
 /// All WebSocket communication follows this format: a `name` field
 /// identifying the event type and a `data` field with the payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WebSocketMessage<T> {
     pub name: String,
     pub data: T,

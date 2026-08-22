@@ -1,12 +1,13 @@
 #![allow(clippy::disallowed_types)]
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Standard API success response envelope.
 ///
 /// Endpoints that return data wrap it in this structure. For custom
 /// response shapes (login, auth status, etc.), use dedicated types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiResponse<T> {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,7 +60,7 @@ impl ApiResponse<()> {
 ///
 /// Matches the JSON error format used by HTTP boundary renderers:
 /// `{ "success": false, "error": "...", "code": "...", "details": ... }`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub success: bool,
     pub error: String,

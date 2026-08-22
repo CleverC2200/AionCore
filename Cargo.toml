@@ -85,6 +85,8 @@ http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+utoipa = { version = "5.5", features = ["preserve_order"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "debug-embed", "vendored"] }
 
 # Async utilities
 futures-util = "0.3"
