@@ -3961,7 +3961,7 @@ impl ConversationService {
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
-        // the block can state `workspace: same` without the model comparing
+        // the block can state `"workspace":"same"` without the model comparing
         // path strings.
         //
         // ⚠️ ORDER MATTERS TWICE, and both constraints are load-bearing:

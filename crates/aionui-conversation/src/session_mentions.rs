@@ -5,7 +5,10 @@
 //! broadcast, and agent input all see the same bytes.
 
 use aionui_api_types::TeamSessionBinding;
-use aionui_common::constants::{AIONUI_SESSIONS_END_MARKER, AIONUI_SESSIONS_MARKER};
+use aionui_common::constants::{
+    AIONUI_SESSION_MARKER_ENVELOPE_VERSION, AIONUI_SESSIONS_END_MARKER, AIONUI_SESSIONS_MARKER,
+};
+use serde::Serialize;
 
 use crate::error::ConversationError;
 
@@ -18,7 +21,19 @@ pub struct SessionMentionTargetInfo {
     pub workspace: Option<String>,
 }
 
-/// The `workspace:` field value for one target.
+#[derive(Serialize)]
+struct SessionsEnvelope<'a> {
+    sessions: Vec<SessionMentionEnvelopeTarget<'a>>,
+}
+
+#[derive(Serialize)]
+struct SessionMentionEnvelopeTarget<'a> {
+    name: &'a str,
+    id: &'a str,
+    workspace: String,
+}
+
+/// The `workspace` field value for one target.
 ///
 /// One field with a conditional value rather than `workspace` +
 /// `same_workspace`: when the workspaces match, the absolute path carries no
@@ -41,18 +56,21 @@ pub fn workspace_field_value(sender_workspace: Option<&str>, target_workspace: O
 /// (spec §8.3): the trigger is the user typing `@@`, and the auto-inject skill
 /// is what must independently explain sending.
 pub fn build_sessions_block(sender_workspace: Option<&str>, targets: &[SessionMentionTargetInfo]) -> String {
-    let mut block = String::from(AIONUI_SESSIONS_MARKER);
-    for target in targets {
-        block.push('\n');
-        block.push_str(&target.name);
-        block.push('\t');
-        block.push_str(&target.id);
-        block.push_str("\tworkspace: ");
-        block.push_str(&workspace_field_value(sender_workspace, target.workspace.as_deref()));
-    }
-    block.push('\n');
-    block.push_str(AIONUI_SESSIONS_END_MARKER);
-    block
+    let payload = SessionsEnvelope {
+        sessions: targets
+            .iter()
+            .map(|target| SessionMentionEnvelopeTarget {
+                name: &target.name,
+                id: &target.id,
+                workspace: workspace_field_value(sender_workspace, target.workspace.as_deref()),
+            })
+            .collect(),
+    };
+    let payload = serde_json::to_string(&payload).expect("session marker payload contains only JSON strings");
+
+    format!(
+        "{AIONUI_SESSIONS_MARKER}\n{AIONUI_SESSION_MARKER_ENVELOPE_VERSION}\n{payload}\n{AIONUI_SESSIONS_END_MARKER}"
+    )
 }
 
 /// Read `extra.workspace` out of a conversation row's raw `extra` JSON string.

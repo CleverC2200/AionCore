@@ -20,12 +20,15 @@ use aionui_api_types::{
     SendMessageRequest, SendMessageResponse, SessionDeliveryStatus, SessionMessageRateLimitedPayload, SessionRateGate,
     SessionSendMessageRequest, SessionSendMessageResponse, WebSocketMessage,
 };
-use aionui_common::constants::{AIONUI_SESSION_MESSAGE_END_MARKER, AIONUI_SESSION_MESSAGE_MARKER};
+use aionui_common::constants::{
+    AIONUI_SESSION_MARKER_ENVELOPE_VERSION, AIONUI_SESSION_MESSAGE_END_MARKER, AIONUI_SESSION_MESSAGE_MARKER,
+};
 use aionui_conversation::session_mentions::{team_id_from_extra_str, workspace_from_extra};
 use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::{IConversationRepository, ISettingsRepository};
 use aionui_realtime::EventBroadcaster;
 use async_trait::async_trait;
+use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -34,18 +37,41 @@ use crate::error::SessionMessageError;
 use crate::queue::{DeliveryQueue, PendingDelivery, TTL_MS};
 use crate::rate_limit::{RateLimiter, RateVerdict};
 
+const REPLY_INSTRUCTION: &str = "session send-message, to=reply_to";
+
+#[derive(Serialize)]
+struct SessionMessageEnvelope<'a> {
+    from: SessionMessageSender<'a>,
+    workspace: &'a str,
+    reply_to: &'a str,
+    reply_instruction: &'static str,
+}
+
+#[derive(Serialize)]
+struct SessionMessageSender<'a> {
+    name: &'a str,
+    id: &'a str,
+}
+
 /// Build the recipient-side block.
 ///
-/// The short reply pointer after `reply_to` is deliberate (~10-15 tokens): the
-/// recipient must know it can reply at all, or the reply path is dead. The full
-/// schema does not go here — that is what `session capabilities` is for.
+/// The short `reply_instruction` is deliberate: the recipient must know it can
+/// reply at all, or the reply path is dead. The full schema does not go here —
+/// that is what `session capabilities` is for.
 pub fn build_session_message_block(from_name: &str, from_id: &str, workspace_field: &str, reply_to: &str) -> String {
+    let payload = SessionMessageEnvelope {
+        from: SessionMessageSender {
+            name: from_name,
+            id: from_id,
+        },
+        workspace: workspace_field,
+        reply_to,
+        reply_instruction: REPLY_INSTRUCTION,
+    };
+    let payload = serde_json::to_string(&payload).expect("session message marker payload contains only JSON strings");
+
     format!(
-        "{AIONUI_SESSION_MESSAGE_MARKER}\n\
-         from: {from_name}\t{from_id}\n\
-         workspace: {workspace_field}\n\
-         reply_to: {reply_to}\t（回信: session send-message, to=reply_to）\n\
-         {AIONUI_SESSION_MESSAGE_END_MARKER}"
+        "{AIONUI_SESSION_MESSAGE_MARKER}\n{AIONUI_SESSION_MARKER_ENVELOPE_VERSION}\n{payload}\n{AIONUI_SESSION_MESSAGE_END_MARKER}"
     )
 }
 
@@ -54,7 +80,7 @@ pub fn compose_delivery_content(block: &str, message: &str) -> String {
     format!("{block}\n\n{message}")
 }
 
-/// `workspace:` value for the recipient block.
+/// `workspace` value for the recipient block.
 ///
 /// Reports the SENDER's path, because that is what the recipient cannot infer.
 /// An unknown sender workspace renders as `unknown` — never `same` — for the

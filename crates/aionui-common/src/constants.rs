@@ -11,6 +11,10 @@ pub const AIONUI_FILES_MARKER: &str = "[[AION_FILES]]";
 pub const AIONUI_SESSIONS_MARKER: &str = "[[AION_SESSIONS]]";
 pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
 
+/// Schema version written on the second line of both cross-session marker
+/// envelopes. Dynamic fields are serialized as JSON on the following line.
+pub const AIONUI_SESSION_MARKER_ENVELOPE_VERSION: &str = "v2";
+
 /// Recipient-side block prepended to a cross-session delivery. Tells the
 /// receiving agent who sent it, whether the sender's workspace matches, and
 /// the reply address.

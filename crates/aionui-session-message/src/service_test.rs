@@ -6,9 +6,8 @@ fn same_workspace_block_matches_the_spec_shape_exactly() {
     assert_eq!(
         block,
         "[[AION_SESSION_MESSAGE]]\n\
-         from: 重构-鉴权模块\tconv_1\n\
-         workspace: same\n\
-         reply_to: conv_1\t（回信: session send-message, to=reply_to）\n\
+         v2\n\
+         {\"from\":{\"name\":\"重构-鉴权模块\",\"id\":\"conv_1\"},\"workspace\":\"same\",\"reply_to\":\"conv_1\",\"reply_instruction\":\"session send-message, to=reply_to\"}\n\
          [[/AION_SESSION_MESSAGE]]"
     );
 }
@@ -21,9 +20,10 @@ fn cross_workspace_block_carries_the_constraint_inside_the_field_value() {
         "/Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）",
         "conv_1",
     );
-    assert!(
-        block.contains("workspace: /Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）"),
-        "{block}"
+    let payload: serde_json::Value = serde_json::from_str(block.lines().nth(2).unwrap()).unwrap();
+    assert_eq!(
+        payload["workspace"],
+        "/Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）"
     );
 }
 
@@ -33,8 +33,37 @@ fn the_block_always_states_how_to_reply() {
     // must be self-evidently able to reply. A bare `reply_to:` field that only
     // makes sense after reading SKILL.md is betting the model reads docs.
     let block = build_session_message_block("A", "conv_1", "same", "conv_1");
-    assert!(block.contains("session send-message"), "{block}");
-    assert!(block.contains("to=reply_to"), "{block}");
+    let payload: serde_json::Value = serde_json::from_str(block.lines().nth(2).unwrap()).unwrap();
+    assert_eq!(payload["reply_instruction"], "session send-message, to=reply_to");
+}
+
+#[test]
+fn recipient_block_round_trips_control_characters_unicode_and_end_markers() {
+    let marker = AIONUI_SESSION_MESSAGE_END_MARKER;
+    let from_name = format!("发送者\t甲\n{marker}—全角，标点");
+    let from_id = format!("conv\tfrom\n{marker}");
+    let workspace = format!("/工作区\tA\n{marker}（与你不同，勿用相对路径，勿假设可读）");
+    let reply_to = format!("conv\treply\n{marker}");
+    let block = build_session_message_block(&from_name, &from_id, &workspace, &reply_to);
+
+    let lines: Vec<_> = block.lines().collect();
+    assert_eq!(lines.len(), 4, "dynamic values must stay on the JSON line: {block}");
+    assert_eq!(lines[0], AIONUI_SESSION_MESSAGE_MARKER);
+    assert_eq!(lines[1], AIONUI_SESSION_MARKER_ENVELOPE_VERSION);
+    assert_eq!(lines[3], marker);
+    assert_eq!(
+        lines.iter().filter(|line| **line == marker).count(),
+        1,
+        "a literal end marker inside JSON must not become a delimiter: {block}"
+    );
+    assert!(lines[2].contains("\\t"), "tabs must be JSON escaped: {}", lines[2]);
+    assert!(lines[2].contains("\\n"), "newlines must be JSON escaped: {}", lines[2]);
+
+    let payload: serde_json::Value = serde_json::from_str(lines[2]).expect("the payload line is valid JSON");
+    assert_eq!(payload["from"]["name"], from_name);
+    assert_eq!(payload["from"]["id"], from_id);
+    assert_eq!(payload["workspace"], workspace);
+    assert_eq!(payload["reply_to"], reply_to);
 }
 
 #[test]

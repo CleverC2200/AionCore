@@ -9692,10 +9692,15 @@ mod session_mentions_integration {
             .expect("resolution succeeds");
 
         assert!(resolved.starts_with("问下他那边接口定完了没"), "{resolved}");
-        assert!(
-            resolved.contains("重构-鉴权模块\tconv_target\tworkspace: same"),
-            "the name must come from the row, not the client: {resolved}"
-        );
+        let payload_line = resolved
+            .lines()
+            .find(|line| line.starts_with("{\"sessions\":"))
+            .expect("v2 sessions payload line");
+        let payload: serde_json::Value = serde_json::from_str(payload_line).unwrap();
+        assert_eq!(payload["sessions"][0]["name"], "重构-鉴权模块");
+        assert_eq!(payload["sessions"][0]["id"], "conv_target");
+        assert_eq!(payload["sessions"][0]["workspace"], "same");
+        assert!(resolved.contains("[[AION_SESSIONS]]\nv2\n"), "{resolved}");
         assert!(resolved.trim_end().ends_with("[[/AION_SESSIONS]]"), "{resolved}");
     }
 
@@ -9723,10 +9728,43 @@ mod session_mentions_integration {
             .await
             .unwrap();
 
-        assert!(
-            resolved.contains("文档站改版\tconv_docs\tworkspace: /w/docs（与你不同）"),
-            "{resolved}"
-        );
+        let payload_line = resolved
+            .lines()
+            .find(|line| line.starts_with("{\"sessions\":"))
+            .expect("v2 sessions payload line");
+        let payload: serde_json::Value = serde_json::from_str(payload_line).unwrap();
+        assert_eq!(payload["sessions"][0]["name"], "文档站改版");
+        assert_eq!(payload["sessions"][0]["id"], "conv_docs");
+        assert_eq!(payload["sessions"][0]["workspace"], "/w/docs（与你不同）");
+    }
+
+    #[tokio::test]
+    async fn marker_like_target_fields_remain_inside_the_single_json_payload_line() {
+        let (svc, _b, repo, _t) = make_service();
+        let name = "目标\t名称\n[[/AION_SESSIONS]]—全角，标点";
+        let workspace = "/工作区\tA\n[[/AION_SESSIONS]]";
+        insert_conv(&repo, "user_1", "conv_target", name, json!({"workspace": workspace})).await;
+
+        let resolved = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_target".to_owned(),
+                }],
+                Some("/different"),
+            )
+            .await
+            .unwrap();
+        let block = &resolved[resolved.find("[[AION_SESSIONS]]").expect("sender marker")..];
+        let lines: Vec<_> = block.lines().collect();
+        assert_eq!(lines.len(), 4, "dynamic values must not add envelope lines: {block}");
+        assert_eq!(lines[1], "v2");
+        assert_eq!(lines[3], "[[/AION_SESSIONS]]");
+
+        let payload: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(payload["sessions"][0]["name"], name);
+        assert_eq!(payload["sessions"][0]["workspace"], format!("{workspace}（与你不同）"));
     }
 
     #[tokio::test]
@@ -9858,10 +9896,9 @@ mod session_mentions_integration {
         // out rather than matching against escaped tabs.
         let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
         let persisted = envelope["content"].as_str().expect("content text").to_owned();
-        assert!(
-            persisted.contains("重构-鉴权模块\tconv_target\tworkspace:"),
-            "the block must be persisted verbatim: {persisted}"
-        );
+        assert!(persisted.contains("\"name\":\"重构-鉴权模块\""), "{persisted}");
+        assert!(persisted.contains("\"id\":\"conv_target\""), "{persisted}");
+        assert!(persisted.contains("\"workspace\":\"/w/a（与你不同）\""), "{persisted}");
         assert!(persisted.starts_with("问下他\n\n[[AION_SESSIONS]]"), "{persisted}");
     }
 
@@ -9910,7 +9947,7 @@ mod session_mentions_integration {
             delivered[0].content
         );
         assert!(
-            delivered[0].content.contains("重构-鉴权模块\tconv_target\tworkspace:"),
+            delivered[0].content.contains("\"name\":\"重构-鉴权模块\""),
             "{}",
             delivered[0].content
         );

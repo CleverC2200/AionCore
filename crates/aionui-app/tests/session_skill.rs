@@ -64,6 +64,20 @@ fn the_skill_teaches_how_to_read_both_marker_blocks() {
         body.contains("[[AION_SESSION_MESSAGE]]"),
         "recipient-side block: {body}"
     );
+    assert_eq!(
+        body.matches("\nv2\n").count(),
+        2,
+        "both examples must be strict v2: {body}"
+    );
+    for field in [
+        "\"sessions\":",
+        "\"name\":",
+        "\"id\":",
+        "\"workspace\":",
+        "\"reply_to\":",
+    ] {
+        assert!(body.contains(field), "agent-visible field {field}: {body}");
+    }
 }
 
 #[test]

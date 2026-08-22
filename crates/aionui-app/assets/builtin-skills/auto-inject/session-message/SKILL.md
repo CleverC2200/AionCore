@@ -36,12 +36,13 @@ When the user typed `@@`, their message carries a block like:
 
 ```
 [[AION_SESSIONS]]
-重构-鉴权模块	conv_019f…	workspace: same
-文档站改版	conv_01a0…	workspace: /Users/x/docs（与你不同）
+v2
+{"sessions":[{"name":"重构-鉴权模块","id":"conv_019f…","workspace":"same"},{"name":"文档站改版","id":"conv_01a0…","workspace":"/Users/x/docs（与你不同）"}]}
 [[/AION_SESSIONS]]
 ```
 
-Each line is `name`, tab, `id`, tab, `workspace:`. Use the **id**.
+The third line is one JSON object. Read each object in `sessions` and use its
+`id`; `name` is display context, not an address.
 
 ## Delivering a message
 
@@ -60,9 +61,8 @@ A delivered message arrives with this block at the top:
 
 ```
 [[AION_SESSION_MESSAGE]]
-from: 重构-鉴权模块	conv_019f…
-workspace: same
-reply_to: conv_019f…	（回信: session send-message, to=reply_to）
+v2
+{"from":{"name":"重构-鉴权模块","id":"conv_019f…"},"workspace":"same","reply_to":"conv_019f…","reply_instruction":"session send-message, to=reply_to"}
 [[/AION_SESSION_MESSAGE]]
 ```
 

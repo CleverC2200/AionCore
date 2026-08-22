@@ -21,11 +21,12 @@ fn request(to: &str, message: &str) -> SessionSendMessageRequest {
 /// Pull `reply_to` back out of the recipient block, exactly as the receiving
 /// agent has to.
 fn extract_reply_to(content: &str) -> Option<String> {
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("reply_to: "))
-        .and_then(|rest| rest.split('\t').next())
-        .map(str::to_owned)
+    let mut lines = content.lines();
+    (lines.next()? == "[[AION_SESSION_MESSAGE]]").then_some(())?;
+    (lines.next()? == "v2").then_some(())?;
+    let payload: serde_json::Value = serde_json::from_str(lines.next()?).ok()?;
+    (lines.next()? == "[[/AION_SESSION_MESSAGE]]").then_some(())?;
+    payload.get("reply_to")?.as_str().map(str::to_owned)
 }
 
 #[tokio::test]
@@ -51,8 +52,14 @@ async fn a_delivers_b_replies_and_a_opens_a_turn() {
         .unwrap();
 
     let back = ctx.last_user_message_content(&a.id).await;
-    assert!(back.contains(&format!("from: B\t{}", b.id)), "{back}");
-    assert!(back.contains(&format!("reply_to: {}", b.id)), "{back}");
+    let mut lines = back.lines();
+    assert_eq!(lines.next(), Some("[[AION_SESSION_MESSAGE]]"));
+    assert_eq!(lines.next(), Some("v2"));
+    let payload: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(payload["from"]["name"], "B");
+    assert_eq!(payload["from"]["id"], b.id);
+    assert_eq!(payload["reply_to"], b.id);
+    assert_eq!(lines.next(), Some("[[/AION_SESSION_MESSAGE]]"));
     assert!(back.trim_end().ends_with("定完了。"), "{back}");
 }
 
