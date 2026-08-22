@@ -63,6 +63,8 @@ pub async fn csrf_middleware(
         || path.starts_with("/api/auth/internal/external-users/")
         || path == "/api/auth/internal/external-sessions"
         || path == "/api/auth/internal/external-sessions/revoke"
+        || path == "/api/auth/internal/external-sessions/refresh"
+        || path == "/api/auth/internal/external-sessions/revoke-matching"
         || is_antigravity_hook
         || is_runtime_token_request;
 

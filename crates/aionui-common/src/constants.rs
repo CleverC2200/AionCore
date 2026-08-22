@@ -42,6 +42,7 @@ pub const WS_CLOSE_POLICY_VIOLATION: u16 = 1008;
 /// with the real JWT/cookie lifetime (30 days).
 pub const SESSION_EXPIRY: &str = "30d";
 pub const COOKIE_NAME: &str = "aionui-session";
+pub const REFRESH_COOKIE_NAME: &str = "aionui-refresh-session";
 pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
 pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";

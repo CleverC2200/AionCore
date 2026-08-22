@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::{
-    ConnectionId, PER_CONNECTION_BUFFER, TokenValidator, WebSocketCloseCode, WebSocketManager, WsOutbound,
+    AsyncTokenValidator, ConnectionId, PER_CONNECTION_BUFFER, WebSocketCloseCode, WebSocketManager, WsOutbound,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
 
-fn always_valid() -> TokenValidator {
-    Arc::new(|_| true)
+fn always_valid() -> AsyncTokenValidator {
+    Arc::new(|_| Box::pin(async { true }))
 }
 
 fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
@@ -198,7 +198,7 @@ async fn heartbeat_closes_expired_token_with_auth_expired_event() {
     let (tx, mut rx) = new_client_tx();
     mgr.add_client("bad-token".into(), tx);
 
-    let expired_validator: TokenValidator = Arc::new(|_| false);
+    let expired_validator: AsyncTokenValidator = Arc::new(|_| Box::pin(async { false }));
     let handle = mgr.start_heartbeat(expired_validator);
 
     // Expect realtime auth-expired event and close as one terminal outbound.

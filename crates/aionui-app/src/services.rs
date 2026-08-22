@@ -9,17 +9,21 @@ use aionui_ai_agent::{
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_approval::ApprovalService;
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{
+    CookieConfig, JwtService, QrTokenStore, SessionLifecycle, SessionLifecycleConfig, derive_refresh_key,
+    resolve_jwt_secret,
+};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IExternalIdentityRepository,
-    IGeaResourceRepository, IMcpServerRepository, IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteExternalIdentityRepository, SqliteGeaResourceRepository,
-    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
-    SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, ICoreAuthSessionRepository,
+    IExternalIdentityRepository, IGeaResourceRepository, IMcpServerRepository, IProjectStore, ISkillRepository,
+    IUserOrderStore, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteApprovalReceiptRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteCoreAuthSessionRepository,
+    SqliteExternalIdentityRepository, SqliteGeaResourceRepository, SqliteMcpServerRepository, SqliteProjectStore,
+    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
+    SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -35,6 +39,8 @@ pub struct AppServices {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
     pub external_identity_repo: Arc<dyn IExternalIdentityRepository>,
+    pub core_auth_session_repo: Arc<dyn ICoreAuthSessionRepository>,
+    pub session_lifecycle: Arc<SessionLifecycle>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
@@ -166,6 +172,8 @@ impl AppServices {
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
         let external_identity_repo: Arc<dyn IExternalIdentityRepository> =
             Arc::new(SqliteExternalIdentityRepository::new(database.pool().clone()));
+        let core_auth_session_repo: Arc<dyn ICoreAuthSessionRepository> =
+            Arc::new(SqliteCoreAuthSessionRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
         let env_secret = std::env::var("JWT_SECRET").ok();
@@ -211,6 +219,25 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&secret);
+        let jwt_service = Arc::new(JwtService::new(secret.clone()));
+        let session_lifecycle_config = SessionLifecycleConfig::from_values(
+            std::env::var("AIONCORE_EXTERNAL_ACCESS_TTL_SECS").ok().as_deref(),
+            std::env::var("AIONCORE_EXTERNAL_REFRESH_TTL_SECS").ok().as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!("Invalid external session configuration: {error}"))?;
+        let session_lifecycle = Arc::new(SessionLifecycle::new(
+            core_auth_session_repo.clone(),
+            jwt_service.clone(),
+            session_lifecycle_config,
+            derive_refresh_key(&secret),
+        ));
+        let pruned_sessions = session_lifecycle
+            .prune_terminal()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to prune terminal external sessions: {error}"))?;
+        if pruned_sessions > 0 {
+            tracing::info!(count = pruned_sessions, "pruned terminal external Core sessions");
+        }
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -362,10 +389,12 @@ impl AppServices {
 
         Ok(Self {
             database,
-            jwt_service: Arc::new(JwtService::new(secret.clone())),
+            jwt_service,
             antigravity_hook_tokens,
             user_repo,
             external_identity_repo,
+            core_auth_session_repo,
+            session_lifecycle,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),

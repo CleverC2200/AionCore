@@ -458,6 +458,8 @@ pub(crate) async fn run_server(
     }
 
     let shutdown_error = shutdown_error_rx.await.ok();
+    router_runtime.realtime_heartbeat.abort();
+    let _ = router_runtime.realtime_heartbeat.await;
 
     // The scanner breaks out of its select loop as soon as it observes the
     // shutdown watch value; the bound covers an in-progress scan_and_cleanup

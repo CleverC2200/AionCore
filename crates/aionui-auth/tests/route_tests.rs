@@ -13,12 +13,12 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionRevokedHook, auth_routes,
-    csrf_middleware, hash_password,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionLifecycle,
+    SessionLifecycleConfig, SessionRevokedHook, auth_routes, csrf_middleware, derive_refresh_key, hash_password,
 };
 use aionui_db::{
-    IExternalIdentityRepository, IUserRepository, SqliteExternalIdentityRepository, SqliteUserRepository, UserStatus,
-    UserType, init_database_memory,
+    ICoreAuthSessionRepository, IExternalIdentityRepository, IUserRepository, SqliteCoreAuthSessionRepository,
+    SqliteExternalIdentityRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,14 @@ async fn test_app_with_options_and_hook(
     let external_identity_repo =
         Arc::new(SqliteExternalIdentityRepository::new(db.pool().clone())) as Arc<dyn IExternalIdentityRepository>;
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
+    let core_auth_session_repo =
+        Arc::new(SqliteCoreAuthSessionRepository::new(db.pool().clone())) as Arc<dyn ICoreAuthSessionRepository>;
+    let session_lifecycle = Arc::new(SessionLifecycle::new(
+        core_auth_session_repo,
+        jwt_service.clone(),
+        SessionLifecycleConfig::default(),
+        derive_refresh_key("test_secret_for_routes"),
+    ));
     let cookie_config = Arc::new(CookieConfig {
         secure: false,
         same_site: "Lax",
@@ -59,6 +67,7 @@ async fn test_app_with_options_and_hook(
         jwt_service: jwt_service.clone(),
         user_repo: user_repo.clone(),
         external_identity_repo,
+        session_lifecycle,
         fs_adopter: None,
         cookie_config: cookie_config.clone(),
         qr_token_store: qr_token_store.clone(),
@@ -71,6 +80,8 @@ async fn test_app_with_options_and_hook(
         },
         bootstrap_secret: bootstrap_secret.map(Arc::<str>::from),
         session_revoked_hook,
+        session_refreshed_hook: None,
+        matching_session_revoked_hook: None,
         local,
         aionpro_mode,
     };
@@ -164,6 +175,37 @@ fn external_identity_body(tenant_id: &str, subject: &str) -> String {
     .to_string()
 }
 
+async fn provision_and_exchange_identity(
+    app: &Router,
+    tenant_id: &str,
+    subject: &str,
+) -> (String, String, serde_json::Value) {
+    let identity = external_identity_body(tenant_id, subject);
+    let provision = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-identities",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provision.status(), StatusCode::OK);
+    let exchange = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exchange.status(), StatusCode::OK);
+    let access = extract_session_token(&exchange).unwrap();
+    let refresh = extract_refresh_credential(&exchange).unwrap();
+    (access, refresh, body_json(exchange).await)
+}
+
 /// Helper: perform a JSON POST request with auth token.
 fn json_post_with_token(uri: &str, body: &str, token: &str) -> Request<Body> {
     Request::builder()
@@ -206,18 +248,41 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
+    extract_set_cookie_value(resp, "aionui-session")
+}
+
+fn extract_refresh_credential(resp: &axum::response::Response) -> Option<String> {
+    extract_set_cookie_value(resp, "aionui-refresh-session")
+}
+
+fn extract_set_cookie_value(resp: &axum::response::Response, name: &str) -> Option<String> {
     resp.headers()
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .find_map(|cookie| {
             cookie
-                .split(',')
-                .find(|part| part.trim_start().starts_with("aionui-session="))
-                .and_then(|part| part.trim_start().strip_prefix("aionui-session="))
+                .strip_prefix(&format!("{name}="))
                 .and_then(|value| value.split(';').next())
                 .map(str::to_owned)
         })
+}
+
+fn empty_post_with_bootstrap_cookie(
+    uri: &str,
+    secret: &str,
+    refresh_credential: &str,
+    idempotency_key: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("x-aioncore-bootstrap-secret", secret)
+        .header(header::COOKIE, format!("aionui-refresh-session={refresh_credential}"));
+    if let Some(key) = idempotency_key {
+        builder = builder.header("x-aioncore-refresh-idempotency-key", key);
+    }
+    builder.body(Body::empty()).unwrap()
 }
 
 /// Helper: login and return (token, user_id).
@@ -1381,6 +1446,359 @@ async fn external_identity_sessions_are_concurrent_and_isolated_by_core_user() {
 }
 
 #[tokio::test]
+async fn renewable_external_session_rotates_idempotently_and_replay_revokes() {
+    const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let identity = external_identity_body("tenant-renew", "subject-renew");
+    assert_eq!(
+        app.clone()
+            .oneshot(json_put_with_bootstrap_secret(
+                "/api/auth/internal/external-identities",
+                &identity,
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let exchange = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exchange.status(), StatusCode::OK);
+    assert_eq!(exchange.headers().get_all(header::SET_COOKIE).iter().count(), 2);
+    let old_access = extract_session_token(&exchange).unwrap();
+    let old_refresh = extract_refresh_credential(&exchange).unwrap();
+    let exchange_json = body_json(exchange).await;
+    let session = &exchange_json["data"]["session"];
+    assert_eq!(session["rotation"], 0);
+    assert!(session["access_expires_at"].as_u64().unwrap() < session["refresh_expires_at"].as_u64().unwrap());
+    assert_eq!(exchange_json["data"].as_object().unwrap().len(), 3);
+    assert!(!exchange_json.to_string().contains(&old_access));
+    assert!(!exchange_json.to_string().contains(&old_refresh));
+    let old_payload = ctx.jwt_service.verify(&old_access).unwrap();
+    assert_eq!(old_payload.exp - old_payload.iat, 15 * 60);
+    assert_eq!(old_payload.sid.as_deref(), session["sid"].as_str());
+    let absolute_expiry = session["refresh_expires_at"].as_u64().unwrap();
+
+    let refreshed = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &old_refresh,
+            Some(KEY_A),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let current_access = extract_session_token(&refreshed).unwrap();
+    let current_refresh = extract_refresh_credential(&refreshed).unwrap();
+    let refreshed_json = body_json(refreshed).await;
+    assert_eq!(refreshed_json["data"].as_object().unwrap().len(), 1);
+    assert_eq!(refreshed_json["data"]["session"]["rotation"], 1);
+    assert_eq!(refreshed_json["data"]["session"]["refresh_expires_at"], absolute_expiry);
+
+    let legacy_refresh = app
+        .clone()
+        .oneshot(json_post(
+            "/api/auth/refresh",
+            &serde_json::json!({"token": &current_access}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_refresh.status(), StatusCode::UNAUTHORIZED);
+
+    let ws_token = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/ws-token", &current_access))
+        .await
+        .unwrap();
+    assert_eq!(ws_token.status(), StatusCode::OK);
+    let ws_json = body_json(ws_token).await;
+    assert_eq!(ws_json["ws_token"], current_access);
+    assert!(
+        ws_json["expires_in"]
+            .as_u64()
+            .is_some_and(|millis| millis > 0 && millis <= 900_000)
+    );
+
+    for key in [None, Some("malformed")] {
+        let invalid_previous = app
+            .clone()
+            .oneshot(empty_post_with_bootstrap_cookie(
+                "/api/auth/internal/external-sessions/refresh",
+                "bootstrap-secret",
+                &old_refresh,
+                key,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_previous.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let retry = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &old_refresh,
+            Some(KEY_A),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        extract_refresh_credential(&retry).as_deref(),
+        Some(current_refresh.as_str())
+    );
+    assert_eq!(body_json(retry).await["data"]["session"]["rotation"], 1);
+
+    for key in [None, Some("malformed")] {
+        let invalid = app
+            .clone()
+            .oneshot(empty_post_with_bootstrap_cookie(
+                "/api/auth/internal/external-sessions/refresh",
+                "bootstrap-secret",
+                &current_refresh,
+                key,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+    let non_empty = Request::builder()
+        .method("POST")
+        .uri("/api/auth/internal/external-sessions/refresh")
+        .header("x-aioncore-bootstrap-secret", "bootstrap-secret")
+        .header("x-aioncore-refresh-idempotency-key", KEY_B)
+        .header(header::COOKIE, format!("aionui-refresh-session={current_refresh}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(non_empty).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let sid = session["sid"].as_str().unwrap();
+    let row: (i64, Option<i64>, String) =
+        sqlx::query_as("SELECT rotation, revoked_at, current_refresh_hash FROM core_auth_sessions WHERE sid = ?")
+            .bind(sid)
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    assert_eq!(row.0, 1);
+    assert!(row.1.is_none());
+    assert!(!row.2.contains(&current_refresh));
+    assert!(!row.2.contains(current_refresh.split_once('.').unwrap().1));
+
+    let replay = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &old_refresh,
+            Some(KEY_B),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(replay).await["code"], "EXTERNAL_SESSION_REFRESH_REPLAYED");
+    let after_replay = app
+        .oneshot(get_with_session_cookie("/api/auth/user", &current_access))
+        .await
+        .unwrap();
+    assert_eq!(after_replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(after_replay).await["code"], "EXTERNAL_SESSION_REVOKED");
+}
+
+#[tokio::test]
+async fn matching_revoke_accepts_recent_previous_cookie_and_does_not_revoke_sibling_sid() {
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let identity = external_identity_body("tenant-sid", "subject-sid");
+    app.clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-identities",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let first = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let first_old_refresh = extract_refresh_credential(&first).unwrap();
+    let first_sid = body_json(first).await["data"]["session"]["sid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sibling = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let sibling_access = extract_session_token(&sibling).unwrap();
+
+    let rotated = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &first_old_refresh,
+            Some(KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated_access = extract_session_token(&rotated).unwrap();
+
+    let revoke = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/revoke-matching",
+            "bootstrap-secret",
+            &first_old_refresh,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+    assert_eq!(revoke.headers().get_all(header::SET_COOKIE).iter().count(), 2);
+    let revoke_json = body_json(revoke).await;
+    assert_eq!(revoke_json["data"]["sid"], first_sid);
+    assert_eq!(revoke_json["data"]["revoked"], true);
+
+    assert_eq!(
+        app.clone()
+            .oneshot(get_with_session_cookie("/api/auth/user", &rotated_access))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.oneshot(get_with_session_cookie("/api/auth/user", &sibling_access))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn renewable_session_expired_disabled_and_generation_states_fail_closed() {
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let (expired_access, expired_refresh, expired_json) =
+        provision_and_exchange_identity(&app, "tenant-terminal", "expired").await;
+    let expired_sid = expired_json["data"]["session"]["sid"].as_str().unwrap();
+    sqlx::query("UPDATE core_auth_sessions SET created_at = 1, session_expires_at = 2 WHERE sid = ?")
+        .bind(expired_sid)
+        .execute(ctx._db.pool())
+        .await
+        .unwrap();
+    let expired = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &expired_refresh,
+            Some(KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(expired).await["code"], "EXTERNAL_SESSION_EXPIRED");
+    let expired_access_response = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &expired_access))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(expired_access_response).await["code"],
+        "EXTERNAL_SESSION_EXPIRED"
+    );
+
+    let (disabled_access, disabled_refresh, disabled_json) =
+        provision_and_exchange_identity(&app, "tenant-terminal", "disabled").await;
+    let disabled_user = disabled_json["data"]["user"]["id"].as_str().unwrap();
+    ctx.user_repo
+        .set_status(disabled_user, UserStatus::Disabled)
+        .await
+        .unwrap();
+    let disabled = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &disabled_refresh,
+            Some(KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(disabled).await["code"], "CORE_USER_DISABLED");
+    let disabled_access_response = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &disabled_access))
+        .await
+        .unwrap();
+    assert_eq!(disabled_access_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(disabled_access_response).await["code"], "CORE_USER_DISABLED");
+
+    let (generation_access, generation_refresh, generation_json) =
+        provision_and_exchange_identity(&app, "tenant-terminal", "generation").await;
+    let generation_user = generation_json["data"]["user"]["id"].as_str().unwrap();
+    ctx.user_repo
+        .increment_session_generation(generation_user)
+        .await
+        .unwrap();
+    let stale_access = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &generation_access))
+        .await
+        .unwrap();
+    assert_eq!(stale_access.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(stale_access).await["code"],
+        "EXTERNAL_SESSION_GENERATION_MISMATCH"
+    );
+    let stale_refresh = app
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &generation_refresh,
+            Some(KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_refresh.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(stale_refresh).await["code"],
+        "EXTERNAL_SESSION_GENERATION_MISMATCH"
+    );
+}
+
+#[tokio::test]
 async fn external_identity_session_exchange_fails_closed_for_missing_disabled_and_legacy_owner() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     for path in [
@@ -1551,6 +1969,39 @@ async fn csrf_exemption_is_limited_to_exact_bootstrap_auth_routes() {
         .await
         .unwrap();
     assert_eq!(session.status(), StatusCode::OK);
+    let refresh_credential = extract_refresh_credential(&session).unwrap();
+
+    let refresh = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &refresh_credential,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        refresh.status(),
+        StatusCode::OK,
+        "global CSRF must allow trusted refresh"
+    );
+
+    let matching_revoke = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/revoke-matching",
+            "bootstrap-secret",
+            &refresh_credential,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        matching_revoke.status(),
+        StatusCode::OK,
+        "global CSRF must allow trusted matching revoke"
+    );
 
     let prefix_lookalike = app
         .clone()
@@ -1562,6 +2013,15 @@ async fn csrf_exemption_is_limited_to_exact_bootstrap_auth_routes() {
         .unwrap();
     assert_eq!(prefix_lookalike.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(prefix_lookalike).await["code"], "CSRF_INVALID");
+
+    for lookalike in [
+        "/api/auth/internal/external-sessions/refresh-extra",
+        "/api/auth/internal/external-sessions/revoke-matching-extra",
+    ] {
+        let response = app.clone().oneshot(json_post_anonymous(lookalike, "")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "CSRF_INVALID");
+    }
 
     let ordinary_state_change = app
         .oneshot(json_post_anonymous(

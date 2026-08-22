@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -21,7 +22,7 @@ use aionui_api_types::{
     WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
-use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
+use aionui_common::constants::REFRESH_COOKIE_NAME;
 use aionui_db::{DbError, IExternalIdentityRepository, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
@@ -29,7 +30,7 @@ use crate::external_identity::{
     ExternalIdentityMappingError, ExternalIdentityMappingService, ExternalIdentitySessionError,
     ExternalIdentitySessionService,
 };
-use crate::extract::extract_token_from_headers;
+use crate::extract::{extract_cookie_value, extract_token_from_headers};
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
@@ -38,11 +39,14 @@ use crate::rate_limit::{
 };
 use crate::service::{AuthProvisionService, ProvisionError};
 use crate::validation::{validate_password, validate_username};
-use crate::{CookieConfig, JwtService};
+use crate::{CookieConfig, JwtService, SessionLifecycle, SessionLifecycleError};
 
 const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
+const REFRESH_IDEMPOTENCY_HEADER: &str = "x-aioncore-refresh-idempotency-key";
 
 pub type SessionRevokedHook = dyn Fn(&str) + Send + Sync;
+pub type SessionRefreshedHook = dyn Fn(&str, &str, i64) + Send + Sync;
+pub type MatchingSessionRevokedHook = dyn Fn(&str) + Send + Sync;
 
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
@@ -75,6 +79,7 @@ pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
     pub external_identity_repo: Arc<dyn IExternalIdentityRepository>,
+    pub session_lifecycle: Arc<SessionLifecycle>,
     /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
@@ -82,6 +87,8 @@ pub struct AuthRouterState {
     pub identity_mode: AuthIdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+    pub session_refreshed_hook: Option<Arc<SessionRefreshedHook>>,
+    pub matching_session_revoked_hook: Option<Arc<MatchingSessionRevokedHook>>,
     pub local: bool,
     pub aionpro_mode: bool,
 }
@@ -262,9 +269,63 @@ fn external_identity_session_error_to_api_error(err: ExternalIdentitySessionErro
             tracing::error!("external identity session persistence failed");
             ApiError::Internal("External identity session unavailable".to_owned())
         }
-        ExternalIdentitySessionError::Token(_) => {
-            tracing::error!("external identity Core session signing failed");
-            ApiError::Internal("External identity session unavailable".to_owned())
+        ExternalIdentitySessionError::Lifecycle(error) => session_lifecycle_error_to_api_error(error),
+    }
+}
+
+pub(crate) fn session_lifecycle_error_to_api_error(err: SessionLifecycleError) -> ApiError {
+    let coded = |status, code, message| ApiError::coded(status, code, message, None);
+    match err {
+        SessionLifecycleError::RefreshRequired => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_REFRESH_REQUIRED",
+            "External session refresh credential required.",
+        ),
+        SessionLifecycleError::RefreshInvalid => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_REFRESH_INVALID",
+            "External session refresh credential invalid.",
+        ),
+        SessionLifecycleError::IdempotencyKeyRequired => coded(
+            StatusCode::BAD_REQUEST,
+            "EXTERNAL_SESSION_REFRESH_IDEMPOTENCY_REQUIRED",
+            "External session refresh idempotency key required.",
+        ),
+        SessionLifecycleError::IdempotencyKeyInvalid => coded(
+            StatusCode::BAD_REQUEST,
+            "EXTERNAL_SESSION_REFRESH_IDEMPOTENCY_INVALID",
+            "External session refresh idempotency key invalid.",
+        ),
+        SessionLifecycleError::RefreshReplayed => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_REFRESH_REPLAYED",
+            "External session refresh credential replayed.",
+        ),
+        SessionLifecycleError::Expired => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_EXPIRED",
+            "External session expired.",
+        ),
+        SessionLifecycleError::Revoked => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_REVOKED",
+            "External session revoked.",
+        ),
+        SessionLifecycleError::UserDisabled => {
+            coded(StatusCode::FORBIDDEN, "CORE_USER_DISABLED", "Core user disabled.")
+        }
+        SessionLifecycleError::GenerationMismatch => coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_GENERATION_MISMATCH",
+            "External session generation is stale.",
+        ),
+        SessionLifecycleError::Database(_) | SessionLifecycleError::Token(_) | SessionLifecycleError::Clock => {
+            tracing::error!("external session lifecycle unavailable");
+            coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "EXTERNAL_SESSION_UNAVAILABLE",
+                "External session unavailable.",
+            )
         }
     }
 }
@@ -311,6 +372,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
+        session_lifecycle: Some(state.session_lifecycle.clone()),
         identity_mode: if state.aionpro_mode {
             AuthIdentityMode::AionPro
         } else {
@@ -346,6 +408,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route(
             "/api/auth/internal/external-sessions/revoke",
             post(revoke_external_session_handler),
+        )
+        .route(
+            "/api/auth/internal/external-sessions/refresh",
+            post(refresh_external_session_handler),
+        )
+        .route(
+            "/api/auth/internal/external-sessions/revoke-matching",
+            post(revoke_matching_external_session_handler),
         )
         .route(
             "/api/auth/internal/users",
@@ -480,24 +550,36 @@ async fn create_external_session_handler(
 ) -> Result<Response, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let exchange = match req {
-        EnsureExternalSessionRequest::AionPro(subject) => AuthProvisionService::new(state.user_repo, state.jwt_service)
-            .create_external_session(subject)
-            .await
-            .map_err(provision_error_to_api_error)?,
-        EnsureExternalSessionRequest::ExternalIdentity(subject) => {
-            ExternalIdentitySessionService::new(state.external_identity_repo, state.user_repo, state.jwt_service)
-                .create_session(subject.identity)
+    match req {
+        EnsureExternalSessionRequest::AionPro(subject) => {
+            let exchange = AuthProvisionService::new(state.user_repo, state.jwt_service)
+                .create_external_session(subject)
                 .await
-                .map_err(external_identity_session_error_to_api_error)?
+                .map_err(provision_error_to_api_error)?;
+            tracing::info!(user_id = %exchange.response.user.id, "legacy external Core session exchange succeeded");
+            let cookie = state.cookie_config.build_session_cookie(&exchange.token);
+            Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(exchange.response))).into_response())
         }
-    };
-    tracing::info!(
-        user_id = %exchange.response.user.id,
-        "external core session exchange succeeded"
-    );
-    let cookie = state.cookie_config.build_session_cookie(&exchange.token);
-    Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(exchange.response))).into_response())
+        EnsureExternalSessionRequest::ExternalIdentity(subject) => {
+            let exchange = ExternalIdentitySessionService::new(
+                state.external_identity_repo,
+                state.user_repo,
+                state.session_lifecycle,
+            )
+            .create_session(subject.identity)
+            .await
+            .map_err(external_identity_session_error_to_api_error)?;
+            tracing::info!(sid = %exchange.response.session.sid, "renewable external Core session issued");
+            Ok(external_session_response(
+                &state.cookie_config,
+                exchange.access_token,
+                exchange.refresh_credential,
+                exchange.response.session.access_expires_at,
+                exchange.response.session.refresh_expires_at,
+                ApiResponse::ok(exchange.response),
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +599,7 @@ async fn revoke_external_session_handler(
             .await
             .map_err(provision_error_to_api_error)?,
         RevokeExternalSessionRequest::ExternalIdentity(subject) => {
-            ExternalIdentitySessionService::new(state.external_identity_repo, state.user_repo, state.jwt_service)
+            ExternalIdentitySessionService::new(state.external_identity_repo, state.user_repo, state.session_lifecycle)
                 .revoke_sessions(subject.identity)
                 .await
                 .map_err(external_identity_session_error_to_api_error)?
@@ -532,6 +614,109 @@ async fn revoke_external_session_handler(
         hook(&response.user_id);
     }
     Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn refresh_external_session_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    require_empty_body(&body)?;
+    let refresh_credential = extract_cookie_value(&headers, REFRESH_COOKIE_NAME);
+    let idempotency_key = headers
+        .get(REFRESH_IDEMPOTENCY_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let exchange = state
+        .session_lifecycle
+        .refresh(refresh_credential.as_deref(), idempotency_key)
+        .await
+        .map_err(session_lifecycle_error_to_api_error)?;
+    if let Some(hook) = &state.session_refreshed_hook {
+        hook(
+            &exchange.response.session.sid,
+            &exchange.access_token,
+            exchange.response.session.rotation,
+        );
+    }
+    tracing::info!(
+        sid = %exchange.response.session.sid,
+        rotation = exchange.response.session.rotation,
+        "renewable external Core session refreshed"
+    );
+    Ok(external_session_response(
+        &state.cookie_config,
+        exchange.access_token,
+        exchange.refresh_credential,
+        exchange.response.session.access_expires_at,
+        exchange.response.session.refresh_expires_at,
+        ApiResponse::ok(exchange.response),
+    ))
+}
+
+async fn revoke_matching_external_session_handler(
+    State(state): State<AuthRouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
+    require_empty_body(&body)?;
+    let refresh_credential = extract_cookie_value(&headers, REFRESH_COOKIE_NAME);
+    let response = state
+        .session_lifecycle
+        .revoke_matching(refresh_credential.as_deref())
+        .await
+        .map_err(session_lifecycle_error_to_api_error)?;
+    if let Some(hook) = &state.matching_session_revoked_hook {
+        hook(&response.sid);
+    }
+    tracing::info!(sid = %response.sid, "renewable external Core session revoked");
+    let mut response = Json(ApiResponse::ok(response)).into_response();
+    append_set_cookie(&mut response, state.cookie_config.clear_session_cookie());
+    append_set_cookie(&mut response, state.cookie_config.clear_external_refresh_cookie());
+    Ok(response)
+}
+
+fn require_empty_body(body: &Bytes) -> Result<(), ApiError> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest("Request body must be empty".to_owned()))
+    }
+}
+
+fn external_session_response<T: Serialize>(
+    cookie_config: &CookieConfig,
+    access_token: String,
+    refresh_credential: String,
+    access_expires_at: u64,
+    refresh_expires_at: u64,
+    payload: ApiResponse<T>,
+) -> Response {
+    let now = unix_now_secs();
+    let mut response = Json(payload).into_response();
+    append_set_cookie(
+        &mut response,
+        cookie_config.build_external_access_cookie(&access_token, access_expires_at.saturating_sub(now).max(1)),
+    );
+    append_set_cookie(
+        &mut response,
+        cookie_config.build_external_refresh_cookie(&refresh_credential, refresh_expires_at.saturating_sub(now).max(1)),
+    );
+    response
+}
+
+fn append_set_cookie(response: &mut Response, value: String) {
+    if let Ok(value) = value.parse() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +1084,16 @@ async fn refresh_handler(
         return Err(user_context_required());
     }
 
+    if user.user_type == aionui_db::UserType::External
+        || payload.token_kind.is_some()
+        || payload.sid.is_some()
+        || payload.session_rotation.is_some()
+    {
+        return Err(ApiError::Unauthorized(
+            "Renewable external sessions must use the trusted refresh endpoint".into(),
+        ));
+    }
+
     if payload.session_generation != user.session_generation {
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
@@ -938,8 +1133,12 @@ async fn ws_token_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
-    // Cookie max age in milliseconds
-    let expires_in = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60 * 1000;
+    let payload = state
+        .jwt_service
+        .verify(&token)
+        .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+    let now = unix_now_secs();
+    let expires_in = payload.exp.saturating_sub(now).saturating_mul(1000);
 
     Ok(Json(WsTokenResponse {
         success: true,

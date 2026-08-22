@@ -58,6 +58,7 @@ use super::trace::with_access_log;
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+    pub realtime_heartbeat: tokio::task::JoinHandle<()>,
 }
 
 async fn forward_event_bus_to_websocket(
@@ -183,6 +184,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         None => fs_router,
     };
     let ws_state = build_ws_state(services, inbound_router);
+    let realtime_heartbeat = services
+        .ws_manager
+        .start_heartbeat(ws_state.heartbeat_validator.clone());
     let router = create_router_with_all_state(services, states, ws_state);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -193,6 +197,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         RouterRuntime {
             client_pref_service,
             team_service,
+            realtime_heartbeat,
         },
     ))
 }
@@ -220,6 +225,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         external_identity_repo: services.external_identity_repo.clone(),
+        session_lifecycle: services.session_lifecycle.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),
             skill_repo: services.skill_repo.clone(),
@@ -276,6 +282,18 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 });
             }))
         },
+        session_refreshed_hook: {
+            let ws_manager = services.ws_manager.clone();
+            Some(Arc::new(move |sid: &str, access_token: &str, rotation: i64| {
+                ws_manager.refresh_session(sid, access_token, rotation);
+            }))
+        },
+        matching_session_revoked_hook: {
+            let ws_manager = services.ws_manager.clone();
+            Some(Arc::new(move |sid: &str| {
+                ws_manager.disconnect_session(sid, "session revoked");
+            }))
+        },
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
     };
@@ -283,6 +301,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let auth_mw_state = AuthState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
+        session_lifecycle: Some(services.session_lifecycle.clone()),
         identity_mode: auth_identity_mode(services.identity_mode),
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),

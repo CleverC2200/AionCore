@@ -148,6 +148,38 @@ pub struct EnsureExternalSessionResponse {
     pub session_generation: i64,
 }
 
+/// Non-sensitive lifecycle metadata for a renewable external Core session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenewableExternalSessionMetadata {
+    pub sid: String,
+    pub rotation: i64,
+    /// Unix timestamp in seconds.
+    pub access_expires_at: u64,
+    /// Unix timestamp in seconds.
+    pub refresh_expires_at: u64,
+}
+
+/// Exchange response used only for generic external identities (currently Lark).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureRenewableExternalSessionResponse {
+    pub user: PublicUser,
+    pub session_generation: i64,
+    pub session: RenewableExternalSessionMetadata,
+}
+
+/// Successful refresh response. Credentials remain cookie-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshExternalSessionResponse {
+    pub session: RenewableExternalSessionMetadata,
+}
+
+/// Successful matching-session revocation response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeMatchingExternalSessionResponse {
+    pub sid: String,
+    pub revoked: bool,
+}
+
 /// Request body for `POST /api/auth/internal/external-sessions/revoke`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
