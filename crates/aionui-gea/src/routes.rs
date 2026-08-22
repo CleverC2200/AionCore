@@ -638,13 +638,43 @@ fn enforce_runtime_conversation_scope(headers: &HeaderMap, path_conversation_id:
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use axum::http::{HeaderMap, HeaderValue};
+    use serde_json::Value;
     use utoipa::OpenApi;
 
     use super::{
         GeaApiDoc, enforce_runtime_conversation_scope, gea_swagger_config, reject_runtime_auth_session_access,
     };
     use aionui_auth::{RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
+
+    fn openapi_value() -> Value {
+        serde_json::to_value(GeaApiDoc::openapi()).unwrap()
+    }
+
+    fn assert_schema_properties(document: &Value, name: &str, expected: &[&str]) {
+        let schema = &document["components"]["schemas"][name];
+        let actual = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("OpenAPI schema {name} must be an object"))
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "OpenAPI schema properties drifted for {name}");
+    }
+
+    fn assert_schema_enum(document: &Value, name: &str, expected: &[&str]) {
+        let actual = document["components"]["schemas"][name]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("OpenAPI schema {name} must expose enum values"))
+            .iter()
+            .map(|value| value.as_str().expect("enum values must be strings"))
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "OpenAPI enum values drifted for {name}");
+    }
 
     #[test]
     fn trusted_client_requests_do_not_require_runtime_conversation_headers() {
@@ -677,7 +707,7 @@ mod tests {
 
     #[test]
     fn gea_openapi_contains_the_current_route_set_and_unique_operation_ids() {
-        let value = serde_json::to_value(GeaApiDoc::openapi()).unwrap();
+        let value = openapi_value();
         let paths = value["paths"].as_object().unwrap();
         let expected = [
             "/api/gea/auth/session",
@@ -710,6 +740,109 @@ mod tests {
             }
         }
         assert_eq!(operation_ids.len(), 12);
+    }
+
+    #[test]
+    fn gea_openapi_pins_session_and_tool_schema_fields() {
+        let document = openapi_value();
+        assert_schema_properties(&document, "SetGeaAuthSessionRequest", &["accessToken", "tenantId"]);
+        assert_schema_properties(
+            &document,
+            "GeaAuthSessionStatus",
+            &["authenticated", "reauthRequired", "tenantId"],
+        );
+        assert_schema_properties(&document, "CreateGeaSessionRequest", &["consumerCode", "preparationId"]);
+        assert_schema_properties(
+            &document,
+            "GeaSessionResponse",
+            &[
+                "consumerCode",
+                "conversationId",
+                "effectiveCapabilityCodes",
+                "sessionId",
+            ],
+        );
+        assert_schema_properties(
+            &document,
+            "GeaToolInfo",
+            &["description", "inputSchema", "name", "sourceCode"],
+        );
+        assert_schema_properties(&document, "GeaToolCallRequest", &["arguments"]);
+        assert_schema_properties(&document, "GeaToolCallResponse", &["auditId", "result"]);
+    }
+
+    #[test]
+    fn gea_openapi_pins_interaction_request_schema_fields() {
+        let document = openapi_value();
+        assert_schema_properties(
+            &document,
+            "InteractionRequestList",
+            &[
+                "failed_session_count",
+                "failure_codes",
+                "items",
+                "revision",
+                "sync_state",
+            ],
+        );
+        assert_schema_properties(
+            &document,
+            "InteractionRequestActionCommand",
+            &["action_id", "expected_version", "idempotency_key", "payload"],
+        );
+        assert_schema_properties(
+            &document,
+            "InteractionRequestReceipt",
+            &[
+                "receipt_id",
+                "request_id",
+                "request",
+                "resolved_at",
+                "resolved_by",
+                "status",
+                "turn_continuation",
+                "version",
+            ],
+        );
+        assert_schema_properties(&document, "GeaInteractionRequestSnapshot", &["items", "revision"]);
+        assert_schema_properties(
+            &document,
+            "GeaInteractionRequestActionCommand",
+            &["actionId", "expectedVersion", "idempotencyKey", "payload"],
+        );
+        assert_schema_properties(
+            &document,
+            "GeaInteractionRequestReceipt",
+            &[
+                "auditId",
+                "receiptId",
+                "request",
+                "requestId",
+                "resolvedAt",
+                "resolvedBy",
+                "status",
+                "turnContinuation",
+                "version",
+            ],
+        );
+        assert_schema_properties(&document, "InteractionRequestChangedPayload", &["revision", "user_id"]);
+    }
+
+    #[test]
+    fn gea_openapi_pins_client_resource_schema_fields_and_values() {
+        let document = openapi_value();
+        assert_schema_properties(&document, "SyncGeaClientResourcesRequest", &["resources"]);
+        assert_schema_enum(&document, "GeaClientResourceKind", &["assistants", "mcps", "skills"]);
+        assert_schema_properties(
+            &document,
+            "GeaClientResourceSyncResult",
+            &["changed", "failed", "revision", "skipped", "status"],
+        );
+        assert_schema_enum(
+            &document,
+            "GeaClientResourceSyncStatus",
+            &["completed", "notAuthenticated", "partial", "unavailable"],
+        );
     }
 
     #[test]
