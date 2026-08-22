@@ -673,11 +673,15 @@ mod tests {
             ..Default::default()
         };
         let initial = AppServices::from_config(db, &config).await.unwrap();
+        let sender_workspace = tmp.path().join("sender");
+        let target_workspace = tmp.path().join("target");
+        std::fs::create_dir_all(&sender_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
         let sender = initial
             .conversation_service
             .create(
                 "system_default_user",
-                create_conversation_request("sender", &tmp.path().join("sender")),
+                create_conversation_request("sender", &sender_workspace),
             )
             .await
             .unwrap();
@@ -685,7 +689,7 @@ mod tests {
             .conversation_service
             .create(
                 "system_default_user",
-                create_conversation_request("target", &tmp.path().join("target")),
+                create_conversation_request("target", &target_workspace),
             )
             .await
             .unwrap();
