@@ -1041,7 +1041,7 @@ mod tests {
         assert_schema_properties(
             &document,
             "NotificationChangedPayload",
-            &["notification_id", "reason", "revision", "trace_id", "user_id"],
+            &["notification_id", "reason", "revision", "trace_id"],
         );
         assert_schema_enum(&document, "NotificationStatus", &["dismissed", "read", "unread"]);
         assert_schema_enum(

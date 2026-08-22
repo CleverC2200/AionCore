@@ -438,21 +438,22 @@ async fn notification_changed_reaches_only_its_authenticated_user() {
     wait_for_clients(&app, 2).await;
 
     let payload = aionui_api_types::NotificationChangedPayload {
-        user_id: "user-a".to_owned(),
         revision: "notification-r2".to_owned(),
         reason: aionui_api_types::NotificationChangedReason::Updated,
         notification_id: Some("notification-1".to_owned()),
         trace_id: Some("trace-1".to_owned()),
     };
-    app.services.event_bus.broadcast(WebSocketMessage::new(
-        "notification.changed",
-        serde_json::to_value(payload).unwrap(),
-    ));
+    let mut data = serde_json::to_value(payload).unwrap();
+    data["user_id"] = json!("user-a");
+    app.services
+        .event_bus
+        .broadcast(WebSocketMessage::new("notification.changed", data));
 
     let msg_a = read_text(&mut rx_a).await;
     assert_eq!(msg_a["name"], "notification.changed");
     assert_eq!(msg_a["data"]["revision"], "notification-r2");
     assert_eq!(msg_a["data"]["notification_id"], "notification-1");
+    assert!(msg_a["data"].get("user_id").is_none());
     let timeout_result = tokio::time::timeout(Duration::from_millis(200), rx_b.next()).await;
     assert!(
         timeout_result.is_err(),

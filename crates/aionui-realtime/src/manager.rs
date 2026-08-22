@@ -304,7 +304,7 @@ impl Default for WebSocketManager {
 }
 
 impl EventBroadcaster for WebSocketManager {
-    fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+    fn broadcast(&self, mut event: WebSocketMessage<serde_json::Value>) {
         let Some(user_id) = event
             .data
             .get("user_id")
@@ -317,6 +317,9 @@ impl EventBroadcaster for WebSocketManager {
             );
             return;
         };
+        if let Some(data) = event.data.as_object_mut() {
+            data.remove("user_id");
+        }
         self.broadcast_to_user(&user_id, event);
     }
 }

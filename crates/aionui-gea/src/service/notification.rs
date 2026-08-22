@@ -103,6 +103,13 @@ impl NotificationProjection {
             .list(user_id, tenant_id, Some("all"))
             .await
             .map_err(storage_error)?;
+        let revision_before = self
+            .repo
+            .scope(user_id, tenant_id)
+            .await
+            .map_err(storage_error)?
+            .map(|scope| scope.revision)
+            .unwrap_or_default();
         let before_by_id = before
             .iter()
             .map(|item| (item.notification_id.as_str(), item))
@@ -173,8 +180,10 @@ impl NotificationProjection {
             )?;
             tracing::info!(
                 event = "notification.projection.reconciled",
+                attempt = 1,
                 trace_id,
-                revision = %snapshot.revision,
+                revision_before,
+                revision_after = %snapshot.revision,
                 created_count,
                 updated_count,
                 removed_count,
@@ -344,16 +353,16 @@ impl NotificationProjection {
             "GEA Notification invalidation emitted"
         );
         let payload = NotificationChangedPayload {
-            user_id: user_id.to_owned(),
             revision: revision.to_owned(),
             reason,
             notification_id,
             trace_id,
         };
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            CHANGED_EVENT,
-            serde_json::to_value(payload).map_err(storage_json_error)?,
-        ));
+        let mut data = serde_json::to_value(payload).map_err(storage_json_error)?;
+        data.as_object_mut()
+            .ok_or_else(|| storage_json_error("notification event payload is not an object"))?
+            .insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
+        self.broadcaster.broadcast(WebSocketMessage::new(CHANGED_EVENT, data));
         Ok(())
     }
 }

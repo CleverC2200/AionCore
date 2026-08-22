@@ -93,6 +93,8 @@ async fn receipt_and_projection_status_commit_atomically_and_replay_by_intent() 
     .await
     .unwrap();
 
+    drop(repo);
+    let repo = SqliteNotificationRepository::new(db.pool().clone());
     let row = repo.find(USER_ID, "tenant-a", "notification-a").await.unwrap().unwrap();
     assert_eq!(row.version, "v2");
     assert_eq!(row.status, "read");

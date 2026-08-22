@@ -17,6 +17,7 @@ use aionui_db::{
 use aionui_realtime::EventBroadcaster;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -671,11 +672,15 @@ impl GeaService {
         let _sync_guard = match sync_lock.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                let guard = sync_lock.lock().await;
-                drop(guard);
-                return projection.list(user_id, tenant_id, status).await;
+                let mut list = projection.list(user_id, tenant_id, status).await?;
+                list.sync_state = NotificationSyncState::Syncing;
+                list.failure_codes.clear();
+                return Ok(list);
             }
         };
+        projection
+            .set_sync_state(user_id, tenant_id, NotificationSyncState::Syncing, Vec::new())
+            .await;
         tracing::info!(
             event = "notification.sync.started",
             trace_id,
@@ -700,6 +705,7 @@ impl GeaService {
                     changed,
                     duration_ms = started.elapsed().as_millis(),
                     event = "notification.sync.succeeded",
+                    attempt = 1,
                     sync_state = "fresh",
                     result = "succeeded",
                     "GEA Notification sync succeeded"
@@ -727,6 +733,7 @@ impl GeaService {
                     partial_page_count,
                     duration_ms = started.elapsed().as_millis(),
                     event = "notification.sync.failed",
+                    attempt = 1,
                     sync_state = ?list.sync_state,
                     result = "preserved_last_good",
                     "GEA Notification sync failed; preserving last-good projection"
@@ -836,9 +843,72 @@ impl GeaService {
         action: &str,
         command: NotificationActionCommand,
     ) -> Result<NotificationReceipt, GeaError> {
-        validate_notification_action(notification_id, &command)?;
         let started = Instant::now();
         let trace_id = Uuid::now_v7().to_string();
+        let idempotency_key_hash = hex::encode(Sha256::digest(command.idempotency_key.as_bytes()));
+        tracing::info!(
+            event = "notification.action.started",
+            trace_id,
+            notification_id,
+            action,
+            expected_version = %command.expected_version,
+            idempotency_key_hash,
+            "GEA Notification action started"
+        );
+        let result = self
+            .act_on_notification_inner(user_id, notification_id, action, &command, &trace_id)
+            .await;
+        match &result {
+            Ok(receipt) => tracing::info!(
+                event = "notification.action.completed",
+                trace_id,
+                notification_id,
+                action,
+                expected_version = %command.expected_version,
+                idempotency_key_hash,
+                version = %receipt.version,
+                duration_ms = started.elapsed().as_millis(),
+                "GEA Notification action completed"
+            ),
+            Err(error) if error.status == axum::http::StatusCode::CONFLICT => tracing::warn!(
+                event = "notification.action.conflicted",
+                trace_id,
+                notification_id,
+                action,
+                expected_version = %command.expected_version,
+                idempotency_key_hash,
+                code = %error.body.code,
+                category = %error.body.category,
+                retryable = error.body.retryable,
+                duration_ms = started.elapsed().as_millis(),
+                "GEA Notification action conflicted"
+            ),
+            Err(error) => tracing::warn!(
+                event = "notification.action.failed",
+                trace_id,
+                notification_id,
+                action,
+                expected_version = %command.expected_version,
+                idempotency_key_hash,
+                code = %error.body.code,
+                category = %error.body.category,
+                retryable = error.body.retryable,
+                duration_ms = started.elapsed().as_millis(),
+                "GEA Notification action failed"
+            ),
+        }
+        result
+    }
+
+    async fn act_on_notification_inner(
+        &self,
+        user_id: &str,
+        notification_id: &str,
+        action: &str,
+        command: &NotificationActionCommand,
+        trace_id: &str,
+    ) -> Result<NotificationReceipt, GeaError> {
+        validate_notification_action(notification_id, command)?;
         let credential = self.credential(user_id).await?;
         let tenant_id = credential.tenant_id.as_deref().unwrap_or("");
         let projection = self.notification_projection()?;
@@ -868,27 +938,46 @@ impl GeaService {
         }
 
         let current = projection.find(user_id, tenant_id, notification_id).await?;
+        let state_details = || {
+            json!({
+                "notificationId": current.id,
+                "version": current.version,
+                "status": current.status,
+                "dismissible": current.dismissible,
+            })
+        };
         if current.version != command.expected_version {
-            return Err(GeaError::conflict(
+            let mut error = GeaError::conflict(
                 "GEA_NOTIFICATION_VERSION_CONFLICT",
                 "Notification 版本已变化，请刷新后重试",
-            ));
+            );
+            error.body.details = Some(state_details());
+            return Err(error);
         }
         if action == "dismiss" && !current.dismissible {
-            return Err(GeaError::conflict(
-                "GEA_NOTIFICATION_NOT_DISMISSIBLE",
-                "该 Notification 不允许关闭",
-            ));
+            let mut error = GeaError::conflict("GEA_NOTIFICATION_NOT_DISMISSIBLE", "该 Notification 不允许关闭");
+            error.body.details = Some(state_details());
+            return Err(error);
         }
-
-        tracing::info!(
-            event = "notification.action.started",
-            trace_id,
-            notification_id,
-            action,
-            expected_version = %command.expected_version,
-            "GEA Notification action started"
-        );
+        if current.expires_at.as_deref().is_some_and(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .is_some_and(|value| value <= chrono::Utc::now())
+        }) {
+            let mut error = GeaError::conflict("GEA_NOTIFICATION_EXPIRED", "该 Notification 已过期");
+            error.body.details = Some(state_details());
+            return Err(error);
+        }
+        if current.status == NotificationStatus::Dismissed {
+            let mut error = GeaError::conflict("GEA_NOTIFICATION_ALREADY_DISMISSED", "该 Notification 已关闭");
+            error.body.details = Some(state_details());
+            return Err(error);
+        }
+        if action == "read" && current.status == NotificationStatus::Read {
+            let mut error = GeaError::conflict("GEA_NOTIFICATION_ALREADY_READ", "该 Notification 已读");
+            error.body.details = Some(state_details());
+            return Err(error);
+        }
         let path = format!(
             "/ai/gateway/notifications/{}/{}",
             encode_path_segment(notification_id.trim()),
@@ -903,7 +992,7 @@ impl GeaService {
                     "expectedVersion": command.expected_version,
                     "idempotencyKey": command.idempotency_key,
                 }),
-                &trace_id,
+                trace_id,
             )
             .await?;
         let upstream = parse_notification_receipt(&value, notification_id)?;
@@ -931,18 +1020,9 @@ impl GeaService {
                 &command.idempotency_key,
                 action,
                 &receipt,
-                &trace_id,
+                trace_id,
             )
             .await?;
-        tracing::info!(
-            event = "notification.action.completed",
-            trace_id,
-            notification_id,
-            action,
-            version = %receipt.version,
-            duration_ms = started.elapsed().as_millis(),
-            "GEA Notification action completed"
-        );
         Ok(receipt)
     }
 

@@ -748,6 +748,7 @@ dependencies = [
  "aionui-realtime",
  "axum",
  "chrono",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",

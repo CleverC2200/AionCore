@@ -600,7 +600,6 @@ pub enum NotificationChangedReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NotificationChangedPayload {
-    pub user_id: String,
     pub revision: String,
     pub reason: NotificationChangedReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -4,6 +4,8 @@ mod common;
 
 use axum::http::StatusCode;
 use serde_json::json;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -12,6 +14,20 @@ use common::{
     body_json as response_json, build_app, build_app_with_gea_base_url, get_request, get_with_token, json_with_token,
     setup_and_login,
 };
+
+#[derive(Clone)]
+struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 fn snapshot() -> serde_json::Value {
     json!({
@@ -326,11 +342,200 @@ async fn concurrent_list_requests_share_one_upstream_snapshot_sync() {
         .oneshot(get_with_token("/api/notifications?status=active", &token));
     let request_b = app.oneshot(get_with_token("/api/notifications?status=active", &token));
     let (response_a, response_b) = tokio::join!(request_a, request_b);
+    let mut states = Vec::new();
     for response in [response_a.unwrap(), response_b.unwrap()] {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["data"]["sync_state"], "fresh");
-        assert_eq!(body["data"]["revision"], "notification-r1");
+        states.push(body["data"]["sync_state"].as_str().unwrap().to_owned());
+        if body["data"]["sync_state"] == "fresh" {
+            assert_eq!(body["data"]["revision"], "notification-r1");
+        }
+    }
+    states.sort();
+    assert_eq!(states, ["fresh", "syncing"]);
+}
+
+#[tokio::test]
+async fn notification_action_conflicts_return_the_current_safe_state_matrix() {
+    let gea = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ai/gateway/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
+        .expect(1)
+        .mount(&gea)
+        .await;
+    let (mut app, services) = build_app_with_gea_base_url(gea.uri()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/gea/auth/session",
+            json!({ "accessToken": "access-test", "tenantId": "tenant-a" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/notifications?status=active", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let version_conflict = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/notifications/notification-1/read",
+            json!({ "expected_version": "stale-v0", "idempotency_key": "version-conflict" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(version_conflict.status(), StatusCode::CONFLICT);
+    let body = response_json(version_conflict).await;
+    assert_eq!(body["code"], "GEA_NOTIFICATION_VERSION_CONFLICT");
+    assert_eq!(body["details"]["upstream"]["version"], "v1");
+    assert_eq!(body["details"]["upstream"]["status"], "unread");
+
+    let expired = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/notifications/notification-expired/read",
+            json!({ "expected_version": "v1", "idempotency_key": "expired-read" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(expired).await["code"], "GEA_NOTIFICATION_EXPIRED");
+
+    sqlx::query(
+        "UPDATE gea_notifications SET version = 'v2', status = 'read' \
+         WHERE user_id = 'system_default_user' AND tenant_id = 'tenant-a' AND notification_id = 'notification-1'",
+    )
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    let already_read = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/notifications/notification-1/read",
+            json!({ "expected_version": "v2", "idempotency_key": "already-read" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(already_read.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(already_read).await["code"],
+        "GEA_NOTIFICATION_ALREADY_READ"
+    );
+
+    sqlx::query(
+        "UPDATE gea_notifications SET version = 'v3', status = 'dismissed' \
+         WHERE user_id = 'system_default_user' AND tenant_id = 'tenant-a' AND notification_id = 'notification-1'",
+    )
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    let already_dismissed = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/notifications/notification-1/read",
+            json!({ "expected_version": "v3", "idempotency_key": "already-dismissed" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(already_dismissed.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(already_dismissed).await["code"],
+        "GEA_NOTIFICATION_ALREADY_DISMISSED"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn notification_action_logs_are_terminal_and_exclude_sensitive_content() {
+    let gea = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ai/gateway/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
+        .expect(1)
+        .mount(&gea)
+        .await;
+    let (mut app, services) = build_app_with_gea_base_url(gea.uri()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/gea/auth/session",
+            json!({ "accessToken": "access-test-sensitive", "tenantId": "tenant-a" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer = SharedLogBuffer(Arc::clone(&bytes));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/notifications?status=active", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/notifications/notification-1/read",
+            json!({
+                "expected_version": "stale-v0",
+                "idempotency_key": "secret-idempotency-key"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    drop(_guard);
+
+    let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("notification.action.started"));
+    assert!(logs.contains("notification.action.conflicted"));
+    assert!(logs.contains("notification.sync.started"));
+    assert!(logs.contains("notification.sync.succeeded"));
+    assert!(logs.contains("notification.projection.reconciled"));
+    assert!(logs.contains("revision_before"));
+    assert!(logs.contains("revision_after"));
+    assert!(logs.contains("idempotency_key_hash"));
+    for secret in [
+        "secret-idempotency-key",
+        "access-test-sensitive",
+        "Forecast needs review",
+        "September forecast",
+        "Review the changed forecast before submission.",
+    ] {
+        assert!(!logs.contains(secret), "logs must not contain {secret}");
     }
 }
 
