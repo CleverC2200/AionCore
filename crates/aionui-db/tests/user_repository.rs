@@ -266,6 +266,22 @@ async fn t2_14_external_user_provision_is_idempotent() {
 }
 
 #[tokio::test]
+async fn t2_14_external_identity_users_cannot_use_aionpro_external_user_ids() {
+    let r = repo().await;
+
+    let error = r
+        .ensure_external_user(
+            UserType::External,
+            "must-not-alias-an-identity-tuple",
+            ExternalUserProjection::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, DbError::Conflict(_)));
+}
+
+#[tokio::test]
 async fn t2_15_disabled_user_is_not_active() {
     let r = repo().await;
     let user = r

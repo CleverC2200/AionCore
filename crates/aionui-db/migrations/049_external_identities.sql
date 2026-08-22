@@ -1,6 +1,6 @@
 -- Migration 049: persist external identity tuples independently from Core users.
 
-CREATE TABLE external_identities (
+CREATE TABLE IF NOT EXISTS external_identities (
     id         TEXT PRIMARY KEY NOT NULL,
     provider   TEXT NOT NULL CHECK (provider IN ('lark')),
     issuer     TEXT NOT NULL CHECK (length(issuer) > 0),
@@ -11,5 +11,5 @@ CREATE TABLE external_identities (
     UNIQUE (provider, issuer, tenant_id, subject)
 );
 
-CREATE INDEX idx_external_identities_user
+CREATE INDEX IF NOT EXISTS idx_external_identities_user
     ON external_identities(user_id);

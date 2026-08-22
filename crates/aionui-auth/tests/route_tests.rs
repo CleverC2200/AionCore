@@ -18,7 +18,7 @@ use aionui_auth::{
 };
 use aionui_db::{
     IExternalIdentityRepository, IUserRepository, SqliteExternalIdentityRepository, SqliteUserRepository, UserStatus,
-    init_database_memory,
+    UserType, init_database_memory,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ fn json_put_anonymous(uri: &str, body: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn external_identity_body(core_user_id: &str, tenant_id: &str, subject: &str) -> String {
+fn external_identity_body(tenant_id: &str, subject: &str) -> String {
     serde_json::json!({
         "identity": {
             "provider": "lark",
@@ -160,7 +160,6 @@ fn external_identity_body(core_user_id: &str, tenant_id: &str, subject: &str) ->
             "tenant_id": tenant_id,
             "subject": subject,
         },
-        "core_user_id": core_user_id,
     })
     .to_string()
 }
@@ -1073,9 +1072,8 @@ async fn external_session_exchange_rejects_disabled_user() {
 
 #[tokio::test]
 async fn external_identity_mapping_requires_bootstrap_authentication() {
-    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let user = ctx.user_repo.create_user("mapped-user", "hash").await.unwrap();
-    let body = external_identity_body(&user.id, "tenant-1", "subject-1");
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let body = external_identity_body("tenant-1", "subject-1");
 
     let response = app
         .oneshot(json_put_anonymous("/api/auth/internal/external-identities", &body))
@@ -1090,8 +1088,7 @@ async fn external_identity_mapping_requires_bootstrap_authentication() {
 #[tokio::test]
 async fn external_identity_mapping_is_idempotent_and_returns_no_session_or_identity_payload() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let user = ctx.user_repo.create_user("mapped-user", "hash").await.unwrap();
-    let body = external_identity_body(&user.id, "tenant-1", "subject-1");
+    let body = external_identity_body("tenant-1", "subject-1");
 
     let first = app
         .clone()
@@ -1105,7 +1102,12 @@ async fn external_identity_mapping_is_idempotent_and_returns_no_session_or_ident
     assert_eq!(first.status(), StatusCode::OK);
     assert!(first.headers().get(header::SET_COOKIE).is_none());
     let first_json = body_json(first).await;
-    assert_eq!(first_json["data"]["core_user_id"], user.id);
+    let core_user_id = first_json["data"]["core_user_id"].as_str().unwrap();
+    let core_user = ctx.user_repo.find_by_id(core_user_id).await.unwrap().unwrap();
+    assert_eq!(core_user.user_type, UserType::External);
+    assert!(core_user.external_user_id.is_none());
+    assert!(core_user.password_hash.is_none());
+    assert!(core_user.jwt_secret.is_none());
     assert_eq!(first_json["data"]["created"], true);
     assert_eq!(first_json["data"].as_object().unwrap().len(), 2);
     assert!(first_json["data"].get("token").is_none());
@@ -1121,37 +1123,35 @@ async fn external_identity_mapping_is_idempotent_and_returns_no_session_or_ident
         .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
     let second_json = body_json(second).await;
-    assert_eq!(second_json["data"]["core_user_id"], user.id);
+    assert_eq!(second_json["data"]["core_user_id"], core_user_id);
     assert_eq!(second_json["data"]["created"], false);
 }
 
 #[tokio::test]
-async fn external_identity_mapping_rejects_missing_and_disabled_core_users() {
+async fn external_identity_mapping_rejects_disabled_existing_mapping() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let missing_body = external_identity_body("missing-user", "tenant-1", "subject-missing");
-
-    let missing = app
+    let body = external_identity_body("tenant-disabled", "subject-disabled");
+    let provisioned = app
         .clone()
         .oneshot(json_put_with_bootstrap_secret(
             "/api/auth/internal/external-identities",
-            &missing_body,
+            &body,
             "bootstrap-secret",
         ))
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert_eq!(body_json(missing).await["code"], "CORE_USER_NOT_FOUND");
-
-    let disabled_user = ctx.user_repo.create_user("disabled-mapping", "hash").await.unwrap();
+    let core_user_id = body_json(provisioned).await["data"]["core_user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     ctx.user_repo
-        .set_status(&disabled_user.id, UserStatus::Disabled)
+        .set_status(&core_user_id, UserStatus::Disabled)
         .await
         .unwrap();
-    let disabled_body = external_identity_body(&disabled_user.id, "tenant-1", "subject-disabled");
     let disabled = app
         .oneshot(json_put_with_bootstrap_secret(
             "/api/auth/internal/external-identities",
-            &disabled_body,
+            &body,
             "bootstrap-secret",
         ))
         .await
@@ -1161,26 +1161,24 @@ async fn external_identity_mapping_rejects_missing_and_disabled_core_users() {
 }
 
 #[tokio::test]
-async fn external_identity_mapping_rejects_cross_user_remapping_without_leaking_the_owner() {
+async fn external_identity_mapping_rejects_incompatible_existing_owner_without_leaking_it() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let first_user = ctx.user_repo.create_user("mapping-owner", "hash").await.unwrap();
-    let second_user = ctx.user_repo.create_user("mapping-attacker", "hash").await.unwrap();
-
-    let first = app
-        .clone()
-        .oneshot(json_put_with_bootstrap_secret(
-            "/api/auth/internal/external-identities",
-            &external_identity_body(&first_user.id, "tenant-1", "shared-subject"),
-            "bootstrap-secret",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
+    let incompatible_owner = ctx.user_repo.create_user("mapping-owner", "hash").await.unwrap();
+    sqlx::query(
+        "INSERT INTO external_identities \
+         (id, provider, issuer, tenant_id, subject, user_id, created_at) \
+         VALUES ('incompatible-mapping', 'lark', 'https://open.feishu.cn', \
+                 'tenant-conflict', 'subject-conflict', ?, 1)",
+    )
+    .bind(&incompatible_owner.id)
+    .execute(ctx._db.pool())
+    .await
+    .unwrap();
 
     let conflict = app
         .oneshot(json_put_with_bootstrap_secret(
             "/api/auth/internal/external-identities",
-            &external_identity_body(&second_user.id, "tenant-1", "shared-subject"),
+            &external_identity_body("tenant-conflict", "subject-conflict"),
             "bootstrap-secret",
         ))
         .await
@@ -1188,13 +1186,12 @@ async fn external_identity_mapping_rejects_cross_user_remapping_without_leaking_
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     let conflict_json = body_json(conflict).await;
     assert_eq!(conflict_json["code"], "EXTERNAL_IDENTITY_CONFLICT");
-    assert!(!conflict_json.to_string().contains(&first_user.id));
+    assert!(!conflict_json.to_string().contains(&incompatible_owner.id));
 }
 
 #[tokio::test]
 async fn external_identity_mapping_rejects_provider_credentials_and_invalid_tuple_components() {
-    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let user = ctx.user_repo.create_user("credential-test", "hash").await.unwrap();
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     let credential = serde_json::json!({
         "identity": {
             "provider": "lark",
@@ -1203,7 +1200,6 @@ async fn external_identity_mapping_rejects_provider_credentials_and_invalid_tupl
             "subject": "subject-1",
             "access_token": "provider-secret",
         },
-        "core_user_id": user.id,
     })
     .to_string();
 
@@ -1231,10 +1227,10 @@ async fn external_identity_mapping_rejects_provider_credentials_and_invalid_tupl
             "tenant_id": " tenant-1",
             "subject": "subject-1",
         },
-        "core_user_id": user.id,
     })
     .to_string();
     let invalid_response = app
+        .clone()
         .oneshot(json_put_with_bootstrap_secret(
             "/api/auth/internal/external-identities",
             &invalid,
@@ -1244,12 +1240,31 @@ async fn external_identity_mapping_rejects_provider_credentials_and_invalid_tupl
         .unwrap();
     assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(invalid_response).await["code"], "EXTERNAL_IDENTITY_INVALID");
+
+    let caller_selected_user = serde_json::json!({
+        "identity": {
+            "provider": "lark",
+            "issuer": "https://open.feishu.cn",
+            "tenant_id": "tenant-1",
+            "subject": "subject-1",
+        },
+        "core_user_id": "caller-selected-user",
+    })
+    .to_string();
+    let strict_response = app
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-identities",
+            &caller_selected_user,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(strict_response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn csrf_exemption_is_limited_to_the_bootstrap_identity_mapping_route() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    let user = ctx.user_repo.create_user("csrf-mapping", "hash").await.unwrap();
     let app = app.layer(middleware::from_fn_with_state(
         ctx.cookie_config.clone(),
         csrf_middleware,
@@ -1259,7 +1274,7 @@ async fn csrf_exemption_is_limited_to_the_bootstrap_identity_mapping_route() {
         .clone()
         .oneshot(json_put_with_bootstrap_secret(
             "/api/auth/internal/external-identities",
-            &external_identity_body(&user.id, "tenant-csrf", "subject-csrf"),
+            &external_identity_body("tenant-csrf", "subject-csrf"),
             "bootstrap-secret",
         ))
         .await

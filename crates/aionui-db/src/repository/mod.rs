@@ -65,7 +65,10 @@ pub use diagnostics::{
     FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
 };
-pub use external_identity::{EnsureExternalIdentityParams, EnsureExternalIdentityResult, IExternalIdentityRepository};
+pub use external_identity::{
+    IExternalIdentityRepository, ProvisionExternalIdentityError, ProvisionExternalIdentityParams,
+    ProvisionExternalIdentityResult,
+};
 pub use mcp_server::IMcpServerRepository;
 pub use oauth_token::IOAuthTokenRepository;
 pub use project::IProjectStore;

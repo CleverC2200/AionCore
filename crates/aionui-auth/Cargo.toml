@@ -25,4 +25,5 @@ sha2.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 http-body-util.workspace = true
+sqlx.workspace = true
 tower = { workspace = true, features = ["util"] }

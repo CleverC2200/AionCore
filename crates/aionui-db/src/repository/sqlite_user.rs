@@ -133,9 +133,9 @@ impl IUserRepository for SqliteUserRepository {
         external_user_id: &str,
         projection: ExternalUserProjection,
     ) -> Result<User, DbError> {
-        if user_type == UserType::Local {
+        if user_type != UserType::Aionpro {
             return Err(DbError::Conflict(
-                "External identity projection requires a non-local user type".to_string(),
+                "External user projection is only supported for AionPro users".to_string(),
             ));
         }
         if external_user_id.trim().is_empty() {
@@ -193,16 +193,18 @@ impl IUserRepository for SqliteUserRepository {
     async fn adopt_system_default_data(&self, owner_id: &str) -> Result<u64, DbError> {
         let mut tx = self.pool.begin().await?;
 
-        // Adoption window: exactly one external user, and it is the caller.
-        // A second provisioned account closes the window forever — later
-        // accounts must never inherit another machine user's data.
-        let (external_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE user_type != 'local'")
+        // Adoption window: exactly one AionPro user, and it is the caller.
+        // Generic external-identity users are a separate authentication
+        // domain and must neither trigger nor close the AionPro adoption window.
+        // A second provisioned AionPro account closes the window forever —
+        // later accounts must never inherit another machine user's data.
+        let (aionpro_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE user_type = 'aionpro'")
             .fetch_one(&mut *tx)
             .await?;
-        if external_count != 1 {
+        if aionpro_count != 1 {
             return Ok(0);
         }
-        let (is_owner,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type != 'local'")
+        let (is_owner,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ? AND user_type = 'aionpro'")
             .bind(owner_id)
             .fetch_one(&mut *tx)
             .await?;

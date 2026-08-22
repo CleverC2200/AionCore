@@ -183,7 +183,6 @@ pub struct ExternalIdentityTuple {
 #[serde(deny_unknown_fields)]
 pub struct EnsureExternalIdentityMappingRequest {
     pub identity: ExternalIdentityTuple,
-    pub core_user_id: String,
 }
 
 /// Mapping result. It deliberately contains no external identity payload,
@@ -199,7 +198,6 @@ pub struct EnsureExternalIdentityMappingResponse {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExternalIdentityMappingErrorCode {
     ExternalIdentityInvalid,
-    CoreUserNotFound,
     CoreUserDisabled,
     ExternalIdentityConflict,
 }
@@ -349,10 +347,20 @@ mod tests {
                 "tenant_id": "tenant-1",
                 "subject": "subject-1",
                 "access_token": "provider-secret"
+            }
+        }"#;
+        assert!(serde_json::from_str::<EnsureExternalIdentityMappingRequest>(credential_payload).is_err());
+
+        let caller_selected_user = r#"{
+            "identity": {
+                "provider": "lark",
+                "issuer": "https://open.feishu.cn",
+                "tenant_id": "tenant-1",
+                "subject": "subject-1"
             },
             "core_user_id": "user-1"
         }"#;
-        assert!(serde_json::from_str::<EnsureExternalIdentityMappingRequest>(credential_payload).is_err());
+        assert!(serde_json::from_str::<EnsureExternalIdentityMappingRequest>(caller_selected_user).is_err());
 
         let response = EnsureExternalIdentityMappingResponse {
             core_user_id: "user-1".to_owned(),

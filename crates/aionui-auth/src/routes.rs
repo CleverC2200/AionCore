@@ -221,12 +221,6 @@ fn external_identity_error_to_api_error(err: ExternalIdentityMappingError) -> Ap
             "External identity is invalid.",
             None,
         ),
-        ExternalIdentityMappingError::CoreUserNotFound => ApiError::coded(
-            StatusCode::NOT_FOUND,
-            "CORE_USER_NOT_FOUND",
-            "Core user not found.",
-            None,
-        ),
         ExternalIdentityMappingError::CoreUserDisabled => {
             ApiError::coded(StatusCode::FORBIDDEN, "CORE_USER_DISABLED", "Core user disabled.", None)
         }
@@ -404,7 +398,7 @@ async fn ensure_external_identity_mapping_handler(
 ) -> Result<Json<ApiResponse<EnsureExternalIdentityMappingResponse>>, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(request) = body.map_err(ApiError::from)?;
-    let service = ExternalIdentityMappingService::new(state.external_identity_repo, state.user_repo);
+    let service = ExternalIdentityMappingService::new(state.external_identity_repo);
     let response = service
         .ensure_mapping(request)
         .await
