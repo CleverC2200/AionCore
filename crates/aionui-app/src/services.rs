@@ -734,12 +734,7 @@ mod tests {
             .unwrap();
         services
             .conversation_service
-            .cancel(
-                "system_default_user",
-                &target.id,
-                "turn-active",
-                &task_manager,
-            )
+            .cancel("system_default_user", &target.id, "turn-active", &task_manager)
             .await
             .unwrap();
         assert_eq!(
