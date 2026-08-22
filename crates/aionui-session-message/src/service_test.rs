@@ -58,6 +58,12 @@ fn recipient_block_round_trips_control_characters_unicode_and_end_markers() {
     );
     assert!(lines[2].contains("\\t"), "tabs must be JSON escaped: {}", lines[2]);
     assert!(lines[2].contains("\\n"), "newlines must be JSON escaped: {}", lines[2]);
+    assert!(
+        !lines[2].contains(AIONUI_SESSION_MESSAGE_END_MARKER),
+        "the payload must not contain the raw closing delimiter: {}",
+        lines[2]
+    );
+    assert!(lines[2].contains(r"\u005b[/AION_SESSION_MESSAGE]]"), "{}", lines[2]);
 
     let payload: serde_json::Value = serde_json::from_str(lines[2]).expect("the payload line is valid JSON");
     assert_eq!(payload["from"]["name"], from_name);

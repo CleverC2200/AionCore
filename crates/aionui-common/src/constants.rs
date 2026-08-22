@@ -21,6 +21,14 @@ pub const AIONUI_SESSION_MARKER_ENVELOPE_VERSION: &str = "v2";
 pub const AIONUI_SESSION_MESSAGE_MARKER: &str = "[[AION_SESSION_MESSAGE]]";
 pub const AIONUI_SESSION_MESSAGE_END_MARKER: &str = "[[/AION_SESSION_MESSAGE]]";
 
+/// Hide a structural marker inside a JSON string without changing its decoded
+/// value. The first `[` becomes a JSON Unicode escape, so a delimiter scanner
+/// cannot mistake user-controlled content for the envelope boundary.
+pub fn escape_json_envelope_marker(payload: &str, marker: &str) -> String {
+    let rest = marker.strip_prefix('[').expect("JSON envelope markers start with '['");
+    payload.replace(marker, &format!(r"\u005b{rest}"))
+}
+
 // --- WebSocket ---
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;

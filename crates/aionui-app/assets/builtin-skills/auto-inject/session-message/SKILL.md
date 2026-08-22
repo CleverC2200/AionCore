@@ -77,6 +77,33 @@ Reply by sending to `reply_to` with the same command:
 JSON
 ```
 
+## Legacy v1 read compatibility
+
+Some historical messages contain v1 blocks with no `v2` line. Continue to
+read them, but never emit v1. In the syntax below, `{TAB}` means one literal
+tab character.
+
+Sender-side v1 target lines are:
+
+```text
+name{TAB}id{TAB}workspace: value
+```
+
+Use the second tab-separated field as the conversation id. Recipient-side v1
+blocks are:
+
+```text
+[[AION_SESSION_MESSAGE]]
+from: name{TAB}id
+workspace: value
+reply_to: id{TAB}(reply hint)
+[[/AION_SESSION_MESSAGE]]
+```
+
+Read the labeled values and use the id after `reply_to:` when replying. This is
+read-only compatibility for historical context; all newly generated envelopes
+use v2 JSON.
+
 Replying is optional. Decide for yourself whether a reply is useful — there is
 no synchronous wait on the other side.
 

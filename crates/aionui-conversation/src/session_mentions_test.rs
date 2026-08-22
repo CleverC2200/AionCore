@@ -70,6 +70,12 @@ fn sessions_block_round_trips_control_characters_unicode_and_end_markers() {
     );
     assert!(lines[2].contains("\\t"), "tabs must be JSON escaped: {}", lines[2]);
     assert!(lines[2].contains("\\n"), "newlines must be JSON escaped: {}", lines[2]);
+    assert!(
+        !lines[2].contains(AIONUI_SESSIONS_END_MARKER),
+        "the payload must not contain the raw closing delimiter: {}",
+        lines[2]
+    );
+    assert!(lines[2].contains(r"\u005b[/AION_SESSIONS]]"), "{}", lines[2]);
 
     let payload: serde_json::Value = serde_json::from_str(lines[2]).expect("the payload line is valid JSON");
     let target = &payload["sessions"][0];

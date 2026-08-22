@@ -81,6 +81,19 @@ fn the_skill_teaches_how_to_read_both_marker_blocks() {
 }
 
 #[test]
+fn the_skill_keeps_legacy_v1_read_compatibility_without_emitting_it() {
+    let body = skill_body();
+    assert!(body.contains("## Legacy v1 read compatibility"), "{body}");
+    assert!(body.contains("no `v2` line"), "{body}");
+    assert!(body.contains("never emit v1"), "{body}");
+    assert!(body.contains("name{TAB}id{TAB}workspace: value"), "{body}");
+    assert!(body.contains("from: name{TAB}id"), "{body}");
+    assert!(body.contains("reply_to: id{TAB}(reply hint)"), "{body}");
+    assert!(body.contains("read-only compatibility"), "{body}");
+    assert!(body.contains("all newly generated envelopes\nuse v2 JSON"), "{body}");
+}
+
+#[test]
 fn the_skill_states_the_non_negotiable_rules() {
     let body = skill_prose();
     // Ids only, no broadcast (spec §6.1).

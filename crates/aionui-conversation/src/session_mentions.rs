@@ -7,6 +7,7 @@
 use aionui_api_types::TeamSessionBinding;
 use aionui_common::constants::{
     AIONUI_SESSION_MARKER_ENVELOPE_VERSION, AIONUI_SESSIONS_END_MARKER, AIONUI_SESSIONS_MARKER,
+    escape_json_envelope_marker,
 };
 use serde::Serialize;
 
@@ -67,6 +68,7 @@ pub fn build_sessions_block(sender_workspace: Option<&str>, targets: &[SessionMe
             .collect(),
     };
     let payload = serde_json::to_string(&payload).expect("session marker payload contains only JSON strings");
+    let payload = escape_json_envelope_marker(&payload, AIONUI_SESSIONS_END_MARKER);
 
     format!(
         "{AIONUI_SESSIONS_MARKER}\n{AIONUI_SESSION_MARKER_ENVELOPE_VERSION}\n{payload}\n{AIONUI_SESSIONS_END_MARKER}"

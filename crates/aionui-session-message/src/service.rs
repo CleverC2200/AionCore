@@ -22,6 +22,7 @@ use aionui_api_types::{
 };
 use aionui_common::constants::{
     AIONUI_SESSION_MARKER_ENVELOPE_VERSION, AIONUI_SESSION_MESSAGE_END_MARKER, AIONUI_SESSION_MESSAGE_MARKER,
+    escape_json_envelope_marker,
 };
 use aionui_conversation::session_mentions::{team_id_from_extra_str, workspace_from_extra};
 use aionui_conversation::{ConversationError, ConversationService};
@@ -69,6 +70,7 @@ pub fn build_session_message_block(from_name: &str, from_id: &str, workspace_fie
         reply_instruction: REPLY_INSTRUCTION,
     };
     let payload = serde_json::to_string(&payload).expect("session message marker payload contains only JSON strings");
+    let payload = escape_json_envelope_marker(&payload, AIONUI_SESSION_MESSAGE_END_MARKER);
 
     format!(
         "{AIONUI_SESSION_MESSAGE_MARKER}\n{AIONUI_SESSION_MARKER_ENVELOPE_VERSION}\n{payload}\n{AIONUI_SESSION_MESSAGE_END_MARKER}"

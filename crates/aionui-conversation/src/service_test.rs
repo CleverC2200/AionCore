@@ -9761,6 +9761,7 @@ mod session_mentions_integration {
         assert_eq!(lines.len(), 4, "dynamic values must not add envelope lines: {block}");
         assert_eq!(lines[1], "v2");
         assert_eq!(lines[3], "[[/AION_SESSIONS]]");
+        assert!(!lines[2].contains("[[/AION_SESSIONS]]"), "{block}");
 
         let payload: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(payload["sessions"][0]["name"], name);

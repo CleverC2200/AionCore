@@ -300,6 +300,7 @@ async fn delivered_sender_fields_cannot_create_marker_boundaries() {
     let lines: Vec<_> = block.lines().collect();
     assert_eq!(lines.len(), 4);
     assert_eq!(lines.iter().filter(|line| **line == marker).count(), 1);
+    assert!(!lines[2].contains(marker), "{block}");
     let payload = recipient_payload(&content);
     assert_eq!(payload["from"]["name"], name);
     assert_eq!(
