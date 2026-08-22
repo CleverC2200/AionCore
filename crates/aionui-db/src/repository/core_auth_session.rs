@@ -23,7 +23,8 @@ pub struct RotateCoreAuthSessionParams<'a> {
 
 #[derive(Debug, Clone)]
 pub struct RotateAuthCredentialsParams<'a> {
-    pub user_id: &'a str,
+    pub password_user_id: &'a str,
+    pub jwt_secret_user_id: &'a str,
     pub expected_password_hash: &'a str,
     pub new_password_hash: &'a str,
     pub new_jwt_secret: &'a str,

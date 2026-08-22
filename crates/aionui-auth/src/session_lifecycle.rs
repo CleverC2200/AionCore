@@ -22,6 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const JWT_SECRET_AUTHORITY_USER_ID: &str = "system_default_user";
 const MIN_ACCESS_TTL: Duration = Duration::from_secs(60);
 const MAX_ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_REFRESH_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -148,6 +149,7 @@ pub struct SessionLifecycle {
     config: SessionLifecycleConfig,
     refresh_key: Arc<tokio::sync::RwLock<[u8; 32]>>,
     jwt_secret_source: JwtSecretSource,
+    jwt_secret_user_id: Arc<str>,
 }
 
 impl SessionLifecycle {
@@ -157,7 +159,14 @@ impl SessionLifecycle {
         config: SessionLifecycleConfig,
         refresh_key: [u8; 32],
     ) -> Self {
-        Self::new_with_source(repository, jwt_service, config, refresh_key, JwtSecretSource::Database)
+        Self::new_with_source(
+            repository,
+            jwt_service,
+            config,
+            refresh_key,
+            JwtSecretSource::Database,
+            JWT_SECRET_AUTHORITY_USER_ID,
+        )
     }
 
     pub fn new_with_source(
@@ -166,6 +175,7 @@ impl SessionLifecycle {
         config: SessionLifecycleConfig,
         refresh_key: [u8; 32],
         jwt_secret_source: JwtSecretSource,
+        jwt_secret_user_id: &str,
     ) -> Self {
         Self {
             repository,
@@ -173,6 +183,7 @@ impl SessionLifecycle {
             config,
             refresh_key: Arc::new(tokio::sync::RwLock::new(refresh_key)),
             jwt_secret_source,
+            jwt_secret_user_id: Arc::from(jwt_secret_user_id),
         }
     }
 
@@ -328,7 +339,8 @@ impl SessionLifecycle {
         let new_secret = generate_random_secret_string();
         self.repository
             .rotate_auth_credentials(RotateAuthCredentialsParams {
-                user_id,
+                password_user_id: user_id,
+                jwt_secret_user_id: &self.jwt_secret_user_id,
                 expected_password_hash,
                 new_password_hash,
                 new_jwt_secret: &new_secret,
@@ -591,7 +603,8 @@ mod tests {
     #[tokio::test]
     async fn master_rotation_waits_for_in_flight_issue_then_revokes_its_session() {
         let db = init_database_memory().await.unwrap();
-        sqlx::query("UPDATE users SET password_hash = 'old-hash' WHERE id = 'system_default_user'")
+        sqlx::query("UPDATE users SET password_hash = 'old-hash' WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .execute(db.pool())
             .await
             .unwrap();
@@ -634,7 +647,7 @@ mod tests {
             tokio::spawn(async move {
                 rotation_started.wait().await;
                 lifecycle
-                    .rotate_auth_credentials("system_default_user", "old-hash", "new-hash")
+                    .rotate_auth_credentials(JWT_SECRET_AUTHORITY_USER_ID, "old-hash", "new-hash")
                     .await
                     .unwrap()
             })
@@ -649,7 +662,8 @@ mod tests {
         create_release.wait().await;
         let issued = issuing.await.unwrap();
         rotating.await.unwrap();
-        let new_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = 'system_default_user'")
+        let new_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .fetch_one(db.pool())
             .await
             .unwrap();

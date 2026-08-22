@@ -10,8 +10,8 @@ use aionui_ai_agent::{
 };
 use aionui_approval::ApprovalService;
 use aionui_auth::{
-    CookieConfig, JwtSecretSource, JwtService, QrTokenStore, SessionLifecycle, SessionLifecycleConfig,
-    derive_refresh_key, resolve_jwt_secret,
+    CookieConfig, JWT_SECRET_AUTHORITY_USER_ID, JwtSecretSource, JwtService, QrTokenStore, SessionLifecycle,
+    SessionLifecycleConfig, derive_refresh_key, resolve_jwt_secret,
 };
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
@@ -236,6 +236,7 @@ impl AppServices {
             session_lifecycle_config,
             derive_refresh_key(&secret),
             jwt_secret_source,
+            JWT_SECRET_AUTHORITY_USER_ID,
         ));
         let pruned_sessions = session_lifecycle
             .prune_terminal()

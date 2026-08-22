@@ -13,8 +13,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtSecretSource, JwtService, QrTokenStore, SessionLifecycle,
-    SessionLifecycleConfig, SessionRevokedHook, auth_routes, csrf_middleware, derive_refresh_key, hash_password,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JWT_SECRET_AUTHORITY_USER_ID, JwtSecretSource, JwtService,
+    QrTokenStore, SessionLifecycle, SessionLifecycleConfig, SessionRevokedHook, auth_routes, csrf_middleware,
+    derive_refresh_key, hash_password,
 };
 use aionui_db::{
     ICoreAuthSessionRepository, IExternalIdentityRepository, IUserRepository, SqliteCoreAuthSessionRepository,
@@ -50,6 +51,7 @@ async fn test_app_with_options_and_hook(
         aionpro_mode,
         session_revoked_hook,
         JwtSecretSource::Database,
+        JWT_SECRET_AUTHORITY_USER_ID,
     )
     .await
 }
@@ -60,6 +62,7 @@ async fn test_app_with_options_hook_and_source(
     aionpro_mode: bool,
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     jwt_secret_source: JwtSecretSource,
+    jwt_secret_user_id: &str,
 ) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
@@ -74,6 +77,7 @@ async fn test_app_with_options_hook_and_source(
         SessionLifecycleConfig::default(),
         derive_refresh_key("test_secret_for_routes"),
         jwt_secret_source,
+        jwt_secret_user_id,
     ));
     let cookie_config = Arc::new(CookieConfig {
         secure: false,
@@ -661,7 +665,12 @@ async fn change_password_invalidates_durable_external_refresh_sessions() {
     const REFRESH_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const REFRESH_KEY_2: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
     let (mut app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
-    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    create_test_user(&ctx, "operator", "OldP@ssword1").await;
+    let operator = ctx.user_repo.find_by_username("operator").await.unwrap().unwrap();
+    ctx.user_repo
+        .update_jwt_secret(&operator.id, "non-authoritative-user-secret")
+        .await
+        .unwrap();
 
     let identity = external_identity_body("tenant-password-rotation", "subject-password-rotation");
     let provisioned = app
@@ -687,17 +696,33 @@ async fn change_password_invalidates_durable_external_refresh_sessions() {
     let old_access = extract_session_token(&exchange).unwrap();
     let old_refresh = extract_refresh_credential(&exchange).unwrap();
 
-    let (admin_token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+    let (password_user_token, _) = login(&mut app, "operator", "OldP@ssword1").await;
     let changed = app
         .clone()
         .oneshot(json_post_with_token(
             "/api/auth/change-password",
             r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
-            &admin_token,
+            &password_user_token,
         ))
         .await
         .unwrap();
     assert_eq!(changed.status(), StatusCode::OK);
+    assert!(ctx.jwt_service.verify(&password_user_token).is_err());
+    let operator_after = ctx.user_repo.find_by_id(&operator.id).await.unwrap().unwrap();
+    assert_eq!(
+        operator_after.jwt_secret.as_deref(),
+        Some("non-authoritative-user-secret")
+    );
+    let system_secret = ctx
+        .user_repo
+        .get_system_user()
+        .await
+        .unwrap()
+        .and_then(|user| user.jwt_secret)
+        .unwrap();
+    assert_ne!(system_secret, "non-authoritative-user-secret");
+    let (new_password_token, _) = login(&mut app, "operator", "NewP@ssword2").await;
+    assert!(ctx.jwt_service.verify(&new_password_token).is_ok());
 
     assert!(ctx.jwt_service.verify(&old_access).is_err());
     let old_access_response = app
@@ -746,7 +771,8 @@ async fn change_password_invalidates_durable_external_refresh_sessions() {
     let refreshed_access = extract_session_token(&refreshed).unwrap();
     let refreshed_credential = extract_refresh_credential(&refreshed).unwrap();
 
-    let persisted_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = 'system_default_user'")
+    let persisted_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = ?")
+        .bind(JWT_SECRET_AUTHORITY_USER_ID)
         .fetch_one(ctx._db.pool())
         .await
         .unwrap();
@@ -771,7 +797,7 @@ async fn change_password_transaction_failure_rolls_back_database_and_runtime() {
     let (mut app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     create_test_user(&ctx, "admin", "OldP@ssword1").await;
     ctx.user_repo
-        .update_jwt_secret("system_default_user", "test_secret_for_routes")
+        .update_jwt_secret(JWT_SECRET_AUTHORITY_USER_ID, "test_secret_for_routes")
         .await
         .unwrap();
     let identity = external_identity_body("tenant-rotation-rollback", "subject-rotation-rollback");
@@ -800,7 +826,8 @@ async fn change_password_transaction_failure_rolls_back_database_and_runtime() {
     let old_refresh = extract_refresh_credential(&exchange).unwrap();
     let sid = old_refresh.split_once('.').unwrap().0;
     let before_user: (Option<String>, Option<String>) =
-        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .fetch_one(ctx._db.pool())
             .await
             .unwrap();
@@ -832,7 +859,8 @@ async fn change_password_transaction_failure_rolls_back_database_and_runtime() {
     assert_eq!(body_json(failed).await["code"], "EXTERNAL_SESSION_UNAVAILABLE");
 
     let after_user: (Option<String>, Option<String>) =
-        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .fetch_one(ctx._db.pool())
             .await
             .unwrap();
@@ -858,6 +886,37 @@ async fn change_password_transaction_failure_rolls_back_database_and_runtime() {
 }
 
 #[tokio::test]
+async fn change_password_missing_secret_authority_rolls_back_password_and_runtime() {
+    let (mut app, ctx) = test_app_with_options_hook_and_source(
+        false,
+        Some("bootstrap-secret"),
+        false,
+        None,
+        JwtSecretSource::Database,
+        "missing-jwt-secret-authority",
+    )
+    .await;
+    create_test_user(&ctx, "operator", "OldP@ssword1").await;
+    let operator = ctx.user_repo.find_by_username("operator").await.unwrap().unwrap();
+    let before_hash = operator.password_hash.unwrap();
+    let (token, _) = login(&mut app, "operator", "OldP@ssword1").await;
+
+    let failed = app
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(failed).await["code"], "EXTERNAL_SESSION_UNAVAILABLE");
+    let after = ctx.user_repo.find_by_id(&operator.id).await.unwrap().unwrap();
+    assert_eq!(after.password_hash.as_deref(), Some(before_hash.as_str()));
+    assert!(ctx.jwt_service.verify(&token).is_ok());
+}
+
+#[tokio::test]
 async fn change_password_rejects_environment_managed_secret_without_mutation() {
     let (mut app, ctx) = test_app_with_options_hook_and_source(
         false,
@@ -865,11 +924,13 @@ async fn change_password_rejects_environment_managed_secret_without_mutation() {
         false,
         None,
         JwtSecretSource::Environment,
+        JWT_SECRET_AUTHORITY_USER_ID,
     )
     .await;
     create_test_user(&ctx, "admin", "OldP@ssword1").await;
     let before: (Option<String>, Option<String>) =
-        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .fetch_one(ctx._db.pool())
             .await
             .unwrap();
@@ -886,7 +947,8 @@ async fn change_password_rejects_environment_managed_secret_without_mutation() {
     assert_eq!(rejected.status(), StatusCode::CONFLICT);
     assert_eq!(body_json(rejected).await["code"], "JWT_SECRET_ENV_MANAGED");
     let after: (Option<String>, Option<String>) =
-        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = ?")
+            .bind(JWT_SECRET_AUTHORITY_USER_ID)
             .fetch_one(ctx._db.pool())
             .await
             .unwrap();

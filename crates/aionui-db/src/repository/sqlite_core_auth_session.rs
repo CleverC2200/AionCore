@@ -213,19 +213,29 @@ impl ICoreAuthSessionRepository for SqliteCoreAuthSessionRepository {
     async fn rotate_auth_credentials(&self, params: RotateAuthCredentialsParams<'_>) -> Result<u64, DbError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(DbError::from)?;
         let updated_user = sqlx::query(
-            "UPDATE users SET password_hash = ?, jwt_secret = ?, updated_at = ? \
+            "UPDATE users SET password_hash = ?, updated_at = ? \
              WHERE id = ? AND user_type = 'local' AND status = 'active' AND password_hash = ?",
         )
         .bind(params.new_password_hash)
-        .bind(params.new_jwt_secret)
         .bind(params.now)
-        .bind(params.user_id)
+        .bind(params.password_user_id)
         .bind(params.expected_password_hash)
         .execute(&mut *tx)
         .await
         .map_err(DbError::from)?;
         if updated_user.rows_affected() != 1 {
             return Err(DbError::Conflict("User credentials changed during rotation".to_owned()));
+        }
+        let updated_authority =
+            sqlx::query("UPDATE users SET jwt_secret = ?, updated_at = ? WHERE id = ? AND user_type = 'local'")
+                .bind(params.new_jwt_secret)
+                .bind(params.now)
+                .bind(params.jwt_secret_user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::from)?;
+        if updated_authority.rows_affected() != 1 {
+            return Err(DbError::NotFound("JWT secret authority user not found".to_owned()));
         }
         let revoked = sqlx::query(
             "UPDATE core_auth_sessions SET revoked_at = ?, revoke_reason = 'jwt_secret_rotation', updated_at = ? \

@@ -29,9 +29,9 @@ pub use jwt::{
     JwtService, SignedAccessToken, TokenKind, TokenPayload, generate_random_secret_string, resolve_jwt_secret,
 };
 pub use session_lifecycle::{
-    DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, JwtSecretSource, RefreshSessionExchange, RenewableSessionExchange,
-    SessionLifecycle, SessionLifecycleConfig, SessionLifecycleConfigError, SessionLifecycleError,
-    VerifiedAccessSession, derive_refresh_key,
+    DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, JWT_SECRET_AUTHORITY_USER_ID, JwtSecretSource, RefreshSessionExchange,
+    RenewableSessionExchange, SessionLifecycle, SessionLifecycleConfig, SessionLifecycleConfigError,
+    SessionLifecycleError, VerifiedAccessSession, derive_refresh_key,
 };
 
 // Password service
