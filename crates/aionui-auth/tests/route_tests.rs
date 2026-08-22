@@ -639,6 +639,71 @@ async fn t8_2_change_password_old_token_invalidated() {
 }
 
 #[tokio::test]
+async fn change_password_invalidates_durable_external_refresh_sessions() {
+    const REFRESH_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (mut app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+
+    let identity = external_identity_body("tenant-password-rotation", "subject-password-rotation");
+    let provisioned = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-identities",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::OK);
+    let exchange = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exchange.status(), StatusCode::OK);
+    let old_access = extract_session_token(&exchange).unwrap();
+    let old_refresh = extract_refresh_credential(&exchange).unwrap();
+
+    let (admin_token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+    let changed = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+
+    assert!(ctx.jwt_service.verify(&old_access).is_err());
+    let old_access_response = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &old_access))
+        .await
+        .unwrap();
+    assert_eq!(old_access_response.status(), StatusCode::UNAUTHORIZED);
+
+    let old_refresh_response = app
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &old_refresh,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old_refresh_response.status(), StatusCode::UNAUTHORIZED);
+    assert!(extract_session_token(&old_refresh_response).is_none());
+    let json = body_json(old_refresh_response).await;
+    assert_eq!(json["code"], "EXTERNAL_SESSION_REVOKED");
+}
+
+#[tokio::test]
 async fn t8_3_change_password_wrong_current() {
     let (mut app, ctx) = test_app().await;
     create_test_user(&ctx, "admin", "CorrectP@ss1").await;
@@ -1617,6 +1682,90 @@ async fn renewable_external_session_rotates_idempotently_and_replay_revokes() {
         .unwrap();
     assert_eq!(after_replay.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(body_json(after_replay).await["code"], "EXTERNAL_SESSION_REVOKED");
+}
+
+#[tokio::test]
+async fn cross_user_refresh_secret_replay_revokes_only_the_presented_sid() {
+    const REFRESH_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let identity_a = external_identity_body("tenant-cross-user-refresh", "subject-a");
+    let identity_b = external_identity_body("tenant-cross-user-refresh", "subject-b");
+
+    for identity in [&identity_a, &identity_b] {
+        let response = app
+            .clone()
+            .oneshot(json_put_with_bootstrap_secret(
+                "/api/auth/internal/external-identities",
+                identity,
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let exchange_a = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity_a,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let exchange_b = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity_b,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exchange_a.status(), StatusCode::OK);
+    assert_eq!(exchange_b.status(), StatusCode::OK);
+    let refresh_a = extract_refresh_credential(&exchange_a).unwrap();
+    let refresh_b = extract_refresh_credential(&exchange_b).unwrap();
+    let (sid_a, _) = refresh_a.split_once('.').unwrap();
+    let (_, secret_b) = refresh_b.split_once('.').unwrap();
+    let crossed_credential = format!("{sid_a}.{secret_b}");
+
+    let crossed = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &crossed_credential,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(crossed.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(crossed).await["code"], "EXTERNAL_SESSION_REFRESH_REPLAYED");
+
+    let revoked_a = app
+        .clone()
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &refresh_a,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_a.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(revoked_a).await["code"], "EXTERNAL_SESSION_REVOKED");
+
+    let unaffected_b = app
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &refresh_b,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unaffected_b.status(), StatusCode::OK);
 }
 
 #[tokio::test]

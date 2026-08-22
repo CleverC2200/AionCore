@@ -135,7 +135,7 @@ pub struct SessionLifecycle {
     repository: Arc<dyn ICoreAuthSessionRepository>,
     jwt_service: Arc<JwtService>,
     config: SessionLifecycleConfig,
-    refresh_key: [u8; 32],
+    refresh_key: Arc<tokio::sync::RwLock<[u8; 32]>>,
 }
 
 impl SessionLifecycle {
@@ -149,7 +149,7 @@ impl SessionLifecycle {
             repository,
             jwt_service,
             config,
-            refresh_key,
+            refresh_key: Arc::new(tokio::sync::RwLock::new(refresh_key)),
         }
     }
 
@@ -158,9 +158,10 @@ impl SessionLifecycle {
     }
 
     pub async fn issue(&self, user: User) -> Result<RenewableSessionExchange, SessionLifecycleError> {
+        let refresh_key = self.refresh_key.read().await;
         let now = now_ms()?;
         let sid = aionui_common::generate_prefixed_id("core_session");
-        let secret = self.derive_refresh_secret(&sid, 0);
+        let secret = derive_refresh_secret(&refresh_key, &sid, 0);
         let secret_hash = hash_value(&secret);
         let session_expires_at = add_duration_ms(now, self.config.refresh_ttl)?;
         let session = self
@@ -214,13 +215,14 @@ impl SessionLifecycle {
         // Validate the retry key before touching persistence. Missing or
         // malformed keys are caller errors and must never mutate session state.
         let key_hash = hash_value(parse_idempotency_key(idempotency_key)?);
+        let refresh_key = self.refresh_key.read().await;
         let before = self
             .repository
             .find(sid)
             .await
             .map_err(SessionLifecycleError::Database)?
             .ok_or(SessionLifecycleError::RefreshInvalid)?;
-        let replacement_secret = self.derive_refresh_secret(sid, before.rotation.saturating_add(1));
+        let replacement_secret = derive_refresh_secret(&refresh_key, sid, before.rotation.saturating_add(1));
         let presented_hash = hash_value(presented_secret);
         let replacement_hash = hash_value(&replacement_secret);
         let now = now_ms()?;
@@ -235,7 +237,7 @@ impl SessionLifecycle {
             })
             .await
             .map_err(map_repository_error)?;
-        let current_secret = self.derive_refresh_secret(&rotated.session.sid, rotated.session.rotation);
+        let current_secret = derive_refresh_secret(&refresh_key, &rotated.session.sid, rotated.session.rotation);
         let signed = match self.jwt_service.sign_external_access(
             &rotated.session.user_id,
             &rotated.username,
@@ -285,6 +287,17 @@ impl SessionLifecycle {
             .map_err(map_repository_error)
     }
 
+    pub async fn rotate_master_secret(&self) -> Result<String, SessionLifecycleError> {
+        let mut refresh_key = self.refresh_key.write().await;
+        self.repository
+            .revoke_all(now_ms()?)
+            .await
+            .map_err(SessionLifecycleError::Database)?;
+        let new_secret = self.jwt_service.rotate_secret().map_err(SessionLifecycleError::Token)?;
+        *refresh_key = derive_refresh_key(&new_secret);
+        Ok(new_secret)
+    }
+
     pub async fn verify_access(
         &self,
         payload: &TokenPayload,
@@ -316,15 +329,15 @@ impl SessionLifecycle {
             .await
             .map_err(SessionLifecycleError::Database)
     }
+}
 
-    fn derive_refresh_secret(&self, sid: &str, rotation: i64) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.refresh_key).expect("HMAC accepts a 32-byte key");
-        mac.update(b"aioncore-refresh-secret-v1\0");
-        mac.update(sid.as_bytes());
-        mac.update(b"\0");
-        mac.update(&rotation.to_be_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    }
+fn derive_refresh_secret(refresh_key: &[u8; 32], sid: &str, rotation: i64) -> String {
+    let mut mac = HmacSha256::new_from_slice(refresh_key).expect("HMAC accepts a 32-byte key");
+    mac.update(b"aioncore-refresh-secret-v1\0");
+    mac.update(sid.as_bytes());
+    mac.update(b"\0");
+    mac.update(&rotation.to_be_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 pub fn derive_refresh_key(jwt_secret: &str) -> [u8; 32] {
@@ -416,6 +429,75 @@ fn map_repository_error(error: CoreAuthSessionError) -> SessionLifecycleError {
 mod tests {
     use super::*;
 
+    use aionui_db::{
+        ActiveCoreAuthSession, CoreAuthSession, DbError, RotateCoreAuthSessionResult, SqliteCoreAuthSessionRepository,
+        init_database_memory,
+    };
+    use tokio::sync::Barrier;
+
+    struct BlockingCreateRepository {
+        inner: Arc<dyn ICoreAuthSessionRepository>,
+        create_entered: Arc<Barrier>,
+        create_release: Arc<Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl ICoreAuthSessionRepository for BlockingCreateRepository {
+        async fn find(&self, sid: &str) -> Result<Option<CoreAuthSession>, DbError> {
+            self.inner.find(sid).await
+        }
+
+        async fn create(
+            &self,
+            params: CreateCoreAuthSessionParams<'_>,
+        ) -> Result<CoreAuthSession, CoreAuthSessionError> {
+            self.create_entered.wait().await;
+            self.create_release.wait().await;
+            self.inner.create(params).await
+        }
+
+        async fn rotate(
+            &self,
+            params: RotateCoreAuthSessionParams<'_>,
+        ) -> Result<RotateCoreAuthSessionResult, CoreAuthSessionError> {
+            self.inner.rotate(params).await
+        }
+
+        async fn validate_access(
+            &self,
+            sid: &str,
+            user_id: &str,
+            session_generation: i64,
+            rotation: i64,
+            now: i64,
+        ) -> Result<ActiveCoreAuthSession, CoreAuthSessionError> {
+            self.inner
+                .validate_access(sid, user_id, session_generation, rotation, now)
+                .await
+        }
+
+        async fn revoke_matching(
+            &self,
+            sid: &str,
+            presented_secret_hash: &str,
+            now: i64,
+        ) -> Result<CoreAuthSession, CoreAuthSessionError> {
+            self.inner.revoke_matching(sid, presented_secret_hash, now).await
+        }
+
+        async fn revoke_user(&self, user_id: &str, now: i64) -> Result<i64, CoreAuthSessionError> {
+            self.inner.revoke_user(user_id, now).await
+        }
+
+        async fn revoke_all(&self, now: i64) -> Result<u64, DbError> {
+            self.inner.revoke_all(now).await
+        }
+
+        async fn prune_terminal(&self, now: i64) -> Result<u64, DbError> {
+            self.inner.prune_terminal(now).await
+        }
+    }
+
     #[test]
     fn external_session_ttls_are_independent_and_fail_closed() {
         assert_eq!(
@@ -456,5 +538,72 @@ mod tests {
             Err(SessionLifecycleError::IdempotencyKeyInvalid)
         ));
         assert!(parse_idempotency_key(Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn master_rotation_waits_for_in_flight_issue_then_revokes_its_session() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, status, session_generation, created_at, updated_at) \
+             VALUES ('external-race', 'external', 'external-race', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = 'external-race'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let create_entered = Arc::new(Barrier::new(2));
+        let create_release = Arc::new(Barrier::new(2));
+        let repository = Arc::new(BlockingCreateRepository {
+            inner: Arc::new(SqliteCoreAuthSessionRepository::new(db.pool().clone())),
+            create_entered: create_entered.clone(),
+            create_release: create_release.clone(),
+        });
+        let jwt_service = Arc::new(JwtService::new("master-before".into()));
+        let lifecycle = Arc::new(SessionLifecycle::new(
+            repository,
+            jwt_service.clone(),
+            SessionLifecycleConfig::default(),
+            derive_refresh_key("master-before"),
+        ));
+
+        let issuing = {
+            let lifecycle = lifecycle.clone();
+            tokio::spawn(async move { lifecycle.issue(user).await.unwrap() })
+        };
+        create_entered.wait().await;
+
+        let rotation_started = Arc::new(Barrier::new(2));
+        let rotating = {
+            let lifecycle = lifecycle.clone();
+            let rotation_started = rotation_started.clone();
+            tokio::spawn(async move {
+                rotation_started.wait().await;
+                lifecycle.rotate_master_secret().await.unwrap()
+            })
+        };
+        rotation_started.wait().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !rotating.is_finished(),
+            "rotation must wait for the in-flight issue read lock"
+        );
+
+        create_release.wait().await;
+        let issued = issuing.await.unwrap();
+        let new_secret = rotating.await.unwrap();
+        assert!(jwt_service.verify(&issued.access_token).is_err());
+        assert!(JwtService::new(new_secret).verify(&issued.access_token).is_err());
+        assert!(matches!(
+            lifecycle
+                .refresh(
+                    Some(&issued.refresh_credential),
+                    Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                )
+                .await,
+            Err(SessionLifecycleError::Revoked)
+        ));
     }
 }

@@ -210,6 +210,22 @@ impl ICoreAuthSessionRepository for SqliteCoreAuthSessionRepository {
         Ok(generation)
     }
 
+    async fn revoke_all(&self, now: i64) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(DbError::from)?;
+        let affected = sqlx::query(
+            "UPDATE core_auth_sessions SET revoked_at = ?, revoke_reason = 'jwt_secret_rotation', updated_at = ? \
+             WHERE revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::from)?
+        .rows_affected();
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(affected)
+    }
+
     async fn prune_terminal(&self, now: i64) -> Result<u64, DbError> {
         sqlx::query("DELETE FROM core_auth_sessions WHERE revoked_at IS NOT NULL OR session_expires_at <= ?")
             .bind(now)

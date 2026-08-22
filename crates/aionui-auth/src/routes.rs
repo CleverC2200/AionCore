@@ -1039,11 +1039,13 @@ async fn change_password_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
-    // Rotate JWT secret to invalidate all sessions
+    // Revoke durable refresh sessions and rotate both access and refresh
+    // signing material under the lifecycle's issue/refresh write barrier.
     let new_secret = state
-        .jwt_service
-        .rotate_secret()
-        .map_err(|e| ApiError::Internal(format!("Secret rotation error: {e}")))?;
+        .session_lifecycle
+        .rotate_master_secret()
+        .await
+        .map_err(session_lifecycle_error_to_api_error)?;
 
     // Persist new secret to database
     state

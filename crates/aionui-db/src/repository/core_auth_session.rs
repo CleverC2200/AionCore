@@ -86,6 +86,10 @@ pub trait ICoreAuthSessionRepository: Send + Sync {
     /// and revokes all renewable rows in the same transaction.
     async fn revoke_user(&self, user_id: &str, now: TimestampMs) -> Result<i64, CoreAuthSessionError>;
 
+    /// Revoke every durable session before rotating the process-wide JWT
+    /// master secret.
+    async fn revoke_all(&self, now: TimestampMs) -> Result<u64, DbError>;
+
     /// Delete terminal rows during startup. The durable expiry is absolute,
     /// so pruning cannot extend or otherwise mutate a live session.
     async fn prune_terminal(&self, now: TimestampMs) -> Result<u64, DbError>;
