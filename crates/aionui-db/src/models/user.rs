@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum UserType {
     Local,
     Aionpro,
+    External,
 }
 
 impl UserType {
@@ -14,6 +15,7 @@ impl UserType {
         match self {
             Self::Local => "local",
             Self::Aionpro => "aionpro",
+            Self::External => "external",
         }
     }
 }

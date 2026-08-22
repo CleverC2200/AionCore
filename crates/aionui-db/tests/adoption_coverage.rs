@@ -64,8 +64,15 @@ const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
     ("assistant_sessions", "assistant_users"),
 ];
 
-/// Identity / infrastructure tables outside the ownership model.
-const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];
+/// Identity / infrastructure tables outside the adoptable-data model.
+const INFRA_TABLES: &[&str] = &[
+    "users",
+    "_sqlx_migrations",
+    // An external identity mapping is an authorization boundary, not user
+    // content. It may point at system_default_user but must never be silently
+    // re-bound by the first-external-user data adoption sweep.
+    "external_identities",
+];
 
 async fn table_names(pool: &sqlx::SqlitePool) -> Vec<String> {
     sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -94,11 +101,12 @@ async fn every_table_is_classified_for_aionpro_adoption() {
 
     for table in table_names(pool).await {
         let non_core_user_id = NON_CORE_USER_ID_TABLES.iter().any(|(name, _)| *name == table);
-        let owned_by_user_id = has_column(pool, &table, "user_id").await && table != "users" && !non_core_user_id;
+        let infra = INFRA_TABLES.contains(&table.as_str());
+        let owned_by_user_id =
+            has_column(pool, &table, "user_id").await && table != "users" && !non_core_user_id && !infra;
         let owned_by_owner_user_id = has_column(pool, &table, "owner_user_id").await;
         let parent_scoped = PARENT_SCOPED.iter().any(|(name, _, _)| *name == table);
         let global = GLOBAL_TABLES.iter().any(|(name, _)| *name == table);
-        let infra = INFRA_TABLES.contains(&table.as_str());
 
         let categories = [
             owned_by_user_id,

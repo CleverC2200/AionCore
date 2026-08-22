@@ -13,13 +13,13 @@ use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
-    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IGeaResourceRepository,
-    IMcpServerRepository, IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository,
+    Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IExternalIdentityRepository,
+    IGeaResourceRepository, IMcpServerRepository, IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteGeaResourceRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteExternalIdentityRepository, SqliteGeaResourceRepository,
+    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
+    SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -34,6 +34,7 @@ pub struct AppServices {
     pub database: Database,
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub external_identity_repo: Arc<dyn IExternalIdentityRepository>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
@@ -163,6 +164,8 @@ impl AppServices {
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
+        let external_identity_repo: Arc<dyn IExternalIdentityRepository> =
+            Arc::new(SqliteExternalIdentityRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
         let env_secret = std::env::var("JWT_SECRET").ok();
@@ -362,6 +365,7 @@ impl AppServices {
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,
             user_repo,
+            external_identity_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),

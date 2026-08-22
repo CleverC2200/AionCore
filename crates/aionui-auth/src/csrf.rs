@@ -59,6 +59,7 @@ pub async fn csrf_middleware(
     let is_antigravity_hook = path.starts_with("/internal/antigravity-hook/");
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
+        || path == "/api/auth/internal/external-identities"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
         || is_antigravity_hook

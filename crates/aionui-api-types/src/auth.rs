@@ -155,6 +155,54 @@ pub enum InternalAuthErrorCode {
 }
 
 // ---------------------------------------------------------------------------
+// Trusted external identity mapping
+// ---------------------------------------------------------------------------
+
+/// External identity authority supported by the Core mapping contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalIdentityProvider {
+    Lark,
+}
+
+/// Exact external identity tuple asserted by a trusted bootstrap caller.
+///
+/// Provider credentials are intentionally absent. Unknown fields are rejected
+/// so access tokens cannot be mistaken for Core identity or session material.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIdentityTuple {
+    pub provider: ExternalIdentityProvider,
+    pub issuer: String,
+    pub tenant_id: String,
+    pub subject: String,
+}
+
+/// Request for `PUT /api/auth/internal/external-identities`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnsureExternalIdentityMappingRequest {
+    pub identity: ExternalIdentityTuple,
+}
+
+/// Mapping result. It deliberately contains no external identity payload,
+/// provider credential, Core JWT, or cookie value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureExternalIdentityMappingResponse {
+    pub core_user_id: String,
+    pub created: bool,
+}
+
+/// Stable error codes for the trusted external identity mapping contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExternalIdentityMappingErrorCode {
+    ExternalIdentityInvalid,
+    CoreUserDisabled,
+    ExternalIdentityConflict,
+}
+
+// ---------------------------------------------------------------------------
 // WebUI admin credential endpoints (local-only)
 // ---------------------------------------------------------------------------
 
@@ -288,6 +336,38 @@ mod tests {
 
         let code = serde_json::to_value(InternalAuthErrorCode::UserContextRequired).unwrap();
         assert_eq!(code, "USER_CONTEXT_REQUIRED");
+    }
+
+    #[test]
+    fn external_identity_mapping_contract_rejects_credentials_and_has_minimal_response() {
+        let credential_payload = r#"{
+            "identity": {
+                "provider": "lark",
+                "issuer": "https://open.feishu.cn",
+                "tenant_id": "tenant-1",
+                "subject": "subject-1",
+                "access_token": "provider-secret"
+            }
+        }"#;
+        assert!(serde_json::from_str::<EnsureExternalIdentityMappingRequest>(credential_payload).is_err());
+
+        let caller_selected_user = r#"{
+            "identity": {
+                "provider": "lark",
+                "issuer": "https://open.feishu.cn",
+                "tenant_id": "tenant-1",
+                "subject": "subject-1"
+            },
+            "core_user_id": "user-1"
+        }"#;
+        assert!(serde_json::from_str::<EnsureExternalIdentityMappingRequest>(caller_selected_user).is_err());
+
+        let response = EnsureExternalIdentityMappingResponse {
+            core_user_id: "user-1".to_owned(),
+            created: true,
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json, json!({ "core_user_id": "user-1", "created": true }));
     }
 
     #[test]
