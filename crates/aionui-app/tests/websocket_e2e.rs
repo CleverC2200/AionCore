@@ -429,6 +429,39 @@ async fn interaction_request_changed_reaches_only_its_authenticated_user() {
 }
 
 #[tokio::test]
+async fn notification_changed_reaches_only_its_authenticated_user() {
+    let app = start_app().await;
+    let token_a = sign_token(&app, "user-a").await;
+    let token_b = sign_token(&app, "user-b").await;
+    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    wait_for_clients(&app, 2).await;
+
+    let payload = aionui_api_types::NotificationChangedPayload {
+        revision: "notification-r2".to_owned(),
+        reason: aionui_api_types::NotificationChangedReason::Updated,
+        notification_id: Some("notification-1".to_owned()),
+        trace_id: Some("trace-1".to_owned()),
+    };
+    let mut data = serde_json::to_value(payload).unwrap();
+    data["user_id"] = json!("user-a");
+    app.services
+        .event_bus
+        .broadcast(WebSocketMessage::new("notification.changed", data));
+
+    let msg_a = read_text(&mut rx_a).await;
+    assert_eq!(msg_a["name"], "notification.changed");
+    assert_eq!(msg_a["data"]["revision"], "notification-r2");
+    assert_eq!(msg_a["data"]["notification_id"], "notification-1");
+    assert!(msg_a["data"].get("user_id").is_none());
+    let timeout_result = tokio::time::timeout(Duration::from_millis(200), rx_b.next()).await;
+    assert!(
+        timeout_result.is_err(),
+        "another user must not receive the invalidation"
+    );
+}
+
+#[tokio::test]
 async fn t4_1_unscoped_business_event_is_dropped_by_bridge() {
     let app = start_app().await;
     let token = sign_token(&app, "user-a").await;

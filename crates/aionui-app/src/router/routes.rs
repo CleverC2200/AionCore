@@ -83,7 +83,13 @@ async fn forward_event_bus_to_websocket(
             .and_then(|value| value.as_str())
             .map(str::to_owned)
         {
-            ws_manager.broadcast_to_user(&user_id, event);
+            let mut scoped_event = event;
+            if scoped_event.name == "notification.changed"
+                && let Some(data) = scoped_event.data.as_object_mut()
+            {
+                data.remove("user_id");
+            }
+            ws_manager.broadcast_to_user(&user_id, scoped_event);
         } else if is_global_websocket_event(&event.name) {
             ws_manager.broadcast_all(event);
         } else {

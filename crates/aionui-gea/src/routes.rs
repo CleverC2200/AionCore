@@ -2,10 +2,14 @@ use aionui_api_types::{
     ApiResponse, CreateGeaSessionRequest, ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult,
     GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot,
     GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand,
-    InteractionRequestList, InteractionRequestReceipt, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    InteractionRequestList, InteractionRequestReceipt, NotificationActionCommand, NotificationList,
+    NotificationReceipt, NotificationView, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 #[cfg(debug_assertions)]
-use aionui_api_types::{InteractionRequestChangedPayload, WebSocketMessage};
+use aionui_api_types::{
+    GeaNotification, GeaNotificationReceipt, GeaNotificationSnapshot, InteractionRequestChangedPayload,
+    NotificationChangedPayload, NotificationTarget, WebSocketMessage,
+};
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -46,6 +50,16 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
         .route(
             "/api/interaction-requests/{request_id}/actions",
             post(act_on_global_interaction_request),
+        )
+        .route("/api/notifications", get(list_notifications))
+        .route("/api/notifications/{notification_id}", get(get_notification))
+        .route(
+            "/api/notifications/{notification_id}/read",
+            post(mark_notification_read),
+        )
+        .route(
+            "/api/notifications/{notification_id}/dismiss",
+            post(dismiss_notification),
         )
         .route("/api/client-resources/sync", post(sync_client_resources))
         .route(
@@ -201,6 +215,144 @@ async fn act_on_global_interaction_request(
     let receipt = state
         .service
         .act_on_global_interaction_request(&user.id, &request_id, command)
+        .await?;
+    Ok(Json(ApiResponse::ok(receipt)))
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationListQuery {
+    #[serde(default = "active_status")]
+    status: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/notifications",
+    operation_id = "listNotifications",
+    tag = "Notification",
+    params(
+        ("status" = Option<String>, Query, description = "active, unread, read, dismissed, or all; default is active")
+    ),
+    responses(
+        (status = 200, description = "Tenant-scoped recoverable notification projection", body = ApiResponse<NotificationList>),
+        (status = 400, description = "Unsupported status filter", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 429, description = "GEA rate limit", body = ErrorResponse),
+        (status = 500, description = "Projection storage is unavailable", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid response", body = ErrorResponse),
+        (status = 503, description = "GEA is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_notifications(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<NotificationListQuery>,
+) -> Result<Json<ApiResponse<NotificationList>>, GeaError> {
+    if !matches!(
+        query.status.as_str(),
+        "active" | "unread" | "read" | "dismissed" | "all"
+    ) {
+        return Err(GeaError::invalid_request("Notification status 筛选无效"));
+    }
+    let list = state.service.list_notifications(&user.id, Some(&query.status)).await?;
+    Ok(Json(ApiResponse::ok(list)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/notifications/{notification_id}",
+    operation_id = "getNotification",
+    tag = "Notification",
+    params(("notification_id" = String, Path, description = "Notification identifier")),
+    responses(
+        (status = 200, description = "Notification detail", body = ApiResponse<NotificationView>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 404, description = "Notification not found in the current user and tenant scope", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn get_notification(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(notification_id): Path<String>,
+) -> Result<Json<ApiResponse<NotificationView>>, GeaError> {
+    let notification = state.service.get_notification(&user.id, &notification_id).await?;
+    Ok(Json(ApiResponse::ok(notification)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/notifications/{notification_id}/read",
+    operation_id = "markNotificationRead",
+    tag = "Notification",
+    request_body = NotificationActionCommand,
+    params(
+        ("notification_id" = String, Path, description = "Notification identifier"),
+        ("x-csrf-token" = Option<String>, Header, description = "Required outside local identity mode")
+    ),
+    responses(
+        (status = 200, description = "Stable read receipt", body = ApiResponse<NotificationReceipt>),
+        (status = 400, description = "Invalid action command", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "CSRF validation or ownership check failed", body = ErrorResponse),
+        (status = 404, description = "Notification not found", body = ErrorResponse),
+        (status = 409, description = "Version or state conflict", body = ErrorResponse),
+        (status = 422, description = "Notification action is not valid for the current state", body = ErrorResponse),
+        (status = 429, description = "GEA rate limit", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid response", body = ErrorResponse),
+        (status = 503, description = "GEA is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn mark_notification_read(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(notification_id): Path<String>,
+    body: Result<Json<NotificationActionCommand>, JsonRejection>,
+) -> Result<Json<ApiResponse<NotificationReceipt>>, GeaError> {
+    let Json(command) = body.map_err(|_| GeaError::invalid_request("Notification 已读参数无效"))?;
+    let receipt = state
+        .service
+        .mark_notification_read(&user.id, &notification_id, command)
+        .await?;
+    Ok(Json(ApiResponse::ok(receipt)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/notifications/{notification_id}/dismiss",
+    operation_id = "dismissNotification",
+    tag = "Notification",
+    request_body = NotificationActionCommand,
+    params(
+        ("notification_id" = String, Path, description = "Notification identifier"),
+        ("x-csrf-token" = Option<String>, Header, description = "Required outside local identity mode")
+    ),
+    responses(
+        (status = 200, description = "Stable dismiss receipt", body = ApiResponse<NotificationReceipt>),
+        (status = 400, description = "Invalid action command", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "CSRF validation or ownership check failed", body = ErrorResponse),
+        (status = 404, description = "Notification not found", body = ErrorResponse),
+        (status = 409, description = "Version, state, or dismissible conflict", body = ErrorResponse),
+        (status = 422, description = "Notification action is not valid for the current state", body = ErrorResponse),
+        (status = 429, description = "GEA rate limit", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid response", body = ErrorResponse),
+        (status = 503, description = "GEA is temporarily unavailable", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn dismiss_notification(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(notification_id): Path<String>,
+    body: Result<Json<NotificationActionCommand>, JsonRejection>,
+) -> Result<Json<ApiResponse<NotificationReceipt>>, GeaError> {
+    let Json(command) = body.map_err(|_| GeaError::invalid_request("Notification 关闭参数无效"))?;
+    let receipt = state
+        .service
+        .dismiss_notification(&user.id, &notification_id, command)
         .await?;
     Ok(Json(ApiResponse::ok(receipt)))
 }
@@ -588,19 +740,30 @@ impl utoipa::Modify for SecuritySchemes {
         test_mcp_connection,
         list_all_interaction_requests,
         act_on_global_interaction_request,
+        list_notifications,
+        get_notification,
+        mark_notification_read,
+        dismiss_notification,
         list_interaction_requests,
         act_on_interaction_request,
         sync_client_resources
     ),
     components(schemas(
         InteractionRequestChangedPayload,
-        WebSocketMessage<InteractionRequestChangedPayload>
+        WebSocketMessage<InteractionRequestChangedPayload>,
+        NotificationChangedPayload,
+        WebSocketMessage<NotificationChangedPayload>,
+        GeaNotification,
+        GeaNotificationReceipt,
+        GeaNotificationSnapshot,
+        NotificationTarget
     )),
     modifiers(&SecuritySchemes),
     tags(
         (name = "GEA session", description = "GEA credential status and conversation Gateway Session"),
         (name = "GEA tools", description = "GEA MCP tool discovery, connection test, and invocation"),
         (name = "InteractionRequest", description = "GEA-owned requests and AionCore's recoverable user projection"),
+        (name = "Notification", description = "GEA-owned user notifications and AionCore's tenant-scoped recoverable projection"),
         (name = "Client resources", description = "GEA Resource Catalog synchronization; current implementation materializes skills only")
     )
 )]
@@ -719,6 +882,10 @@ mod tests {
             "/api/gea/conversations/{conversation_id}/interaction-requests/{request_id}/actions",
             "/api/interaction-requests",
             "/api/interaction-requests/{request_id}/actions",
+            "/api/notifications",
+            "/api/notifications/{notification_id}",
+            "/api/notifications/{notification_id}/read",
+            "/api/notifications/{notification_id}/dismiss",
             "/api/client-resources/sync",
         ];
         assert_eq!(paths.len(), expected.len());
@@ -739,7 +906,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_ids.len(), 12);
+        assert_eq!(operation_ids.len(), 16);
     }
 
     #[test]
@@ -826,6 +993,62 @@ mod tests {
             ],
         );
         assert_schema_properties(&document, "InteractionRequestChangedPayload", &["revision", "user_id"]);
+    }
+
+    #[test]
+    fn gea_openapi_pins_notification_schema_fields_and_values() {
+        let document = openapi_value();
+        assert_schema_properties(
+            &document,
+            "NotificationList",
+            &["failure_codes", "items", "last_synced_at", "revision", "sync_state"],
+        );
+        assert_schema_properties(
+            &document,
+            "GeaNotificationSnapshot",
+            &["items", "nextCursor", "revision"],
+        );
+        assert_schema_properties(
+            &document,
+            "NotificationView",
+            &[
+                "body",
+                "created_at",
+                "dismissible",
+                "expires_at",
+                "id",
+                "interaction_request_id",
+                "kind",
+                "severity",
+                "source",
+                "status",
+                "summary",
+                "target",
+                "title",
+                "version",
+            ],
+        );
+        assert_schema_properties(
+            &document,
+            "NotificationActionCommand",
+            &["expected_version", "idempotency_key"],
+        );
+        assert_schema_properties(
+            &document,
+            "NotificationReceipt",
+            &["notification", "notification_id", "receipt_id", "status", "version"],
+        );
+        assert_schema_properties(
+            &document,
+            "NotificationChangedPayload",
+            &["notification_id", "reason", "revision", "trace_id"],
+        );
+        assert_schema_enum(&document, "NotificationStatus", &["dismissed", "read", "unread"]);
+        assert_schema_enum(
+            &document,
+            "NotificationSyncState",
+            &["failed", "fresh", "idle", "partial", "stale", "syncing"],
+        );
     }
 
     #[test]
