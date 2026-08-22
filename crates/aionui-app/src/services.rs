@@ -10,8 +10,8 @@ use aionui_ai_agent::{
 };
 use aionui_approval::ApprovalService;
 use aionui_auth::{
-    CookieConfig, JwtService, QrTokenStore, SessionLifecycle, SessionLifecycleConfig, derive_refresh_key,
-    resolve_jwt_secret,
+    CookieConfig, JwtSecretSource, JwtService, QrTokenStore, SessionLifecycle, SessionLifecycleConfig,
+    derive_refresh_key, resolve_jwt_secret,
 };
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
@@ -177,6 +177,11 @@ impl AppServices {
 
         // Resolve JWT secret: env var → system user db field → random generation
         let env_secret = std::env::var("JWT_SECRET").ok();
+        let jwt_secret_source = if env_secret.is_some() {
+            JwtSecretSource::Environment
+        } else {
+            JwtSecretSource::Database
+        };
         let system_user = user_repo
             .get_system_user()
             .await
@@ -225,11 +230,12 @@ impl AppServices {
             std::env::var("AIONCORE_EXTERNAL_REFRESH_TTL_SECS").ok().as_deref(),
         )
         .map_err(|error| anyhow::anyhow!("Invalid external session configuration: {error}"))?;
-        let session_lifecycle = Arc::new(SessionLifecycle::new(
+        let session_lifecycle = Arc::new(SessionLifecycle::new_with_source(
             core_auth_session_repo.clone(),
             jwt_service.clone(),
             session_lifecycle_config,
             derive_refresh_key(&secret),
+            jwt_secret_source,
         ));
         let pruned_sessions = session_lifecycle
             .prune_terminal()

@@ -66,7 +66,7 @@ pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
 pub use core_auth_session::{
     ActiveCoreAuthSession, CoreAuthSessionError, CreateCoreAuthSessionParams, ICoreAuthSessionRepository,
-    RotateCoreAuthSessionParams, RotateCoreAuthSessionResult,
+    RotateAuthCredentialsParams, RotateCoreAuthSessionParams, RotateCoreAuthSessionResult,
 };
 pub use cron::ICronRepository;
 pub use diagnostics::{

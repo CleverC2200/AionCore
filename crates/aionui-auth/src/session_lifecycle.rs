@@ -12,10 +12,11 @@ use aionui_api_types::{
 };
 use aionui_db::models::User;
 use aionui_db::{
-    CoreAuthSessionError, CreateCoreAuthSessionParams, ICoreAuthSessionRepository, RotateCoreAuthSessionParams,
+    CoreAuthSessionError, CreateCoreAuthSessionParams, ICoreAuthSessionRepository, RotateAuthCredentialsParams,
+    RotateCoreAuthSessionParams,
 };
 
-use crate::{AuthError, JwtService, TokenKind, TokenPayload};
+use crate::{AuthError, JwtService, TokenKind, TokenPayload, generate_random_secret_string};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -102,10 +103,14 @@ pub enum SessionLifecycleError {
     UserDisabled,
     #[error("external session generation is stale")]
     GenerationMismatch,
+    #[error("JWT secret is managed by the environment")]
+    EnvironmentManagedSecret,
     #[error("external session unavailable")]
     Database(#[source] aionui_db::DbError),
     #[error("external session signing failed")]
     Token(#[source] AuthError),
+    #[error("persisted JWT secret could not be activated; authentication cannot continue")]
+    RuntimeActivation(#[source] AuthError),
     #[error("system clock unavailable")]
     Clock,
 }
@@ -130,12 +135,19 @@ pub struct VerifiedAccessSession {
     pub rotation: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtSecretSource {
+    Database,
+    Environment,
+}
+
 #[derive(Clone)]
 pub struct SessionLifecycle {
     repository: Arc<dyn ICoreAuthSessionRepository>,
     jwt_service: Arc<JwtService>,
     config: SessionLifecycleConfig,
     refresh_key: Arc<tokio::sync::RwLock<[u8; 32]>>,
+    jwt_secret_source: JwtSecretSource,
 }
 
 impl SessionLifecycle {
@@ -145,11 +157,22 @@ impl SessionLifecycle {
         config: SessionLifecycleConfig,
         refresh_key: [u8; 32],
     ) -> Self {
+        Self::new_with_source(repository, jwt_service, config, refresh_key, JwtSecretSource::Database)
+    }
+
+    pub fn new_with_source(
+        repository: Arc<dyn ICoreAuthSessionRepository>,
+        jwt_service: Arc<JwtService>,
+        config: SessionLifecycleConfig,
+        refresh_key: [u8; 32],
+        jwt_secret_source: JwtSecretSource,
+    ) -> Self {
         Self {
             repository,
             jwt_service,
             config,
             refresh_key: Arc::new(tokio::sync::RwLock::new(refresh_key)),
+            jwt_secret_source,
         }
     }
 
@@ -287,15 +310,40 @@ impl SessionLifecycle {
             .map_err(map_repository_error)
     }
 
-    pub async fn rotate_master_secret(&self) -> Result<String, SessionLifecycleError> {
+    pub fn ensure_master_secret_rotation_allowed(&self) -> Result<(), SessionLifecycleError> {
+        if self.jwt_secret_source == JwtSecretSource::Environment {
+            return Err(SessionLifecycleError::EnvironmentManagedSecret);
+        }
+        Ok(())
+    }
+
+    pub async fn rotate_auth_credentials(
+        &self,
+        user_id: &str,
+        expected_password_hash: &str,
+        new_password_hash: &str,
+    ) -> Result<(), SessionLifecycleError> {
+        self.ensure_master_secret_rotation_allowed()?;
         let mut refresh_key = self.refresh_key.write().await;
+        let new_secret = generate_random_secret_string();
         self.repository
-            .revoke_all(now_ms()?)
+            .rotate_auth_credentials(RotateAuthCredentialsParams {
+                user_id,
+                expected_password_hash,
+                new_password_hash,
+                new_jwt_secret: &new_secret,
+                now: now_ms()?,
+            })
             .await
             .map_err(SessionLifecycleError::Database)?;
-        let new_secret = self.jwt_service.rotate_secret().map_err(SessionLifecycleError::Token)?;
+        if let Err(error) = self.jwt_service.activate_secret(new_secret.clone()) {
+            tracing::error!(
+                "fatal JWT runtime activation failure after committed credential rotation; restart required"
+            );
+            return Err(SessionLifecycleError::RuntimeActivation(error));
+        }
         *refresh_key = derive_refresh_key(&new_secret);
-        Ok(new_secret)
+        Ok(())
     }
 
     pub async fn verify_access(
@@ -489,8 +537,8 @@ mod tests {
             self.inner.revoke_user(user_id, now).await
         }
 
-        async fn revoke_all(&self, now: i64) -> Result<u64, DbError> {
-            self.inner.revoke_all(now).await
+        async fn rotate_auth_credentials(&self, params: RotateAuthCredentialsParams<'_>) -> Result<u64, DbError> {
+            self.inner.rotate_auth_credentials(params).await
         }
 
         async fn prune_terminal(&self, now: i64) -> Result<u64, DbError> {
@@ -543,6 +591,10 @@ mod tests {
     #[tokio::test]
     async fn master_rotation_waits_for_in_flight_issue_then_revokes_its_session() {
         let db = init_database_memory().await.unwrap();
+        sqlx::query("UPDATE users SET password_hash = 'old-hash' WHERE id = 'system_default_user'")
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO users (id, user_type, username, status, session_generation, created_at, updated_at) \
              VALUES ('external-race', 'external', 'external-race', 'active', 0, 1, 1)",
@@ -581,7 +633,10 @@ mod tests {
             let rotation_started = rotation_started.clone();
             tokio::spawn(async move {
                 rotation_started.wait().await;
-                lifecycle.rotate_master_secret().await.unwrap()
+                lifecycle
+                    .rotate_auth_credentials("system_default_user", "old-hash", "new-hash")
+                    .await
+                    .unwrap()
             })
         };
         rotation_started.wait().await;
@@ -593,7 +648,11 @@ mod tests {
 
         create_release.wait().await;
         let issued = issuing.await.unwrap();
-        let new_secret = rotating.await.unwrap();
+        rotating.await.unwrap();
+        let new_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = 'system_default_user'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert!(jwt_service.verify(&issued.access_token).is_err());
         assert!(JwtService::new(new_secret).verify(&issued.access_token).is_err());
         assert!(matches!(

@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionLifecycle,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtSecretSource, JwtService, QrTokenStore, SessionLifecycle,
     SessionLifecycleConfig, SessionRevokedHook, auth_routes, csrf_middleware, derive_refresh_key, hash_password,
 };
 use aionui_db::{
@@ -44,6 +44,23 @@ async fn test_app_with_options_and_hook(
     aionpro_mode: bool,
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
 ) -> (Router, TestContext) {
+    test_app_with_options_hook_and_source(
+        local,
+        bootstrap_secret,
+        aionpro_mode,
+        session_revoked_hook,
+        JwtSecretSource::Database,
+    )
+    .await
+}
+
+async fn test_app_with_options_hook_and_source(
+    local: bool,
+    bootstrap_secret: Option<&str>,
+    aionpro_mode: bool,
+    session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+    jwt_secret_source: JwtSecretSource,
+) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
     let external_identity_repo =
@@ -51,11 +68,12 @@ async fn test_app_with_options_and_hook(
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
     let core_auth_session_repo =
         Arc::new(SqliteCoreAuthSessionRepository::new(db.pool().clone())) as Arc<dyn ICoreAuthSessionRepository>;
-    let session_lifecycle = Arc::new(SessionLifecycle::new(
+    let session_lifecycle = Arc::new(SessionLifecycle::new_with_source(
         core_auth_session_repo,
         jwt_service.clone(),
         SessionLifecycleConfig::default(),
         derive_refresh_key("test_secret_for_routes"),
+        jwt_secret_source,
     ));
     let cookie_config = Arc::new(CookieConfig {
         secure: false,
@@ -641,6 +659,7 @@ async fn t8_2_change_password_old_token_invalidated() {
 #[tokio::test]
 async fn change_password_invalidates_durable_external_refresh_sessions() {
     const REFRESH_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const REFRESH_KEY_2: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
     let (mut app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     create_test_user(&ctx, "admin", "OldP@ssword1").await;
 
@@ -689,6 +708,7 @@ async fn change_password_invalidates_durable_external_refresh_sessions() {
     assert_eq!(old_access_response.status(), StatusCode::UNAUTHORIZED);
 
     let old_refresh_response = app
+        .clone()
         .oneshot(empty_post_with_bootstrap_cookie(
             "/api/auth/internal/external-sessions/refresh",
             "bootstrap-secret",
@@ -701,6 +721,177 @@ async fn change_password_invalidates_durable_external_refresh_sessions() {
     assert!(extract_session_token(&old_refresh_response).is_none());
     let json = body_json(old_refresh_response).await;
     assert_eq!(json["code"], "EXTERNAL_SESSION_REVOKED");
+
+    let new_exchange = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_exchange.status(), StatusCode::OK);
+    let new_refresh = extract_refresh_credential(&new_exchange).unwrap();
+    let refreshed = app
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &new_refresh,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let refreshed_access = extract_session_token(&refreshed).unwrap();
+    let refreshed_credential = extract_refresh_credential(&refreshed).unwrap();
+
+    let persisted_secret: String = sqlx::query_scalar("SELECT jwt_secret FROM users WHERE id = 'system_default_user'")
+        .fetch_one(ctx._db.pool())
+        .await
+        .unwrap();
+    let restarted_jwt = Arc::new(JwtService::new(persisted_secret.clone()));
+    assert!(restarted_jwt.verify(&refreshed_access).is_ok());
+    let restarted_lifecycle = SessionLifecycle::new(
+        Arc::new(SqliteCoreAuthSessionRepository::new(ctx._db.pool().clone())),
+        restarted_jwt.clone(),
+        SessionLifecycleConfig::default(),
+        derive_refresh_key(&persisted_secret),
+    );
+    let after_restart = restarted_lifecycle
+        .refresh(Some(&refreshed_credential), Some(REFRESH_KEY_2))
+        .await
+        .unwrap();
+    assert!(restarted_jwt.verify(&after_restart.access_token).is_ok());
+}
+
+#[tokio::test]
+async fn change_password_transaction_failure_rolls_back_database_and_runtime() {
+    const REFRESH_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (mut app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    ctx.user_repo
+        .update_jwt_secret("system_default_user", "test_secret_for_routes")
+        .await
+        .unwrap();
+    let identity = external_identity_body("tenant-rotation-rollback", "subject-rotation-rollback");
+    assert_eq!(
+        app.clone()
+            .oneshot(json_put_with_bootstrap_secret(
+                "/api/auth/internal/external-identities",
+                &identity,
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let exchange = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let old_access = extract_session_token(&exchange).unwrap();
+    let old_refresh = extract_refresh_credential(&exchange).unwrap();
+    let sid = old_refresh.split_once('.').unwrap().0;
+    let before_user: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    let before_session: (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT revoked_at, revoke_reason FROM core_auth_sessions WHERE sid = ?")
+            .bind(sid)
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_auth_rotation_revoke BEFORE UPDATE OF revoked_at ON core_auth_sessions \
+         WHEN NEW.revoke_reason = 'jwt_secret_rotation' BEGIN SELECT RAISE(ABORT, 'forced rotation failure'); END",
+    )
+    .execute(ctx._db.pool())
+    .await
+    .unwrap();
+
+    let (admin_token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+    let failed = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(failed).await["code"], "EXTERNAL_SESSION_UNAVAILABLE");
+
+    let after_user: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    let after_session: (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT revoked_at, revoke_reason FROM core_auth_sessions WHERE sid = ?")
+            .bind(sid)
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after_user, before_user);
+    assert_eq!(after_session, before_session);
+    assert!(ctx.jwt_service.verify(&old_access).is_ok());
+    let old_refresh_response = app
+        .oneshot(empty_post_with_bootstrap_cookie(
+            "/api/auth/internal/external-sessions/refresh",
+            "bootstrap-secret",
+            &old_refresh,
+            Some(REFRESH_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old_refresh_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn change_password_rejects_environment_managed_secret_without_mutation() {
+    let (mut app, ctx) = test_app_with_options_hook_and_source(
+        false,
+        Some("bootstrap-secret"),
+        false,
+        None,
+        JwtSecretSource::Environment,
+    )
+    .await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    let before: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    let (token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+
+    let rejected = app
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(rejected).await["code"], "JWT_SECRET_ENV_MANAGED");
+    let after: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT password_hash, jwt_secret FROM users WHERE id = 'system_default_user'")
+            .fetch_one(ctx._db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+    assert!(ctx.jwt_service.verify(&token).is_ok());
 }
 
 #[tokio::test]

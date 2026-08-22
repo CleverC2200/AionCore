@@ -202,15 +202,21 @@ impl JwtService {
     /// Returns the new secret string for database persistence.
     pub fn rotate_secret(&self) -> Result<String, AuthError> {
         let new_secret = generate_random_secret_string();
+        self.activate_secret(new_secret.clone())?;
+        Ok(new_secret)
+    }
+
+    /// Activate a previously persisted JWT secret.
+    pub fn activate_secret(&self, new_secret: String) -> Result<(), AuthError> {
         let mut secret = self
             .secret
             .write()
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
-        *secret = new_secret.clone();
+        *secret = new_secret;
         // All old tokens are invalid with the new secret; clear the blacklist
         self.blacklist.clear();
         tracing::info!("JWT secret rotated; all existing tokens invalidated");
-        Ok(new_secret)
+        Ok(())
     }
 
     /// Remove expired entries from the blacklist.

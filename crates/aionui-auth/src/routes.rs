@@ -319,7 +319,15 @@ pub(crate) fn session_lifecycle_error_to_api_error(err: SessionLifecycleError) -
             "EXTERNAL_SESSION_GENERATION_MISMATCH",
             "External session generation is stale.",
         ),
-        SessionLifecycleError::Database(_) | SessionLifecycleError::Token(_) | SessionLifecycleError::Clock => {
+        SessionLifecycleError::EnvironmentManagedSecret => coded(
+            StatusCode::CONFLICT,
+            "JWT_SECRET_ENV_MANAGED",
+            "Password change cannot rotate an environment-managed JWT secret.",
+        ),
+        SessionLifecycleError::Database(_)
+        | SessionLifecycleError::Token(_)
+        | SessionLifecycleError::RuntimeActivation(_)
+        | SessionLifecycleError::Clock => {
             tracing::error!("external session lifecycle unavailable");
             coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1006,6 +1014,11 @@ async fn change_password_handler(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
+    state
+        .session_lifecycle
+        .ensure_master_secret_rotation_allowed()
+        .map_err(session_lifecycle_error_to_api_error)?;
+
     // Validate new password strength
     validate_password(&req.new_password)?;
 
@@ -1032,27 +1045,13 @@ async fn change_password_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
 
-    // Persist new password hash
+    // Persist the verified user's new password, candidate JWT secret and
+    // durable-session revocation atomically; only then activate runtime keys.
     state
-        .user_repo
-        .update_password(&current_user.id, &new_hash)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
-
-    // Revoke durable refresh sessions and rotate both access and refresh
-    // signing material under the lifecycle's issue/refresh write barrier.
-    let new_secret = state
         .session_lifecycle
-        .rotate_master_secret()
+        .rotate_auth_credentials(&current_user.id, password_hash, &new_hash)
         .await
         .map_err(session_lifecycle_error_to_api_error)?;
-
-    // Persist new secret to database
-    state
-        .user_repo
-        .update_jwt_secret(&current_user.id, &new_secret)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }

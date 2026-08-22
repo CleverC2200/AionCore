@@ -21,6 +21,15 @@ pub struct RotateCoreAuthSessionParams<'a> {
     pub now: TimestampMs,
 }
 
+#[derive(Debug, Clone)]
+pub struct RotateAuthCredentialsParams<'a> {
+    pub user_id: &'a str,
+    pub expected_password_hash: &'a str,
+    pub new_password_hash: &'a str,
+    pub new_jwt_secret: &'a str,
+    pub now: TimestampMs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateCoreAuthSessionResult {
     pub session: CoreAuthSession,
@@ -86,9 +95,9 @@ pub trait ICoreAuthSessionRepository: Send + Sync {
     /// and revokes all renewable rows in the same transaction.
     async fn revoke_user(&self, user_id: &str, now: TimestampMs) -> Result<i64, CoreAuthSessionError>;
 
-    /// Revoke every durable session before rotating the process-wide JWT
-    /// master secret.
-    async fn revoke_all(&self, now: TimestampMs) -> Result<u64, DbError>;
+    /// Atomically replace a verified local user's password and persisted JWT
+    /// secret while revoking every durable external session.
+    async fn rotate_auth_credentials(&self, params: RotateAuthCredentialsParams<'_>) -> Result<u64, DbError>;
 
     /// Delete terminal rows during startup. The durable expiry is absolute,
     /// so pruning cannot extend or otherwise mutate a live session.
