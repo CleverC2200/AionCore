@@ -26,7 +26,7 @@ impl IdentityMode {
 }
 
 /// Application configuration parsed from CLI arguments.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
@@ -41,6 +41,24 @@ pub struct AppConfig {
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
     pub recover_corrupted_database: bool,
+}
+
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("data_dir", &self.data_dir)
+            .field("work_dir", &self.work_dir)
+            .field("app_version", &self.app_version)
+            .field("local", &self.local)
+            .field("identity_mode", &self.identity_mode)
+            .field("bootstrap_secret_configured", &self.bootstrap_secret.is_some())
+            .field("dump_prompts", &self.dump_prompts)
+            .field("recover_corrupted_database", &self.recover_corrupted_database)
+            .finish()
+    }
 }
 
 impl AppConfig {
@@ -112,6 +130,18 @@ mod tests {
         assert!(config.bootstrap_secret.is_none());
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
+    }
+
+    #[test]
+    fn app_config_debug_redacts_bootstrap_secret() {
+        let config = AppConfig {
+            bootstrap_secret: Some("trusted-secret".to_owned()),
+            ..AppConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("bootstrap_secret_configured: true"));
+        assert!(!debug.contains("trusted-secret"));
     }
 
     #[test]

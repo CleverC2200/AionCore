@@ -18,7 +18,10 @@ mod validation;
 
 // Error type
 pub use error::AuthError;
-pub use external_identity::{ExternalIdentityMappingError, ExternalIdentityMappingService};
+pub use external_identity::{
+    ExternalIdentityMappingError, ExternalIdentityMappingService, ExternalIdentitySessionError,
+    ExternalIdentitySessionService,
+};
 
 // JWT service
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};

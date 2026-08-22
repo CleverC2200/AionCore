@@ -185,6 +185,15 @@ fn get_with_token(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn get_with_session_cookie(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::COOKIE, format!("aionui-session={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// Helper: perform a GET request without auth.
 fn get_anonymous(uri: &str) -> Request<Body> {
     Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
@@ -1263,7 +1272,258 @@ async fn external_identity_mapping_rejects_provider_credentials_and_invalid_tupl
 }
 
 #[tokio::test]
-async fn csrf_exemption_is_limited_to_the_bootstrap_identity_mapping_route() {
+async fn external_identity_sessions_are_concurrent_and_isolated_by_core_user() {
+    let revoked_users = Arc::new(Mutex::new(Vec::new()));
+    let hook_users = revoked_users.clone();
+    let (app, _ctx) = test_app_with_options_and_hook(
+        false,
+        Some("bootstrap-secret"),
+        false,
+        Some(Arc::new(move |user_id: &str| {
+            hook_users.lock().unwrap().push(user_id.to_owned());
+        })),
+    )
+    .await;
+    let identity_a = external_identity_body("tenant-sessions", "subject-a");
+    let identity_b = external_identity_body("tenant-sessions", "subject-b");
+
+    for identity in [&identity_a, &identity_b] {
+        let response = app
+            .clone()
+            .oneshot(json_put_with_bootstrap_secret(
+                "/api/auth/internal/external-identities",
+                identity,
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let exchange_a = app.clone().oneshot(json_post_with_bootstrap_secret(
+        "/api/auth/internal/external-sessions",
+        &identity_a,
+        "bootstrap-secret",
+    ));
+    let exchange_b = app.clone().oneshot(json_post_with_bootstrap_secret(
+        "/api/auth/internal/external-sessions",
+        &identity_b,
+        "bootstrap-secret",
+    ));
+    let (session_a, session_b) = tokio::join!(exchange_a, exchange_b);
+    let session_a = session_a.unwrap();
+    let session_b = session_b.unwrap();
+    assert_eq!(session_a.status(), StatusCode::OK);
+    assert_eq!(session_b.status(), StatusCode::OK);
+    let cookie_a = session_a.headers()[header::SET_COOKIE].to_str().unwrap().to_owned();
+    let cookie_b = session_b.headers()[header::SET_COOKIE].to_str().unwrap().to_owned();
+    assert!(cookie_a.contains("HttpOnly"));
+    assert!(cookie_b.contains("HttpOnly"));
+    assert_ne!(cookie_a, cookie_b);
+    let token_a = extract_session_token(&session_a).unwrap();
+    let token_b = extract_session_token(&session_b).unwrap();
+    let session_a_json = body_json(session_a).await;
+    let session_b_json = body_json(session_b).await;
+    let user_a = session_a_json["data"]["user"]["id"].as_str().unwrap().to_owned();
+    let user_b = session_b_json["data"]["user"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(user_a, user_b);
+    for json in [&session_a_json, &session_b_json] {
+        assert!(json["data"].get("token").is_none());
+        assert!(json["data"].get("identity").is_none());
+        assert!(!json.to_string().contains("tenant-sessions"));
+        assert!(!json.to_string().contains("subject-"));
+    }
+
+    let current_a = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &token_a))
+        .await
+        .unwrap();
+    assert_eq!(current_a.status(), StatusCode::OK);
+    assert_eq!(body_json(current_a).await["user"]["id"], user_a);
+    let current_b = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(current_b.status(), StatusCode::OK);
+    assert_eq!(body_json(current_b).await["user"]["id"], user_b);
+
+    let revoke_a = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions/revoke",
+            &identity_a,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke_a.status(), StatusCode::OK);
+    let revoke_a_json = body_json(revoke_a).await;
+    assert_eq!(revoke_a_json["data"]["user_id"], user_a);
+    assert!(revoke_a_json["data"].get("identity").is_none());
+    assert!(!revoke_a_json.to_string().contains("tenant-sessions"));
+    assert!(!revoke_a_json.to_string().contains("subject-a"));
+    assert_eq!(revoked_users.lock().unwrap().as_slice(), &[user_a]);
+
+    let revoked_a = app
+        .clone()
+        .oneshot(get_with_session_cookie("/api/auth/user", &token_a))
+        .await
+        .unwrap();
+    assert_eq!(revoked_a.status(), StatusCode::UNAUTHORIZED);
+    let unaffected_b = app
+        .oneshot(get_with_session_cookie("/api/auth/user", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(unaffected_b.status(), StatusCode::OK);
+    assert_eq!(body_json(unaffected_b).await["user"]["id"], user_b);
+}
+
+#[tokio::test]
+async fn external_identity_session_exchange_fails_closed_for_missing_disabled_and_legacy_owner() {
+    let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    for path in [
+        "/api/auth/internal/external-sessions",
+        "/api/auth/internal/external-sessions/revoke",
+    ] {
+        let missing = app
+            .clone()
+            .oneshot(json_post_with_bootstrap_secret(
+                path,
+                &external_identity_body("tenant-session-missing", "subject-missing"),
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(missing).await["code"], "USER_CONTEXT_REQUIRED");
+    }
+
+    let disabled_identity = external_identity_body("tenant-session-disabled", "subject-disabled");
+    let provisioned = app
+        .clone()
+        .oneshot(json_put_with_bootstrap_secret(
+            "/api/auth/internal/external-identities",
+            &disabled_identity,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    let disabled_user_id = body_json(provisioned).await["data"]["core_user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ctx.user_repo
+        .set_status(&disabled_user_id, UserStatus::Disabled)
+        .await
+        .unwrap();
+    for path in [
+        "/api/auth/internal/external-sessions",
+        "/api/auth/internal/external-sessions/revoke",
+    ] {
+        let disabled = app
+            .clone()
+            .oneshot(json_post_with_bootstrap_secret(
+                path,
+                &disabled_identity,
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(disabled).await["code"], "CORE_USER_DISABLED");
+    }
+
+    let legacy_owner = ctx.user_repo.create_user("legacy-session-owner", "hash").await.unwrap();
+    sqlx::query(
+        "INSERT INTO external_identities \
+         (id, provider, issuer, tenant_id, subject, user_id, created_at) \
+         VALUES ('legacy-session-mapping', 'lark', 'https://open.feishu.cn', \
+                 'tenant-session-conflict', 'subject-conflict', ?, 1)",
+    )
+    .bind(&legacy_owner.id)
+    .execute(ctx._db.pool())
+    .await
+    .unwrap();
+    for path in [
+        "/api/auth/internal/external-sessions",
+        "/api/auth/internal/external-sessions/revoke",
+    ] {
+        let conflict = app
+            .clone()
+            .oneshot(json_post_with_bootstrap_secret(
+                path,
+                &external_identity_body("tenant-session-conflict", "subject-conflict"),
+                "bootstrap-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_json = body_json(conflict).await;
+        assert_eq!(conflict_json["code"], "EXTERNAL_IDENTITY_CONFLICT");
+        assert!(!conflict_json.to_string().contains(&legacy_owner.id));
+    }
+}
+
+#[tokio::test]
+async fn external_identity_session_endpoints_require_bootstrap_and_reject_credentials() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let identity = external_identity_body("tenant-session-auth", "subject-auth");
+    let unauthenticated = app
+        .clone()
+        .oneshot(json_post("/api/auth/internal/external-sessions", &identity))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(unauthenticated).await["code"], "BOOTSTRAP_SECRET_REQUIRED");
+
+    let credential = serde_json::json!({
+        "identity": {
+            "provider": "lark",
+            "issuer": "https://open.feishu.cn",
+            "tenant_id": "tenant-session-auth",
+            "subject": "subject-auth",
+            "access_token": "provider-secret",
+        },
+    })
+    .to_string();
+    for path in [
+        "/api/auth/internal/external-sessions",
+        "/api/auth/internal/external-sessions/revoke",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_post_with_bootstrap_secret(path, &credential, "bootstrap-secret"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!body_json(response).await.to_string().contains("provider-secret"));
+    }
+
+    let invalid = serde_json::json!({
+        "identity": {
+            "provider": "lark",
+            "issuer": "https://open.feishu.cn/ ",
+            "tenant_id": "tenant-session-auth",
+            "subject": "subject-auth",
+        },
+    })
+    .to_string();
+    let invalid_response = app
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &invalid,
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(invalid_response).await["code"], "EXTERNAL_IDENTITY_INVALID");
+}
+
+#[tokio::test]
+async fn csrf_exemption_is_limited_to_exact_bootstrap_auth_routes() {
     let (app, ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
     let app = app.layer(middleware::from_fn_with_state(
         ctx.cookie_config.clone(),
@@ -1280,6 +1540,28 @@ async fn csrf_exemption_is_limited_to_the_bootstrap_identity_mapping_route() {
         .await
         .unwrap();
     assert_eq!(bootstrap.status(), StatusCode::OK);
+
+    let session = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/auth/internal/external-sessions",
+            &external_identity_body("tenant-csrf", "subject-csrf"),
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+
+    let prefix_lookalike = app
+        .clone()
+        .oneshot(json_post_anonymous(
+            "/api/auth/internal/external-sessions-not-a-route",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prefix_lookalike.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(prefix_lookalike).await["code"], "CSRF_INVALID");
 
     let ordinary_state_change = app
         .oneshot(json_post_anonymous(
