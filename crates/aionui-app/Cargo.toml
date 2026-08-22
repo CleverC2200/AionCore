@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = ["telegram", "lark", "dingtalk", "weixin", "slack", "discord"]
+test-support = ["aionui-gea/test-support"]
 telegram = ["aionui-channel/telegram"]
 lark = ["aionui-channel/lark"]
 dingtalk = ["aionui-channel/dingtalk"]
