@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.71 (2026-08-22)
+
+
+### Features
+
+* **gea:** add a debug-only Swagger interface catalog ([#12](https://github.com/CleverC2200/AionCore/pull/12))
+* **session-message:** deliver messages across a user's conversations ([#16](https://github.com/CleverC2200/AionCore/pull/16))
+
+
+### Bug Fixes
+
+* **auth:** align the JWT and session cookie lifetime at 30 days ([#14](https://github.com/CleverC2200/AionCore/pull/14))
+
+
+### Maintenance
+
+* **acp:** sync the verified dimcode, grok, and nova registry pins ([#13](https://github.com/CleverC2200/AionCore/pull/13))
+* **cli-version:** verify Codex CLI 0.149.0 ([#15](https://github.com/CleverC2200/AionCore/pull/15))
+
+
+### Retained Personal Integrations
+
+* Keep the personal fork's approval, GEA runtime, Team work-kernel, and managed voice integrations.
+
 ## [0.1.70](https://github.com/iOfficeAI/AionCore/compare/v0.1.69...v0.1.70) (2026-08-19)
 
 
