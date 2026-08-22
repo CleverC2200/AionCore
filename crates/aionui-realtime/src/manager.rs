@@ -317,7 +317,9 @@ impl EventBroadcaster for WebSocketManager {
             );
             return;
         };
-        if let Some(data) = event.data.as_object_mut() {
+        if event.name == "notification.changed"
+            && let Some(data) = event.data.as_object_mut()
+        {
             data.remove("user_id");
         }
         self.broadcast_to_user(&user_id, event);
@@ -899,11 +901,37 @@ mod tests {
         let msg = rx.try_recv().unwrap();
         match msg {
             WsOutbound::Text(text) => {
-                assert!(text.contains("via-trait"));
+                let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(event["name"], "via-trait");
+                assert_eq!(event["data"]["user_id"], "user-a");
             }
             _ => panic!("expected Text"),
         }
         assert!(rx_other.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_broadcaster_impl_hides_notification_routing_user() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = new_client_tx();
+        mgr.add_client_for_user("user-a".into(), "tok".into(), tx);
+
+        let broadcaster: &dyn EventBroadcaster = &mgr;
+        broadcaster.broadcast(WebSocketMessage::new(
+            "notification.changed",
+            json!({"user_id": "user-a", "revision": "r2"}),
+        ));
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            WsOutbound::Text(text) => {
+                let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(event["name"], "notification.changed");
+                assert_eq!(event["data"]["revision"], "r2");
+                assert!(event["data"].get("user_id").is_none());
+            }
+            _ => panic!("expected Text"),
+        }
     }
 
     #[test]

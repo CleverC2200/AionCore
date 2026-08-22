@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::error::GeaError;
 
 const CHANGED_EVENT: &str = "notification.changed";
+type NotificationSyncStates = HashMap<String, (NotificationSyncState, Vec<String>)>;
 
 #[derive(Clone)]
 pub(super) struct NotificationProjection {
@@ -25,7 +26,7 @@ pub(super) struct NotificationProjection {
     action_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     sync_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     mutation_gates: Arc<Mutex<HashMap<String, Weak<RwLock<()>>>>>,
-    sync_states: Arc<Mutex<HashMap<String, (NotificationSyncState, Vec<String>)>>>,
+    sync_states: Arc<Mutex<NotificationSyncStates>>,
 }
 
 impl NotificationProjection {

@@ -84,7 +84,9 @@ async fn forward_event_bus_to_websocket(
             .map(str::to_owned)
         {
             let mut scoped_event = event;
-            if let Some(data) = scoped_event.data.as_object_mut() {
+            if scoped_event.name == "notification.changed"
+                && let Some(data) = scoped_event.data.as_object_mut()
+            {
                 data.remove("user_id");
             }
             ws_manager.broadcast_to_user(&user_id, scoped_event);
