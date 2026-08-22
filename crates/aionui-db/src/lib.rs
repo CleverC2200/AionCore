@@ -29,8 +29,8 @@ pub use models::{
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams, ExternalIdentity,
     ExternalIdentityProvider, ExternalUserProjection, FolderRow, GeaManagedSkillRow, GeaResourceCatalogRow,
     OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow, SkillRow,
-    StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt,
-    StoredNotification, StoredNotificationReceipt, StoredNotificationScope, StoredUnfinalizedInteractionRequestReceipt,
+    StoredGeaSessionBootstrap, StoredInteractionRequest, StoredInteractionRequestReceipt, StoredNotification,
+    StoredNotificationReceipt, StoredNotificationScope, StoredUnfinalizedInteractionRequestReceipt,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
     UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
@@ -83,10 +83,9 @@ pub use repository::{
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteExternalIdentityRepository, SqliteFeedbackDiagnosticsRepository, SqliteGeaResourceRepository,
     SqliteInteractionRequestRepository, SqliteMcpServerRepository, SqliteNotificationRepository,
-    SqliteOAuthTokenRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
-    SqliteSkillRepository, SqliteTeamRepository, SqliteTeamWorkRepository, SqliteUserOrderStore, SqliteUserRepository,
-    SqliteVoiceConfigurationRepository,
+    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository,
+    SqliteTeamWorkRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceConfigurationRepository,
 };
 
 // Re-export sqlx pool type for downstream crates
