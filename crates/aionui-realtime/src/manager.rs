@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{future::Future, pin::Pin};
 
 use aionui_api_types::WebSocketMessage;
 use dashmap::DashMap;
@@ -17,6 +18,7 @@ use crate::types::{
 /// Validates whether a JWT token is still valid.
 /// Returns `true` if the token is valid, `false` if expired or revoked.
 pub type TokenValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub type AsyncTokenValidator = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 /// Manages active WebSocket connections, heartbeat detection,
 /// and provides broadcast/unicast messaging.
@@ -40,9 +42,22 @@ impl WebSocketManager {
 
     /// Register a new authenticated client connection for an internal user ID.
     pub fn add_client_for_user(&self, user_id: String, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        self.add_client_for_session(user_id, None, None, token, tx)
+    }
+
+    pub fn add_client_for_session(
+        &self,
+        user_id: String,
+        session_id: Option<String>,
+        session_rotation: Option<i64>,
+        token: String,
+        tx: mpsc::Sender<WsOutbound>,
+    ) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
             user_id,
+            session_id,
+            session_rotation,
             token,
             last_ping: Instant::now(),
             tx,
@@ -50,6 +65,32 @@ impl WebSocketManager {
         self.connections.insert(id, info);
         debug!(%id, "client added");
         id
+    }
+
+    /// Replace the access verification snapshot for every live connection of
+    /// one durable sid without forcing a reconnect.
+    pub fn refresh_session(&self, sid: &str, access_token: &str, rotation: i64) -> usize {
+        let mut updated = 0;
+        for mut entry in self.connections.iter_mut() {
+            if entry.session_id.as_deref() == Some(sid) {
+                entry.token = access_token.to_owned();
+                entry.session_rotation = Some(rotation);
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            info!(sid = %sid, rotation, updated, "websocket session snapshot refreshed");
+        }
+        updated
+    }
+
+    pub fn disconnect_session(&self, sid: &str, reason: &str) -> usize {
+        self.disconnect_where(
+            |client| client.session_id.as_deref() == Some(sid),
+            reason,
+            Some(sid),
+            None,
+        )
     }
 
     /// Remove a client connection by ID.
@@ -85,12 +126,22 @@ impl WebSocketManager {
     /// saturated or already-closed outbound queues are still removed from the
     /// manager so no future events are delivered to revoked sessions.
     pub fn disconnect_user(&self, user_id: &str, reason: &str) -> usize {
+        self.disconnect_where(|client| client.user_id == user_id, reason, None, Some(user_id))
+    }
+
+    fn disconnect_where(
+        &self,
+        matches: impl Fn(&ClientInfo) -> bool,
+        reason: &str,
+        sid: Option<&str>,
+        user_id: Option<&str>,
+    ) -> usize {
         let mut to_remove = Vec::new();
 
         for entry in self.connections.iter() {
             let conn_id = *entry.key();
             let client = entry.value();
-            if client.user_id != user_id {
+            if !matches(client) {
                 continue;
             }
 
@@ -102,7 +153,8 @@ impl WebSocketManager {
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         %conn_id,
-                        user_id = %user_id,
+                        user_id = user_id.unwrap_or(""),
+                        sid = sid.unwrap_or(""),
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, user disconnect close dropped"
                     );
@@ -117,7 +169,12 @@ impl WebSocketManager {
 
         let removed = to_remove.len();
         if removed > 0 {
-            info!(user_id = %user_id, removed, "websocket user connections disconnected");
+            info!(
+                user_id = user_id.unwrap_or(""),
+                sid = sid.unwrap_or(""),
+                removed,
+                "websocket connections disconnected"
+            );
         }
         removed
     }
@@ -285,13 +342,13 @@ impl WebSocketManager {
     /// 3. Sends a `ping` message with current timestamp
     ///
     /// Returns a `JoinHandle` — abort it to stop the heartbeat loop.
-    pub fn start_heartbeat(&self, token_validator: TokenValidator) -> JoinHandle<()> {
+    pub fn start_heartbeat(&self, token_validator: AsyncTokenValidator) -> JoinHandle<()> {
         let connections = Arc::clone(&self.connections);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             loop {
                 interval.tick().await;
-                heartbeat_tick(&connections, &token_validator);
+                heartbeat_tick(&connections, &token_validator).await;
             }
         })
     }
@@ -327,42 +384,47 @@ impl EventBroadcaster for WebSocketManager {
 }
 
 /// Single heartbeat tick: check timeouts, token validity, send pings.
-fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validator: &TokenValidator) {
+async fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validator: &AsyncTokenValidator) {
     let now = Instant::now();
-    let mut to_remove = Vec::new();
+    let snapshots: Vec<_> = connections
+        .iter()
+        .map(|entry| (*entry.key(), entry.token.clone(), entry.value().last_ping))
+        .collect();
 
-    for entry in connections.iter() {
-        let conn_id = *entry.key();
-        let client = entry.value();
-
+    for (conn_id, token, last_ping) in snapshots {
         // 1. Heartbeat timeout
-        if now.duration_since(client.last_ping) > HEARTBEAT_TIMEOUT {
-            info!(%conn_id, "heartbeat timeout, closing connection");
-            let _ = client.tx.try_send(terminal_realtime_error(
-                conn_id,
-                RealtimeError::HeartbeatTimeout,
-                "heartbeat timeout",
-            ));
-            to_remove.push(conn_id);
+        if now.duration_since(last_ping) > HEARTBEAT_TIMEOUT {
+            if let Some((_, client)) = connections.remove_if(&conn_id, |_, client| {
+                client.token == token && client.last_ping == last_ping
+            }) {
+                info!(%conn_id, "heartbeat timeout, closing connection");
+                let _ = client.tx.try_send(terminal_realtime_error(
+                    conn_id,
+                    RealtimeError::HeartbeatTimeout,
+                    "heartbeat timeout",
+                ));
+            }
             continue;
         }
 
         // 2. Token expiry
-        if !token_validator(&client.token) {
+        if !(token_validator)(token.clone()).await {
+            // Compare and remove atomically. A refresh that replaces the token
+            // before this linearization point keeps the connection alive.
+            let Some((_, client)) = connections.remove_if(&conn_id, |_, client| client.token == token) else {
+                continue;
+            };
             info!(%conn_id, "token expired, closing connection");
             let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, "token expired");
 
             match client.tx.try_send(outbound) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                    to_remove.push(conn_id);
-                }
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         %conn_id,
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, terminal auth close dropped"
                     );
-                    to_remove.push(conn_id);
                 }
             }
             continue;
@@ -372,6 +434,9 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let timestamp = duration.as_secs() * 1000 + u64::from(duration.subsec_millis());
 
+        let Some(client) = connections.get(&conn_id) else {
+            continue;
+        };
         let ping = WebSocketMessage::new("ping", json!({"timestamp": timestamp}));
         if let Ok(text) = serde_json::to_string(&ping) {
             match client.tx.try_send(WsOutbound::Text(text)) {
@@ -380,15 +445,11 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
                     warn!(%conn_id, "outbound channel full, ping dropped");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    to_remove.push(conn_id);
+                    drop(client);
+                    let _ = connections.remove_if(&conn_id, |_, current| current.token == token);
                 }
             }
         }
-    }
-
-    for conn_id in to_remove {
-        connections.remove(&conn_id);
-        debug!(%conn_id, "connection removed by heartbeat");
     }
 }
 
@@ -407,12 +468,12 @@ mod tests {
     use super::*;
     use crate::types::PER_CONNECTION_BUFFER;
 
-    fn always_valid() -> TokenValidator {
-        Arc::new(|_| true)
+    fn always_valid() -> AsyncTokenValidator {
+        Arc::new(|_| Box::pin(async { true }))
     }
 
-    fn always_expired() -> TokenValidator {
-        Arc::new(|_| false)
+    fn always_expired() -> AsyncTokenValidator {
+        Arc::new(|_| Box::pin(async { false }))
     }
 
     fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
@@ -569,6 +630,78 @@ mod tests {
     }
 
     #[test]
+    fn refresh_and_revoke_are_scoped_to_one_durable_session() {
+        let mgr = WebSocketManager::new();
+        let (tx_a, mut rx_a) = new_client_tx();
+        let (tx_b, mut rx_b) = new_client_tx();
+        mgr.add_client_for_session("user-a".into(), Some("sid-a".into()), Some(0), "old-a".into(), tx_a);
+        mgr.add_client_for_session("user-a".into(), Some("sid-b".into()), Some(0), "old-b".into(), tx_b);
+
+        assert_eq!(mgr.refresh_session("sid-a", "new-a", 1), 1);
+        let refreshed = mgr
+            .connections
+            .iter()
+            .find(|entry| entry.session_id.as_deref() == Some("sid-a"))
+            .unwrap();
+        assert_eq!(refreshed.token, "new-a");
+        assert_eq!(refreshed.session_rotation, Some(1));
+        drop(refreshed);
+
+        assert_eq!(mgr.disconnect_session("sid-a", "session revoked"), 1);
+        assert_eq!(mgr.client_count_for_user("user-a"), 1);
+        assert!(matches!(rx_a.try_recv(), Ok(WsOutbound::TextThenClose(_, _, _))));
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_close_a_session_refreshed_during_validation() {
+        let connections = Arc::new(DashMap::new());
+        let (tx, mut rx) = new_client_tx();
+        connections.insert(
+            ConnectionId(1),
+            ClientInfo {
+                user_id: "user-a".into(),
+                session_id: Some("sid-a".into()),
+                session_rotation: Some(0),
+                token: "old-token".into(),
+                last_ping: Instant::now(),
+                tx,
+            },
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validator: AsyncTokenValidator = {
+            let started = started.clone();
+            let release = release.clone();
+            Arc::new(move |_| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    false
+                })
+            })
+        };
+
+        let tick = tokio::spawn({
+            let connections = connections.clone();
+            async move { heartbeat_tick(&connections, &validator).await }
+        });
+        started.notified().await;
+        {
+            let mut client = connections.get_mut(&ConnectionId(1)).unwrap();
+            client.token = "new-token".into();
+            client.session_rotation = Some(1);
+        }
+        release.notify_one();
+        tick.await.unwrap();
+
+        assert_eq!(connections.len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn disconnect_user_removes_matching_connections_when_queue_is_full() {
         let mgr = WebSocketManager::new();
         let (tx, mut rx) = mpsc::channel(1);
@@ -693,8 +826,8 @@ mod tests {
         assert_eq!(mgr.client_count(), 0);
     }
 
-    #[test]
-    fn heartbeat_tick_sends_ping_to_healthy_connection() {
+    #[tokio::test]
+    async fn heartbeat_tick_sends_ping_to_healthy_connection() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = new_client_tx();
 
@@ -702,13 +835,15 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "valid".into(),
                 last_ping: Instant::now(),
                 tx,
             },
         );
 
-        heartbeat_tick(&connections, &always_valid());
+        heartbeat_tick(&connections, &always_valid()).await;
 
         // Should still be connected
         assert_eq!(connections.len(), 1);
@@ -725,8 +860,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn heartbeat_tick_removes_timed_out_connection() {
+    #[tokio::test]
+    async fn heartbeat_tick_removes_timed_out_connection() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = new_client_tx();
 
@@ -737,13 +872,15 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "valid".into(),
                 last_ping: old_ping,
                 tx,
             },
         );
 
-        heartbeat_tick(&connections, &always_valid());
+        heartbeat_tick(&connections, &always_valid()).await;
 
         // Connection should be removed
         assert_eq!(connections.len(), 0);
@@ -760,8 +897,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn heartbeat_tick_removes_expired_token_connection() {
+    #[tokio::test]
+    async fn heartbeat_tick_removes_expired_token_connection() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = new_client_tx();
 
@@ -769,13 +906,15 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
             },
         );
 
-        heartbeat_tick(&connections, &always_expired());
+        heartbeat_tick(&connections, &always_expired()).await;
 
         // Connection should be removed
         assert_eq!(connections.len(), 0);
@@ -793,8 +932,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn heartbeat_tick_removes_expired_token_connection_when_terminal_queue_is_full() {
+    #[tokio::test]
+    async fn heartbeat_tick_removes_expired_token_connection_when_terminal_queue_is_full() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -803,21 +942,23 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
             },
         );
 
-        heartbeat_tick(&connections, &always_expired());
+        heartbeat_tick(&connections, &always_expired()).await;
 
         assert_eq!(connections.len(), 0);
         assert_eq!(rx.try_recv().unwrap(), WsOutbound::Text("queued".into()));
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn heartbeat_tick_timeout_takes_priority_over_token_check() {
+    #[tokio::test]
+    async fn heartbeat_tick_timeout_takes_priority_over_token_check() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = new_client_tx();
 
@@ -827,13 +968,15 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "expired".into(),
                 last_ping: old_ping,
                 tx,
             },
         );
 
-        heartbeat_tick(&connections, &always_expired());
+        heartbeat_tick(&connections, &always_expired()).await;
 
         assert_eq!(connections.len(), 0);
 
@@ -851,8 +994,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn heartbeat_tick_mixed_connections() {
+    #[tokio::test]
+    async fn heartbeat_tick_mixed_connections() {
         let connections = Arc::new(DashMap::new());
 
         // Healthy connection
@@ -861,6 +1004,8 @@ mod tests {
             ConnectionId(1),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "good".into(),
                 last_ping: Instant::now(),
                 tx: tx1,
@@ -873,14 +1018,16 @@ mod tests {
             ConnectionId(2),
             ClientInfo {
                 user_id: "user-a".into(),
+                session_id: None,
+                session_rotation: None,
                 token: "good".into(),
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,
             },
         );
 
-        let selective_validator: TokenValidator = Arc::new(|_| true);
-        heartbeat_tick(&connections, &selective_validator);
+        let selective_validator: AsyncTokenValidator = Arc::new(|_| Box::pin(async { true }));
+        heartbeat_tick(&connections, &selective_validator).await;
 
         // Only healthy connection remains
         assert_eq!(connections.len(), 1);

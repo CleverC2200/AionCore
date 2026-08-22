@@ -181,6 +181,7 @@ fn protected_auth_app_with_mode_and_verifier(
     let state = AuthState {
         jwt_service,
         user_repo,
+        session_lifecycle: None,
         identity_mode,
         runtime_token_verifier,
     };
@@ -201,6 +202,7 @@ fn identity_echo_app(
     let state = AuthState {
         jwt_service,
         user_repo,
+        session_lifecycle: None,
         identity_mode,
         runtime_token_verifier,
     };
@@ -334,6 +336,37 @@ async fn auth_middleware_session_generation_mismatch_returns_unauthorized_code()
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = json_body(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn auth_middleware_rejects_legacy_jwt_for_external_user() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, status, session_generation, created_at, updated_at) \
+         VALUES ('external-legacy', 'external', 'External', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let token = jwt_service
+        .sign_with_session_generation("external-legacy", "External", 0)
+        .unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = protected_auth_app(jwt_service, repo);
+
+    let response = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["code"], "EXTERNAL_SESSION_REQUIRED");
 }
 
 #[tokio::test]

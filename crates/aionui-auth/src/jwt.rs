@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::AuthError;
 
-/// JWT token lifetime: 30 days.
+/// Legacy JWT token lifetime: 30 days.
 ///
 /// Stop-gap value aligned with the session cookie's `Max-Age`
 /// (`COOKIE_MAX_AGE_DAYS`). The cookie shell used to outlive this JWT, so after
@@ -24,6 +24,12 @@ const JWT_ISSUER: &str = "aionui";
 
 /// JWT audience claim value.
 const JWT_AUDIENCE: &str = "aionui-webui";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    Access,
+}
 
 /// JWT payload (claims embedded in the token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +49,20 @@ pub struct TokenPayload {
     /// User session generation at token issuance time.
     #[serde(default)]
     pub session_generation: i64,
+    /// Renewable external-session claims. All three are absent on legacy
+    /// Local/AionPro JWTs and optional for backward-compatible decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_kind: Option<TokenKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rotation: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAccessToken {
+    pub token: String,
+    pub expires_at: u64,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -89,19 +109,54 @@ impl JwtService {
             iss: JWT_ISSUER.to_owned(),
             aud: JWT_AUDIENCE.to_owned(),
             session_generation,
+            token_kind: None,
+            sid: None,
+            session_rotation: None,
         };
 
+        self.encode_claims(&claims)
+    }
+
+    /// Sign a short-lived access JWT bound to one durable external session.
+    pub fn sign_external_access(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+        sid: &str,
+        session_rotation: i64,
+        lifetime: Duration,
+    ) -> Result<SignedAccessToken, AuthError> {
+        let now = now_secs()?;
+        let expires_at = now
+            .checked_add(lifetime.as_secs())
+            .ok_or_else(|| AuthError::TokenInvalid("Access token expiry overflow".to_owned()))?;
+        let claims = TokenPayload {
+            user_id: user_id.to_owned(),
+            username: username.to_owned(),
+            iat: now,
+            exp: expires_at,
+            iss: JWT_ISSUER.to_owned(),
+            aud: JWT_AUDIENCE.to_owned(),
+            session_generation,
+            token_kind: Some(TokenKind::Access),
+            sid: Some(sid.to_owned()),
+            session_rotation: Some(session_rotation),
+        };
+        Ok(SignedAccessToken {
+            token: self.encode_claims(&claims)?,
+            expires_at,
+        })
+    }
+
+    fn encode_claims(&self, claims: &TokenPayload) -> Result<String, AuthError> {
         let secret = self
             .secret
             .read()
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
 
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        )
-        .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
+        encode(&Header::default(), claims, &EncodingKey::from_secret(secret.as_bytes()))
+            .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
     }
 
     /// Verify a JWT and return its payload.
@@ -147,15 +202,21 @@ impl JwtService {
     /// Returns the new secret string for database persistence.
     pub fn rotate_secret(&self) -> Result<String, AuthError> {
         let new_secret = generate_random_secret_string();
+        self.activate_secret(new_secret.clone())?;
+        Ok(new_secret)
+    }
+
+    /// Activate a previously persisted JWT secret.
+    pub fn activate_secret(&self, new_secret: String) -> Result<(), AuthError> {
         let mut secret = self
             .secret
             .write()
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
-        *secret = new_secret.clone();
+        *secret = new_secret;
         // All old tokens are invalid with the new secret; clear the blacklist
         self.blacklist.clear();
         tracing::info!("JWT secret rotated; all existing tokens invalidated");
-        Ok(new_secret)
+        Ok(())
     }
 
     /// Remove expired entries from the blacklist.
@@ -305,6 +366,9 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            token_kind: None,
+            sid: None,
+            session_rotation: None,
         };
         let token = encode(
             &Header::default(),
@@ -387,6 +451,9 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            token_kind: None,
+            sid: None,
+            session_rotation: None,
         };
         let token = encode(
             &Header::default(),

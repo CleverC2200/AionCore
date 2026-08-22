@@ -10,8 +10,8 @@ use axum::response::Response;
 use aionui_common::ApiError;
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
-use crate::JwtService;
 use crate::extract::extract_token_from_headers;
+use crate::{JwtService, SessionLifecycle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthIdentityMode {
@@ -70,6 +70,7 @@ impl CurrentUser {
 pub struct AuthState {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub session_lifecycle: Option<Arc<SessionLifecycle>>,
     pub identity_mode: AuthIdentityMode,
     /// Optional second credential channel for agent-subprocess helper CLIs
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
@@ -109,6 +110,19 @@ pub async fn auth_middleware(
         tracing::debug!("Token verification failed: {e}");
         ApiError::Unauthorized("Invalid or expired token".into())
     })?;
+    let renewable_session =
+        if payload.token_kind.is_some() || payload.sid.is_some() || payload.session_rotation.is_some() {
+            let lifecycle = state
+                .session_lifecycle
+                .as_ref()
+                .ok_or_else(|| ApiError::Unauthorized("Invalid or expired token".into()))?;
+            lifecycle.verify_access(&payload).await.map_err(|error| {
+                tracing::debug!(error = %error, "renewable access session verification failed");
+                crate::routes::session_lifecycle_error_to_api_error(error)
+            })?
+        } else {
+            None
+        };
 
     let user = state
         .user_repo
@@ -125,6 +139,15 @@ pub async fn auth_middleware(
             StatusCode::UNAUTHORIZED,
             "USER_CONTEXT_REQUIRED",
             "User context required.",
+            None,
+        ));
+    }
+
+    if user.user_type == UserType::External && renewable_session.is_none() {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "EXTERNAL_SESSION_REQUIRED",
+            "Renewable external session required.",
             None,
         ));
     }

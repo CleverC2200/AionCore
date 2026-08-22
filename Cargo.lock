@@ -532,6 +532,7 @@ dependencies = [
  "bcrypt",
  "dashmap",
  "getrandom 0.2.17",
+ "hmac 0.12.1",
  "http-body-util",
  "jsonwebtoken 9.3.1",
  "serde",

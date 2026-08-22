@@ -140,6 +140,9 @@ impl RealtimeError {
 pub struct ClientInfo {
     /// Internal user ID this connection is authenticated as.
     pub user_id: String,
+    /// Durable external-session id; absent for legacy Local/AionPro JWTs.
+    pub session_id: Option<String>,
+    pub session_rotation: Option<i64>,
     /// The JWT token this connection authenticated with.
     pub token: String,
     /// Timestamp of last ping/pong activity.

@@ -14,6 +14,7 @@ mod rate_limit;
 mod routes;
 mod security;
 mod service;
+mod session_lifecycle;
 mod validation;
 
 // Error type
@@ -24,7 +25,14 @@ pub use external_identity::{
 };
 
 // JWT service
-pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
+pub use jwt::{
+    JwtService, SignedAccessToken, TokenKind, TokenPayload, generate_random_secret_string, resolve_jwt_secret,
+};
+pub use session_lifecycle::{
+    DEFAULT_ACCESS_TTL, DEFAULT_REFRESH_TTL, JWT_SECRET_AUTHORITY_USER_ID, JwtSecretSource, RefreshSessionExchange,
+    RenewableSessionExchange, SessionLifecycle, SessionLifecycleConfig, SessionLifecycleConfigError,
+    SessionLifecycleError, VerifiedAccessSession, derive_refresh_key,
+};
 
 // Password service
 pub use password::{
@@ -65,6 +73,6 @@ pub use middleware::{
 pub use qr_token::QrTokenStore;
 
 // Routes
-pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
+pub use routes::{AuthRouterState, MatchingSessionRevokedHook, SessionRefreshedHook, SessionRevokedHook, auth_routes};
 
 pub use service::{AuthProvisionService, ProvisionError, SystemDefaultFilesystemAdopter};

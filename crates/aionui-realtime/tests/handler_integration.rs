@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::{
-    ConnectionId, MessageRouter, NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler,
+    ConnectionId, MessageRouter, NoopMessageRouter, ResolvedWebSocketAuth, WebSocketManager, WsHandlerState,
+    ws_upgrade_handler,
 };
 use axum::Router;
 use axum::routing::get;
@@ -37,8 +38,15 @@ fn default_state() -> (WsHandlerState, Arc<WebSocketManager>) {
         manager: manager.clone(),
         router: Arc::new(NoopMessageRouter),
         token_validator: Arc::new(|t| t == "valid-token"),
+        heartbeat_validator: Arc::new(|token| Box::pin(async move { token == "valid-token" })),
         token_user_resolver: Arc::new(|t| {
-            Box::pin(async move { (t == "valid-token").then(|| "test-user".to_owned()) })
+            Box::pin(async move {
+                (t == "valid-token").then(|| ResolvedWebSocketAuth {
+                    user_id: "test-user".to_owned(),
+                    session_id: None,
+                    session_rotation: None,
+                })
+            })
         }),
         token_extractor: Arc::new(|headers| {
             headers
@@ -399,8 +407,15 @@ async fn unknown_message_routed_to_message_router() {
         manager: manager.clone(),
         router: router.clone(),
         token_validator: Arc::new(|t| t == "valid-token"),
+        heartbeat_validator: Arc::new(|token| Box::pin(async move { token == "valid-token" })),
         token_user_resolver: Arc::new(|t| {
-            Box::pin(async move { (t == "valid-token").then(|| "test-user".to_owned()) })
+            Box::pin(async move {
+                (t == "valid-token").then(|| ResolvedWebSocketAuth {
+                    user_id: "test-user".to_owned(),
+                    session_id: None,
+                    session_rotation: None,
+                })
+            })
         }),
         token_extractor: Arc::new(|headers| {
             headers

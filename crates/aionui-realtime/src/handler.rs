@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::manager::{TokenValidator, WebSocketManager};
+use crate::manager::{AsyncTokenValidator, TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
 use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
 
@@ -22,7 +22,15 @@ use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocket
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
 /// Resolves a verified JWT token to the active internal user ID it represents.
-pub type TokenUserResolver = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWebSocketAuth {
+    pub user_id: String,
+    pub session_id: Option<String>,
+    pub session_rotation: Option<i64>,
+}
+
+pub type TokenUserResolver =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<ResolvedWebSocketAuth>> + Send>> + Send + Sync>;
 
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
@@ -30,6 +38,7 @@ pub struct WsHandlerState {
     pub manager: Arc<WebSocketManager>,
     pub router: Arc<dyn MessageRouter>,
     pub token_validator: TokenValidator,
+    pub heartbeat_validator: AsyncTokenValidator,
     pub token_user_resolver: TokenUserResolver,
     pub token_extractor: TokenExtractor,
 }
@@ -80,27 +89,30 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         return;
     }
 
-    let Some(user_id) = (state.token_user_resolver)(token.clone()).await else {
+    let Some(auth) = (state.token_user_resolver)(token.clone()).await else {
         send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     };
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
+    let conn_id =
+        state
+            .manager
+            .add_client_for_session(auth.user_id.clone(), auth.session_id, auth.session_rotation, token, tx);
 
-    info!(%conn_id, user_id = %user_id, "websocket connection established");
+    info!(%conn_id, user_id = %auth.user_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
     let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, &user_id, ws_receiver, &state).await;
+    recv_loop(conn_id, &auth.user_id, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
     state.manager.remove_client(conn_id);
     // Let stateful routers release per-connection state (e.g. fs subscriptions).
     state.router.on_disconnect(conn_id);
-    info!(%conn_id, user_id = %user_id, "websocket connection closed");
+    info!(%conn_id, user_id = %auth.user_id, "websocket connection closed");
 }
 
 /// Send a realtime boundary error event, then close with 1008.
@@ -273,7 +285,16 @@ mod tests {
             manager,
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
+            heartbeat_validator: Arc::new(|_| Box::pin(async { true })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async {
+                    Some(ResolvedWebSocketAuth {
+                        user_id: "system_default_user".into(),
+                        session_id: None,
+                        session_rotation: None,
+                    })
+                })
+            }),
             token_extractor: Arc::new(|_| None),
         }
     }
@@ -519,7 +540,16 @@ mod tests {
             manager,
             router: router.clone(),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
+            heartbeat_validator: Arc::new(|_| Box::pin(async { true })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async {
+                    Some(ResolvedWebSocketAuth {
+                        user_id: "system_default_user".into(),
+                        session_id: None,
+                        session_rotation: None,
+                    })
+                })
+            }),
             token_extractor: Arc::new(|_| None),
         };
 

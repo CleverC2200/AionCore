@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    EnsureExternalIdentityMappingRequest, EnsureExternalIdentityMappingResponse, EnsureExternalSessionResponse,
-    ExternalIdentityProvider as ApiExternalIdentityProvider, ExternalIdentityTuple, PublicUser,
-    RevokeExternalSessionResponse,
+    EnsureExternalIdentityMappingRequest, EnsureExternalIdentityMappingResponse,
+    ExternalIdentityProvider as ApiExternalIdentityProvider, ExternalIdentityTuple, RevokeExternalSessionResponse,
 };
 use aionui_db::{
     DbError, ExternalIdentityProvider, IExternalIdentityRepository, IUserRepository, ProvisionExternalIdentityError,
     ProvisionExternalIdentityParams, UserStatus, UserType,
 };
 
-use crate::{AuthError, JwtService, service::ExternalSessionExchange};
+use crate::{RenewableSessionExchange, SessionLifecycle, SessionLifecycleError};
 
 const MAX_ISSUER_LENGTH: usize = 512;
 const MAX_TENANT_ID_LENGTH: usize = 255;
@@ -45,15 +44,15 @@ pub enum ExternalIdentitySessionError {
     Conflict,
     #[error("external identity session persistence failed")]
     Database(#[from] DbError),
-    #[error("Core session signing failed")]
-    Token(#[source] AuthError),
+    #[error("external session lifecycle failed")]
+    Lifecycle(#[from] SessionLifecycleError),
 }
 
 #[derive(Clone)]
 pub struct ExternalIdentitySessionService {
     identity_repo: Arc<dyn IExternalIdentityRepository>,
     user_repo: Arc<dyn IUserRepository>,
-    jwt_service: Arc<JwtService>,
+    session_lifecycle: Arc<SessionLifecycle>,
 }
 
 impl ExternalIdentityMappingService {
@@ -93,34 +92,22 @@ impl ExternalIdentitySessionService {
     pub fn new(
         identity_repo: Arc<dyn IExternalIdentityRepository>,
         user_repo: Arc<dyn IUserRepository>,
-        jwt_service: Arc<JwtService>,
+        session_lifecycle: Arc<SessionLifecycle>,
     ) -> Self {
         Self {
             identity_repo,
             user_repo,
-            jwt_service,
+            session_lifecycle,
         }
     }
 
     pub async fn create_session(
         &self,
         identity: ExternalIdentityTuple,
-    ) -> Result<ExternalSessionExchange, ExternalIdentitySessionError> {
+    ) -> Result<RenewableSessionExchange, ExternalIdentitySessionError> {
         let user = self.resolve_user(&identity).await?;
-        let username = user.username.clone().unwrap_or_else(|| "external_user".to_owned());
-        let token = self
-            .jwt_service
-            .sign_with_session_generation(&user.id, &username, user.session_generation)
-            .map_err(ExternalIdentitySessionError::Token)?;
         self.user_repo.update_last_login(&user.id).await?;
-
-        Ok(ExternalSessionExchange {
-            response: EnsureExternalSessionResponse {
-                user: PublicUser { id: user.id, username },
-                session_generation: user.session_generation,
-            },
-            token,
-        })
+        self.session_lifecycle.issue(user).await.map_err(Into::into)
     }
 
     pub async fn revoke_sessions(
@@ -128,7 +115,7 @@ impl ExternalIdentitySessionService {
         identity: ExternalIdentityTuple,
     ) -> Result<RevokeExternalSessionResponse, ExternalIdentitySessionError> {
         let user = self.resolve_user(&identity).await?;
-        let session_generation = self.user_repo.increment_session_generation(&user.id).await?;
+        let session_generation = self.session_lifecycle.revoke_user(&user.id).await?;
         Ok(RevokeExternalSessionResponse {
             user_id: user.id,
             session_generation,

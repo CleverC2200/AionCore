@@ -5,6 +5,7 @@ mod channel;
 mod client_preference;
 mod conversation;
 mod conversation_artifact;
+mod core_auth_session;
 mod cron_job;
 mod external_identity;
 mod gea_resource;
@@ -36,6 +37,7 @@ pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pairi
 pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
+pub use core_auth_session::CoreAuthSession;
 pub use cron_job::CronJobRow;
 pub use external_identity::{ExternalIdentity, ExternalIdentityProvider};
 pub use gea_resource::{GeaManagedSkillRow, GeaResourceCatalogRow};

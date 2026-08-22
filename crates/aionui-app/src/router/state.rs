@@ -1206,7 +1206,16 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
             manager: services.ws_manager.clone(),
             router,
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
+            heartbeat_validator: Arc::new(|_| Box::pin(async { true })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async {
+                    Some(aionui_realtime::ResolvedWebSocketAuth {
+                        user_id: "system_default_user".to_owned(),
+                        session_id: None,
+                        session_rotation: None,
+                    })
+                })
+            }),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }
@@ -1215,18 +1224,34 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
+    let session_lifecycle = services.session_lifecycle.clone();
     let identity_mode = services.identity_mode;
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
+        let session_lifecycle = session_lifecycle.clone();
         Box::pin(async move {
             let payload = jwt_service.verify(&token).ok()?;
+            let renewable = session_lifecycle.verify_access(&payload).await.ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
                 return None;
             }
-            (payload.session_generation == user.session_generation).then_some(user.id)
+            if user.user_type == aionui_db::UserType::External && renewable.is_none() {
+                return None;
+            }
+            (payload.session_generation == user.session_generation).then_some(aionui_realtime::ResolvedWebSocketAuth {
+                user_id: user.id,
+                session_id: renewable.as_ref().map(|session| session.sid.clone()),
+                session_rotation: renewable.as_ref().map(|session| session.rotation),
+            })
         })
+    });
+    let heartbeat_resolver = token_user_resolver.clone();
+    let heartbeat_validator = Arc::new(move |token: String| {
+        let heartbeat_resolver = heartbeat_resolver.clone();
+        Box::pin(async move { heartbeat_resolver(token).await.is_some() })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
     });
 
     let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
@@ -1235,6 +1260,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         manager: services.ws_manager.clone(),
         router,
         token_validator,
+        heartbeat_validator,
         token_user_resolver,
         token_extractor,
     }
@@ -1415,7 +1441,10 @@ mod tests {
             .unwrap();
 
         let resolved = (ws_state.token_user_resolver)(token.clone()).await;
-        assert_eq!(resolved.as_deref(), Some("system_default_user"));
+        assert_eq!(
+            resolved.map(|auth| auth.user_id),
+            Some("system_default_user".to_owned())
+        );
 
         services
             .user_repo
@@ -1425,6 +1454,28 @@ mod tests {
 
         let resolved = (ws_state.token_user_resolver)(token).await;
         assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_rejects_legacy_jwt_for_external_user_before_upgrade() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, status, session_generation, created_at, updated_at) \
+             VALUES ('external-legacy-ws', 'external', 'External', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let token = services
+            .jwt_service
+            .sign_with_session_generation("external-legacy-ws", "External", 0)
+            .unwrap();
+
+        assert_eq!((ws_state.token_user_resolver)(token).await, None);
 
         services.database.close().await;
     }

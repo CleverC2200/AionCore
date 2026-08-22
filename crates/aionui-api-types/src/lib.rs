@@ -84,11 +84,13 @@ pub use assistant::{
 pub use auth::{
     AionProExternalSessionSubject, AuthStatusResponse, ChangePasswordRequest, EnsureExternalIdentityMappingRequest,
     EnsureExternalIdentityMappingResponse, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
-    EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalIdentityMappingErrorCode, ExternalIdentityProvider,
-    ExternalIdentitySessionSubject, ExternalIdentityTuple, ExternalUserType, InternalAuthErrorCode, LoginRequest,
-    LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
-    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    EnsureExternalUserRequest, EnsureExternalUserResponse, EnsureRenewableExternalSessionResponse,
+    ExternalIdentityMappingErrorCode, ExternalIdentityProvider, ExternalIdentitySessionSubject, ExternalIdentityTuple,
+    ExternalUserType, InternalAuthErrorCode, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
+    RefreshExternalSessionResponse, RefreshResponse, RefreshTokenRequest, RenewableExternalSessionMetadata,
+    RevokeExternalSessionRequest, RevokeExternalSessionResponse, RevokeMatchingExternalSessionResponse,
+    UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse,
+    WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,

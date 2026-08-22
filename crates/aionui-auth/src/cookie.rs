@@ -1,4 +1,4 @@
-use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME};
+use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME};
 
 /// Cookie security configuration derived from the deployment environment.
 #[derive(Debug, Clone)]
@@ -40,6 +40,31 @@ impl CookieConfig {
     pub fn clear_session_cookie(&self) -> String {
         format!(
             "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite={}{}; Max-Age=0",
+            self.same_site,
+            if self.secure { "; Secure" } else { "" },
+        )
+    }
+
+    pub fn build_external_access_cookie(&self, token: &str, max_age_secs: u64) -> String {
+        self.build_http_only_cookie(COOKIE_NAME, token, "/", max_age_secs)
+    }
+
+    pub fn build_external_refresh_cookie(&self, credential: &str, max_age_secs: u64) -> String {
+        self.build_http_only_cookie(
+            REFRESH_COOKIE_NAME,
+            credential,
+            "/api/auth/internal/external-sessions",
+            max_age_secs,
+        )
+    }
+
+    pub fn clear_external_refresh_cookie(&self) -> String {
+        self.build_http_only_cookie(REFRESH_COOKIE_NAME, "", "/api/auth/internal/external-sessions", 0)
+    }
+
+    fn build_http_only_cookie(&self, name: &str, value: &str, path: &str, max_age_secs: u64) -> String {
+        format!(
+            "{name}={value}; Path={path}; HttpOnly; SameSite={}{}; Max-Age={max_age_secs}",
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -124,5 +149,29 @@ mod tests {
         let cookie = http_config().build_session_cookie("t");
         let expected = 30 * 24 * 60 * 60;
         assert!(cookie.contains(&format!("Max-Age={expected}")));
+    }
+
+    #[test]
+    fn renewable_external_cookies_have_distinct_scopes_and_lifetimes() {
+        let config = http_config();
+        let access = config.build_external_access_cookie("access", 900);
+        let refresh = config.build_external_refresh_cookie("sid.secret", 2_592_000);
+
+        assert_eq!(
+            access,
+            "aionui-session=access; Path=/; HttpOnly; SameSite=Lax; Max-Age=900"
+        );
+        assert_eq!(
+            refresh,
+            "aionui-refresh-session=sid.secret; Path=/api/auth/internal/external-sessions; HttpOnly; SameSite=Lax; Max-Age=2592000"
+        );
+    }
+
+    #[test]
+    fn matching_revoke_clears_refresh_cookie_on_its_original_path() {
+        assert_eq!(
+            http_config().clear_external_refresh_cookie(),
+            "aionui-refresh-session=; Path=/api/auth/internal/external-sessions; HttpOnly; SameSite=Lax; Max-Age=0"
+        );
     }
 }
