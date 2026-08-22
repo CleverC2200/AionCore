@@ -30,6 +30,7 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
 const LEGACY_PERSONAL_MIGRATION_REMAPS: &[(i64, &str, i64)] = &[
+    (41, "cross session message setting", 48),
     (40, "sidebar ordering and archive", 47),
     (38, "voice configuration", 40),
     (39, "team work kernel", 41),
@@ -971,6 +972,70 @@ mod tests {
             assert_eq!(checksum.as_slice(), current_migration.checksum.as_ref());
             assert_eq!(execution_time, 7);
         }
+    }
+
+    #[tokio::test]
+    async fn official_cross_session_migration_is_remapped_by_exact_checksum() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let current_migration = DB_MIGRATOR.iter().find(|migration| migration.version == 48).unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (41, 'cross session message setting', TRUE, ?, 7)",
+        )
+        .bind(current_migration.checksum.as_ref())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+
+        let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![48]);
+    }
+
+    #[tokio::test]
+    async fn official_cross_session_migration_with_unknown_checksum_is_not_remapped() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL,\
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL\
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (41, 'cross session message setting', TRUE, x'00', 0)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        remap_legacy_personal_migration_versions(&mut conn).await.unwrap();
+
+        let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![41]);
     }
 
     #[tokio::test]

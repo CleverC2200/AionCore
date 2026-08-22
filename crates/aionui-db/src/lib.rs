@@ -38,8 +38,8 @@ pub use models::{
 pub use repository::approval_receipt::{CreateApprovalActionIntentParams, StoredApprovalActionReceipt};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,

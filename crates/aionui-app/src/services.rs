@@ -18,11 +18,17 @@ use aionui_db::{
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteApprovalReceiptRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
     SqliteConversationRepository, SqliteGeaResourceRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
+    SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_session_message::QueueClearingCancelHook;
+use aionui_session_message::queue::{DeliveryQueue, SystemClock};
+use aionui_session_message::rate_limit::RateLimiter;
+use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
 use aionui_sidebar::UserOrderDeleteHook;
+use tokio::sync::Notify;
 
 pub struct AppServices {
     pub database: Database,
@@ -38,6 +44,15 @@ pub struct AppServices {
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
     pub approval_service: ApprovalService,
+    /// Cross-session messaging. The queue, the rate limiter and the notify
+    /// handle are shared by the send path, the drainer, and the cancel hook, so
+    /// they are built once here (`AppServices` is the sole construction centre).
+    pub session_message_service: Arc<SessionMessageService>,
+    /// Same queue the service and the cancel hook share. Exposed so the router
+    /// layer can build the drainer without reaching into the service.
+    pub session_message_queue: Arc<DeliveryQueue>,
+    /// Woken on enqueue so the idle drainer stops sleeping.
+    pub session_message_notify: Arc<Notify>,
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
@@ -87,7 +102,7 @@ impl AppServices {
     /// Primarily used by tests to inject mock implementations.
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
-        self.conversation_service = build_conversation_service(ConversationServiceDeps {
+        let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &self.database,
             work_dir: self.work_dir.clone(),
             event_bus: self.event_bus.clone(),
@@ -104,6 +119,17 @@ impl AppServices {
             project_service: self.project_service.clone(),
             user_order_store: self.user_order_store.clone(),
         });
+        let session_message_service = wire_session_message_service(SessionMessageWiringDeps {
+            database: &self.database,
+            conversation_service: &conversation_service,
+            conversation_repo: self.conversation_repo.clone(),
+            task_manager: self.worker_task_manager.clone(),
+            event_bus: self.event_bus.clone(),
+            queue: self.session_message_queue.clone(),
+            notify: self.session_message_notify.clone(),
+        });
+        self.conversation_service = conversation_service;
+        self.session_message_service = session_message_service;
         self
     }
 
@@ -319,6 +345,18 @@ impl AppServices {
             identity_mode.is_local(),
         );
 
+        let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
+        let session_message_notify = Arc::new(Notify::new());
+        let session_message_service = wire_session_message_service(SessionMessageWiringDeps {
+            database: &database,
+            conversation_service: &conversation_service,
+            conversation_repo: conversation_repo.clone(),
+            task_manager: worker_task_manager.clone(),
+            event_bus: event_bus.clone(),
+            queue: session_message_queue.clone(),
+            notify: session_message_notify.clone(),
+        });
+
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -334,6 +372,9 @@ impl AppServices {
             conversation_runtime_state,
             conversation_service,
             approval_service,
+            session_message_service,
+            session_message_queue,
+            session_message_notify,
             project_service,
             user_order_store,
             task_manager_delete_hook: Some(task_manager_delete_hook),
@@ -356,6 +397,40 @@ impl AppServices {
             runtime_base_url,
         })
     }
+}
+
+struct SessionMessageWiringDeps<'a> {
+    database: &'a Database,
+    conversation_service: &'a ConversationService,
+    conversation_repo: Arc<dyn IConversationRepository>,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    event_bus: Arc<BroadcastEventBus>,
+    queue: Arc<DeliveryQueue>,
+    notify: Arc<Notify>,
+}
+
+/// Build the cross-session service and its cancel hook as one wiring unit.
+///
+/// Both initial construction and test-time task-manager replacement must go
+/// through this function so the delivery service cannot retain an old
+/// `ConversationService`/worker while the public `AppServices` fields point at
+/// replacements. The queue and notify handles deliberately survive a rewire.
+fn wire_session_message_service(deps: SessionMessageWiringDeps<'_>) -> Arc<SessionMessageService> {
+    let service = Arc::new(SessionMessageService::new(SessionMessageDeps {
+        conversation_service: deps.conversation_service.clone(),
+        conversation_repo: deps.conversation_repo,
+        settings_repo: Arc::new(SqliteSettingsRepository::new(deps.database.pool().clone())),
+        task_manager: deps.task_manager,
+        broadcaster: deps.event_bus,
+        queue: deps.queue.clone(),
+        rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
+        notify: deps.notify,
+    }));
+    // Cancel ⇒ clear deliveries queued for that conversation. The hook is
+    // registered on the exact ConversationService held by the service above.
+    deps.conversation_service
+        .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(deps.queue)));
+    service
 }
 
 struct ConversationServiceDeps<'a> {
@@ -417,7 +492,131 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
+    use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent};
+    use aionui_api_types::{CreateConversationRequest, SessionSendMessageRequest};
+    use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
+    use aionui_session_message::queue::PendingDelivery;
+
     use super::*;
+
+    struct OverrideAgent {
+        conversation_id: String,
+        delivered_midturn: Mutex<Vec<SendMessageData>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentTask for OverrideAgent {
+        fn agent_type(&self) -> AgentType {
+            AgentType::Acp
+        }
+
+        fn conversation_id(&self) -> &str {
+            &self.conversation_id
+        }
+
+        fn workspace(&self) -> &str {
+            "/tmp/aionui-app-services-test"
+        }
+
+        fn status(&self) -> Option<ConversationStatus> {
+            None
+        }
+
+        fn last_activity_at(&self) -> TimestampMs {
+            aionui_common::now_ms()
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentStreamEvent> {
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            tx.subscribe()
+        }
+
+        fn supports_midturn_delivery(&self) -> bool {
+            true
+        }
+
+        async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+            self.delivered_midturn.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn cancel(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMockAgent for OverrideAgent {
+        async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+            self.delivered_midturn.lock().unwrap().push(data);
+            Ok(())
+        }
+    }
+
+    struct OverrideTaskManager {
+        target_id: String,
+        agent: Arc<OverrideAgent>,
+    }
+
+    #[async_trait::async_trait]
+    impl IWorkerTaskManager for OverrideTaskManager {
+        fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
+            (conversation_id == self.target_id).then(|| AgentInstance::Mock(self.agent.clone()))
+        }
+
+        async fn get_or_build_task(
+            &self,
+            conversation_id: &str,
+            _options: BuildTaskOptions,
+        ) -> Result<AgentInstance, AgentError> {
+            self.get_task(conversation_id)
+                .ok_or_else(|| AgentError::not_found("test agent not found"))
+        }
+
+        fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn kill_and_wait(
+            &self,
+            _conversation_id: &str,
+            _reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        async fn clear(&self) {}
+
+        fn active_count(&self) -> usize {
+            1
+        }
+
+        fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    fn create_conversation_request(name: &str, workspace: &std::path::Path) -> CreateConversationRequest {
+        CreateConversationRequest {
+            r#type: Some(AgentType::Acp),
+            name: Some(name.to_owned()),
+            model: None,
+            assistant: None,
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({
+                "workspace": workspace,
+                "custom_workspace": true
+            }),
+        }
+    }
 
     #[tokio::test]
     async fn test_app_services_from_memory_db() {
@@ -460,6 +659,93 @@ mod tests {
         let services = AppServices::from_config(db, &config).await.unwrap();
 
         assert_eq!(services.app_version, "9.9.9");
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn worker_task_manager_override_rewires_session_delivery_and_cancel_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            data_dir: tmp.path().join("data"),
+            work_dir: tmp.path().join("work"),
+            ..Default::default()
+        };
+        let initial = AppServices::from_config(db, &config).await.unwrap();
+        let sender_workspace = tmp.path().join("sender");
+        let target_workspace = tmp.path().join("target");
+        std::fs::create_dir_all(&sender_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+        let sender = initial
+            .conversation_service
+            .create(
+                "system_default_user",
+                create_conversation_request("sender", &sender_workspace),
+            )
+            .await
+            .unwrap();
+        let target = initial
+            .conversation_service
+            .create(
+                "system_default_user",
+                create_conversation_request("target", &target_workspace),
+            )
+            .await
+            .unwrap();
+        let agent = Arc::new(OverrideAgent {
+            conversation_id: target.id.clone(),
+            delivered_midturn: Mutex::new(Vec::new()),
+        });
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(OverrideTaskManager {
+            target_id: target.id.clone(),
+            agent: agent.clone(),
+        });
+        let services = initial.with_worker_task_manager(task_manager.clone());
+        let _claim = services
+            .conversation_service
+            .runtime_state()
+            .try_claim_turn(&target.id, "turn-active")
+            .unwrap();
+
+        services
+            .session_message_service
+            .send(
+                "system_default_user",
+                &sender.id,
+                &SessionSendMessageRequest {
+                    to: target.id.clone(),
+                    message: "hello".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.delivered_midturn.lock().unwrap().len(),
+            1,
+            "session delivery must use the replacement task manager"
+        );
+
+        services
+            .session_message_queue
+            .push(PendingDelivery {
+                to: target.id.clone(),
+                user_id: "system_default_user".to_owned(),
+                from_conversation_id: sender.id,
+                message: "queued".to_owned(),
+                expires_at_ms: aionui_common::now_ms() + 60_000,
+            })
+            .unwrap();
+        services
+            .conversation_service
+            .cancel("system_default_user", &target.id, "turn-active", &task_manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            services.session_message_queue.len_for(&target.id),
+            0,
+            "the rebuilt conversation service must clear the existing shared queue on cancel"
+        );
 
         services.database.close().await;
     }
