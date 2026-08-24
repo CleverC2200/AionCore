@@ -310,6 +310,24 @@ mod tests {
     }
 
     #[test]
+    fn token_from_a_previous_process_is_unknown_to_a_fresh_service() {
+        let previous_process = RuntimeTokenService::new();
+        let issue = previous_process.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::ConversationHelper]);
+        let restarted_process = RuntimeTokenService::new();
+
+        assert_eq!(
+            restarted_process.validate(
+                Some(&issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::ConversationHelper,
+                "gen-1"
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
+    }
+
+    #[test]
     fn repeated_issue_for_same_runtime_generation_reuses_existing_token() {
         let service = RuntimeTokenService::new();
         let first = service.issue(

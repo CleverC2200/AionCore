@@ -3670,6 +3670,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_credentials_and_sessions_do_not_cross_process_boundaries() {
+        let previous_process =
+            GeaService::new(reqwest::Client::new(), "https://gea.example").expect("construct previous process service");
+        previous_process
+            .set_auth_session(
+                "user-1",
+                SetGeaAuthSessionRequest {
+                    access_token: "process-local-access-token".to_owned(),
+                    tenant_id: Some("tenant-1".to_owned()),
+                },
+            )
+            .await
+            .expect("set process-local auth session");
+        assert!(previous_process.auth_status("user-1").await.authenticated);
+
+        let restarted_process = GeaService::new(reqwest::Client::new(), "https://gea.example")
+            .expect("construct restarted process service");
+
+        assert!(!restarted_process.auth_status("user-1").await.authenticated);
+        let session_error = match restarted_process.session("user-1", "conversation-1").await {
+            Ok(_) => panic!("fresh process must not inherit a GEA conversation session"),
+            Err(error) => error,
+        };
+        assert_eq!(session_error.body.code, "GEA_SESSION_REQUIRED");
+    }
+
+    #[tokio::test]
     async fn denied_access_decision_returns_forbidden_without_session_context() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
