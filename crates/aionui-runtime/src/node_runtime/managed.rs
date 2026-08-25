@@ -114,8 +114,6 @@ pub async fn install_and_validate_with_reporter(
     let runtime_root = cache::node_runtime_root()
         .ok_or_else(|| NodeRuntimeError::managed_invalid("managed node runtime root unavailable"))?;
     fs::create_dir_all(&runtime_root).map_err(NodeRuntimeError::io_system)?;
-    let _lock =
-        InstallLockGuard::acquire(&install_lock_path(&runtime_root), reporter).map_err(NodeRuntimeError::io_system)?;
 
     let version_dir = runtime_root.join(spec.directory_name());
     match validate_managed_runtime(&version_dir, None).await {
@@ -147,6 +145,14 @@ pub async fn install_and_validate_with_reporter(
             source = source_label(runtime.source),
             "managed node runtime activated from local resources"
         );
+        return Ok(runtime);
+    }
+
+    // Only remote download/extraction needs a cross-process lock. Current
+    // runtimes and content-addressed bundled resources converge without it.
+    let _lock =
+        InstallLockGuard::acquire(&install_lock_path(&runtime_root), reporter).map_err(NodeRuntimeError::io_system)?;
+    if let Ok(runtime) = validate_managed_runtime(&version_dir, None).await {
         return Ok(runtime);
     }
 
@@ -301,7 +307,8 @@ fn runtime_from_root_for_layout(
         )));
     }
 
-    prepare_runtime_files(root)?;
+    let state_root = managed_runtime_state_root(root);
+    prepare_runtime_files(&state_root)?;
 
     let node_path = managed_node_path_for_layout(root, layout);
     if !node_path.is_file() {
@@ -336,7 +343,7 @@ fn runtime_from_root_for_layout(
         npm_args_prefix,
         npx_path,
         npx_args_prefix,
-        env: managed_env(root)?,
+        env: managed_env(root, &state_root)?,
     })
 }
 
@@ -454,7 +461,6 @@ async fn activate_local_runtime_source(
     spec: PlatformSpec,
     reporter: Option<&dyn NodeRuntimeProgressReporter>,
 ) -> Result<Option<ResolvedNodeRuntime>, NodeRuntimeError> {
-    let version_dir = runtime_root.join(spec.directory_name());
     if managed_resources::requires_bundled_resources() {
         let bundled_root = managed_resources::bundled_root_candidate()
             .ok_or_else(|| NodeRuntimeError::managed_invalid("bundled managed resources root unavailable"))?;
@@ -477,13 +483,18 @@ async fn activate_local_runtime_source(
             )),
         );
 
-        match activate_copy_with_retry(|| managed_resources::materialize_directory(&source.root, &version_dir)).await {
-            Ok(()) => {}
+        let objects_root = runtime_root.join("objects").join(spec.folder_suffix);
+        let materialized = match activate_copy_with_retry(|| {
+            managed_resources::materialize_content_addressed_directory(&source.root, &objects_root)
+        })
+        .await
+        {
+            Ok(materialized) => materialized,
             Err(ActivationCopyError::NonTransient(error)) => {
                 warn!(
                     source = source_kind_label(source.kind),
                     source_root = %source.root.display(),
-                    target_root = %version_dir.display(),
+                    target_root = %objects_root.display(),
                     error = %error,
                     "failed to activate local node runtime source"
                 );
@@ -502,7 +513,7 @@ async fn activate_local_runtime_source(
                 warn!(
                     source = source_kind_label(source.kind),
                     source_root = %source.root.display(),
-                    target_root = %version_dir.display(),
+                    target_root = %objects_root.display(),
                     error = %error,
                     "node activation copy failed after bounded retries; classifying as transient I/O"
                 );
@@ -516,9 +527,9 @@ async fn activate_local_runtime_source(
                 }
                 continue;
             }
-        }
+        };
 
-        match validate_managed_runtime(&version_dir, reporter).await {
+        match validate_managed_runtime(&materialized.root, reporter).await {
             Ok(mut runtime) => {
                 runtime.source = map_source_kind(source.kind);
                 return Ok(Some(runtime));
@@ -527,11 +538,11 @@ async fn activate_local_runtime_source(
                 warn!(
                     source = source_kind_label(source.kind),
                     source_root = %source.root.display(),
-                    target_root = %version_dir.display(),
+                    target_root = %materialized.root.display(),
+                    content_sha256 = %materialized.content_sha256,
                     error = %error,
                     "local node runtime source failed validation"
                 );
-                let _ = fs::remove_dir_all(&version_dir);
                 if matches!(source.kind, ManagedResourceSourceKind::Bundled) {
                     return Err(NodeRuntimeError::managed_invalid(format!(
                         "bundled Node runtime failed validation under {}: {}",
@@ -822,9 +833,9 @@ fn prepare_runtime_files(root: &Path) -> Result<(), NodeRuntimeError> {
     Ok(())
 }
 
-fn managed_env(root: &Path) -> Result<Vec<(OsString, OsString)>, NodeRuntimeError> {
+fn managed_env(root: &Path, state_root: &Path) -> Result<Vec<(OsString, OsString)>, NodeRuntimeError> {
     let node_bin = managed_bin_dir(root);
-    let global_bin = managed_prefix_bin_dir(root);
+    let global_bin = managed_prefix_bin_dir(state_root);
     let mut paths = vec![node_bin, global_bin];
     if let Some(current_path) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&current_path));
@@ -834,17 +845,32 @@ fn managed_env(root: &Path) -> Result<Vec<(OsString, OsString)>, NodeRuntimeErro
 
     Ok(vec![
         ("PATH".into(), path),
-        ("npm_config_cache".into(), root.join("cache").into_os_string()),
+        ("npm_config_cache".into(), state_root.join("cache").into_os_string()),
         (
             "npm_config_userconfig".into(),
-            root.join("blank_user_npmrc").into_os_string(),
+            state_root.join("blank_user_npmrc").into_os_string(),
         ),
         (
             "npm_config_globalconfig".into(),
-            root.join("blank_global_npmrc").into_os_string(),
+            state_root.join("blank_global_npmrc").into_os_string(),
         ),
-        ("npm_config_prefix".into(), default_npm_prefix(root).into_os_string()),
+        (
+            "npm_config_prefix".into(),
+            default_npm_prefix(state_root).into_os_string(),
+        ),
     ])
+}
+
+fn managed_runtime_state_root(runtime_root: &Path) -> PathBuf {
+    let identity = runtime_root
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new("runtime"));
+    runtime_root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".state")
+        .join(identity)
 }
 
 fn managed_bin_dir(root: &Path) -> PathBuf {
@@ -974,13 +1000,13 @@ enum ActivationCopyError {
 /// Run the activation copy up to `MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS` times.
 /// Retries only whitelisted transient I/O errors, sleeping the backoff between
 /// attempts. Non-transient errors return immediately without retry.
-async fn activate_copy_with_retry<C>(mut copy: C) -> Result<(), ActivationCopyError>
+async fn activate_copy_with_retry<C, T>(mut copy: C) -> Result<T, ActivationCopyError>
 where
-    C: FnMut() -> std::io::Result<()>,
+    C: FnMut() -> std::io::Result<T>,
 {
     for attempt in 1..=MANAGED_NODE_ACTIVATION_COPY_ATTEMPTS {
         match copy() {
-            Ok(()) => return Ok(()),
+            Ok(value) => return Ok(value),
             Err(error) if !is_transient_activation_io_error(&error) => {
                 return Err(ActivationCopyError::NonTransient(error));
             }
