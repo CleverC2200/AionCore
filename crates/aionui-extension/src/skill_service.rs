@@ -3308,7 +3308,9 @@ mod tests {
         crate::startup_materialize::materialize_embedded_builtin_skills(base, &BUILTIN_SKILLS, "test-version")
             .await
             .expect("failed to materialize embedded corpus for test");
-        make_test_paths(base)
+        let mut paths = make_test_paths(base);
+        paths.builtin_skills_dir = crate::startup_materialize::resolve_materialized_builtin_skills_dir(base);
+        paths
     }
 
     /// Return a `SkillPaths` rooted at `base` with an on-disk
