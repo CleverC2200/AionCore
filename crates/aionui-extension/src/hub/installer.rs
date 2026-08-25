@@ -138,12 +138,10 @@ impl HubInstaller {
             && verify_package_identity(&entry, &ext_dir).is_ok()
             && (entry.dist.is_none() || verify_package_integrity(&entry, &ext_dir).is_ok());
 
-        if !already_desired {
-            if let Err(error) = self.stage_package(&entry, ext_dir.exists()).await {
-                let error = format!("Installation failed: {error}");
-                self.broadcast_state_changed(name, "failed", Some(error.clone()));
-                return HubResult::err(error);
-            }
+        if !already_desired && let Err(error) = self.stage_package(&entry, ext_dir.exists()).await {
+            let error = format!("Installation failed: {error}");
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
         }
 
         if let Err(e) = self.verify_installation(&ext_dir) {
