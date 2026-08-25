@@ -106,6 +106,43 @@ function New-CaseRepo {
     return $dir
 }
 
+function New-ForkUpstreamCaseRepo {
+    param([string] $Name)
+
+    $dir = Join-Path $tmpdir $Name
+    New-Item -ItemType Directory -Force -Path (Join-Path $dir "crates/aionui-db/migrations") | Out-Null
+
+    Push-Location $dir
+    try {
+        Invoke-Native git init -q -b main
+        Invoke-Native git config user.email test@example.com
+        Invoke-Native git config user.name "Migration Test"
+        Set-Content -LiteralPath "crates/aionui-db/migrations/001_initial_schema.sql" -Value "-- 001 initial"
+        Set-Content -LiteralPath "crates/aionui-db/migrations/002_official.sql" -Value "-- 002 official migration"
+        Invoke-Native git add crates/aionui-db/migrations
+        Invoke-Native git commit -q -m "seed official migrations"
+        $officialMain = (git rev-parse HEAD)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        Invoke-Native git mv crates/aionui-db/migrations/002_official.sql crates/aionui-db/migrations/003_personal.sql
+        Invoke-Native git commit -q -m "move personal migration"
+        $personalMain = (git rev-parse HEAD)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        Invoke-Native git remote add origin (Join-Path $dir "origin.git")
+        Invoke-Native git remote add personal (Join-Path $dir "personal.git")
+        Invoke-Native git update-ref refs/remotes/origin/main $officialMain
+        Invoke-Native git update-ref refs/remotes/personal/main $personalMain
+        Invoke-Native git config branch.main.remote personal
+        Invoke-Native git config branch.main.merge refs/heads/main
+        Invoke-Native git checkout -q -b feature
+    } finally {
+        Pop-Location
+    }
+
+    return $dir
+}
+
 try {
     $modifiedRepo = New-CaseRepo "modified"
     Add-Content -LiteralPath (Join-Path $modifiedRepo "crates/aionui-db/migrations/001_initial_schema.sql") -Value "-- modified"
@@ -133,6 +170,9 @@ try {
         AIONCORE_MIGRATION_BASE_REF = "main"
         AIONCORE_ALLOW_MAIN_MIGRATION_EDIT = "1"
     }
+
+    $forkUpstreamRepo = New-ForkUpstreamCaseRepo "fork-upstream"
+    Invoke-InRepo $forkUpstreamRepo 0 "Migration immutability check passed" @{}
 
     Write-Output "Migration immutability script tests passed"
 } finally {

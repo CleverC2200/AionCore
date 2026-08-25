@@ -37,16 +37,23 @@ if ($env:AIONCORE_ALLOW_MAIN_MIGRATION_EDIT -eq "1") {
 
 $baseRef = $env:AIONCORE_MIGRATION_BASE_REF
 if ([string]::IsNullOrWhiteSpace($baseRef)) {
-    git rev-parse --verify --quiet origin/main | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $baseRef = "origin/main"
+    $mainUpstreamOutput = git rev-parse --abbrev-ref --symbolic-full-name 'main@{upstream}' 2>$null
+    $mainUpstreamStatus = $LASTEXITCODE
+    $mainUpstream = ($mainUpstreamOutput | Select-Object -First 1)
+    if ($mainUpstreamStatus -eq 0 -and -not [string]::IsNullOrWhiteSpace($mainUpstream)) {
+        $baseRef = $mainUpstream.Trim()
     } else {
-        git rev-parse --verify --quiet main | Out-Null
+        git rev-parse --verify --quiet origin/main | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            $baseRef = "main"
+            $baseRef = "origin/main"
         } else {
-            Write-Output "No origin/main or main ref found; skipping migration immutability check"
-            exit 0
+            git rev-parse --verify --quiet main | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $baseRef = "main"
+            } else {
+                Write-Output "No configured main upstream, origin/main, or main ref found; skipping migration immutability check"
+                exit 0
+            }
         }
     }
 }

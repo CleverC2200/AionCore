@@ -47,12 +47,15 @@ fi
 
 base_ref="${AIONCORE_MIGRATION_BASE_REF:-}"
 if [[ -z "$base_ref" ]]; then
-    if git rev-parse --verify --quiet origin/main >/dev/null; then
+    main_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name 'main@{upstream}' 2>/dev/null || true)"
+    if [[ -n "$main_upstream" ]] && git rev-parse --verify --quiet "$main_upstream" >/dev/null; then
+        base_ref="$main_upstream"
+    elif git rev-parse --verify --quiet origin/main >/dev/null; then
         base_ref="origin/main"
     elif git rev-parse --verify --quiet main >/dev/null; then
         base_ref="main"
     else
-        echo "No origin/main or main ref found; skipping migration immutability check"
+        echo "No configured main upstream, origin/main, or main ref found; skipping migration immutability check"
         exit 0
     fi
 fi
