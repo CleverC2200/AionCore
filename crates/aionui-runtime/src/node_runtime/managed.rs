@@ -866,11 +866,13 @@ fn managed_runtime_state_root(runtime_root: &Path) -> PathBuf {
         .file_name()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| std::ffi::OsStr::new("runtime"));
-    runtime_root
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".state")
-        .join(identity)
+    let state_parent = runtime_root
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "objects"))
+        .and_then(Path::parent)
+        .or_else(|| runtime_root.parent())
+        .unwrap_or_else(|| Path::new("."));
+    state_parent.join(".state").join(identity)
 }
 
 fn managed_bin_dir(root: &Path) -> PathBuf {

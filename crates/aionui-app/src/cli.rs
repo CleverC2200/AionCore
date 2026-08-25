@@ -134,6 +134,8 @@ pub(crate) enum Command {
     Doctor,
     /// Prepare current-platform managed runtime resources under a bundle output root.
     PrepareManagedResources(PrepareManagedResourcesArgs),
+    /// Inspect handoff state or clean only regenerable AionUi-owned caches.
+    Maintenance(MaintenanceArgs),
 }
 
 impl Command {
@@ -149,11 +151,15 @@ impl Command {
             Self::McpGeaStdio => "mcp-gea-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
+            Self::Maintenance(_) => "maintenance",
         }
     }
 
     pub(crate) fn need_runtime(&self) -> bool {
-        matches!(self, Self::Doctor | Self::PrepareManagedResources(_))
+        matches!(
+            self,
+            Self::Doctor | Self::PrepareManagedResources(_) | Self::Maintenance(_)
+        )
     }
 }
 
@@ -650,6 +656,24 @@ pub(crate) struct PrepareManagedResourcesArgs {
     pub bundle_out: PathBuf,
 }
 
+#[derive(Args, Debug, Clone)]
+pub(crate) struct MaintenanceArgs {
+    #[command(subcommand)]
+    pub command: MaintenanceCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum MaintenanceCommand {
+    /// Print a sanitized handoff and health snapshot as JSON.
+    Status,
+    /// List regenerable cache candidates; pass --apply to remove them.
+    Clean {
+        /// Apply the reported cleanup. Without this flag the command is read-only.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -658,8 +682,8 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SessionCommand,
-        TeamCommand,
+        Cli, Command, ConfigArgs, ConfigCommand, MaintenanceArgs, MaintenanceCommand, ManagedResourcesModeArg,
+        PrepareManagedResourcesArgs, SessionCommand, TeamCommand,
     };
 
     #[test]
@@ -719,6 +743,25 @@ mod tests {
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn maintenance_clean_is_dry_run_unless_apply_is_explicit() {
+        let dry_run = Cli::parse_from(["aioncore", "maintenance", "clean"]);
+        assert!(matches!(
+            dry_run.command,
+            Some(Command::Maintenance(MaintenanceArgs {
+                command: MaintenanceCommand::Clean { apply: false }
+            }))
+        ));
+
+        let apply = Cli::parse_from(["aioncore", "maintenance", "clean", "--apply"]);
+        assert!(matches!(
+            apply.command,
+            Some(Command::Maintenance(MaintenanceArgs {
+                command: MaintenanceCommand::Clean { apply: true }
+            }))
+        ));
     }
 
     #[test]
@@ -782,6 +825,12 @@ mod tests {
             (
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",
+            ),
+            (
+                Command::Maintenance(MaintenanceArgs {
+                    command: MaintenanceCommand::Status,
+                }),
+                "maintenance",
             ),
         ];
 

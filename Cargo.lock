@@ -436,6 +436,7 @@ dependencies = [
  "clap",
  "dirs",
  "dunce",
+ "fs2",
  "futures-util",
  "git2",
  "http-body-util",
@@ -456,6 +457,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
  "windows-sys 0.61.2",
  "wiremock",
 ]

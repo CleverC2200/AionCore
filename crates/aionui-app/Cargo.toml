@@ -19,6 +19,8 @@ slack = ["aionui-channel/slack"]
 discord = ["aionui-channel/discord"]
 
 [dependencies]
+fs2.workspace = true
+walkdir.workspace = true
 aionui-common.workspace = true
 aionui-assets.workspace = true
 aionui-db.workspace = true
