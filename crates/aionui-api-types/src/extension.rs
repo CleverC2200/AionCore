@@ -115,6 +115,16 @@ pub struct HubOperationResponse {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<HubInstallReceipt>,
+}
+
+/// Verified identity of the Hub artifact that converged on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HubInstallReceipt {
+    pub name: String,
+    pub version: String,
+    pub content_sha256: String,
 }
 
 /// Hub update info returned by `POST /api/hub/check-updates`.
@@ -236,10 +246,18 @@ mod tests {
         let resp = HubOperationResponse {
             success: true,
             msg: None,
+            receipt: Some(HubInstallReceipt {
+                name: "my-ext".into(),
+                version: "1.0.0".into(),
+                content_sha256: "abc123".into(),
+            }),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true);
         assert!(json.get("msg").is_none());
+        assert_eq!(json["receipt"]["name"], "my-ext");
+        assert_eq!(json["receipt"]["version"], "1.0.0");
+        assert_eq!(json["receipt"]["content_sha256"], "abc123");
     }
 
     #[test]
@@ -247,6 +265,7 @@ mod tests {
         let resp = HubOperationResponse {
             success: false,
             msg: Some("Extension not found".into()),
+            receipt: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);

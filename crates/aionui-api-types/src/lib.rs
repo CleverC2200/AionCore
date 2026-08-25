@@ -126,8 +126,8 @@ pub use custom_agent::{
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
-    GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
-    InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
+    GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubInstallReceipt, HubOperationResponse,
+    HubUpdateInfo, InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,

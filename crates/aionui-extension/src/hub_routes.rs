@@ -6,7 +6,8 @@ use axum::extract::{Json, State};
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ApiResponse, HubExtensionListItem, HubOperationResponse, HubUpdateInfo as ApiHubUpdateInfo, InstallExtensionRequest,
+    ApiResponse, HubExtensionListItem, HubInstallReceipt, HubOperationResponse, HubUpdateInfo as ApiHubUpdateInfo,
+    InstallExtensionRequest,
 };
 use aionui_common::ApiError;
 
@@ -83,10 +84,7 @@ async fn install_extension(
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.install(&req.name).await;
-    Ok(Json(ApiResponse::ok(HubOperationResponse {
-        success: result.success,
-        msg: result.msg,
-    })))
+    Ok(Json(ApiResponse::ok(operation_response(result))))
 }
 
 /// `POST /api/hub/retry-install` — retry a failed installation.
@@ -96,10 +94,7 @@ async fn retry_install(
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.retry_install(&req.name).await;
-    Ok(Json(ApiResponse::ok(HubOperationResponse {
-        success: result.success,
-        msg: result.msg,
-    })))
+    Ok(Json(ApiResponse::ok(operation_response(result))))
 }
 
 /// `POST /api/hub/check-updates` — check for available updates.
@@ -125,10 +120,7 @@ async fn update_extension(
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.update(&req.name).await;
-    Ok(Json(ApiResponse::ok(HubOperationResponse {
-        success: result.success,
-        msg: result.msg,
-    })))
+    Ok(Json(ApiResponse::ok(operation_response(result))))
 }
 
 /// `POST /api/hub/uninstall` — uninstall an extension.
@@ -138,10 +130,19 @@ async fn uninstall_extension(
 ) -> Result<Json<ApiResponse<HubOperationResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.installer.uninstall(&req.name).await;
-    Ok(Json(ApiResponse::ok(HubOperationResponse {
+    Ok(Json(ApiResponse::ok(operation_response(result))))
+}
+
+fn operation_response(result: crate::hub::installer::HubResult) -> HubOperationResponse {
+    HubOperationResponse {
         success: result.success,
         msg: result.msg,
-    })))
+        receipt: result.receipt.map(|receipt| HubInstallReceipt {
+            name: receipt.name,
+            version: receipt.version,
+            content_sha256: receipt.content_sha256,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------

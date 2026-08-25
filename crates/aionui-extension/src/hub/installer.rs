@@ -29,6 +29,15 @@ const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 pub struct HubResult {
     pub success: bool,
     pub msg: Option<String>,
+    pub receipt: Option<HubInstallReceipt>,
+}
+
+/// Verified identity of the desired Hub artifact installed on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubInstallReceipt {
+    pub name: String,
+    pub version: String,
+    pub content_sha256: String,
 }
 
 impl HubResult {
@@ -36,6 +45,15 @@ impl HubResult {
         Self {
             success: true,
             msg: None,
+            receipt: None,
+        }
+    }
+
+    fn installed(receipt: HubInstallReceipt) -> Self {
+        Self {
+            success: true,
+            msg: None,
+            receipt: Some(receipt),
         }
     }
 
@@ -43,6 +61,7 @@ impl HubResult {
         Self {
             success: false,
             msg: Some(msg.into()),
+            receipt: None,
         }
     }
 }
@@ -86,6 +105,14 @@ impl HubInstaller {
     /// Flow: look up in index → stage package if needed → validate manifest →
     /// verify contributions → trigger hot reload.
     pub async fn install(&self, name: &str) -> HubResult {
+        self.install_desired(name).await
+    }
+
+    /// Converge an extension to the artifact currently desired by the Hub index.
+    ///
+    /// This operation is idempotent across empty, current, stale, partial, and
+    /// retry states. Legacy install/retry/update entry points delegate here.
+    pub async fn install_desired(&self, name: &str) -> HubResult {
         if let Err(error) = validate_hub_name(name) {
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
@@ -106,12 +133,17 @@ impl HubInstaller {
         let target_dir = self.index_manager.install_target_dir();
         let ext_dir = target_dir.join(&entry.name);
 
-        if !ext_dir.exists()
-            && let Err(error) = self.stage_package(&entry, false).await
-        {
-            let error = format!("Installation failed: {error}");
-            self.broadcast_state_changed(name, "failed", Some(error.clone()));
-            return HubResult::err(error);
+        let already_desired = ext_dir.exists()
+            && self.verify_installation(&ext_dir).is_ok()
+            && verify_package_identity(&entry, &ext_dir).is_ok()
+            && (entry.dist.is_none() || verify_package_integrity(&entry, &ext_dir).is_ok());
+
+        if !already_desired {
+            if let Err(error) = self.stage_package(&entry, ext_dir.exists()).await {
+                let error = format!("Installation failed: {error}");
+                self.broadcast_state_changed(name, "failed", Some(error.clone()));
+                return HubResult::err(error);
+            }
         }
 
         if let Err(e) = self.verify_installation(&ext_dir) {
@@ -120,66 +152,39 @@ impl HubInstaller {
             return HubResult::err(error);
         }
 
-        // Trigger hot reload to pick up the new extension.
-        self.registry.hot_reload().await;
-        self.broadcast_state_changed(name, "installed", None);
-
-        info!(name, "hub: extension installed successfully");
-        HubResult::ok()
-    }
-
-    /// Retry a previously failed installation.
-    pub async fn retry_install(&self, name: &str) -> HubResult {
-        debug!(name, "hub: retrying installation");
-        self.install(name).await
-    }
-
-    /// Update an installed extension to the latest version from the index.
-    ///
-    pub async fn update(&self, name: &str) -> HubResult {
-        if let Err(error) = validate_hub_name(name) {
-            self.broadcast_state_changed(name, "failed", Some(error.clone()));
-            return HubResult::err(error);
-        }
-
-        info!(name, "hub: updating extension");
-        self.broadcast_state_changed(name, "updating", None);
-
-        let entry = match self.index_manager.get_extension(name).await {
-            Some(e) => e,
-            None => {
-                let error = format!("Extension '{name}' not found in hub index");
+        let receipt = match hash_extension_contents(&ext_dir) {
+            Ok(content_sha256) => HubInstallReceipt {
+                name: entry.name,
+                version: entry.version,
+                content_sha256,
+            },
+            Err(error) => {
+                let error = format!("Installation receipt failed: {error}");
                 self.broadcast_state_changed(name, "failed", Some(error.clone()));
                 return HubResult::err(error);
             }
         };
 
-        let target_dir = self.index_manager.install_target_dir();
-        let ext_dir = target_dir.join(&entry.name);
-
-        if !ext_dir.exists() {
-            let error = format!("Extension not installed: {}", ext_dir.display());
-            self.broadcast_state_changed(name, "failed", Some(error.clone()));
-            return HubResult::err(error);
-        }
-
-        if entry.dist.is_some()
-            && let Err(error) = self.stage_package(&entry, true).await
-        {
-            let error = format!("Update failed: {error}");
-            self.broadcast_state_changed(name, "failed", Some(error.clone()));
-            return HubResult::err(error);
-        } else if let Err(error) = self.verify_installation(&ext_dir) {
-            let error = format!("Update verification failed: {error}");
-            self.broadcast_state_changed(name, "failed", Some(error.clone()));
-            return HubResult::err(error);
-        }
-
+        // Trigger hot reload only after the converged artifact and its receipt
+        // have both been verified.
         self.registry.hot_reload().await;
         self.broadcast_state_changed(name, "installed", None);
 
-        info!(name, "hub: extension updated successfully");
-        HubResult::ok()
+        info!(name, "hub: extension installed successfully");
+        HubResult::installed(receipt)
+    }
+
+    /// Retry a previously failed installation.
+    pub async fn retry_install(&self, name: &str) -> HubResult {
+        debug!(name, "hub: retrying installation");
+        self.install_desired(name).await
+    }
+
+    /// Update an installed extension to the latest version from the index.
+    ///
+    pub async fn update(&self, name: &str) -> HubResult {
+        debug!(name, "hub: updating extension to desired artifact");
+        self.install_desired(name).await
     }
 
     /// Uninstall an extension by removing its directory and hot-reloading.
@@ -649,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installs_current_aionhub_zip_from_bundled_source() {
+    async fn all_install_entrypoints_converge_to_current_aionhub_artifact() {
         let target = tempfile::TempDir::new().unwrap();
         let bundle = tempfile::TempDir::new().unwrap();
         let manifest = br#"{"name":"test-hub-ext","version":"1.0.0"}"#;
@@ -706,6 +711,38 @@ mod tests {
 
         assert!(result.success, "install should succeed: {:?}", result.msg);
         assert!(target.path().join("test-hub-ext/aion-extension.json").is_file());
+        let receipt = result.receipt.expect("successful install returns a receipt");
+        assert_eq!(receipt.name, "test-hub-ext");
+        assert_eq!(receipt.version, "1.0.0");
+        assert_eq!(receipt.content_sha256, integrity.trim_start_matches("sha256-"));
+
+        let result = installer.install("test-hub-ext").await;
+        assert!(
+            result.success,
+            "current artifact should be idempotent: {:?}",
+            result.msg
+        );
+
+        std::fs::write(
+            target.path().join("test-hub-ext/aion-extension.json"),
+            br#"{"name":"test-hub-ext","version":"0.9.0"}"#,
+        )
+        .unwrap();
+        let result = installer.update("test-hub-ext").await;
+        assert!(result.success, "stale artifact should converge: {:?}", result.msg);
+        assert_eq!(result.receipt.unwrap().version, "1.0.0");
+
+        std::fs::write(target.path().join("test-hub-ext/aion-extension.json"), b"partial").unwrap();
+        let result = installer.retry_install("test-hub-ext").await;
+        assert!(result.success, "partial artifact should converge: {:?}", result.msg);
+
+        std::fs::remove_dir_all(target.path().join("test-hub-ext")).unwrap();
+        let result = installer.update("test-hub-ext").await;
+        assert!(
+            result.success,
+            "update should also converge from empty state: {:?}",
+            result.msg
+        );
     }
 
     #[test]
