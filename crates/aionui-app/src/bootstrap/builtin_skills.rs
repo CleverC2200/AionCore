@@ -5,8 +5,8 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::warn;
 
-/// Gated by a `.version` file so this is a no-op on subsequent starts with
-/// the same binary. When `AIONUI_BUILTIN_SKILLS_PATH` is set, skip
+/// Gated by the active content identity so this is a no-op on subsequent
+/// starts with the same corpus. When `AIONUI_BUILTIN_SKILLS_PATH` is set, skip
 /// materialization — the override path is the source of truth in that mode.
 pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
     let skip = std::env::var(aionui_extension::BUILTIN_SKILLS_ENV_VAR)
@@ -43,13 +43,14 @@ pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn materialize_marker_includes_builtin_skill_corpus_fingerprint() {
+    fn materialize_marker_is_only_the_builtin_skill_content_identity() {
         let marker = aionui_extension::builtin_skills_materialize_marker(
             aionui_extension::builtin_skills_corpus(),
             env!("CARGO_PKG_VERSION"),
         );
 
-        assert_ne!(marker, env!("CARGO_PKG_VERSION"));
-        assert!(marker.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+builtin-skills.")));
+        assert!(marker.starts_with("sha256-"));
+        assert_eq!(marker.len(), "sha256-".len() + 64);
+        assert!(!marker.contains(env!("CARGO_PKG_VERSION")));
     }
 }

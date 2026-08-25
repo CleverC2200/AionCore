@@ -1,54 +1,26 @@
-//! Startup-time materialization of the embedded builtin skills corpus to
-//! `{data_dir}/builtin-skills/`. Gated on a `.version` file so repeat
-//! starts with the same binary skip the rewrite.
+//! Startup-time materialization of the embedded builtin skills corpus.
 //!
-//! Algorithm:
-//!   staging = data_dir/.builtin-skills.tmp (fresh each call)
-//!   write all BUILTIN_SKILLS entries into staging
-//!   write staging/.version ← binary version
-//!   atomic rename(target → .builtin-skills.old, staging → target)
-//!   best-effort remove .builtin-skills.old
-//!
-//! The atomic rename guarantees that concurrent backend processes, or a
-//! crash mid-write, never observe a half-populated target — the old tree
-//! stays in place until staging is fully ready.
+//! Each corpus is stored once under a content-addressed object directory.
+//! Files converge independently through temp-file + rename transactions; a
+//! completion marker is written last, then a small current-ref file is
+//! atomically replaced. Interrupted starts resume the same object without
+//! rewriting an already-valid tree or holding a global materialization lock.
 
-use std::fs::OpenOptions;
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use fs2::FileExt;
 use include_dir::Dir;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 use crate::error::ExtensionError;
 
-const VERSION_FILE: &str = ".version";
-const LOCK_FILE_NAME: &str = ".builtin-skills.lock";
-const STAGING_DIR_NAME: &str = ".builtin-skills.tmp";
-const OLD_DIR_NAME: &str = ".builtin-skills.old";
-
-/// Total budget for acquiring the builtin-skills materialization lock.
-///
-/// Why 15s: this lock is taken *after* the HTTP listener is bound and the
-/// `AIONCORE_LISTENING <port>` line has already been printed (aionui-app
-/// `async_main` binds the listener, then calls `init_data_layer`). So the
-/// parent process is no longer in its port-report window (60s) — it is in its
-/// `/health` polling window, which AionUi caps at 30s
-/// (`waitForHealth(port, timeoutMs = 30_000)` in
-/// `packages/web-host/src/backend-launcher.ts`) before it SIGKILLs the
-/// backend. A 15s budget sits at half of the parent's patience: long enough to
-/// ride out a peer that is legitimately mid-materialization, and short enough
-/// that a timeout still leaves ~15s for the error to surface on stderr as a
-/// parseable `BOOTSTRAP_DATA_INIT_FAILED stage=data.builtin_skills` boundary
-/// line, instead of the user getting an unexplained SIGKILL (AIONUI-168).
-const MATERIALIZE_LOCK_BUDGET: Duration = Duration::from_secs(15);
-
-/// Poll interval while a peer holds the materialize lock. 150ms makes the
-/// hand-off latency negligible against the budget while keeping the retry
-/// count around 100 for a full 15s wait.
-const MATERIALIZE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const LEGACY_VERSION_FILE: &str = ".version";
+const OBJECTS_DIR_NAME: &str = ".builtin-skills.objects";
+const CURRENT_REF_FILE_NAME: &str = ".builtin-skills.current";
+const COMPLETE_FILE_NAME: &str = ".complete";
 
 const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(50),
@@ -58,7 +30,7 @@ const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(800),
 ];
 
-/// Decide whether to materialize based on the `.version` file, then do it.
+/// Decide whether to materialize based on the active content identity.
 /// Returns `true` if a write happened, `false` if the gate said "skip".
 ///
 /// When `BUILTIN_SKILLS_ENV_VAR` is set and non-empty, the caller has
@@ -71,38 +43,21 @@ pub async fn materialize_if_needed(
     corpus: &Dir<'static>,
     binary_version: &str,
 ) -> Result<bool, ExtensionError> {
-    let target = data_dir.join(crate::constants::BUILTIN_SKILLS_DIR_NAME);
-
-    if version_file_matches(&target, binary_version).await {
+    if active_object_matches(data_dir, binary_version).await {
         info!(
-            target = %target.display(),
-            version = binary_version,
+            identity = binary_version,
             "builtin skills up to date; skipping materialize"
         );
         return Ok(false);
     }
 
-    info!(
-        target = %target.display(),
-        version = binary_version,
-        "materializing embedded builtin skills"
-    );
-    let _guard = MaterializeLockGuard::acquire(data_dir).await?;
-    if version_file_matches(&target, binary_version).await {
-        info!(
-            target = %target.display(),
-            version = binary_version,
-            "builtin skills up to date after materialize lock; skipping rewrite"
-        );
-        return Ok(false);
-    }
+    info!(identity = binary_version, "materializing embedded builtin skills");
 
     match materialize_embedded_builtin_skills_unlocked(data_dir, corpus, binary_version).await {
         Ok(()) => {}
-        Err(e) if existing_builtin_skills_looks_usable(&target).await => {
+        Err(e) if existing_builtin_skills_looks_usable(data_dir).await => {
             warn!(
-                target = %target.display(),
-                version = binary_version,
+                identity = binary_version,
                 error = %e,
                 "failed to refresh builtin skills; continuing with existing tree"
             );
@@ -113,25 +68,13 @@ pub async fn materialize_if_needed(
     Ok(true)
 }
 
-/// Read `.version` and compare against the provided `binary_version`.
-/// Returns `true` only on exact match. Missing file / IO error /
-/// mismatch all return `false`.
-async fn version_file_matches(target: &Path, binary_version: &str) -> bool {
-    let version_path = target.join(VERSION_FILE);
-    match tokio::fs::read_to_string(&version_path).await {
-        Ok(s) => s == binary_version,
-        Err(_) => false,
-    }
-}
-
-/// Unconditional materialize: stage, write each file, atomic rename.
+/// Unconditional materialize of a content-addressed object and current ref.
 /// Exposed separately for tests that want to bypass the gate.
 pub async fn materialize_embedded_builtin_skills(
     data_dir: &Path,
     corpus: &Dir<'static>,
     binary_version: &str,
 ) -> Result<(), ExtensionError> {
-    let _guard = MaterializeLockGuard::acquire(data_dir).await?;
     materialize_embedded_builtin_skills_unlocked(data_dir, corpus, binary_version).await
 }
 
@@ -140,110 +83,62 @@ async fn materialize_embedded_builtin_skills_unlocked(
     corpus: &Dir<'static>,
     binary_version: &str,
 ) -> Result<(), ExtensionError> {
-    let target = data_dir.join(crate::constants::BUILTIN_SKILLS_DIR_NAME);
-    let staging = data_dir.join(STAGING_DIR_NAME);
-    let old = data_dir.join(OLD_DIR_NAME);
+    validate_content_identity(binary_version)?;
+    let object = object_dir(data_dir, binary_version);
 
-    // Ensure data_dir itself exists before we try to write into it.
     tokio::fs::create_dir_all(data_dir).await?;
+    tokio::fs::create_dir_all(&object).await?;
 
-    // Clean any leftover staging from a previous crashed run.
-    if staging.exists() {
-        retry_startup_file_op("remove builtin skills staging dir", &staging, || {
-            tokio::fs::remove_dir_all(&staging)
-        })
-        .await
-        .map_err(|e| {
-            ExtensionError::Io(std::io::Error::new(
-                e.kind(),
-                format!("failed to clean staging dir {}: {e}", staging.display()),
-            ))
-        })?;
+    if !object_complete(&object, binary_version).await {
+        write_dir_recursive(corpus, &object).await?;
+        prune_unexpected_object_entries(corpus, &object).await?;
+        atomic_write(&object.join(COMPLETE_FILE_NAME), binary_version.as_bytes()).await?;
     }
-    tokio::fs::create_dir_all(&staging).await?;
-
-    write_dir_recursive(corpus, &staging).await?;
-
-    let version_path = staging.join(VERSION_FILE);
-    tokio::fs::write(&version_path, binary_version).await?;
-
-    // Move existing target out of the way, then move staging in.
-    if target.exists() {
-        if old.exists() {
-            // Tolerate leftover .old from a crashed rename sequence.
-            if let Err(e) = retry_startup_file_op("remove old builtin skills dir", &old, || {
-                tokio::fs::remove_dir_all(&old)
-            })
-            .await
-            {
-                warn!(
-                    old = %old.display(),
-                    error = %e,
-                    "failed to remove stale old builtin skills tree before refresh"
-                );
-            }
-        }
-        retry_startup_file_op("rename builtin skills target to old", &target, || {
-            tokio::fs::rename(&target, &old)
-        })
-        .await?;
-    }
-
-    if let Err(e) = retry_startup_file_op("rename builtin skills staging to target", &staging, || {
-        tokio::fs::rename(&staging, &target)
-    })
-    .await
-    {
-        // Try to restore the original target so we don't leave the user
-        // with no builtin skills.
-        if old.exists()
-            && let Err(restore_error) = retry_startup_file_op("restore old builtin skills target", &old, || {
-                tokio::fs::rename(&old, &target)
-            })
-            .await
-        {
-            warn!(
-                old = %old.display(),
-                target = %target.display(),
-                error = %restore_error,
-                "failed to restore old builtin skills tree after refresh failure"
-            );
-        }
-        return Err(ExtensionError::Io(std::io::Error::new(
-            e.kind(),
-            format!(
-                "atomic rename staging→target failed ({} → {}): {e}",
-                staging.display(),
-                target.display()
-            ),
-        )));
-    }
-
-    // Best-effort cleanup of the superseded tree.
-    if old.exists()
-        && let Err(e) = retry_startup_file_op("remove superseded builtin skills dir", &old, || {
-            tokio::fs::remove_dir_all(&old)
-        })
-        .await
-    {
-        warn!(
-            old = %old.display(),
-            error = %e,
-            "failed to remove superseded builtin skills tree (leaving behind)"
-        );
-    }
+    atomic_write(&data_dir.join(CURRENT_REF_FILE_NAME), binary_version.as_bytes()).await?;
 
     Ok(())
 }
 
-async fn existing_builtin_skills_looks_usable(target: &Path) -> bool {
-    if !target.is_dir() {
-        return false;
+async fn active_object_matches(data_dir: &Path, expected: &str) -> bool {
+    match tokio::fs::read_to_string(data_dir.join(CURRENT_REF_FILE_NAME)).await {
+        Ok(current) if current == expected => object_complete(&object_dir(data_dir, expected), expected).await,
+        _ => false,
     }
-    tokio::fs::metadata(target.join(VERSION_FILE))
-        .await
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
+}
+
+async fn object_complete(object: &Path, identity: &str) -> bool {
+    matches!(tokio::fs::read_to_string(object.join(COMPLETE_FILE_NAME)).await, Ok(marker) if marker == identity)
+}
+
+fn object_dir(data_dir: &Path, identity: &str) -> PathBuf {
+    data_dir.join(OBJECTS_DIR_NAME).join(identity)
+}
+
+fn validate_content_identity(identity: &str) -> Result<(), ExtensionError> {
+    if identity.is_empty()
+        || matches!(identity, "." | "..")
+        || !identity
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ExtensionError::ManifestValidation(format!(
+            "Invalid builtin skills content identity: {identity}"
+        )));
+    }
+    Ok(())
+}
+
+async fn existing_builtin_skills_looks_usable(data_dir: &Path) -> bool {
+    if let Ok(current) = tokio::fs::read_to_string(data_dir.join(CURRENT_REF_FILE_NAME)).await
+        && validate_content_identity(&current).is_ok()
+        && object_complete(&object_dir(data_dir, &current), &current).await
+    {
+        return true;
+    }
+    data_dir
+        .join(crate::constants::BUILTIN_SKILLS_DIR_NAME)
+        .join(LEGACY_VERSION_FILE)
+        .is_file()
 }
 
 async fn retry_startup_file_op<T, F, Fut>(operation: &str, path: &Path, mut op: F) -> std::io::Result<T>
@@ -282,107 +177,9 @@ fn is_retryable_startup_file_error(error: &std::io::Error) -> bool {
     }
 }
 
-struct MaterializeLockGuard {
-    file: std::fs::File,
-}
-
-impl MaterializeLockGuard {
-    async fn acquire(data_dir: &Path) -> Result<Self, ExtensionError> {
-        Self::acquire_within(data_dir, MATERIALIZE_LOCK_BUDGET).await
-    }
-
-    /// Bounded acquisition: poll `try_lock_exclusive` until `budget` elapses,
-    /// then fail with a classifiable timeout instead of blocking forever.
-    ///
-    /// A blocking `lock_exclusive` here made a contended startup look like a
-    /// hang: the process printed one line and went silent until the parent
-    /// killed it, leaving nothing to diagnose (AIONUI-168).
-    ///
-    /// `budget` is a parameter so tests can drive the timeout path in
-    /// milliseconds rather than waiting out the production budget.
-    async fn acquire_within(data_dir: &Path, budget: Duration) -> Result<Self, ExtensionError> {
-        let data_dir = data_dir.to_path_buf();
-        let lock_path = data_dir.join(LOCK_FILE_NAME);
-        let open_path = lock_path.clone();
-        // Directory creation and open() are blocking syscalls; keep them off
-        // the reactor. The lock polling below is non-blocking by construction.
-        let file = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&data_dir)?;
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&open_path)
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("builtin skills lock task failed: {e}")))??;
-
-        let started = Instant::now();
-        let mut attempts: u32 = 0;
-        loop {
-            attempts += 1;
-            match FileExt::try_lock_exclusive(&file) {
-                Ok(()) => {
-                    if attempts > 1 {
-                        info!(
-                            lock_path = %lock_path.display(),
-                            waited_ms = started.elapsed().as_millis() as u64,
-                            attempts,
-                            "acquired builtin skills materialize lock after contention"
-                        );
-                    }
-                    return Ok(Self { file });
-                }
-                // Held by a peer — keep polling until the budget runs out.
-                Err(e) if is_lock_contended(&e) => {}
-                // Anything else (EPERM, ENOLCK, unsupported filesystem, …) is
-                // not going to resolve by waiting.
-                Err(e) => return Err(ExtensionError::Io(e)),
-            }
-
-            let waited = started.elapsed();
-            if waited >= budget {
-                error!(
-                    lock_path = %lock_path.display(),
-                    waited_ms = waited.as_millis() as u64,
-                    budget_ms = budget.as_millis() as u64,
-                    attempts,
-                    "builtin skills materialize lock is still held by another process; giving up"
-                );
-                return Err(ExtensionError::BuiltinSkillsLockTimeout {
-                    lock_path: lock_path.display().to_string(),
-                    waited_ms: waited.as_millis() as u64,
-                });
-            }
-
-            debug!(
-                lock_path = %lock_path.display(),
-                waited_ms = waited.as_millis() as u64,
-                budget_ms = budget.as_millis() as u64,
-                attempts,
-                "builtin skills materialize lock is busy; retrying"
-            );
-            tokio::time::sleep(MATERIALIZE_LOCK_POLL_INTERVAL.min(budget - waited)).await;
-        }
-    }
-}
-
-/// True when `error` is the platform's "already locked by someone else"
-/// signal as produced by `fs2::try_lock_exclusive` (`EWOULDBLOCK` on Unix,
-/// `ERROR_LOCK_VIOLATION` on Windows).
-fn is_lock_contended(error: &std::io::Error) -> bool {
-    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-}
-
-impl Drop for MaterializeLockGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
 /// Recursively copy every file in an `include_dir::Dir` tree into `dest`.
-/// Directories are created as needed. Files overwrite silently.
+/// Directories are created as needed. Matching files are reused; changed or
+/// missing files converge through a task-owned temporary file and rename.
 async fn write_dir_recursive(dir: &Dir<'static>, dest: &Path) -> Result<(), ExtensionError> {
     // The include_dir API is synchronous; we flatten into a Vec then
     // feed the writes through tokio::fs to stay off the reactor's thread
@@ -395,7 +192,10 @@ async fn write_dir_recursive(dir: &Dir<'static>, dest: &Path) -> Result<(), Exte
             if let Some(parent) = out_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&out_path, file.contents()).await?;
+            if matches!(tokio::fs::read(&out_path).await, Ok(existing) if existing == file.contents()) {
+                continue;
+            }
+            atomic_write(&out_path, file.contents()).await?;
         }
         for sub in d.dirs() {
             let sub_rel = sub.path();
@@ -407,112 +207,111 @@ async fn write_dir_recursive(dir: &Dir<'static>, dest: &Path) -> Result<(), Exte
     Ok(())
 }
 
-#[cfg(test)]
-mod materialize_lock_tests {
-    use super::*;
+async fn prune_unexpected_object_entries(corpus: &Dir<'static>, object: &Path) -> Result<(), ExtensionError> {
+    let mut expected = HashSet::new();
+    collect_expected_paths(corpus, corpus.path(), &mut expected);
 
-    /// Uncontended acquisition must not pay any of the retry budget.
-    #[tokio::test]
-    async fn acquire_within_succeeds_immediately_when_uncontended() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let started = Instant::now();
+    let mut entries = walkdir::WalkDir::new(object)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ExtensionError::Io(std::io::Error::other(error)))?;
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.depth()));
 
-        let guard = MaterializeLockGuard::acquire_within(dir.path(), MATERIALIZE_LOCK_BUDGET)
-            .await
-            .expect("uncontended acquire must succeed");
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "uncontended acquire took {:?}",
-            started.elapsed()
-        );
-        assert!(dir.path().join(LOCK_FILE_NAME).exists(), "lock file must be created");
-        drop(guard);
-    }
-
-    /// Regression for AIONUI-168: with the lock held by a peer, acquisition
-    /// must give up inside its budget with a classifiable timeout instead of
-    /// blocking until the parent process kills us.
-    ///
-    /// Unix-only: this relies on `flock` locks being owned by the open file
-    /// description, so two `open()`s in the same process genuinely contend
-    /// (verified by fs2's own tests, fs2-0.4.3/src/unix.rs `lock_replace`).
-    /// The equivalent Windows guarantee is not verified here, so the test is
-    /// gated rather than left to pass vacuously.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn acquire_within_times_out_while_a_peer_holds_the_lock() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let budget = Duration::from_millis(300);
-
-        // Peer: a second open file description holding the exclusive flock.
-        let peer = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.path().join(LOCK_FILE_NAME))
-            .expect("open peer lock file");
-        FileExt::lock_exclusive(&peer).expect("peer must take the lock");
-
-        let started = Instant::now();
-        let result = MaterializeLockGuard::acquire_within(dir.path(), budget).await;
-        let elapsed = started.elapsed();
-
-        match result {
-            Err(ExtensionError::BuiltinSkillsLockTimeout { lock_path, waited_ms }) => {
-                assert_eq!(lock_path, dir.path().join(LOCK_FILE_NAME).display().to_string());
-                assert!(
-                    waited_ms >= budget.as_millis() as u64,
-                    "reported wait {waited_ms}ms is shorter than the {budget:?} budget"
-                );
+    for entry in entries {
+        let path = entry.path();
+        let relative = path.strip_prefix(object).unwrap_or(path);
+        let is_in_flight_temp = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"));
+        if entry.file_type().is_file() && !expected.contains(relative) && !is_in_flight_temp {
+            tokio::fs::remove_file(path).await?;
+        } else if entry.file_type().is_dir() {
+            match tokio::fs::remove_dir(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(other) => panic!("expected BuiltinSkillsLockTimeout, got {other:?}"),
-            Ok(_) => panic!("acquire must not succeed while a peer holds the lock"),
         }
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "acquire blocked for {elapsed:?} instead of honouring its {budget:?} budget"
-        );
-
-        FileExt::unlock(&peer).expect("release peer lock");
     }
+    Ok(())
+}
 
-    /// The budget is a ceiling, not a fixed wait: once the peer releases, the
-    /// poll loop must pick the lock up rather than run out the clock.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn acquire_within_succeeds_once_the_peer_releases() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let peer = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.path().join(LOCK_FILE_NAME))
-            .expect("open peer lock file");
-        FileExt::lock_exclusive(&peer).expect("peer must take the lock");
-
-        let releaser = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            FileExt::unlock(&peer).expect("release peer lock");
-        });
-
-        let started = Instant::now();
-        let guard = MaterializeLockGuard::acquire_within(dir.path(), Duration::from_secs(5))
-            .await
-            .expect("acquire must succeed after the peer releases");
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= Duration::from_millis(200),
-            "acquire returned in {elapsed:?}, before the peer could have released"
-        );
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "acquire took {elapsed:?}, i.e. it ran out the whole budget"
-        );
-        drop(guard);
-        releaser.await.expect("releaser task");
+fn collect_expected_paths(dir: &Dir<'static>, root: &Path, expected: &mut HashSet<PathBuf>) {
+    for file in dir.files() {
+        expected.insert(file.path().strip_prefix(root).unwrap_or(file.path()).to_path_buf());
     }
+    for subdir in dir.dirs() {
+        collect_expected_paths(subdir, root, expected);
+    }
+}
+
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ExtensionError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ExtensionError::Io(std::io::Error::other("materialized path has no parent")))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("resource");
+    let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), sequence));
+    tokio::fs::write(&temp, bytes).await?;
+    if let Err(error) = retry_startup_file_op("activate builtin skills file", path, || replace_file(&temp, path)).await
+    {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(windows))]
+async fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(temp, target).await
+}
+
+#[cfg(windows)]
+async fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temp = temp.to_path_buf();
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let source = temp.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+        let destination = target.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("builtin skills replace task failed: {error}")))?
+}
+
+/// Resolve the active content-addressed corpus, falling back to the legacy
+/// projection during migration or after an interrupted current-ref update.
+pub fn resolve_materialized_builtin_skills_dir(data_dir: &Path) -> PathBuf {
+    if let Ok(identity) = std::fs::read_to_string(data_dir.join(CURRENT_REF_FILE_NAME))
+        && validate_content_identity(&identity).is_ok()
+    {
+        let object = object_dir(data_dir, &identity);
+        if matches!(
+            std::fs::read_to_string(object.join(COMPLETE_FILE_NAME)),
+            Ok(marker) if marker == identity
+        ) {
+            return object;
+        }
+    }
+    data_dir.join(crate::constants::BUILTIN_SKILLS_DIR_NAME)
 }
