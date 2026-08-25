@@ -6,12 +6,15 @@ workflows=(
   ".github/workflows/build-manual.yml"
 )
 
-arm64_cross_rev="29d00c7803f221f1b3f35e561b03792368fb8339"
-arm64_cross_image="ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d"
+arm64_cross_image="$(sed -nE 's/^[[:space:]]*image[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' Cross.toml | head -n 1)"
+if [[ ! "${arm64_cross_image}" =~ ^ghcr[.]io/cross-rs/aarch64-unknown-linux-gnu@sha256:[a-f0-9]{64}$ ]]; then
+  echo "Cross.toml must pin Linux ARM64 to an immutable ghcr.io/cross-rs image digest" >&2
+  exit 1
+fi
 
 grep -Fq "${arm64_cross_image}" Cross.toml \
   || {
-    echo "Cross.toml must pin Linux ARM64 to the v0.1.39/v0.1.40 cross image digest" >&2
+    echo "Cross.toml must contain the resolved Linux ARM64 cross image digest" >&2
     exit 1
   }
 
@@ -28,6 +31,7 @@ grep -Fq '"platform":"linux-x64","os":"ubuntu-22.04","target":"x86_64-unknown-li
     exit 1
   }
 
+arm64_cross_rev=""
 for workflow in "${workflows[@]}"; do
   if [[ ! -f "${workflow}" ]]; then
     echo "Workflow not found: ${workflow}" >&2
@@ -40,11 +44,17 @@ for workflow in "${workflows[@]}"; do
       exit 1
     }
 
-  grep -Fq "CROSS_GIT_REV: \"${arm64_cross_rev}\"" "${workflow}" \
-    || {
-      echo "${workflow} must pin cross to the v0.1.39/v0.1.40 git revision" >&2
-      exit 1
-    }
+  workflow_cross_rev="$(sed -nE 's/^[[:space:]]*CROSS_GIT_REV:[[:space:]]*"([a-f0-9]+)"[[:space:]]*$/\1/p' "${workflow}" | head -n 1)"
+  if [[ ! "${workflow_cross_rev}" =~ ^[a-f0-9]{40}$ ]]; then
+    echo "${workflow} must pin CROSS_GIT_REV to an immutable 40-character Git revision" >&2
+    exit 1
+  fi
+  if [[ -z "${arm64_cross_rev}" ]]; then
+    arm64_cross_rev="${workflow_cross_rev}"
+  elif [[ "${workflow_cross_rev}" != "${arm64_cross_rev}" ]]; then
+    echo "${workflow} must use the same CROSS_GIT_REV as the other release workflows" >&2
+    exit 1
+  fi
 
   grep -Fq 'cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked' "${workflow}" \
     || {
@@ -71,4 +81,4 @@ for workflow in "${workflows[@]}"; do
     }
 done
 
-echo "Linux GLIBC workflow config is pinned for x64 and arm64"
+echo "Linux build inputs are immutable and consistent; GLIBC gates are configured for x64 and arm64"
