@@ -4,6 +4,8 @@ use aionui_api_types::{
     GeaInteractionPresentation, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
     GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaInteractionRequestStatus,
 };
+use chrono::{NaiveDateTime, SecondsFormat, TimeZone};
+use chrono_tz::Asia::Shanghai;
 use serde_json::Value;
 
 use crate::error::GeaError;
@@ -93,6 +95,9 @@ pub(crate) fn parse_receipt(
         .get("result")
         .cloned()
         .ok_or_else(|| invalid_upstream("GEA Interaction Request 动作响应缺少 result"))?;
+    if let Some(receipt) = result.as_object_mut() {
+        normalize_timestamp_field(receipt, "resolvedAt", "resolvedAt")?;
+    }
     if let Some(request) = result.get_mut("request") {
         normalize_request(request)?;
     }
@@ -180,6 +185,8 @@ fn normalize_request(value: &mut Value) -> Result<(), GeaError> {
     {
         request.insert("requestId".to_owned(), id);
     }
+    normalize_timestamp_field(request, "updatedAt", "request.updatedAt")?;
+    normalize_timestamp_field(request, "expiresAt", "request.expiresAt")?;
     if request.get("presentation").is_none_or(Value::is_null) {
         let kind = request
             .get("kind")
@@ -219,6 +226,32 @@ fn validate_timestamp(field: &str, value: &str) -> Result<(), GeaError> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|_| ())
         .map_err(|_| invalid_upstream(format!("{field} 必须是带时区的 RFC 3339 时间")))
+}
+
+fn normalize_timestamp_field(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<(), GeaError> {
+    let Some(Value::String(value)) = object.get_mut(key) else {
+        return Ok(());
+    };
+    *value = normalize_timestamp(field, value)?;
+    Ok(())
+}
+
+fn normalize_timestamp(field: &str, value: &str) -> Result<String, GeaError> {
+    if value.trim().is_empty() || chrono::DateTime::parse_from_rfc3339(value).is_ok() {
+        return Ok(value.to_owned());
+    }
+
+    let local = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| invalid_upstream(format!("{field} 必须是带时区的 RFC 3339 或 yyyy-MM-dd HH:mm:ss 时间")))?;
+    let timestamp = Shanghai
+        .from_local_datetime(&local)
+        .single()
+        .ok_or_else(|| invalid_upstream(format!("{field} 无法按 GEA 服务时区 Asia/Shanghai 唯一确定")))?;
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Secs, false))
 }
 
 fn reject_sensitive_fields(value: &Value) -> Result<(), GeaError> {
@@ -289,6 +322,83 @@ mod tests {
             snapshot.items[0].presentation,
             aionui_api_types::GeaInteractionPresentation::Question { ref questions } if questions.is_empty()
         ));
+    }
+
+    #[test]
+    fn snapshot_normalizes_gea_legacy_timestamps_to_rfc3339() {
+        let snapshot = parse_snapshot(&json!({
+            "result": {
+                "revision": "gea-pending-legacy-time",
+                "items": [{
+                    "requestId": "request-legacy-time",
+                    "version": "v1",
+                    "kind": "question",
+                    "status": "pending",
+                    "title": "请确认预测范围",
+                    "allowedActions": ["answer", "decline"],
+                    "presentation": {"type": "question"},
+                    "updatedAt": "2026-08-26 20:10:32",
+                    "expiresAt": "2026-08-26 21:10:32"
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.items[0].updated_at, "2026-08-26T20:10:32+08:00");
+        assert_eq!(
+            snapshot.items[0].expires_at.as_deref(),
+            Some("2026-08-26T21:10:32+08:00")
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_rfc3339_timestamps() {
+        let snapshot = parse_snapshot(&json!({
+            "result": {
+                "revision": "gea-pending-rfc3339-time",
+                "items": [{
+                    "requestId": "request-rfc3339-time",
+                    "version": "v1",
+                    "kind": "question",
+                    "status": "pending",
+                    "title": "请确认预测范围",
+                    "allowedActions": ["answer", "decline"],
+                    "presentation": {"type": "question"},
+                    "updatedAt": "2026-08-26T20:10:32+08:00",
+                    "expiresAt": "2026-08-26T21:10:32+08:00"
+                }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.items[0].updated_at, "2026-08-26T20:10:32+08:00");
+        assert_eq!(
+            snapshot.items[0].expires_at.as_deref(),
+            Some("2026-08-26T21:10:32+08:00")
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_legacy_timestamp() {
+        let error = parse_snapshot(&json!({
+            "result": {
+                "revision": "gea-pending-invalid-time",
+                "items": [{
+                    "requestId": "request-invalid-time",
+                    "version": "v1",
+                    "kind": "question",
+                    "status": "pending",
+                    "title": "请确认预测范围",
+                    "allowedActions": ["answer", "decline"],
+                    "presentation": {"type": "question"},
+                    "updatedAt": "2026-02-30 20:10:32"
+                }]
+            }
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.body.code, "GEA_INVALID_RESPONSE");
+        assert!(error.to_string().contains("yyyy-MM-dd HH:mm:ss"));
     }
 
     #[test]
@@ -492,5 +602,24 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn receipt_normalizes_gea_legacy_resolved_at_to_rfc3339() {
+        let receipt = parse_receipt(
+            &json!({
+                "result": {
+                    "receiptId": "receipt-legacy-time",
+                    "requestId": "request-1",
+                    "version": "v2",
+                    "status": "accepted",
+                    "resolvedAt": "2026-08-26 20:15:32"
+                }
+            }),
+            "request-1",
+        )
+        .unwrap();
+
+        assert_eq!(receipt.resolved_at.as_deref(), Some("2026-08-26T20:15:32+08:00"));
     }
 }
