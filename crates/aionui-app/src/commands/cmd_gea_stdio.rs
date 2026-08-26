@@ -31,9 +31,13 @@ const ENV_AGENT_CODE: &str = "AIONUI_GEA_AGENT_CODE";
 const DEFAULT_AGENT_CODE: &str = "sales_forecast";
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(125);
+const SESSION_START_MAX_RETRIES: usize = 5;
+const SESSION_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const GEA_IDENTITY_BOOTSTRAP_TOOL: &str = "gateway.session.currentUser.resolve";
 const BUSINESS_DATA_TOOL_NAME: &str = "query_business_data";
+const GEA_MCP_INSTRUCTIONS: &str = "GEA enterprise tools scoped to the current AionUi conversation. Use these tools as the only route for GEA-governed data. Never discover or call direct upstream MCP endpoints, and never reuse credentials from client configuration. If retryable GEA errors persist, report the gateway error instead of bypassing GEA.";
+const GEA_RETRYABLE_RECOVERY_HINT: &str = "Retry the same GEA tool after retryAfterMs or a short delay. Do not discover or call direct upstream MCP endpoints; report the GEA error if retries remain unsuccessful.";
 
 pub async fn run_gea_stdio() -> ExitCode {
     let env = match GeaStdioEnv::from_env() {
@@ -287,14 +291,36 @@ impl GeaStdioServer {
             "/api/gea/conversations/{}/session",
             encode_path_segment(&self.env.conversation_id)
         );
-        self.request::<Value>(
-            reqwest::Method::POST,
-            &path,
-            Some(json!({
-                "consumerCode": self.env.agent_code
-            })),
-        )
-        .await?;
+        for attempt in 1..=(SESSION_START_MAX_RETRIES + 1) {
+            match self
+                .request::<Value>(
+                    reqwest::Method::POST,
+                    &path,
+                    Some(json!({
+                        "consumerCode": self.env.agent_code
+                    })),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    let Some(delay) = session_retry_delay(&error, attempt) else {
+                        return Err(error);
+                    };
+                    tracing::warn!(
+                        event = "gea_session_start_retry",
+                        conversation_id = %self.env.conversation_id,
+                        retry_attempt = attempt,
+                        max_retries = SESSION_START_MAX_RETRIES,
+                        delay_ms = delay.as_millis(),
+                        code = error_field(&error, "code").unwrap_or("unknown"),
+                        category = error_field(&error, "category").unwrap_or("unknown"),
+                        "retrying GEA session startup after retryable backend error"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
         *ready = true;
         Ok(())
     }
@@ -390,25 +416,44 @@ fn backend_mcp_error(status: reqwest::StatusCode, body: &[u8]) -> McpError {
         "{}: {} [category={} retryable={}]",
         error.code, error.message, error.category, error.retryable
     );
-    let data = serde_json::to_value(error).ok();
+    let retryable = error.retryable;
+    let mut data = serde_json::to_value(error).ok();
+    if retryable && let Some(data) = data.as_mut().and_then(Value::as_object_mut) {
+        data.insert(
+            "recoveryHint".to_owned(),
+            Value::String(GEA_RETRYABLE_RECOVERY_HINT.to_owned()),
+        );
+    }
     McpError::internal_error(message, data)
 }
 
 fn should_reset_session_after_error(error: &McpError) -> bool {
-    matches!(
-        error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("category"))
-            .and_then(Value::as_str),
-        None | Some("AUTHENTICATION" | "SESSION" | "UPSTREAM" | "INTERNAL")
-    )
+    matches!(error_field(error, "category"), Some("AUTHENTICATION" | "SESSION"))
+}
+
+fn error_field<'a>(error: &'a McpError, field: &str) -> Option<&'a str> {
+    error.data.as_ref()?.get(field)?.as_str()
+}
+
+fn session_retry_delay(error: &McpError, failed_attempt: usize) -> Option<Duration> {
+    if failed_attempt > SESSION_START_MAX_RETRIES
+        || error.data.as_ref()?.get("retryable").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let retry_after = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("retryAfterMs"))
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis);
+    let exponential = Duration::from_millis(250 * (1_u64 << (failed_attempt - 1)));
+    Some(retry_after.unwrap_or(exponential).min(SESSION_RETRY_MAX_DELAY))
 }
 
 impl ServerHandler for GeaStdioServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("GEA enterprise tools scoped to the current AionUi conversation")
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(GEA_MCP_INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -538,6 +583,8 @@ mod tests {
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use serde_json::json;
     use tokio::sync::{Mutex, RwLock};
@@ -545,8 +592,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GeaStdioEnv, GeaStdioServer, ToolInfo, backend_mcp_error, compatible_tool_name, exposed_input_schema,
-        gateway_arguments, should_expose_tool_to_agent, should_reset_session_after_error,
+        GEA_MCP_INSTRUCTIONS, GEA_RETRYABLE_RECOVERY_HINT, GeaStdioEnv, GeaStdioServer, SESSION_START_MAX_RETRIES,
+        ToolInfo, backend_mcp_error, compatible_tool_name, exposed_input_schema, gateway_arguments,
+        session_retry_delay, should_expose_tool_to_agent, should_reset_session_after_error,
     };
 
     fn legacy_business_data_tool() -> ToolInfo {
@@ -606,6 +654,30 @@ mod tests {
     fn agent_projection_excludes_gateway_identity_bootstrap_tool() {
         assert!(!should_expose_tool_to_agent("gateway.session.currentUser.resolve"));
         assert!(should_expose_tool_to_agent("query_business_data"));
+    }
+
+    #[test]
+    fn gea_server_instructions_forbid_direct_upstream_fallback() {
+        let server = GeaStdioServer {
+            client: reqwest::Client::new(),
+            env: GeaStdioEnv {
+                base_url: "http://127.0.0.1".to_owned(),
+                conversation_id: "conversation-1".to_owned(),
+                user_id: "user-1".to_owned(),
+                runtime_token: "runtime-token".to_owned(),
+                agent_code: "sales_forecast".to_owned(),
+            },
+            session_ready: Arc::new(Mutex::new(false)),
+            tools: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let instructions = rmcp::ServerHandler::get_info(&server)
+            .instructions
+            .expect("GEA MCP instructions");
+
+        assert_eq!(instructions, GEA_MCP_INSTRUCTIONS);
+        assert!(instructions.contains("Never discover or call direct upstream MCP endpoints"));
+        assert!(instructions.contains("instead of bypassing GEA"));
     }
 
     #[tokio::test]
@@ -694,6 +766,86 @@ mod tests {
             error.data.as_ref().and_then(|data| data["category"].as_str()),
             Some("AUTHORIZATION")
         );
+        assert!(*server.session_ready.lock().await);
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_keeps_the_ready_session() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/gea/conversations/conversation-1/tools"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "code": "GEA_INVALID_RESPONSE",
+                "message": "GEA 返回无效响应",
+                "category": "UPSTREAM",
+                "retryable": true
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let server = GeaStdioServer {
+            client: reqwest::Client::new(),
+            env: GeaStdioEnv {
+                base_url: upstream.uri(),
+                conversation_id: "conversation-1".to_owned(),
+                user_id: "user-1".to_owned(),
+                runtime_token: "runtime-token".to_owned(),
+                agent_code: "sales_forecast".to_owned(),
+            },
+            session_ready: Arc::new(Mutex::new(true)),
+            tools: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let error = match server.load_tools().await {
+            Ok(_) => panic!("upstream failure must surface"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["category"].as_str()),
+            Some("UPSTREAM")
+        );
+        assert!(*server.session_ready.lock().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_session_failures_are_retried_within_the_same_startup() {
+        let upstream = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = Arc::clone(&attempts);
+        Mock::given(method("POST"))
+            .and(path("/api/gea/conversations/conversation-1/session"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(502).set_body_json(json!({
+                        "code": "GEA_SESSION_UPSTREAM_FAILED",
+                        "message": "GEA 会话创建失败",
+                        "category": "UPSTREAM",
+                        "retryable": true
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({ "data": {} }))
+                }
+            })
+            .expect(3)
+            .mount(&upstream)
+            .await;
+        let server = GeaStdioServer {
+            client: reqwest::Client::new(),
+            env: GeaStdioEnv {
+                base_url: upstream.uri(),
+                conversation_id: "conversation-1".to_owned(),
+                user_id: "user-1".to_owned(),
+                runtime_token: "runtime-token".to_owned(),
+                agent_code: "sales_forecast".to_owned(),
+            },
+            session_ready: Arc::new(Mutex::new(false)),
+            tools: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        server.ensure_session().await.expect("retryable session should recover");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(*server.session_ready.lock().await);
     }
 
@@ -787,12 +939,19 @@ mod tests {
         assert_eq!(value["data"]["category"], "RATE_LIMIT");
         assert_eq!(value["data"]["retryable"], true);
         assert_eq!(value["data"]["retryAfterMs"], 2000);
+        assert_eq!(value["data"]["recoveryHint"], GEA_RETRYABLE_RECOVERY_HINT);
+        assert_eq!(session_retry_delay(&error, 1), Some(Duration::from_secs(2)));
+        assert_eq!(
+            session_retry_delay(&error, SESSION_START_MAX_RETRIES),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(session_retry_delay(&error, SESSION_START_MAX_RETRIES + 1), None);
         assert!(!should_reset_session_after_error(&error));
     }
 
     #[test]
-    fn session_and_upstream_failures_require_session_recovery() {
-        for category in ["AUTHENTICATION", "SESSION", "UPSTREAM", "INTERNAL"] {
+    fn only_authentication_and_session_failures_require_session_recovery() {
+        for category in ["AUTHENTICATION", "SESSION"] {
             let error = backend_mcp_error(
                 reqwest::StatusCode::CONFLICT,
                 json!({
@@ -807,5 +966,24 @@ mod tests {
 
             assert!(should_reset_session_after_error(&error), "category={category}");
         }
+
+        for category in ["AUTHORIZATION", "RATE_LIMIT", "UPSTREAM", "INTERNAL"] {
+            let error = backend_mcp_error(
+                reqwest::StatusCode::BAD_GATEWAY,
+                json!({
+                    "code": "GEA_SESSION_STILL_VALID",
+                    "message": "session remains valid",
+                    "category": category,
+                    "retryable": true
+                })
+                .to_string()
+                .as_bytes(),
+            );
+
+            assert!(!should_reset_session_after_error(&error), "category={category}");
+        }
+
+        let unstructured = rmcp::ErrorData::internal_error("GEA_MCP_BACKEND_UNAVAILABLE", None);
+        assert!(!should_reset_session_after_error(&unstructured));
     }
 }
