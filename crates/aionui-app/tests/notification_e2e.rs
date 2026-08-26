@@ -33,36 +33,33 @@ fn snapshot() -> serde_json::Value {
     json!({
         "success": true,
         "result": {
-            "revision": "notification-r1",
             "items": [{
-                "notificationId": "notification-1",
-                "version": "v1",
-                "status": "unread",
-                "kind": "event",
+                "id": "notification-1",
+                "version": 1,
+                "state": "unread",
+                "kind": "workflow_event",
                 "severity": "warning",
                 "title": "Forecast needs review",
                 "summary": "September forecast",
-                "body": "Review the changed forecast before submission.",
                 "dismissible": true,
-                "source": "gea.workflow",
-                "target": {
-                    "type": "conversation",
-                    "conversationId": "conversation-1"
-                },
-                "createdAt": "2026-08-22T08:00:00Z"
+                "source": {"type": "business_system", "ref": "forecast-1", "label": "gea.workflow"},
+                "target": {"type": "aggregate", "value": "forecast-1"},
+                "created_at": "2026-08-22T08:00:00Z"
             }, {
-                "notificationId": "notification-expired",
-                "version": "v1",
-                "status": "unread",
+                "id": "notification-expired",
+                "version": 1,
+                "state": "unread",
                 "kind": "reminder",
                 "severity": "info",
                 "title": "Expired reminder",
                 "dismissible": true,
-                "source": "gea.workflow",
-                "target": { "type": "notification" },
-                "createdAt": "2020-01-01T00:00:00Z",
-                "expiresAt": "2020-01-02T00:00:00Z"
-            }]
+                "source": {"type": "business_system", "ref": "reminder-1", "label": "gea.workflow"},
+                "target": {"type": "aggregate", "value": "reminder-1"},
+                "created_at": "2020-01-01T00:00:00Z",
+                "expires_at": "2020-01-02T00:00:00Z"
+            }],
+            "unread_count": 2,
+            "total": 2
         }
     })
 }
@@ -107,23 +104,25 @@ async fn notification_routes_require_aioncore_authentication() {
 async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
         .expect(1)
         .mount(&gea)
         .await;
     Mock::given(method("POST"))
-        .and(path("/ai/gateway/notifications/notification-1/read"))
+        .and(path("/api/v1/notifications/notification-1/read"))
         .and(body_json(json!({
-            "expectedVersion": "v1",
+            "expectedVersion": "1",
             "idempotencyKey": "command-read-1"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
-                "receiptId": "receipt-read-1",
-                "notificationId": "notification-1",
-                "version": "v2",
+                "receipt_id": "receipt-read-1",
+                "notification_id": "notification-1",
+                "version": 2,
                 "status": "read"
             }
         })))
@@ -153,11 +152,17 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert_eq!(body["data"]["revision"], "notification-r1");
+    assert!(
+        body["data"]["revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("gea-sha256:")),
+        "unexpected notification list response: {body}"
+    );
     assert_eq!(body["data"]["sync_state"], "fresh");
     assert_eq!(body["data"]["items"].as_array().unwrap().len(), 1);
     assert_eq!(body["data"]["items"][0]["id"], "notification-1");
-    assert_eq!(body["data"]["items"][0]["target"]["conversationId"], "conversation-1");
+    assert_eq!(body["data"]["items"][0]["target"]["type"], "notification");
+    assert_eq!(body["data"]["items"][0]["kind"], "event");
 
     let response = app
         .clone()
@@ -165,10 +170,7 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(response).await["data"]["body"],
-        "Review the changed forecast before submission."
-    );
+    assert_eq!(response_json(response).await["data"]["summary"], "September forecast");
 
     for _ in 0..2 {
         let response = app
@@ -177,7 +179,7 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
                 "POST",
                 "/api/notifications/notification-1/read",
                 json!({
-                    "expected_version": "v1",
+                    "expected_version": "1",
                     "idempotency_key": "command-read-1"
                 }),
                 &token,
@@ -197,7 +199,7 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
             "POST",
             "/api/notifications/notification-1/dismiss",
             json!({
-                "expected_version": "v1",
+                "expected_version": "1",
                 "idempotency_key": "command-read-1"
             }),
             &token,
@@ -209,23 +211,38 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
 
     gea.reset().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
-        .and(query_param("cursor", "page-2"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "2"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(503))
+        .expect(1)
         .with_priority(1)
         .mount(&gea)
         .await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
-        .and(query_param("limit", "200"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
-                "revision": "notification-r2",
-                "items": [],
-                "nextCursor": "page-2"
+                "items": [{
+                    "id": "notification-partial",
+                    "version": 1,
+                    "state": "unread",
+                    "kind": "event",
+                    "severity": "info",
+                    "title": "Partial page",
+                    "dismissible": true,
+                    "source": {"type": "business_system", "ref": "partial-1"},
+                    "target": {"type": "aggregate", "value": "partial-1"},
+                    "created_at": "2026-08-22T08:00:00Z"
+                }],
+                "unread_count": 2,
+                "total": 2
             }
         })))
+        .expect(1)
         .with_priority(10)
         .mount(&gea)
         .await;
@@ -262,10 +279,12 @@ async fn notification_sync_detail_action_replay_and_last_good_form_a_closed_loop
 
     gea.reset().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
-            "result": { "revision": "notification-r3", "items": [] }
+            "result": { "items": [], "unread_count": 0, "total": 0 }
         })))
         .mount(&gea)
         .await;
@@ -313,7 +332,9 @@ async fn notification_action_rejects_missing_csrf_before_dispatch() {
 async fn concurrent_list_requests_share_one_upstream_snapshot_sync() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(std::time::Duration::from_millis(100))
@@ -348,7 +369,11 @@ async fn concurrent_list_requests_share_one_upstream_snapshot_sync() {
         let body = response_json(response).await;
         states.push(body["data"]["sync_state"].as_str().unwrap().to_owned());
         if body["data"]["sync_state"] == "fresh" {
-            assert_eq!(body["data"]["revision"], "notification-r1");
+            assert!(
+                body["data"]["revision"]
+                    .as_str()
+                    .is_some_and(|revision| revision.starts_with("gea-sha256:"))
+            );
         }
     }
     states.sort();
@@ -359,7 +384,9 @@ async fn concurrent_list_requests_share_one_upstream_snapshot_sync() {
 async fn notification_action_conflicts_return_the_current_safe_state_matrix() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
         .expect(1)
         .mount(&gea)
@@ -399,7 +426,7 @@ async fn notification_action_conflicts_return_the_current_safe_state_matrix() {
     assert_eq!(version_conflict.status(), StatusCode::CONFLICT);
     let body = response_json(version_conflict).await;
     assert_eq!(body["code"], "GEA_NOTIFICATION_VERSION_CONFLICT");
-    assert_eq!(body["details"]["upstream"]["version"], "v1");
+    assert_eq!(body["details"]["upstream"]["version"], "1");
     assert_eq!(body["details"]["upstream"]["status"], "unread");
 
     let expired = app
@@ -407,7 +434,7 @@ async fn notification_action_conflicts_return_the_current_safe_state_matrix() {
         .oneshot(json_with_token(
             "POST",
             "/api/notifications/notification-expired/read",
-            json!({ "expected_version": "v1", "idempotency_key": "expired-read" }),
+            json!({ "expected_version": "1", "idempotency_key": "expired-read" }),
             &token,
             &csrf,
         ))
@@ -468,7 +495,9 @@ async fn notification_action_conflicts_return_the_current_safe_state_matrix() {
 async fn notification_action_logs_are_terminal_and_exclude_sensitive_content() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
         .expect(1)
         .mount(&gea)
@@ -543,7 +572,9 @@ async fn notification_action_logs_are_terminal_and_exclude_sensitive_content() {
 async fn snapshot_reconciliation_cannot_interrupt_an_in_flight_action_receipt() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(snapshot()))
         .expect(1)
         .mount(&gea)
@@ -571,16 +602,16 @@ async fn snapshot_reconciliation_cannot_interrupt_an_in_flight_action_receipt() 
 
     gea.reset().await;
     Mock::given(method("POST"))
-        .and(path("/ai/gateway/notifications/notification-1/read"))
+        .and(path("/api/v1/notifications/notification-1/read"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(std::time::Duration::from_millis(100))
                 .set_body_json(json!({
                     "success": true,
                     "result": {
-                        "receiptId": "receipt-concurrent",
-                        "notificationId": "notification-1",
-                        "version": "v2",
+                        "receipt_id": "receipt-concurrent",
+                        "notification_id": "notification-1",
+                        "version": 2,
                         "status": "read"
                     }
                 })),
@@ -589,10 +620,12 @@ async fn snapshot_reconciliation_cannot_interrupt_an_in_flight_action_receipt() 
         .mount(&gea)
         .await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
-            "result": { "revision": "notification-r2", "items": [] }
+            "result": { "items": [], "unread_count": 0, "total": 0 }
         })))
         .expect(1)
         .mount(&gea)
@@ -606,7 +639,7 @@ async fn snapshot_reconciliation_cannot_interrupt_an_in_flight_action_receipt() 
             .oneshot(json_with_token(
                 "POST",
                 "/api/notifications/notification-1/read",
-                json!({ "expected_version": "v1", "idempotency_key": "concurrent-read" }),
+                json!({ "expected_version": "1", "idempotency_key": "concurrent-read" }),
                 &action_token,
                 &action_csrf,
             ))
@@ -640,36 +673,39 @@ async fn snapshot_reconciliation_cannot_interrupt_an_in_flight_action_receipt() 
 async fn dismissibility_and_interaction_request_state_remain_independent() {
     let gea = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/ai/gateway/notifications"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("pageNo", "1"))
+        .and(query_param("pageSize", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
-                "revision": "independent-r1",
                 "items": [{
-                    "notificationId": "notification-linked",
-                    "version": "v1",
-                    "status": "unread",
+                    "id": "notification-linked",
+                    "version": 1,
+                    "state": "unread",
                     "kind": "action_required",
                     "severity": "warning",
                     "title": "Review required",
                     "dismissible": false,
-                    "source": "gea.workflow",
-                    "interactionRequestId": "request-linked",
-                    "target": { "type": "interaction_request", "requestId": "request-linked" },
-                    "createdAt": "2026-08-22T08:00:00Z"
-                }]
+                    "source": {"type": "business_system", "ref": "request-linked", "label": "gea.workflow"},
+                    "interaction_request_id": "request-linked",
+                    "target": { "type": "aggregate", "value": "request-linked" },
+                    "created_at": "2026-08-22T08:00:00Z"
+                }],
+                "unread_count": 1,
+                "total": 1
             }
         })))
         .mount(&gea)
         .await;
     Mock::given(method("POST"))
-        .and(path("/ai/gateway/notifications/notification-linked/read"))
+        .and(path("/api/v1/notifications/notification-linked/read"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "result": {
-                "receiptId": "receipt-linked",
-                "notificationId": "notification-linked",
-                "version": "v2",
+                "receipt_id": "receipt-linked",
+                "notification_id": "notification-linked",
+                "version": 2,
                 "status": "read"
             }
         })))
@@ -703,7 +739,7 @@ async fn dismissibility_and_interaction_request_state_remain_independent() {
         .oneshot(json_with_token(
             "POST",
             "/api/notifications/notification-linked/dismiss",
-            json!({ "expected_version": "v1", "idempotency_key": "dismiss-linked" }),
+            json!({ "expected_version": "1", "idempotency_key": "dismiss-linked" }),
             &token,
             &csrf,
         ))
@@ -716,7 +752,7 @@ async fn dismissibility_and_interaction_request_state_remain_independent() {
         .oneshot(json_with_token(
             "POST",
             "/api/notifications/notification-linked/read",
-            json!({ "expected_version": "v1", "idempotency_key": "read-linked" }),
+            json!({ "expected_version": "1", "idempotency_key": "read-linked" }),
             &token,
             &csrf,
         ))

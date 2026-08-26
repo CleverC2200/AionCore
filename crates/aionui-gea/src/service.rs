@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::error::GeaError;
 use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command, validate_question_answers};
-use crate::notification::{parse_notification_receipt, parse_notification_snapshot, validate_notification_action};
+use crate::notification::{parse_notification_page, parse_notification_receipt, validate_notification_action};
 
 #[path = "service/notification.rs"]
 mod notification_service;
@@ -749,35 +749,34 @@ impl GeaService {
         credential: &GeaCredential,
         trace_id: &str,
     ) -> Result<GeaNotificationSnapshot, (GeaError, usize)> {
-        const PAGE_LIMIT: usize = 200;
+        const PAGE_SIZE: usize = 100;
         const MAX_PAGES: usize = 100;
-        let mut revision: Option<String> = None;
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
+        let mut total: Option<usize> = None;
         let mut seen_ids = HashSet::new();
         let mut items = Vec::new();
         let mut page_count = 0;
         loop {
-            let path = match cursor.as_deref() {
-                Some(cursor) => format!(
-                    "/ai/gateway/notifications?limit={PAGE_LIMIT}&cursor={}",
-                    encode_path_segment(cursor)
-                ),
-                None => format!("/ai/gateway/notifications?limit={PAGE_LIMIT}"),
-            };
+            let page_no = page_count + 1;
+            let path = format!("/api/v1/notifications?pageNo={page_no}&pageSize={PAGE_SIZE}");
             let value = self
                 .get_for_user_path(user_id, credential, &path, trace_id)
                 .await
                 .map_err(|error| (error, page_count))?;
-            let page = parse_notification_snapshot(&value).map_err(|error| (error, page_count))?;
+            let page = parse_notification_page(&value).map_err(|error| (error, page_count))?;
             page_count += 1;
-            if revision.as_deref().is_some_and(|current| current != page.revision) {
+            if total.is_some_and(|current| current != page.total) {
                 return Err((
-                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 revision 不一致"),
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 total 不一致"),
                     page_count,
                 ));
             }
-            revision.get_or_insert_with(|| page.revision.clone());
+            total.get_or_insert(page.total);
+            if page.items.is_empty() && items.len() < page.total {
+                return Err((
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页在到达 total 前为空"),
+                    page_count,
+                ));
+            }
             for item in page.items {
                 if !seen_ids.insert(item.id.clone()) {
                     return Err((
@@ -787,19 +786,33 @@ impl GeaService {
                 }
                 items.push(item);
             }
-            let Some(next_cursor) = page.next_cursor else {
+            let expected_total = total.unwrap_or_default();
+            if items.len() == expected_total {
                 break;
-            };
-            if page_count >= MAX_PAGES || !seen_cursors.insert(next_cursor.clone()) {
+            }
+            if items.len() > expected_total {
                 return Err((
-                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 cursor 无效"),
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页 items 数量超过 total"),
                     page_count,
                 ));
             }
-            cursor = Some(next_cursor);
+            if page_count >= MAX_PAGES {
+                return Err((
+                    GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 分页超过安全上限"),
+                    page_count,
+                ));
+            }
         }
+        let mut revision_items = items.clone();
+        revision_items.sort_by(|left, right| left.id.cmp(&right.id));
+        let revision_bytes = serde_json::to_vec(&revision_items).map_err(|_| {
+            (
+                GeaError::bad_gateway("GEA_INVALID_RESPONSE", "GEA Notification 快照无法生成 revision"),
+                page_count,
+            )
+        })?;
         Ok(GeaNotificationSnapshot {
-            revision: revision.unwrap_or_default(),
+            revision: format!("gea-sha256:{}", hex::encode(Sha256::digest(revision_bytes))),
             items,
             next_cursor: None,
         })
@@ -979,7 +992,7 @@ impl GeaService {
             return Err(error);
         }
         let path = format!(
-            "/ai/gateway/notifications/{}/{}",
+            "/api/v1/notifications/{}/{}",
             encode_path_segment(notification_id.trim()),
             action
         );
