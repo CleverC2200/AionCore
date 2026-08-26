@@ -444,6 +444,8 @@ fn parse_task(value: &Value) -> Result<ApprovalTask, ApprovalError> {
     Ok(ApprovalTask {
         task_id: required_string(value, "task_id")?,
         instance_code: required_string(value, "instance_code")?,
+        instance_external_id: string_value(value.get("instance_external_id")),
+        task_external_id: string_value(value.get("task_external_id")),
         definition_code: required_string(value, "definition_code")?,
         definition_name: required_string(value, "definition_name")?,
         title: required_string(value, "title")?,
@@ -751,6 +753,37 @@ mod tests {
         .expect("task list");
         assert_eq!(parsed.tasks[0].status, "1");
         assert!(parsed.tasks[0].support_api_operate);
+    }
+
+    #[test]
+    fn task_parser_preserves_external_approval_identifiers() {
+        let parsed = parse_task_list(&json!({
+            "count": 1,
+            "has_more": false,
+            "tasks": [{
+                "task_id": "task-1",
+                "instance_code": "instance-1",
+                "instance_external_id": "external-instance-1",
+                "task_external_id": "external-task-1",
+                "definition_code": "definition-1",
+                "definition_name": "业务系统权限申请流程",
+                "title": "业务系统权限申请流程",
+                "topic": 1,
+                "status": 1,
+                "instance_status": 1,
+                "user_id": "ou_owner",
+                "support_api_operate": false,
+                "link": "https://applink.feishu.cn/client/mini_program/open",
+                "summaries": [{"key": "事项说明", "value": "权限申请"}]
+            }]
+        }))
+        .expect("external task list");
+
+        assert_eq!(
+            parsed.tasks[0].instance_external_id.as_deref(),
+            Some("external-instance-1")
+        );
+        assert_eq!(parsed.tasks[0].task_external_id.as_deref(), Some("external-task-1"));
     }
 
     #[tokio::test]
