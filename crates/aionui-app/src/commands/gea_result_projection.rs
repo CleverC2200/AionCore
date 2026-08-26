@@ -57,11 +57,16 @@ fn project_inspect_result(parsed: Value, requested_model: Option<&str>) -> Resul
                 details: Some(json!({ "availableModels": available_models })),
             });
         };
-        json!({
+        let full_schema = json!({
             "status": status,
             "action": "inspect",
             "semanticModel": [model]
-        })
+        });
+        if serialized_len(&full_schema)? <= MODEL_RESULT_MAX_BYTES {
+            full_schema
+        } else {
+            compact_model_schema(status, model)
+        }
     } else {
         let catalog = models
             .iter()
@@ -86,6 +91,41 @@ fn project_inspect_result(parsed: Value, requested_model: Option<&str>) -> Resul
     };
 
     serialize(projected)
+}
+
+fn compact_model_schema(status: Value, model: &Value) -> Value {
+    let compact_members = |field: &str| {
+        model
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| {
+                        let name = member.get("name")?.as_str()?;
+                        Some(json!({
+                            "name": name,
+                            "title": member.get("title").cloned().unwrap_or(Value::Null),
+                            "type": member.get("type").cloned().unwrap_or(Value::Null)
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    json!({
+        "status": status,
+        "action": "inspect",
+        "semanticModel": [{
+            "name": model.get("name").cloned().unwrap_or(Value::Null),
+            "title": model.get("title").cloned().unwrap_or(Value::Null),
+            "measures": compact_members("measures"),
+            "dimensions": compact_members("dimensions"),
+            "segments": compact_members("segments")
+        }],
+        "schemaProjection": "compact",
+        "nextStep": "The compact schema preserves every queryable member name. Build queries only from these exact names."
+    })
 }
 
 fn project_query_result(mut result: Value) -> Result<Value, ProjectionError> {
@@ -278,6 +318,62 @@ mod tests {
 
         assert_eq!(selected["semanticModel"].as_array().map(Vec::len), Some(1));
         assert_eq!(selected["semanticModel"][0]["name"], "inventory_age_snapshot");
+    }
+
+    #[test]
+    fn oversized_inspect_compacts_schema_without_dropping_member_names() {
+        let dimensions = (0..80)
+            .map(|index| {
+                json!({
+                    "name": format!("agents_sales_forecast_detail.dimension_{index}"),
+                    "title": format!("Dimension {index}"),
+                    "type": "string",
+                    "description": "A deliberately verbose description that should not be exposed in the compact schema projection."
+                })
+            })
+            .collect::<Vec<_>>();
+        let projected = project_business_data_result(
+            BusinessDataAction::Inspect {
+                model: Some("agents_sales_forecast_detail"),
+            },
+            Value::String(
+                json!({
+                    "status": "completed",
+                    "semanticModel": [{
+                        "name": "agents_sales_forecast_detail",
+                        "title": "Sales forecast detail",
+                        "measures": [{
+                            "name": "agents_sales_forecast_detail.predicted_sales_amount",
+                            "title": "Predicted sales amount",
+                            "type": "number",
+                            "description": "A deliberately verbose description that should be omitted."
+                        }],
+                        "dimensions": dimensions,
+                        "segments": []
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .expect("compact oversized schema");
+        let serialized = projected.as_str().expect("serialized result");
+        let selected = parse_projected(projected.clone());
+
+        assert!(serialized.len() <= MODEL_RESULT_MAX_BYTES);
+        assert_eq!(selected["schemaProjection"], "compact");
+        assert_eq!(
+            selected["semanticModel"][0]["dimensions"].as_array().map(Vec::len),
+            Some(80)
+        );
+        assert_eq!(
+            selected["semanticModel"][0]["measures"][0]["name"],
+            "agents_sales_forecast_detail.predicted_sales_amount"
+        );
+        assert!(
+            selected["semanticModel"][0]["dimensions"][0]
+                .get("description")
+                .is_none()
+        );
     }
 
     #[test]
