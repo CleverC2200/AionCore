@@ -29,6 +29,8 @@ pub struct ApprovalSummary {
 pub struct ApprovalTask {
     pub task_id: String,
     pub instance_code: String,
+    pub instance_external_id: Option<String>,
+    pub task_external_id: Option<String>,
     pub definition_code: String,
     pub definition_name: String,
     pub title: String,
