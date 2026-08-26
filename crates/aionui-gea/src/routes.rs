@@ -1,9 +1,10 @@
 use aionui_api_types::{
     ApiResponse, CreateGeaSessionRequest, ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult,
     GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot,
-    GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand,
-    InteractionRequestList, InteractionRequestReceipt, NotificationActionCommand, NotificationList,
-    NotificationReceipt, NotificationView, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    GeaResourceContents, GeaResourceList, GeaResourceTemplateList, GeaSessionResponse, GeaToolCallRequest,
+    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
+    InteractionRequestReceipt, NotificationActionCommand, NotificationList, NotificationReceipt, NotificationView,
+    ReadGeaResourceRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 #[cfg(debug_assertions)]
 use aionui_api_types::{
@@ -37,6 +38,18 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
         )
         .route("/api/gea/conversations/{conversation_id}/session", post(create_session))
         .route("/api/gea/conversations/{conversation_id}/tools", get(list_tools))
+        .route(
+            "/api/gea/conversations/{conversation_id}/resources",
+            get(list_resources),
+        )
+        .route(
+            "/api/gea/conversations/{conversation_id}/resource-templates",
+            get(list_resource_templates),
+        )
+        .route(
+            "/api/gea/conversations/{conversation_id}/resources/read",
+            post(read_resource),
+        )
         .route("/api/gea/mcp/test", post(test_mcp_connection))
         .route(
             "/api/gea/conversations/{conversation_id}/interaction-requests",
@@ -606,6 +619,110 @@ async fn call_tool(
     Ok(Json(ApiResponse::ok(result)))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeaResourceListQuery {
+    cursor: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/conversations/{conversation_id}/resources",
+    operation_id = "listGeaConversationResources",
+    tag = "GEA tools",
+    params(
+        ("conversation_id" = String, Path, description = "AionCore conversation identifier"),
+        ("cursor" = Option<String>, Query, description = "GEA MCP pagination cursor")
+    ),
+    responses(
+        (status = 200, description = "Sanitized resources visible to the current GEA session", body = ApiResponse<GeaResourceList>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "Runtime credential conversation mismatch", body = ErrorResponse),
+        (status = 409, description = "GEA conversation session is required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid resource list", body = ErrorResponse)
+    ),
+    security(("runtimeToken" = []))
+)]
+async fn list_resources(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    Query(query): Query<GeaResourceListQuery>,
+) -> Result<Json<ApiResponse<GeaResourceList>>, GeaError> {
+    require_runtime_conversation_scope(&headers, &conversation_id)?;
+    let resources = state
+        .service
+        .list_resources(&user.id, &conversation_id, query.cursor)
+        .await?;
+    Ok(Json(ApiResponse::ok(resources)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/conversations/{conversation_id}/resource-templates",
+    operation_id = "listGeaConversationResourceTemplates",
+    tag = "GEA tools",
+    params(
+        ("conversation_id" = String, Path, description = "AionCore conversation identifier"),
+        ("cursor" = Option<String>, Query, description = "GEA MCP pagination cursor")
+    ),
+    responses(
+        (status = 200, description = "Sanitized MCP resource templates", body = ApiResponse<GeaResourceTemplateList>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "Runtime credential conversation mismatch", body = ErrorResponse),
+        (status = 409, description = "GEA conversation session is required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid resource template list", body = ErrorResponse)
+    ),
+    security(("runtimeToken" = []))
+)]
+async fn list_resource_templates(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    Query(query): Query<GeaResourceListQuery>,
+) -> Result<Json<ApiResponse<GeaResourceTemplateList>>, GeaError> {
+    require_runtime_conversation_scope(&headers, &conversation_id)?;
+    let templates = state
+        .service
+        .list_resource_templates(&user.id, &conversation_id, query.cursor)
+        .await?;
+    Ok(Json(ApiResponse::ok(templates)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/gea/conversations/{conversation_id}/resources/read",
+    operation_id = "readGeaConversationResource",
+    tag = "GEA tools",
+    request_body = ReadGeaResourceRequest,
+    params(("conversation_id" = String, Path, description = "AionCore conversation identifier")),
+    responses(
+        (status = 200, description = "Integrity-checked UTF-8 resource contents", body = ApiResponse<GeaResourceContents>),
+        (status = 400, description = "Invalid Resource URI", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "Runtime credential conversation mismatch", body = ErrorResponse),
+        (status = 404, description = "Resource is not bound to the current GEA session", body = ErrorResponse),
+        (status = 502, description = "Resource integrity validation or upstream read failed", body = ErrorResponse)
+    ),
+    security(("runtimeToken" = []))
+)]
+async fn read_resource(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    Json(request): Json<ReadGeaResourceRequest>,
+) -> Result<Json<ApiResponse<GeaResourceContents>>, GeaError> {
+    require_runtime_conversation_scope(&headers, &conversation_id)?;
+    let content = state
+        .service
+        .read_resource(&user.id, &conversation_id, &request.uri)
+        .await?;
+    Ok(Json(ApiResponse::ok(content)))
+}
+
 #[utoipa::path(
     get,
     path = "/api/gea/conversations/{conversation_id}/interaction-requests",
@@ -737,6 +854,9 @@ impl utoipa::Modify for SecuritySchemes {
         create_session,
         list_tools,
         call_tool,
+        list_resources,
+        list_resource_templates,
+        read_resource,
         test_mcp_connection,
         list_all_interaction_requests,
         act_on_global_interaction_request,
@@ -799,6 +919,17 @@ fn enforce_runtime_conversation_scope(headers: &HeaderMap, path_conversation_id:
     Ok(())
 }
 
+fn require_runtime_conversation_scope(headers: &HeaderMap, path_conversation_id: &str) -> Result<(), GeaError> {
+    if !headers.contains_key(RUNTIME_TOKEN_HEADER) {
+        return Err(GeaError::new(
+            StatusCode::FORBIDDEN,
+            "GEA_RESOURCE_RUNTIME_REQUIRED",
+            "GEA Resource 正文只能由受信对话运行时读取",
+        ));
+    }
+    enforce_runtime_conversation_scope(headers, path_conversation_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -809,6 +940,7 @@ mod tests {
 
     use super::{
         GeaApiDoc, enforce_runtime_conversation_scope, gea_swagger_config, reject_runtime_auth_session_access,
+        require_runtime_conversation_scope,
     };
     use aionui_auth::{RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 
@@ -869,6 +1001,12 @@ mod tests {
     }
 
     #[test]
+    fn resource_contents_require_a_conversation_runtime_credential() {
+        let error = require_runtime_conversation_scope(&HeaderMap::new(), "conversation-1").unwrap_err();
+        assert_eq!(error.body.code, "GEA_RESOURCE_RUNTIME_REQUIRED");
+    }
+
+    #[test]
     fn gea_openapi_contains_the_current_route_set_and_unique_operation_ids() {
         let value = openapi_value();
         let paths = value["paths"].as_object().unwrap();
@@ -877,6 +1015,9 @@ mod tests {
             "/api/gea/conversations/{conversation_id}/session",
             "/api/gea/conversations/{conversation_id}/tools",
             "/api/gea/conversations/{conversation_id}/tools/{tool_name}",
+            "/api/gea/conversations/{conversation_id}/resources",
+            "/api/gea/conversations/{conversation_id}/resource-templates",
+            "/api/gea/conversations/{conversation_id}/resources/read",
             "/api/gea/mcp/test",
             "/api/gea/conversations/{conversation_id}/interaction-requests",
             "/api/gea/conversations/{conversation_id}/interaction-requests/{request_id}/actions",
@@ -906,7 +1047,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_ids.len(), 16);
+        assert_eq!(operation_ids.len(), 19);
     }
 
     #[test]
@@ -935,7 +1076,16 @@ mod tests {
             &["description", "inputSchema", "name", "sourceCode"],
         );
         assert_schema_properties(&document, "GeaToolCallRequest", &["arguments"]);
-        assert_schema_properties(&document, "GeaToolCallResponse", &["auditId", "result"]);
+        assert_schema_properties(
+            &document,
+            "GeaToolCallResponse",
+            &["auditId", "content", "isError", "result"],
+        );
+        assert_schema_properties(
+            &document,
+            "GeaResourceContents",
+            &["expiresAt", "mimeType", "sha256", "text", "uri"],
+        );
     }
 
     #[test]

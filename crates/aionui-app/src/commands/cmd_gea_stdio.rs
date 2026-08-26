@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool,
+    AnnotateAble, CallToolRequestParams, CallToolResult, Content, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, Meta, PaginatedRequestParams, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, service::ServiceExt, transport};
 use serde::de::DeserializeOwned;
@@ -169,6 +170,77 @@ struct ToolInfo {
 #[serde(rename_all = "camelCase")]
 struct ToolCallResponse {
     result: Value,
+    #[serde(default)]
+    content: Vec<ToolContent>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolContent {
+    Text {
+        text: String,
+    },
+    ResourceLink {
+        uri: String,
+        name: String,
+        title: Option<String>,
+        description: Option<String>,
+        #[serde(rename = "mimeType")]
+        mime_type: Option<String>,
+        size: Option<u64>,
+        sha256: String,
+        #[serde(rename = "expiresAt")]
+        expires_at: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceDescriptor {
+    uri: String,
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    size: Option<u64>,
+    sha256: String,
+    expires_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceListResponse {
+    resources: Vec<ResourceDescriptor>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceTemplateDescriptor {
+    uri_template: String,
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceTemplateListResponse {
+    resource_templates: Vec<ResourceTemplateDescriptor>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceContentsResponse {
+    uri: String,
+    mime_type: Option<String>,
+    text: String,
+    sha256: String,
+    expires_at: String,
 }
 
 struct BusinessDataArtifact {
@@ -566,7 +638,8 @@ fn retryable_artifact_error(code: &'static str) -> McpError {
 
 impl ServerHandler for GeaStdioServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(GEA_MCP_INSTRUCTIONS)
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
+            .with_instructions(GEA_MCP_INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -614,7 +687,7 @@ impl ServerHandler for GeaStdioServer {
         let arguments = Value::Object(request.arguments.unwrap_or_default());
         let gateway_arguments = gateway_arguments(&tool, arguments.clone());
         let mut failed_attempt = 0;
-        let hydrated_result = loop {
+        let response = loop {
             let attempt_result = match self
                 .request::<ToolCallResponse>(
                     reqwest::Method::POST,
@@ -623,14 +696,27 @@ impl ServerHandler for GeaStdioServer {
                 )
                 .await
             {
-                Ok(response) => {
-                    hydrate_business_data_artifact(&self.client, &self.env.conversation_id, &tool, response.result)
-                        .await
+                Ok(mut response) if response.content.is_empty() => {
+                    match hydrate_business_data_artifact(
+                        &self.client,
+                        &self.env.conversation_id,
+                        &tool,
+                        response.result,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            response.result = result;
+                            Ok(response)
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
+                Ok(response) => Ok(response),
                 Err(error) => Err(error),
             };
             match attempt_result {
-                Ok(result) => break result,
+                Ok(response) => break response,
                 Err(error) => {
                     failed_attempt += 1;
                     if should_reset_session_after_error(&error) {
@@ -655,17 +741,169 @@ impl ServerHandler for GeaStdioServer {
                 }
             }
         };
-        let result_value = adapt_business_data_result(&tool, &arguments, hydrated_result)?;
+        if !response.content.is_empty() {
+            let content = response
+                .content
+                .into_iter()
+                .map(tool_content_to_mcp)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut result = if response.is_error {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            };
+            if response.result.is_object() {
+                result.structured_content = Some(response.result);
+            }
+            return Ok(result);
+        }
+        let result_value = adapt_business_data_result(&tool, &arguments, response.result)?;
         let text = match &result_value {
             Value::String(value) => value.clone(),
             value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
         };
-        let mut result = CallToolResult::success(vec![Content::text(text)]);
+        let mut result = if response.is_error {
+            CallToolResult::error(vec![Content::text(text)])
+        } else {
+            CallToolResult::success(vec![Content::text(text)])
+        };
         if result_value.is_object() {
             result.structured_content = Some(result_value);
         }
         Ok(result)
     }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        self.ensure_session().await?;
+        let mut path = format!(
+            "/api/gea/conversations/{}/resources",
+            encode_path_segment(&self.env.conversation_id)
+        );
+        if let Some(cursor) = request.and_then(|request| request.cursor) {
+            path.push_str("?cursor=");
+            path.push_str(&encode_path_segment(&cursor));
+        }
+        let response: ResourceListResponse = self.request(reqwest::Method::GET, &path, None).await?;
+        let resources = response
+            .resources
+            .into_iter()
+            .map(resource_descriptor_to_mcp)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ListResourcesResult {
+            meta: None,
+            next_cursor: response.next_cursor,
+            resources,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        self.ensure_session().await?;
+        let path = format!(
+            "/api/gea/conversations/{}/resources/read",
+            encode_path_segment(&self.env.conversation_id)
+        );
+        let content: ResourceContentsResponse = self
+            .request(reqwest::Method::POST, &path, Some(json!({ "uri": request.uri })))
+            .await?;
+        let mut meta = Meta::new();
+        meta.insert("sha256".to_owned(), Value::String(content.sha256));
+        meta.insert("expiresAt".to_owned(), Value::String(content.expires_at));
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(content.text, content.uri)
+                .with_mime_type(content.mime_type.unwrap_or_else(|| "text/plain".to_owned()))
+                .with_meta(meta),
+        ]))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        self.ensure_session().await?;
+        let mut path = format!(
+            "/api/gea/conversations/{}/resource-templates",
+            encode_path_segment(&self.env.conversation_id)
+        );
+        if let Some(cursor) = request.and_then(|request| request.cursor) {
+            path.push_str("?cursor=");
+            path.push_str(&encode_path_segment(&cursor));
+        }
+        let response: ResourceTemplateListResponse = self.request(reqwest::Method::GET, &path, None).await?;
+        let resource_templates = response
+            .resource_templates
+            .into_iter()
+            .map(resource_template_to_mcp)
+            .collect();
+        Ok(ListResourceTemplatesResult {
+            meta: None,
+            next_cursor: response.next_cursor,
+            resource_templates,
+        })
+    }
+}
+
+fn tool_content_to_mcp(content: ToolContent) -> Result<Content, McpError> {
+    match content {
+        ToolContent::Text { text } => Ok(Content::text(text)),
+        ToolContent::ResourceLink {
+            uri,
+            name,
+            title,
+            description,
+            mime_type,
+            size,
+            sha256,
+            expires_at,
+        } => {
+            let mut resource = RawResource::new(uri, name);
+            resource.title = title;
+            resource.description = description;
+            resource.mime_type = mime_type;
+            resource.size = size
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| McpError::internal_error("GEA_RESOURCE_SIZE_UNSUPPORTED", None))?;
+            let mut meta = Meta::new();
+            meta.insert("sha256".to_owned(), Value::String(sha256));
+            meta.insert("expiresAt".to_owned(), Value::String(expires_at));
+            resource.meta = Some(meta);
+            Ok(Content::resource_link(resource))
+        }
+    }
+}
+
+fn resource_descriptor_to_mcp(resource: ResourceDescriptor) -> Result<rmcp::model::Resource, McpError> {
+    let mut raw = RawResource::new(resource.uri, resource.name);
+    raw.title = resource.title;
+    raw.description = resource.description;
+    raw.mime_type = resource.mime_type;
+    raw.size = resource
+        .size
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| McpError::internal_error("GEA_RESOURCE_SIZE_UNSUPPORTED", None))?;
+    let mut meta = Meta::new();
+    meta.insert("sha256".to_owned(), Value::String(resource.sha256));
+    meta.insert("expiresAt".to_owned(), Value::String(resource.expires_at));
+    raw.meta = Some(meta);
+    Ok(raw.no_annotation())
+}
+
+fn resource_template_to_mcp(template: ResourceTemplateDescriptor) -> rmcp::model::ResourceTemplate {
+    let mut raw = RawResourceTemplate::new(template.uri_template, template.name);
+    raw.title = template.title;
+    raw.description = template.description;
+    raw.mime_type = template.mime_type;
+    raw.no_annotation()
 }
 
 async fn hydrate_business_data_artifact(

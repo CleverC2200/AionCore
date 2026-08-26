@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aionui_api_types::{
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
-    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaNotificationSnapshot, GeaSessionResponse,
-    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
+    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaNotificationSnapshot, GeaResourceContents,
+    GeaResourceDescriptor, GeaResourceList, GeaResourceTemplate, GeaResourceTemplateList, GeaSessionResponse,
+    GeaToolCallResponse, GeaToolContent, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
     InteractionRequestReceipt, InteractionRequestSyncState, NotificationActionCommand, NotificationList,
     NotificationReceipt, NotificationStatus, NotificationSyncState, SetGeaAuthSessionRequest,
 };
@@ -25,6 +27,8 @@ use crate::error::GeaError;
 use crate::interaction_request::{parse_receipt, parse_snapshot, validate_action_command, validate_question_answers};
 use crate::notification::{parse_notification_page, parse_notification_receipt, validate_notification_action};
 
+#[path = "service/mcp_transport.rs"]
+mod mcp_transport;
 #[path = "service/notification.rs"]
 mod notification_service;
 #[path = "service/interaction_request.rs"]
@@ -32,6 +36,7 @@ mod projection_service;
 #[path = "service/resource_catalog.rs"]
 mod resource_catalog_service;
 
+use self::mcp_transport::{McpTransportClient, McpTransportSession};
 use self::notification_service::NotificationProjection;
 use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
 use crate::{InteractionTurnResolver, InteractionTurnResumer};
@@ -92,6 +97,9 @@ struct GeaConversationSession {
     conversation_id: String,
     delegation_token: Arc<str>,
     tools: HashMap<String, GeaToolInfo>,
+    mcp_transport: Arc<McpTransportSession>,
+    resources: Arc<RwLock<HashMap<String, GeaResourceDescriptor>>>,
+    legacy_mcp: Arc<AtomicBool>,
 }
 
 /// A per-process GEA gateway. Credentials and delegation tokens deliberately
@@ -99,6 +107,7 @@ struct GeaConversationSession {
 #[derive(Clone)]
 pub struct GeaService {
     client: reqwest::Client,
+    mcp_client: Arc<McpTransportClient>,
     base_url: String,
     credentials: Arc<RwLock<HashMap<String, GeaCredential>>>,
     reauth_required: Arc<RwLock<HashSet<String>>>,
@@ -136,6 +145,7 @@ impl GeaService {
             return Err(GeaError::invalid_request("GEA 地址必须使用 HTTPS"));
         }
         Ok(Self {
+            mcp_client: Arc::new(McpTransportClient::new(client.clone(), &base_url)),
             client,
             base_url,
             credentials: Arc::new(RwLock::new(HashMap::new())),
@@ -251,9 +261,9 @@ impl GeaService {
 
     pub async fn clear_auth_session(&self, user_id: &str) {
         self.stop_interaction_request_poll(user_id).await;
+        self.clear_sessions(user_id).await;
         self.credentials.write().await.remove(user_id);
         self.reauth_required.write().await.remove(user_id);
-        self.clear_sessions(user_id).await;
         self.clear_resource_scope(user_id).await;
     }
 
@@ -374,6 +384,9 @@ impl GeaService {
                 conversation_id: returned_conversation_id.clone(),
                 delegation_token: Arc::from(delegation_token),
                 tools: HashMap::new(),
+                mcp_transport: Arc::new(McpTransportSession::default()),
+                resources: Arc::new(RwLock::new(HashMap::new())),
+                legacy_mcp: Arc::new(AtomicBool::new(false)),
             },
         );
         if persist_for_conversation && let Some(projection) = self.projection.as_ref() {
@@ -426,26 +439,55 @@ impl GeaService {
         )
         .await?;
         let result = self.list_tools(user_id, &conversation_id).await;
-        self.sessions
-            .write()
-            .await
-            .remove(&(user_id.to_owned(), conversation_id));
+        self.clear_conversation_session(user_id, &conversation_id).await;
         result
     }
 
     pub async fn list_tools(&self, user_id: &str, conversation_id: &str) -> Result<Vec<GeaToolInfo>, GeaError> {
         let credential = self.credential(user_id).await?;
         let session = self.session(user_id, conversation_id).await?;
-        let body = session.gateway_body();
-        let value = self
-            .post_for_conversation(
+        let headers = self.user_headers(&credential)?;
+        let value = if session.legacy_mcp.load(Ordering::Relaxed) {
+            self.post_for_conversation(
                 user_id,
                 conversation_id,
                 &credential,
                 "/ai/gateway/mcp/proxy/list",
-                &body,
+                &session.gateway_body(),
             )
-            .await?;
+            .await?
+        } else {
+            match self
+                .mcp_request_for_conversation(
+                    user_id,
+                    conversation_id,
+                    &headers,
+                    &session.mcp_transport,
+                    "tools/list",
+                    json!({ "_meta": session.gateway_body() }),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) if should_fallback_to_legacy_mcp(&error) => {
+                    session.legacy_mcp.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        user_id,
+                        conversation_id,
+                        "GEA Streamable HTTP endpoint is unavailable; using the legacy MCP proxy"
+                    );
+                    self.post_for_conversation(
+                        user_id,
+                        conversation_id,
+                        &credential,
+                        "/ai/gateway/mcp/proxy/list",
+                        &session.gateway_body(),
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let raw_tools = value
             .get("tools")
             .and_then(Value::as_array)
@@ -457,7 +499,13 @@ impl GeaService {
             if !names.insert(name.clone()) {
                 return Err(invalid_upstream("GEA Tool 列表存在重名工具"));
             }
-            let source_code = required_string(raw, "sourceCode")?;
+            let source_code = raw
+                .get("sourceCode")
+                .or_else(|| raw.get("mcpCode"))
+                .or_else(|| raw.pointer("/_meta/mcpCode"))
+                .and_then(Value::as_str)
+                .and_then(non_empty)
+                .ok_or_else(|| invalid_upstream("GEA Tool 列表响应缺少 mcpCode"))?;
             let input_schema = sanitize_tool_input_schema(
                 raw.get("inputSchema")
                     .cloned()
@@ -508,41 +556,268 @@ impl GeaService {
             .cloned()
             .ok_or_else(|| GeaError::tool_not_found(tool_name))?;
         let body = json!({
-            "agentCode": session.agent_code,
-            "sessionId": session.session_id,
-            "conversationId": session.conversation_id,
-            "delegationToken": session.delegation_token.as_ref(),
-            "mcpCode": tool.source_code,
-            "toolName": tool.name,
-            "arguments": if arguments.is_null() { json!({}) } else { arguments }
+            "name": tool.name,
+            "arguments": if arguments.is_null() { json!({}) } else { arguments },
+            "_meta": session.gateway_body_with_mcp_code(&tool.source_code),
         });
         let started = Instant::now();
-        let value = self
-            .post_for_conversation(
+        let headers = self.user_headers(&credential)?;
+        if session.legacy_mcp.load(Ordering::Relaxed) {
+            let legacy_body = json!({
+                "agentCode": session.agent_code,
+                "sessionId": session.session_id,
+                "conversationId": session.conversation_id,
+                "delegationToken": session.delegation_token.as_ref(),
+                "mcpCode": tool.source_code,
+                "toolName": tool.name,
+                "arguments": body.get("arguments").cloned().unwrap_or_else(|| json!({})),
+            });
+            let value = self
+                .post_for_conversation(
+                    user_id,
+                    conversation_id,
+                    &credential,
+                    "/ai/gateway/mcp/proxy/call",
+                    &legacy_body,
+                )
+                .await?;
+            if value.get("sourceCode").and_then(Value::as_str) != Some(tool.source_code.as_str())
+                || value.get("toolName").and_then(Value::as_str) != Some(tool.name.as_str())
+            {
+                return Err(invalid_upstream("GEA Tool 调用响应与请求不匹配"));
+            }
+            let audit_id = value.get("auditId").and_then(Value::as_str).and_then(non_empty);
+            tracing::info!(
                 user_id,
                 conversation_id,
-                &credential,
-                "/ai/gateway/mcp/proxy/call",
-                &body,
+                tool_name,
+                audit_id,
+                duration_ms = started.elapsed().as_millis(),
+                "GEA legacy tool call completed"
+            );
+            return Ok(GeaToolCallResponse {
+                result: value.get("result").cloned().unwrap_or(Value::Null),
+                content: Vec::new(),
+                is_error: false,
+                audit_id,
+            });
+        }
+        let value = self
+            .mcp_request_for_conversation(
+                user_id,
+                conversation_id,
+                &headers,
+                &session.mcp_transport,
+                "tools/call",
+                body,
             )
             .await?;
-        if value.get("sourceCode").and_then(Value::as_str) != Some(tool.source_code.as_str())
-            || value.get("toolName").and_then(Value::as_str) != Some(tool.name.as_str())
-        {
-            return Err(invalid_upstream("GEA Tool 调用响应与请求不匹配"));
+        let (content, resources) = parse_tool_content(&value)?;
+        if !resources.is_empty() {
+            let mut stored = session.resources.write().await;
+            stored.extend(resources.into_iter().map(|resource| (resource.uri.clone(), resource)));
         }
-        let audit_id = value.get("auditId").and_then(Value::as_str).and_then(non_empty);
+        let result = legacy_result_projection(&value, &content);
+        let is_error = value.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let audit_id = value
+            .get("auditId")
+            .or_else(|| value.pointer("/_meta/auditId"))
+            .and_then(Value::as_str)
+            .and_then(non_empty);
         tracing::info!(
             user_id,
             conversation_id,
             tool_name,
             audit_id,
+            resource_count = content
+                .iter()
+                .filter(|item| matches!(item, GeaToolContent::ResourceLink { .. }))
+                .count(),
             duration_ms = started.elapsed().as_millis(),
             "GEA tool call completed"
         );
         Ok(GeaToolCallResponse {
-            result: value.get("result").cloned().unwrap_or(Value::Null),
+            result,
+            content,
+            is_error,
             audit_id,
+        })
+    }
+
+    pub async fn list_resources(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        cursor: Option<String>,
+    ) -> Result<GeaResourceList, GeaError> {
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        if session.legacy_mcp.load(Ordering::Relaxed) {
+            return Err(GeaError::conflict(
+                "GEA_MCP_RESOURCES_UNAVAILABLE",
+                "当前 GEA 环境尚未启用 MCP Resources",
+            ));
+        }
+        let headers = self.user_headers(&credential)?;
+        let mut params = json!({ "_meta": session.gateway_body() });
+        if let Some(cursor) = cursor.and_then(non_empty) {
+            params["cursor"] = Value::String(cursor);
+        }
+        let value = self
+            .mcp_request_for_conversation(
+                user_id,
+                conversation_id,
+                &headers,
+                &session.mcp_transport,
+                "resources/list",
+                params,
+            )
+            .await?;
+        let resources = value
+            .get("resources")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_upstream("GEA Resource 列表响应缺少 resources"))?
+            .iter()
+            .map(parse_resource_descriptor)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !resources.is_empty() {
+            let mut stored = session.resources.write().await;
+            stored.extend(
+                resources
+                    .iter()
+                    .cloned()
+                    .map(|resource| (resource.uri.clone(), resource)),
+            );
+        }
+        Ok(GeaResourceList {
+            resources,
+            next_cursor: value.get("nextCursor").and_then(Value::as_str).and_then(non_empty),
+        })
+    }
+
+    pub async fn list_resource_templates(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        cursor: Option<String>,
+    ) -> Result<GeaResourceTemplateList, GeaError> {
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        if session.legacy_mcp.load(Ordering::Relaxed) {
+            return Err(GeaError::conflict(
+                "GEA_MCP_RESOURCES_UNAVAILABLE",
+                "当前 GEA 环境尚未启用 MCP Resources",
+            ));
+        }
+        let headers = self.user_headers(&credential)?;
+        let mut params = json!({ "_meta": session.gateway_body() });
+        if let Some(cursor) = cursor.and_then(non_empty) {
+            params["cursor"] = Value::String(cursor);
+        }
+        let value = self
+            .mcp_request_for_conversation(
+                user_id,
+                conversation_id,
+                &headers,
+                &session.mcp_transport,
+                "resources/templates/list",
+                params,
+            )
+            .await?;
+        let resource_templates = value
+            .get("resourceTemplates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_upstream("GEA Resource Template 列表响应缺少 resourceTemplates"))?
+            .iter()
+            .map(parse_resource_template)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GeaResourceTemplateList {
+            resource_templates,
+            next_cursor: value.get("nextCursor").and_then(Value::as_str).and_then(non_empty),
+        })
+    }
+
+    pub async fn read_resource(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        uri: &str,
+    ) -> Result<GeaResourceContents, GeaError> {
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return Err(GeaError::invalid_request("Resource URI 不能为空"));
+        }
+        let credential = self.credential(user_id).await?;
+        let session = self.session(user_id, conversation_id).await?;
+        if session.legacy_mcp.load(Ordering::Relaxed) {
+            return Err(GeaError::conflict(
+                "GEA_MCP_RESOURCES_UNAVAILABLE",
+                "当前 GEA 环境尚未启用 MCP Resources",
+            ));
+        }
+        let descriptor = session.resources.read().await.get(uri).cloned().ok_or_else(|| {
+            GeaError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "GEA_RESOURCE_NOT_FOUND",
+                "Resource 不属于当前 GEA 会话或已过期",
+            )
+        })?;
+        let headers = self.user_headers(&credential)?;
+        let value = self
+            .mcp_request_for_conversation(
+                user_id,
+                conversation_id,
+                &headers,
+                &session.mcp_transport,
+                "resources/read",
+                json!({
+                    "uri": uri,
+                    "_meta": session.gateway_body(),
+                }),
+            )
+            .await?;
+        let content = value
+            .get("contents")
+            .and_then(Value::as_array)
+            .and_then(|contents| {
+                contents
+                    .iter()
+                    .find(|content| content.get("uri").and_then(Value::as_str) == Some(uri))
+            })
+            .ok_or_else(|| invalid_upstream("GEA Resource 读取响应缺少匹配内容"))?;
+        let text = content
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_upstream("GEA Resource 正文不是 UTF-8 文本"))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let response_sha256 = content
+            .pointer("/_meta/sha256")
+            .and_then(Value::as_str)
+            .and_then(non_empty)
+            .ok_or_else(|| invalid_upstream("GEA Resource 响应缺少 sha256"))?;
+        if !actual_sha256.eq_ignore_ascii_case(&descriptor.sha256)
+            || !actual_sha256.eq_ignore_ascii_case(&response_sha256)
+            || descriptor.size.is_some_and(|expected| expected != text.len() as u64)
+        {
+            return Err(GeaError::bad_gateway(
+                "GEA_RESOURCE_INTEGRITY_FAILED",
+                "GEA Resource 完整性校验失败",
+            ));
+        }
+        Ok(GeaResourceContents {
+            uri: uri.to_owned(),
+            mime_type: content
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .and_then(non_empty)
+                .or(descriptor.mime_type),
+            text: text.to_owned(),
+            sha256: actual_sha256,
+            expires_at: content
+                .pointer("/_meta/expiresAt")
+                .and_then(Value::as_str)
+                .and_then(non_empty)
+                .unwrap_or(descriptor.expires_at),
         })
     }
 
@@ -1463,11 +1738,65 @@ impl GeaService {
     }
 
     async fn clear_sessions(&self, user_id: &str) {
-        self.sessions.write().await.retain(|(owner, _), _| owner != user_id);
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            let removed = sessions
+                .iter()
+                .filter(|((owner, _), _)| owner == user_id)
+                .map(|(_, session)| session.clone())
+                .collect::<Vec<_>>();
+            sessions.retain(|(owner, _), _| owner != user_id);
+            removed
+        };
+        self.close_mcp_sessions(user_id, removed).await;
         self.interaction_locks
             .lock()
             .await
             .retain(|(owner, _), _| owner != user_id);
+    }
+
+    async fn clear_conversation_session(&self, user_id: &str, conversation_id: &str) {
+        let removed = self
+            .sessions
+            .write()
+            .await
+            .remove(&(user_id.to_owned(), conversation_id.to_owned()))
+            .into_iter()
+            .collect();
+        self.close_mcp_sessions(user_id, removed).await;
+    }
+
+    async fn close_mcp_sessions(&self, user_id: &str, sessions: Vec<GeaConversationSession>) {
+        let Some(credential) = self.credentials.read().await.get(user_id).cloned() else {
+            return;
+        };
+        let Ok(headers) = self.user_headers(&credential) else {
+            return;
+        };
+        for session in sessions {
+            if session.legacy_mcp.load(Ordering::Relaxed) {
+                continue;
+            }
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.mcp_client.close(&headers, &session.mcp_transport),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    user_id,
+                    conversation_id = session.conversation_id,
+                    code = %error.body.code,
+                    "failed to close GEA MCP transport session"
+                ),
+                Err(_) => tracing::warn!(
+                    user_id,
+                    conversation_id = session.conversation_id,
+                    "timed out closing GEA MCP transport session"
+                ),
+            }
+        }
     }
 
     async fn interaction_lock(&self, user_id: &str, conversation_id: &str) -> InteractionMutex {
@@ -1656,6 +1985,27 @@ impl GeaService {
         result
     }
 
+    async fn mcp_request_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        headers: &HeaderMap,
+        transport: &McpTransportSession,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, GeaError> {
+        let result = self.mcp_client.request(headers, transport, method, params).await;
+        if matches!(&result, Err(error) if error.is_unauthorized()) {
+            self.invalidate_auth_session(user_id).await;
+        } else if matches!(&result, Err(error) if error.body.category == "SESSION") {
+            self.sessions
+                .write()
+                .await
+                .remove(&(user_id.to_owned(), conversation_id.to_owned()));
+        }
+        result
+    }
+
     async fn post(&self, credential: &GeaCredential, path: &str, body: &Value) -> Result<Value, GeaError> {
         let headers = self.user_headers(credential)?;
         let response = self
@@ -1822,6 +2172,133 @@ impl GeaConversationSession {
             "delegationToken": self.delegation_token.as_ref()
         })
     }
+
+    fn gateway_body_with_mcp_code(&self, mcp_code: &str) -> Value {
+        let mut body = self.gateway_body();
+        body["mcpCode"] = Value::String(mcp_code.to_owned());
+        body
+    }
+}
+
+fn parse_tool_content(value: &Value) -> Result<(Vec<GeaToolContent>, Vec<GeaResourceDescriptor>), GeaError> {
+    let raw_content = value
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_upstream("GEA Tool 调用响应缺少 content"))?;
+    let mut content = Vec::with_capacity(raw_content.len());
+    let mut resources = Vec::new();
+    for item in raw_content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => content.push(GeaToolContent::Text {
+                text: required_string(item, "text")?,
+            }),
+            Some("resource_link") => {
+                let resource = parse_resource_descriptor(item)?;
+                content.push(GeaToolContent::ResourceLink {
+                    uri: resource.uri.clone(),
+                    name: resource.name.clone(),
+                    title: resource.title.clone(),
+                    description: resource.description.clone(),
+                    mime_type: resource.mime_type.clone(),
+                    size: resource.size,
+                    sha256: resource.sha256.clone(),
+                    expires_at: resource.expires_at.clone(),
+                });
+                resources.push(resource);
+            }
+            Some(content_type) => {
+                return Err(invalid_upstream(format!(
+                    "GEA Tool 返回了暂不支持的 content 类型 {content_type}"
+                )));
+            }
+            None => return Err(invalid_upstream("GEA Tool content 缺少 type")),
+        }
+    }
+    Ok((content, resources))
+}
+
+fn parse_resource_descriptor(value: &Value) -> Result<GeaResourceDescriptor, GeaError> {
+    let uri = required_string(value, "uri")?;
+    if !uri.starts_with("data-artifact://gateway/") {
+        return Err(invalid_upstream("GEA Resource URI 不属于 Gateway 命名空间"));
+    }
+    let sha256 = value
+        .pointer("/_meta/sha256")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| invalid_upstream("GEA Resource 缺少有效 sha256"))?;
+    let expires_at = value
+        .pointer("/_meta/expiresAt")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+        .ok_or_else(|| invalid_upstream("GEA Resource 缺少 expiresAt"))?;
+    Ok(GeaResourceDescriptor {
+        uri,
+        name: required_string(value, "name")?,
+        title: value.get("title").and_then(Value::as_str).and_then(non_empty),
+        description: value.get("description").and_then(Value::as_str).and_then(non_empty),
+        mime_type: value.get("mimeType").and_then(Value::as_str).and_then(non_empty),
+        size: value.get("size").and_then(Value::as_u64),
+        sha256: sha256.to_ascii_lowercase(),
+        expires_at,
+    })
+}
+
+fn parse_resource_template(value: &Value) -> Result<GeaResourceTemplate, GeaError> {
+    let uri_template = value
+        .get("uriTemplate")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+        .filter(|uri| uri.starts_with("data-artifact://gateway/"))
+        .ok_or_else(|| invalid_upstream("GEA Resource Template URI 无效"))?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+        .ok_or_else(|| invalid_upstream("GEA Resource Template 缺少名称"))?;
+    Ok(GeaResourceTemplate {
+        uri_template,
+        name,
+        title: value.get("title").and_then(Value::as_str).and_then(non_empty),
+        description: value.get("description").and_then(Value::as_str).and_then(non_empty),
+        mime_type: value.get("mimeType").and_then(Value::as_str).and_then(non_empty),
+    })
+}
+
+fn legacy_result_projection(value: &Value, content: &[GeaToolContent]) -> Value {
+    if let Some(structured) = value.get("structuredContent") {
+        return structured.clone();
+    }
+    if let [GeaToolContent::Text { text }] = content {
+        return serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()));
+    }
+    let resources = content
+        .iter()
+        .filter_map(|item| match item {
+            GeaToolContent::ResourceLink {
+                uri,
+                name,
+                title,
+                description,
+                mime_type,
+                size,
+                sha256,
+                expires_at,
+            } => Some(json!({
+                "uri": uri,
+                "name": name,
+                "title": title,
+                "description": description,
+                "mimeType": mime_type,
+                "size": size,
+                "sha256": sha256,
+                "expiresAt": expires_at,
+            })),
+            GeaToolContent::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    json!({ "artifacts": resources })
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -1882,6 +2359,13 @@ fn is_gea_context_field(name: &str) -> bool {
 
 fn invalid_upstream(message: impl Into<String>) -> GeaError {
     GeaError::bad_gateway("GEA_INVALID_RESPONSE", message)
+}
+
+fn should_fallback_to_legacy_mcp(error: &GeaError) -> bool {
+    matches!(
+        error.body.code.as_str(),
+        "GEA_MCP_HTTP_400" | "GEA_MCP_HTTP_404" | "GEA_MCP_HTTP_405"
+    )
 }
 
 fn resume_delivery_unknown() -> GeaError {
@@ -1978,6 +2462,7 @@ mod tests {
     use aionui_db::{SqliteConversationRepository, SqliteInteractionRequestRepository, init_database_memory};
     use aionui_realtime::BroadcastEventBus;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3561,6 +4046,180 @@ mod tests {
 
         assert_eq!(response.audit_id.as_deref(), Some("audit-1"));
         assert_eq!(response.result, json!({ "rows": [] }));
+    }
+
+    #[tokio::test]
+    async fn streamable_mcp_resource_link_is_sanitized_and_verified_on_read() {
+        let server = MockServer::start().await;
+        mount_session(&server).await;
+        let resource_text = r#"{"rows":[1]}"#;
+        let sha256 = format!("{:x}", Sha256::digest(resource_text.as_bytes()));
+        let resource_uri = "data-artifact://gateway/artifact-1";
+
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(body_partial_json(json!({ "method": "initialize" })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "mcp-transport-1")
+                    .insert_header("mcp-protocol-version", "2025-11-25")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "tools": {}, "resources": {} },
+                            "serverInfo": { "name": "gea-mcp-proxy", "version": "1.0" }
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(header("mcp-session-id", "mcp-transport-1"))
+            .and(header("mcp-protocol-version", "2025-11-25"))
+            .and(body_partial_json(json!({ "method": "notifications/initialized" })))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(body_partial_json(json!({
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "agentCode": "agent-sales",
+                        "sessionId": "gea-session-1",
+                        "conversationId": "conversation-1",
+                        "delegationToken": "delegation-secret"
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{
+                        "name": "query_business_data",
+                        "description": "Query business data",
+                        "inputSchema": { "type": "object" },
+                        "_meta": { "mcpCode": "cube" }
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(body_partial_json(json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "query_business_data",
+                    "arguments": { "queries": [] },
+                    "_meta": { "mcpCode": "cube" }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{
+                        "type": "resource_link",
+                        "uri": resource_uri,
+                        "name": "query-result",
+                        "mimeType": "application/json",
+                        "size": resource_text.len(),
+                        "_meta": {
+                            "sha256": sha256,
+                            "expiresAt": "2026-08-25T18:00:00+08:00",
+                            "oss_url": "https://private.example/signed-secret"
+                        }
+                    }],
+                    "isError": false
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(body_partial_json(json!({
+                "method": "resources/templates/list"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "resourceTemplates": [{
+                        "uriTemplate": "data-artifact://gateway/{artifactId}",
+                        "name": "gateway-data-artifact",
+                        "mimeType": "application/json",
+                        "_meta": { "oss_url": "https://private.example/template-secret" }
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ai/gateway/mcp/proxy/mcp"))
+            .and(body_partial_json(json!({
+                "method": "resources/read",
+                "params": { "uri": resource_uri }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "result": {
+                    "contents": [{
+                        "uri": resource_uri,
+                        "mimeType": "application/json",
+                        "text": resource_text,
+                        "_meta": {
+                            "sha256": sha256,
+                            "expiresAt": "2026-08-25T18:00:00+08:00",
+                            "oss_url": "https://private.example/refreshed-secret"
+                        }
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let service = authenticated_service(&server).await;
+        create_session(&service).await;
+        service.list_tools("user-1", "conversation-1").await.unwrap();
+        let response = service
+            .call_tool(
+                "user-1",
+                "conversation-1",
+                "query_business_data",
+                json!({ "queries": [] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content.len(), 1);
+        assert!(!serde_json::to_string(&response).unwrap().contains("oss_url"));
+        assert!(!serde_json::to_string(&response).unwrap().contains("signed-secret"));
+
+        let templates = service
+            .list_resource_templates("user-1", "conversation-1", None)
+            .await
+            .unwrap();
+        assert_eq!(templates.resource_templates[0].name, "gateway-data-artifact");
+        assert!(!serde_json::to_string(&templates).unwrap().contains("oss_url"));
+
+        let contents = service
+            .read_resource("user-1", "conversation-1", resource_uri)
+            .await
+            .unwrap();
+        assert_eq!(contents.text, resource_text);
+        assert_eq!(contents.sha256, sha256);
     }
 
     #[tokio::test]
