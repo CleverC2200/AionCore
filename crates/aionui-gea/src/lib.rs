@@ -12,7 +12,7 @@ mod service;
 mod state;
 
 pub use error::{GeaError, GeaErrorBody};
-pub use routes::gea_routes;
+pub use routes::{gea_routes, gea_sales_plan_action_routes};
 pub use service::GeaService;
 pub use state::GeaRouterState;
 

@@ -33,7 +33,7 @@ use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
-use aionui_gea::gea_routes;
+use aionui_gea::{gea_routes, gea_sales_plan_action_routes};
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
@@ -400,8 +400,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // GEA credentials and gateway sessions are scoped to the authenticated
     // AionCore user and never exposed to renderer or agent processes.
+    let gea_action_limiter = Arc::new(RateLimiter::authenticated_action());
+    gea_action_limiter.start_cleanup_task(Duration::from_secs(60));
     let gea_authenticated =
-        gea_routes(states.gea).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+        gea_routes(states.gea.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let gea_sales_plan_action_authenticated = gea_sales_plan_action_routes(states.gea)
+        .route_layer(from_fn_with_state(
+            gea_action_limiter,
+            authenticated_action_rate_limit_middleware,
+        ))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Voice configuration health checks and session creation reach metered
     // upstream APIs, so rate-limit the authenticated voice surface.
@@ -479,6 +487,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(approval_read_authenticated)
         .merge(approval_action_authenticated)
         .merge(gea_authenticated)
+        .merge(gea_sales_plan_action_authenticated)
         .merge(voice_capability_authenticated)
         .merge(voice_configuration_action_authenticated)
         .merge(voice_session_authenticated)

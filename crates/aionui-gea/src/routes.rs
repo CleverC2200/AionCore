@@ -14,10 +14,11 @@ use aionui_api_types::{
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use serde_json::Value;
 #[cfg(debug_assertions)]
 use utoipa::OpenApi;
 #[cfg(debug_assertions)]
@@ -75,6 +76,22 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
             post(dismiss_notification),
         )
         .route("/api/client-resources/sync", post(sync_client_resources))
+        .route("/api/gea/sales-plan/periods", get(list_sales_plan_periods))
+        .route("/api/gea/sales-plan/plans", get(list_sales_plans))
+        .route("/api/gea/sales-plan/plans/{plan_id}", get(get_sales_plan))
+        .route(
+            "/api/gea/sales-plan/plans/{plan_id}/versions",
+            get(list_sales_plan_versions),
+        )
+        .route("/api/gea/sales-plan/plans/{plan_id}/logs", get(list_sales_plan_logs))
+        .route(
+            "/api/gea/sales-plan/plans/versions/{version_id}/skus",
+            get(list_sales_plan_version_skus),
+        )
+        .route(
+            "/api/gea/sales-plan/plans/{plan_id}/compare",
+            get(compare_sales_plan_versions),
+        )
         .route(
             "/api/gea/conversations/{conversation_id}/tools/{tool_name}",
             post(call_tool),
@@ -90,6 +107,240 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
     {
         router
     }
+}
+
+pub fn gea_sales_plan_action_routes(state: GeaRouterState) -> Router {
+    Router::new()
+        .route(
+            "/api/gea/sales-plan/plans/versions/{version_id}/actions",
+            post(act_on_sales_plan_version),
+        )
+        .with_state(state)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/periods",
+    operation_id = "listSalesPlanPeriods",
+    tag = "Sales plan",
+    responses(
+        (status = 200, description = "GEA sales-plan periods", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_sales_plan_periods(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state
+        .service
+        .list_sales_plan_periods(&user.id, query.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans",
+    operation_id = "listSalesPlans",
+    tag = "Sales plan",
+    responses(
+        (status = 200, description = "GEA sales-plan page", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_sales_plans(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state.service.list_sales_plans(&user.id, query.as_deref()).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans/{plan_id}",
+    operation_id = "getSalesPlan",
+    tag = "Sales plan",
+    params(("plan_id" = String, Path, description = "Sales plan identifier")),
+    responses(
+        (status = 200, description = "GEA sales-plan detail", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn get_sales_plan(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(plan_id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state.service.get_sales_plan(&user.id, &plan_id).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans/{plan_id}/versions",
+    operation_id = "listSalesPlanVersions",
+    tag = "Sales plan",
+    params(("plan_id" = String, Path, description = "Sales plan identifier")),
+    responses(
+        (status = 200, description = "GEA sales-plan versions", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_sales_plan_versions(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(plan_id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state.service.list_sales_plan_versions(&user.id, &plan_id).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans/{plan_id}/logs",
+    operation_id = "listSalesPlanLogs",
+    tag = "Sales plan",
+    params(("plan_id" = String, Path, description = "Sales plan identifier")),
+    responses(
+        (status = 200, description = "GEA sales-plan approval logs", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_sales_plan_logs(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(plan_id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state.service.list_sales_plan_logs(&user.id, &plan_id).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans/versions/{version_id}/skus",
+    operation_id = "listSalesPlanVersionSkus",
+    tag = "Sales plan",
+    params(("version_id" = String, Path, description = "Sales plan version identifier")),
+    responses(
+        (status = 200, description = "GEA sales-plan version SKUs", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn list_sales_plan_version_skus(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(version_id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state
+        .service
+        .list_sales_plan_version_skus(&user.id, &version_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gea/sales-plan/plans/{plan_id}/compare",
+    operation_id = "compareSalesPlanVersions",
+    tag = "Sales plan",
+    params(("plan_id" = String, Path, description = "Sales plan identifier")),
+    responses(
+        (status = 200, description = "GEA sales-plan version comparison", body = ApiResponse<Value>),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn compare_sales_plan_versions(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(plan_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    let result = state
+        .service
+        .compare_sales_plan_versions(&user.id, &plan_id, query.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/gea/sales-plan/plans/versions/{version_id}/actions",
+    operation_id = "actOnSalesPlanVersion",
+    tag = "Sales plan",
+    params(
+        ("version_id" = String, Path, description = "Sales plan version identifier"),
+        ("idempotency-key" = String, Header, description = "Required action idempotency key"),
+        ("x-request-id" = String, Header, description = "Required request correlation id")
+    ),
+    request_body(content = Value),
+    responses(
+        (status = 200, description = "GEA sales-plan action receipt", body = ApiResponse<Value>),
+        (status = 400, description = "Invalid headers or JSON body", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "CSRF validation failed or a runtime credential attempted a trusted-client sales-plan action", body = ErrorResponse),
+        (status = 409, description = "Sales-plan status or idempotency conflict", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn act_on_sales_plan_version(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(version_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<ApiResponse<Value>>, GeaError> {
+    reject_runtime_sales_plan_action(&headers)?;
+    let idempotency_key = required_sales_plan_header(&headers, "idempotency-key", 160)?;
+    let request_id = required_sales_plan_header(&headers, "x-request-id", 64)?;
+    let Json(body) = body.map_err(|_| GeaError::invalid_request("销售计划审批动作参数无效"))?;
+    let result = state
+        .service
+        .act_on_sales_plan_version(&user.id, &version_id, idempotency_key, request_id, &body)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+fn reject_runtime_sales_plan_action(headers: &HeaderMap) -> Result<(), GeaError> {
+    if headers.contains_key(RUNTIME_TOKEN_HEADER) {
+        return Err(GeaError::new(
+            StatusCode::FORBIDDEN,
+            "GEA_SALES_PLAN_ACTION_TRUSTED_CLIENT_REQUIRED",
+            "销售计划审批动作只能由受信客户端发起",
+        ));
+    }
+    Ok(())
+}
+
+fn required_sales_plan_header<'a>(headers: &'a HeaderMap, name: &str, max_len: usize) -> Result<&'a str, GeaError> {
+    let value = headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GeaError::invalid_request(format!("缺少 {name} 请求头")))?;
+    if value.len() > max_len {
+        return Err(GeaError::invalid_request(format!("{name} 请求头过长")));
+    }
+    Ok(value)
 }
 
 #[cfg(debug_assertions)]
@@ -866,7 +1117,15 @@ impl utoipa::Modify for SecuritySchemes {
         dismiss_notification,
         list_interaction_requests,
         act_on_interaction_request,
-        sync_client_resources
+        sync_client_resources,
+        list_sales_plan_periods,
+        list_sales_plans,
+        get_sales_plan,
+        list_sales_plan_versions,
+        list_sales_plan_logs,
+        list_sales_plan_version_skus,
+        compare_sales_plan_versions,
+        act_on_sales_plan_version
     ),
     components(schemas(
         InteractionRequestChangedPayload,
@@ -884,7 +1143,8 @@ impl utoipa::Modify for SecuritySchemes {
         (name = "GEA tools", description = "GEA MCP tool discovery, connection test, and invocation"),
         (name = "InteractionRequest", description = "GEA-owned requests and AionCore's recoverable user projection"),
         (name = "Notification", description = "GEA-owned user notifications and AionCore's tenant-scoped recoverable projection"),
-        (name = "Client resources", description = "GEA Resource Catalog synchronization; current implementation materializes skills only")
+        (name = "Client resources", description = "GEA Resource Catalog synchronization; current implementation materializes skills only"),
+        (name = "Sales plan", description = "User-session proxy for the GEA sales-plan read and approval APIs")
     )
 )]
 struct GeaApiDoc;
@@ -934,15 +1194,23 @@ fn require_runtime_conversation_scope(headers: &HeaderMap, path_conversation_id:
 mod tests {
     use std::collections::BTreeSet;
 
-    use axum::http::{HeaderMap, HeaderValue};
-    use serde_json::Value;
+    use aionui_api_types::SetGeaAuthSessionRequest;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::Extension;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
     use utoipa::OpenApi;
+    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GeaApiDoc, enforce_runtime_conversation_scope, gea_swagger_config, reject_runtime_auth_session_access,
-        require_runtime_conversation_scope,
+        GeaApiDoc, enforce_runtime_conversation_scope, gea_routes, gea_sales_plan_action_routes, gea_swagger_config,
+        reject_runtime_auth_session_access, require_runtime_conversation_scope,
     };
-    use aionui_auth::{RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
+    use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
+
+    use crate::{GeaRouterState, GeaService};
 
     fn openapi_value() -> Value {
         serde_json::to_value(GeaApiDoc::openapi()).unwrap()
@@ -969,6 +1237,296 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(actual, expected, "OpenAPI enum values drifted for {name}");
+    }
+
+    async fn authenticated_sales_plan_router(server: &MockServer) -> axum::Router {
+        let service = GeaService::new(reqwest::Client::new(), server.uri()).unwrap();
+        service
+            .set_auth_session(
+                "user-1",
+                SetGeaAuthSessionRequest {
+                    access_token: "test-access-token".to_owned(),
+                    tenant_id: Some("tenant-1".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        let mut user = CurrentUser::local_default();
+        user.id = "user-1".to_owned();
+        let state = GeaRouterState::new(service);
+        gea_routes(state.clone())
+            .merge(gea_sales_plan_action_routes(state))
+            .layer(Extension(user))
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sales_plan_get_routes_forward_user_credentials_and_query_and_wrap_result_as_data() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sales-plan/periods"))
+            .and(query_param("pageNo", "2"))
+            .and(query_param("pageSize", "20"))
+            .and(header("x-access-token", "test-access-token"))
+            .and(header("x-tenant-id", "tenant-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "code": "0",
+                "result": {"records": [{"periodMonth": "2026-09"}], "total": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(
+                Request::get("/api/gea/sales-plan/periods?pageNo=2&pageSize=20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["data"],
+            json!({"records": [{"periodMonth": "2026-09"}], "total": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn sales_plan_periods_preserve_successful_empty_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sales-plan/periods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "code": "0",
+                "result": {"records": [], "total": 0}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(Request::get("/api/gea/sales-plan/periods").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["data"],
+            json!({"records": [], "total": 0})
+        );
+    }
+
+    #[tokio::test]
+    async fn sales_plan_resource_routes_map_only_to_documented_upstream_paths() {
+        let server = MockServer::start().await;
+        let cases = [
+            ("/api/gea/sales-plan/plans/plan%2F1", "/sales-plan/plans/plan%2F1"),
+            (
+                "/api/gea/sales-plan/plans/plan-1/versions",
+                "/sales-plan/plans/plan-1/versions",
+            ),
+            ("/api/gea/sales-plan/plans/plan-1/logs", "/sales-plan/plans/plan-1/logs"),
+            (
+                "/api/gea/sales-plan/plans/versions/version-1/skus",
+                "/sales-plan/plans/versions/version-1/skus",
+            ),
+        ];
+        for (local_path, upstream_path) in cases {
+            Mock::given(method("GET"))
+                .and(path(upstream_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "result": {"path": upstream_path}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let response = authenticated_sales_plan_router(&server)
+                .await
+                .oneshot(Request::get(local_path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "local path: {local_path}");
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/sales-plan/plans/plan-1/compare"))
+            .and(query_param("fromVersionId", "v1"))
+            .and(query_param("toVersionId", "v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(
+                Request::get("/api/gea/sales-plan/plans/plan-1/compare?fromVersionId=v1&toVersionId=v2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sales_plan_action_forwards_idempotency_request_id_and_json_body() {
+        let server = MockServer::start().await;
+        let action = json!({"action": "APPROVE", "expectedStatus": 2, "remark": "ok"});
+        Mock::given(method("POST"))
+            .and(path("/sales-plan/plans/versions/version-1/actions"))
+            .and(header("x-access-token", "test-access-token"))
+            .and(header("x-tenant-id", "tenant-1"))
+            .and(header("idempotency-key", "action-key-1"))
+            .and(header("x-request-id", "request-1"))
+            .and(body_json(action.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "result": {"versionId": "version-1", "toStatus": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(
+                Request::post("/api/gea/sales-plan/plans/versions/version-1/actions")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "action-key-1")
+                    .header("x-request-id", "request-1")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["data"]["toStatus"], 3);
+    }
+
+    #[tokio::test]
+    async fn sales_plan_action_rejects_runtime_credentials_without_calling_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sales-plan/plans/versions/version-1/actions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(
+                Request::post("/api/gea/sales-plan/plans/versions/version-1/actions")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "action-key-1")
+                    .header("x-request-id", "request-1")
+                    .header(RUNTIME_TOKEN_HEADER, "runtime-token")
+                    .body(Body::from(r#"{"action":"APPROVE","expectedStatus":2}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(response).await["code"],
+            "GEA_SALES_PLAN_ACTION_TRUSTED_CLIENT_REQUIRED"
+        );
+    }
+
+    #[tokio::test]
+    async fn sales_plan_proxy_requires_user_gea_session_and_preserves_upstream_error_classification() {
+        let server = MockServer::start().await;
+        let service = GeaService::new(reqwest::Client::new(), server.uri()).unwrap();
+        let mut user = CurrentUser::local_default();
+        user.id = "user-1".to_owned();
+        let response = gea_routes(GeaRouterState::new(service))
+            .layer(Extension(user))
+            .oneshot(Request::get("/api/gea/sales-plan/plans").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(response).await["code"], "GEA_AUTH_REQUIRED");
+
+        let service = GeaService::new(reqwest::Client::new(), server.uri()).unwrap();
+        service
+            .set_auth_session(
+                "user-1",
+                SetGeaAuthSessionRequest {
+                    access_token: "test-access-token".to_owned(),
+                    tenant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut user = CurrentUser::local_default();
+        user.id = "user-1".to_owned();
+        let response = gea_routes(GeaRouterState::new(service))
+            .layer(Extension(user))
+            .oneshot(Request::get("/api/gea/sales-plan/plans").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["code"], "GEA_INVALID_REQUEST");
+
+        Mock::given(method("GET"))
+            .and(path("/sales-plan/plans"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "success": false,
+                "code": 409,
+                "errorCode": "SALES_PLAN_STATUS_CONFLICT",
+                "message": "status changed",
+                "category": "CONFLICT",
+                "retryable": false,
+                "requestId": "upstream-request-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(Request::get("/api/gea/sales-plan/plans").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(error["code"], "SALES_PLAN_STATUS_CONFLICT");
+        assert_eq!(error["details"]["requestId"], "upstream-request-1");
+
+        Mock::given(method("GET"))
+            .and(path("/sales-plan/periods"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "success": false,
+                "code": 401,
+                "errorCode": "GEA_TOKEN_EXPIRED",
+                "message": "login expired",
+                "category": "AUTHENTICATION"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = authenticated_sales_plan_router(&server)
+            .await
+            .oneshot(Request::get("/api/gea/sales-plan/periods").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(response).await["code"], "GEA_TOKEN_EXPIRED");
     }
 
     #[test]
@@ -1028,6 +1586,14 @@ mod tests {
             "/api/notifications/{notification_id}/read",
             "/api/notifications/{notification_id}/dismiss",
             "/api/client-resources/sync",
+            "/api/gea/sales-plan/periods",
+            "/api/gea/sales-plan/plans",
+            "/api/gea/sales-plan/plans/{plan_id}",
+            "/api/gea/sales-plan/plans/{plan_id}/versions",
+            "/api/gea/sales-plan/plans/{plan_id}/logs",
+            "/api/gea/sales-plan/plans/versions/{version_id}/skus",
+            "/api/gea/sales-plan/plans/{plan_id}/compare",
+            "/api/gea/sales-plan/plans/versions/{version_id}/actions",
         ];
         assert_eq!(paths.len(), expected.len());
         for path in expected {
@@ -1047,7 +1613,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_ids.len(), 19);
+        assert_eq!(operation_ids.len(), 27);
     }
 
     #[test]

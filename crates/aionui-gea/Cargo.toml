@@ -31,4 +31,5 @@ utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true

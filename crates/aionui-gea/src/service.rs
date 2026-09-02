@@ -35,13 +35,15 @@ mod notification_service;
 mod projection_service;
 #[path = "service/resource_catalog.rs"]
 mod resource_catalog_service;
+#[path = "service/sales_plan.rs"]
+mod sales_plan_service;
 
 use self::mcp_transport::{McpTransportClient, McpTransportSession};
 use self::notification_service::NotificationProjection;
 use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
 use crate::{InteractionTurnResolver, InteractionTurnResumer};
 
-const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn:4443/gea-boot";
+const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GEA_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const INTERACTION_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -2388,8 +2390,9 @@ fn access_denied_error(value: &Value) -> GeaError {
 
 fn upstream_business_error(value: &Value, fallback_status: u16) -> GeaError {
     let code = value
-        .get("code")
+        .get("errorCode")
         .and_then(value_as_string)
+        .or_else(|| value.get("code").and_then(value_as_string))
         .unwrap_or_else(|| "GEA_UPSTREAM_ERROR".to_owned());
     let message = value
         .get("message")
@@ -2466,7 +2469,12 @@ mod tests {
     use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::GeaService;
+    use super::{DEFAULT_GEA_BASE_URL, GeaService};
+
+    #[test]
+    fn production_gea_base_url_does_not_use_the_legacy_4443_port() {
+        assert_eq!(DEFAULT_GEA_BASE_URL, "https://gea.synear.cn/gea-boot");
+    }
 
     async fn authenticated_service(server: &MockServer) -> GeaService {
         let service = GeaService::new(reqwest::Client::new(), server.uri()).unwrap();
