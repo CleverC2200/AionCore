@@ -2588,7 +2588,7 @@ impl AssistantService {
             description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
             avatar: self.avatar_display_value(user_id, definition),
             // For builtins: enabled = overlay if the user has one, else the
-            // manifest default (butler on, others off). sort_order = always the
+            // manifest default. sort_order = always the
             // manifest value (users can't reorder official assistants).
             enabled: match state {
                 Some(row) => row.enabled,

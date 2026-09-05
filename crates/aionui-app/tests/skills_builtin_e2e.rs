@@ -116,6 +116,14 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|item| {
+            item["source"] == "builtin"
+                && item["name"] == "sales-forecast-submit"
+                && item["relative_location"] == "sales-forecast-submit/SKILL.md"
+        }),
+        "sales forecast assistant requires its workflow skill in every packaged install"
+    );
     let auto_items: Vec<&Value> = arr
         .iter()
         .filter(|item| {

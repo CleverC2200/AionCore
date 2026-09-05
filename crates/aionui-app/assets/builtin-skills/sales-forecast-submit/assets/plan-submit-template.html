@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI销售计划 区域经理审批 - 需求预测Agent</title>
+  <style>
+    :root {
+      --brand: #e60012;
+      --brand-dark: #c4000f;
+      --brand-light: #fff1f0;
+      --bg: #f5f5f5;
+      --card-bg: #fff;
+      --text: rgba(0, 0, 0, 0.88);
+      --text-secondary: rgba(0, 0, 0, 0.5);
+      --text-tertiary: rgba(0, 0, 0, 0.35);
+      --border: #f0f0f0;
+      --danger: #e60012;
+      --success: #52c41a;
+      --warning: #faad14;
+      --orange: #ff7a45;
+      --shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .page { padding: 16px 20px 30px; max-width: 1600px; margin: 0 auto; }
+
+    .header-card {
+      background: var(--card-bg); border-radius: var(--radius); box-shadow: var(--shadow);
+      padding: 16px 20px; margin-bottom: 16px;
+    }
+    .header-row { display: flex; justify-content: flex-start; align-items: center; flex-wrap: nowrap; gap: 12px; }
+    .header-period { width: 160px; flex: 0 0 160px; }
+    .title-wrap { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; flex-wrap: nowrap; }
+    .page-title { font-size: 18px; font-weight: 600; white-space: nowrap; }
+
+    /* 业务流程阶段条 —— 颜色由数据状态决定 */
+    .stage-bar {
+      display: flex; align-items: stretch; gap: 8px; flex: 1; min-width: 0; flex-wrap: nowrap;
+      overflow-x: auto; padding: 2px; scrollbar-width: thin;
+    }
+    .stage-node {
+      position: relative; overflow: hidden; padding: 6px 14px; border-radius: 14px; font-size: 12px; font-weight: 500;
+      cursor: pointer; white-space: nowrap; transition: all .2s; border: 1px solid transparent; margin-right: 0;
+    }
+    .stage-node .stage-fill {
+      position: absolute; inset: 0; z-index: 0; transform: scaleX(var(--stage-progress, 0));
+      transform-origin: left center; transition: transform .3s ease-out;
+    }
+    .stage-node .stage-label { position: relative; z-index: 1; }
+    .stage-node.done { background: var(--success); color: #fff; }
+    .stage-node.todo { background: #f5f5f5; color: var(--text-secondary); border-color: var(--border); }
+    .stage-node.active { background: #f5f5f5; color: var(--text); border-color: var(--border); }
+    .stage-node.active .stage-fill { background: var(--brand); }
+    .stage-node.disabled { opacity: .4; cursor: not-allowed; }
+    .stage-node.current { box-shadow: 0 0 0 2px rgba(0,0,0,0.35); }
+    .stage-node:not(.disabled):hover { transform: translateY(-1px); }
+    .stage-arrow { color: var(--text-tertiary); font-size: 12px; margin-right: 0; align-self: center; flex: 0 0 auto; }
+    .select-box, .search-input {
+      height: 32px; border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; font-size: 12px; outline: none; background: #fff;
+    }
+    .search-input { width: 180px; }
+    .select-box:focus, .search-input:focus { border-color: var(--brand); }
+
+    .btn {
+      height: 32px; padding: 0 14px; border-radius: 6px; border: 1px solid var(--border); background: #fff; cursor: pointer;
+      font-size: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; transition: all 0.2s;
+    }
+    .btn:hover { border-color: var(--brand); color: var(--brand); }
+    .btn-primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+    .btn-primary:hover { background: var(--brand-dark); color: #fff; }
+    .btn-success { color: var(--success); border-color: var(--success); }
+    .btn-success:hover { background: var(--success); color: #fff; }
+    .btn-danger { color: var(--danger); border-color: var(--danger); }
+    .btn-danger:hover { background: var(--danger); color: #fff; }
+    .btn-text { border: none; background: transparent; color: var(--brand); }
+    .btn-text:hover { background: var(--brand-light); }
+
+    .ai-card {
+      background: linear-gradient(135deg, #fff8f0 0%, #fff 100%); border: 1px solid #ffd8bf; border-radius: var(--radius);
+      box-shadow: var(--shadow); padding: 16px 20px; margin-bottom: 16px; display: flex; gap: 16px; align-items: flex-start;
+    }
+    .ai-card.success { background: linear-gradient(135deg, #f6ffed 0%, #fff 100%); border-color: #b7eb8f; }
+    .ai-icon {
+      width: 44px; height: 44px; border-radius: 50%; background: var(--warning); color: #fff;
+      display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0;
+    }
+    .ai-card.success .ai-icon { background: var(--success); }
+    .ai-body { flex: 1; }
+    .ai-title { font-weight: 600; font-size: 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+    .ai-tag { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--warning); color: #fff; font-weight: 500; }
+    .ai-card.success .ai-tag { background: var(--success); }
+    .ai-metrics { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 10px; }
+    .ai-metric dt { font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+    .ai-metric dd { font-size: 14px; font-weight: 600; color: var(--text); }
+    .ai-metric dd.up { color: var(--danger); }
+    .ai-metric dd.down { color: var(--success); }
+    .ai-desc { color: var(--text-secondary); font-size: 12px; line-height: 1.8; }
+    .ai-desc strong { color: var(--text); }
+
+    .table-card { background: var(--card-bg); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .table-header { border-bottom: 1px solid var(--border); }
+    .table-header-row {
+      padding: 12px 16px; display: flex; justify-content: space-between;
+      align-items: flex-end; flex-wrap: wrap; gap: 12px;
+    }
+    .table-title { font-weight: 600; font-size: 14px; white-space: nowrap; }
+    .left-group { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; flex: 1; }
+    .view-tabs { display: flex; background: #f5f5f5; border-radius: 6px; padding: 2px; flex-wrap: wrap; gap: 2px; }
+    .view-tab { padding: 5px 12px; border-radius: 5px; cursor: pointer; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+    .view-tab.active { background: #fff; color: var(--brand); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+
+    .filter-inline { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+    .filter-item { display: flex; flex-direction: column; gap: 3px; }
+    .filter-item label { font-size: 11px; color: var(--text-secondary); }
+    .filter-item input, .filter-item select {
+      height: 28px; border: 1px solid var(--border); border-radius: 6px; padding: 0 8px; font-size: 12px; outline: none; background: #fff;
+    }
+    .filter-item input:focus, .filter-item select:focus { border-color: var(--brand); }
+    .filter-actions { display: flex; gap: 6px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1100px; }
+    th, td { padding: 12px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { background: #fafafa; color: var(--text-secondary); font-weight: 500; white-space: nowrap; }
+    tbody tr.parent-row:hover { background: #fafafa; }
+    tbody tr.parent-row.selected { background: #fff1f0; }
+    tbody tr.parent-row.selected:hover { background: #ffe6e4; }
+    td { vertical-align: top; }
+    td.center { text-align: center; }
+    td.right { text-align: right; }
+
+    .row-title { font-weight: 600; color: var(--text); }
+    .row-title.editable-name { color: var(--brand); cursor: pointer; }
+    .row-title.editable-name:hover { text-decoration: underline; }
+    .row-sub { color: var(--text-tertiary); font-size: 11px; margin-top: 2px; }
+    .edit-hint { color: var(--brand); font-size: 11px; margin-top: 3px; line-height: 1.6; }
+    .edit-hint .link { cursor: pointer; text-decoration: underline; }
+    .tree-arrow { color: var(--text-tertiary); display: inline-block; width: 16px; text-align: center; }
+
+    .plan-merged .plan-qty { font-weight: 600; font-size: 13px; }
+    .plan-merged .plan-amt { color: var(--text-tertiary); font-size: 11px; margin-top: 2px; }
+
+    .progress-wrap { margin-top: 6px; }
+    .progress-bar { height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; width: 100px; }
+    .progress-fill { height: 100%; background: var(--brand); border-radius: 3px; }
+    .progress-text { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
+
+    .metric-value { font-weight: 600; font-size: 13px; }
+    .metric-value.pos { color: var(--danger); }
+    .metric-value.neg { color: var(--success); }
+
+    .health-badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+    .health-badge.healthy { background: #f6ffed; color: var(--success); }
+    .health-badge.warning { background: #fffbe6; color: var(--warning); }
+    .health-badge.danger { background: #fff1f0; color: var(--danger); }
+
+    .opinion { color: var(--text-secondary); font-size: 12px; line-height: 1.6; max-width: 220px; }
+
+    .plan-cell-derived { color: var(--text-secondary); background: #fafafa; }
+    .plan-cell-derived .sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+
+    .changed { color: var(--orange); font-weight: 600; }
+
+    input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-color: var(--brand); }
+
+    .empty { padding: 50px; text-align: center; color: var(--text-secondary); }
+
+    .pagination { padding: 12px 16px; display: flex; justify-content: flex-start; align-items: center; gap: 12px; border-top: 1px solid var(--border); }
+    .pagination span { color: var(--text-secondary); font-size: 12px; }
+    .page-size { height: 28px; border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; font-size: 12px; outline: none; background: #fff; }
+    .page-size:focus { border-color: var(--brand); }
+    .page-btn {
+      min-width: 28px; height: 28px; border: 1px solid var(--border); background: #fff; cursor: pointer; border-radius: 4px;
+      display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+    }
+    .page-btn.active { background: var(--brand); color: #fff; border-color: var(--brand); }
+    .page-btn:hover:not(.active) { border-color: var(--brand); color: var(--brand); }
+
+    .sku-input { width: 100px; height: 28px; border: 1px solid var(--border); border-radius: 4px; text-align: right; padding: 0 6px; font-size: 12px; outline: none; background: #fff; }
+    .sku-input:focus { border-color: var(--brand); }
+    .sku-input.amt { color: var(--text-secondary); }
+    .val-pos { color: var(--danger); }
+    .val-neg { color: var(--success); }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none;
+      align-items: center; justify-content: center; z-index: 1000;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal {
+      background: #fff; border-radius: var(--radius); width: 980px; max-width: 94vw; max-height: 88vh;
+      display: flex; flex-direction: column; box-shadow: 0 8px 30px rgba(0,0,0,0.2);
+    }
+    .modal-header {
+      padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;
+    }
+    .modal-title { font-size: 15px; font-weight: 600; }
+    .modal-close { font-size: 20px; cursor: pointer; color: var(--text-secondary); }
+    .modal-close:hover { color: var(--text); }
+    .modal-filter { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .dim-tabs { display: flex; background: #f5f5f5; border-radius: 6px; padding: 2px; }
+    .dim-tab { padding: 5px 14px; border-radius: 5px; cursor: pointer; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+    .dim-tab.active { background: #fff; color: var(--brand); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .modal-summary { font-size: 12px; color: var(--text-secondary); }
+    .modal-summary strong { color: var(--brand); }
+    .modal-body { padding: 0; overflow: auto; flex: 1; }
+    .modal-body table { min-width: 1100px; }
+    .modal-body th, .modal-body td { padding: 10px 12px; white-space: nowrap; }
+    .modal-body tr.adj-group-row td { background: #fafafa; font-weight: 600; }
+    .ai-tip { display: flex; align-items: flex-start; gap: 6px; font-size: 11px; line-height: 1.5; max-width: 290px; white-space: normal; color: var(--text-secondary); cursor: help; }
+    .ai-tip.tone-healthy { color: #237804; }
+    .ai-tip.tone-warning  { color: #ad6800; }
+    .ai-tip.tone-danger   { color: #a8071a; }
+    .ai-tip .ai-suggest-qty { font-weight: 600; }
+    .ai-tip .ai-text { flex: 1; }
+    .ai-adopt {
+      border: 1px solid var(--border); background: #fff; border-radius: 4px;
+      padding: 1px 8px; font-size: 10px; cursor: pointer; flex-shrink: 0;
+      color: var(--text-secondary); transition: all .15s ease;
+    }
+    .ai-adopt:hover:not(:disabled) { background: var(--brand); color: #fff; border-color: var(--brand); }
+    .ai-adopt:disabled { opacity: .4; cursor: not-allowed; }
+    /* 悬浮逻辑注释触发 */
+    .ai-reason-wrap { display: inline-flex; align-items: center; margin-left: 2px; }
+    .ai-reason-link {
+      font-size: 10px; color: var(--text-tertiary); border-bottom: 1px dotted var(--text-tertiary);
+      cursor: help; user-select: none; white-space: nowrap;
+    }
+    .ai-reason-link:hover { color: var(--brand); border-bottom-color: var(--brand); }
+    .reason-pop-fixed {
+      display: none; position: fixed; z-index: 9999; max-width: 320px;
+      background: #1f1f1f; color: #fff; font-size: 11px; line-height: 1.65;
+      padding: 9px 11px; border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.25);
+      white-space: normal; text-align: left; pointer-events: none;
+    }
+    .modal-footer { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; align-items: center; gap: 10px; }
+
+    /* 提报进度弹窗 */
+    .prog-tree { padding: 4px 20px 16px; }
+    .prog-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .prog-row:hover { background: #fafafa; }
+    .prog-arrow { color: var(--text-tertiary); width: 16px; display: inline-block; flex-shrink: 0; text-align: center; }
+    .prog-name { font-weight: 600; min-width: 150px; }
+    .prog-name .sub { font-size: 11px; color: var(--text-tertiary); font-weight: 400; margin-left: 6px; }
+    .prog-bar-wrap { flex: 1; display: flex; align-items: center; gap: 10px; }
+    .prog-bar { height: 8px; background: #f0f0f0; border-radius: 4px; flex: 1; max-width: 360px; overflow: hidden; }
+    .prog-fill { height: 100%; border-radius: 4px; }
+    .prog-pct { font-size: 12px; color: var(--text-secondary); min-width: 40px; text-align: right; }
+    .prog-count { font-size: 12px; color: var(--text-tertiary); min-width: 64px; }
+    .prog-badge { padding: 2px 9px; border-radius: 4px; font-size: 12px; font-weight: 500; min-width: 64px; text-align: center; }
+    .prog-badge.done { background: #f6ffed; color: var(--success); }
+    .prog-badge.doing { background: #fff7e6; color: var(--warning); }
+    .prog-badge.none { background: #fff1f0; color: var(--danger); }
+    .prog-leaf-detail { font-size: 11px; color: var(--text-tertiary); margin-left: auto; }
+
+    /* 中窄窗口：保持“月份 → 标题 → 阶段”单行，压缩阶段装饰而不压缩交互。 */
+    @media (max-width: 1100px) {
+      .header-row { gap: 10px; }
+      .header-period { width: 150px; flex-basis: 150px; }
+      .title-wrap { gap: 10px; }
+      .stage-bar { gap: 6px; }
+      .stage-node { flex: 0 0 auto; padding: 6px 8px; font-size: 11px; }
+      .stage-arrow { display: none; }
+    }
+
+    @media (max-width: 560px) {
+      .page { padding-inline: 12px; }
+      .header-card { padding-inline: 12px; }
+      .header-period { width: 136px; flex-basis: 136px; }
+      .page-title { font-size: 16px; }
+      .title-wrap { gap: 8px; }
+    }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    .ai-card, .table-card { animation: fadeIn 0.3s ease; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header-card">
+      <div class="header-row">
+        <select class="select-box header-period" id="periodSelect" aria-label="计划月份">
+          <option>计划月份（待 MCP 填充）</option>
+        </select>
+        <div class="title-wrap">
+          <span class="page-title">AI预测审批</span>
+          <div class="stage-bar" id="stageBar"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ai-card" id="aiPanel">
+      <div class="ai-icon">🤖</div>
+      <div class="ai-body">
+        <div class="ai-title">
+          AI建议
+          <span class="ai-tag" id="aiTag">待填充</span>
+        </div>
+        <div class="ai-metrics">
+          <div class="ai-metric"><dt>本层级待审</dt><dd class="up" id="aiPending">--</dd></div>
+          <div class="ai-metric"><dt>整体金额达成率</dt><dd id="aiAmtRate">--</dd></div>
+          <div class="ai-metric"><dt>平均库存周转</dt><dd id="aiTurnover">--</dd></div>
+          <div class="ai-metric"><dt>建议关注库存</dt><dd class="down" id="aiInventoryFocus">待填充</dd></div>
+        </div>
+        <div class="ai-desc" id="aiDesc"></div>
+      </div>
+    </div>
+
+    <div class="table-card">
+      <div class="table-header">
+        <div class="table-header-row">
+          <div class="left-group">
+            <span class="table-title">审批核对队列</span>
+            <div class="view-tabs" id="viewTabs"></div>
+            <div class="filter-inline">
+              <div class="filter-item">
+                <label>大区名称</label>
+                <select id="fArea"><option>全部</option></select>
+              </div>
+              <div class="filter-item">
+                <label>省区名称</label>
+                <select id="fProv"><option>全部</option></select>
+              </div>
+              <div class="filter-item">
+                <label>区域名称</label>
+                <select id="fRegion"><option>全部</option></select>
+              </div>
+              <div class="filter-item">
+                <label>客户编号 / 名称</label>
+                <input type="text" id="fName" class="search-input" placeholder="请输入客户编号或名称" />
+              </div>
+              <div class="filter-item">
+                <label>审批状态</label>
+                <select id="fStatus">
+                  <option value="all">全部</option>
+                  <option value="pending">待审批</option>
+                  <option value="approved">已审批</option>
+                </select>
+              </div>
+              <div class="filter-actions">
+                <button class="btn btn-primary" onclick="applyFilters()">查询</button>
+                <button class="btn" onclick="resetFilters()">重置</button>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" onclick="openProgressModal()">📊 提报进度</button>
+            <button class="btn">⤓ 导出</button>
+            <button class="btn btn-success">✓ 同意</button>
+            <button class="btn btn-danger">✕ 不同意</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:40px"><input type="checkbox" id="checkAll" /></th>
+              <th>组织名称</th>
+              <th>月计划</th>
+              <th>月初计划量</th>
+              <th>计划进度<br/><span style="font-size:10px;color:var(--text-tertiary);font-weight:400">金额 / 数量</span></th>
+              <th>同期拉货对比</th>
+              <th>差额</th>
+              <th>健康度</th>
+              <th>AI 审批意见</th>
+            </tr>
+          </thead>
+          <tbody id="queueBody"></tbody>
+        </table>
+      </div>
+
+      <div class="pagination">
+        <select class="page-size" id="pageSize" onchange="onPageSizeChange(this.value)">
+          <option value="10">10条/页</option>
+          <option value="20" selected>20条/页</option>
+          <option value="50">50条/页</option>
+          <option value="100">100条/页</option>
+        </select>
+        <span id="pageTotal">共 0 条</span>
+        <button class="page-btn">&lt;</button>
+        <button class="page-btn active">1</button>
+        <button class="page-btn">&gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 调整明细 modal -->
+  <div class="modal-overlay" id="adjustModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="adjustTitle">调整明细</div>
+        <div class="modal-close" onclick="closeAdjust()">×</div>
+      </div>
+      <div class="modal-filter">
+        <div class="dim-tabs" id="adjustTabs"></div>
+        <div class="modal-summary" id="adjustSummary"></div>
+      </div>
+      <div class="modal-body">
+        <table>
+          <thead id="adjustHead"></thead>
+          <tbody id="adjustBody"></tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <span style="font-size:12px;color:var(--text-secondary);margin-right:auto">调整后实时同步至审批队列（向下分摊到客户 + SKU）</span>
+        <button class="btn" onclick="closeAdjust()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提报进度 modal -->
+  <div class="modal-overlay" id="progModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">提报进度 · <span id="progModalLevel"></span></div>
+        <div class="modal-close" onclick="closeProgressModal()">×</div>
+      </div>
+      <div class="modal-filter">
+        <div class="modal-summary">展示下级提报 / 审批完成情况，点击节点可逐级下钻。</div>
+      </div>
+      <div class="modal-body">
+        <div class="prog-tree" id="progTree"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeProgressModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* ============ MCP 数据入口 ============
+       MCP 可直接调用 window.setApprovalWorkbenchData(payload) 注入同结构数据。
+       默认值仅用于占位和验证交互，不代表真实业务数据。 */
+    const MCP_PLACEHOLDER_PAYLOAD = {
+      meta: {
+        period: '计划月份（待 MCP 填充）',
+        currentLevel: '大区审批',
+        currentTab: 'province',
+        aiTag: '待填充',
+        averageTurnoverDays: null,
+        inventoryFocus: '待 MCP 填充',
+      },
+      permissions: ['客户确认AI预测', '区域审批', '省区审批', '大区审批', '品类计划审核'],
+      customers: [
+        {
+          id: 'placeholder-01', code: '客户编号占位-01', name: '客户名称占位-01',
+          area: '大区名称占位-A', province: '省区名称占位-A', region: '区域名称占位-A', base: '基地名称占位-A',
+          stage: '大区审批', target: 100000, thisShip: 4200, nextShip: 5100,
+          health: '关注', healthClass: 'warning', ai: 'AI 审批意见占位：等待 MCP 返回分析结果',
+          skus: [
+            { sku: 'SKU编码占位-01', name: 'SKU名称占位-01', base: 5000, price: 10 },
+            { sku: 'SKU编码占位-02', name: 'SKU名称占位-02', base: 3000, price: 12 },
+          ],
+        },
+        {
+          id: 'placeholder-02', code: '客户编号占位-02', name: '客户名称占位-02',
+          area: '大区名称占位-A', province: '省区名称占位-A', region: '区域名称占位-B', base: '基地名称占位-A',
+          stage: '大区审批', target: 85000, thisShip: 3600, nextShip: 4400,
+          health: '健康', healthClass: 'healthy', ai: 'AI 审批意见占位：等待 MCP 返回分析结果',
+          skus: [
+            { sku: 'SKU编码占位-01', name: 'SKU名称占位-01', base: 4200, price: 10 },
+            { sku: 'SKU编码占位-03', name: 'SKU名称占位-03', base: 2600, price: 15 },
+          ],
+        },
+        {
+          id: 'placeholder-03', code: '客户编号占位-03', name: '客户名称占位-03',
+          area: '大区名称占位-B', province: '省区名称占位-B', region: '区域名称占位-C', base: '基地名称占位-B',
+          stage: '品类计划审核', target: 72000, thisShip: 2800, nextShip: 3200,
+          health: '预警', healthClass: 'danger', ai: 'AI 审批意见占位：等待 MCP 返回分析结果',
+          skus: [
+            { sku: 'SKU编码占位-04', name: 'SKU名称占位-04', base: 4800, price: 15 },
+          ],
+        },
+        {
+          id: 'placeholder-04', code: '客户编号占位-04', name: '客户名称占位-04',
+          area: '大区名称占位-B', province: '省区名称占位-C', region: '区域名称占位-D', base: '基地名称占位-B',
+          stage: '省区审批', target: 60000, thisShip: 2100, nextShip: 2700,
+          health: '关注', healthClass: 'warning', ai: 'AI 审批意见占位：等待 MCP 返回分析结果',
+          skus: [
+            { sku: 'SKU编码占位-05', name: 'SKU名称占位-05', base: 4000, price: 15 },
+          ],
+        },
+      ],
+    };
+
+    const WORKBENCH_STORAGE_KEY = `aionui:approval-workbench:${location.pathname}`;
+    const WORKBENCH_STORAGE_TTL_MS = 24 * 60 * 60 * 1000;
+
+    function isPlaceholderPayload(payload) {
+      const list = Array.isArray(payload?.customers) ? payload.customers : [];
+      return list.length > 0 && list.every(customer => String(customer?.id || '').startsWith('placeholder-'));
+    }
+
+    function saveWorkbenchPayload(payload) {
+      if (!Array.isArray(payload?.customers) || isPlaceholderPayload(payload)) return;
+      try {
+        localStorage.setItem(WORKBENCH_STORAGE_KEY, JSON.stringify({ savedAt: Date.now(), payload }));
+      } catch (error) {
+        console.warn('审批工作台数据未能保存到当前会话路径', error);
+      }
+    }
+
+    function loadWorkbenchPayload() {
+      try {
+        const raw = localStorage.getItem(WORKBENCH_STORAGE_KEY);
+        if (!raw) return null;
+        const stored = JSON.parse(raw);
+        if (!Number.isFinite(stored?.savedAt) || Date.now() - stored.savedAt > WORKBENCH_STORAGE_TTL_MS) {
+          localStorage.removeItem(WORKBENCH_STORAGE_KEY);
+          return null;
+        }
+        const payload = stored.payload;
+        return payload && Array.isArray(payload.customers) && !isPlaceholderPayload(payload) ? payload : null;
+      } catch (error) {
+        console.warn('审批工作台持久数据无效，已回退到占位数据', error);
+        return null;
+      }
+    }
+
+    let customers = [];
+
+    /* ============ 配置 ============ */
+    const STAGES = ['客户确认AI预测','区域审批','省区审批','大区审批','品类计划审核'];
+    const RANK = { '客户确认AI预测':0, '区域审批':1, '省区审批':2, '大区审批':3, '品类计划审核':4 };
+    // 模拟当前登录账号的权限范围（决定流程条统计口径）
+    let USER_PERM = [];
+    const TAB_DEFS = [
+      { key: 'area', label: '按大区' },
+      { key: 'province', label: '按省区' },
+      { key: 'region', label: '按区域' },
+      { key: 'base', label: '按基地' },
+      { key: 'customer', label: '按客户' },
+    ];
+    const TAB_BY_LEVEL = {
+      '客户确认AI预测': ['customer'],
+      '区域审批': ['region','customer'],
+      '省区审批': ['region','customer'],
+      '大区审批': ['province','region','customer'],
+      '品类计划审核': ['area','province','region','base','customer'],
+    };
+    const PATHS = {
+      area: ['area', 'province', 'region'],
+      province: ['province', 'region'],
+      region: ['region'],
+      base: ['base'],
+      customer: [],
+    };
+    // 提报进度展示的永远是「下级」维度：点大区审批 → 展示省区；点品类计划审核 → 展示大区
+    const PROG_TOP = { '客户确认AI预测':'customer', '区域审批':'customer', '省区审批':'region', '大区审批':'province', '品类计划审核':'area' };
+    const DIM_LABEL = { area: '大区', province: '省区', region: '区域', base: '基地', customer: '客户' };
+
+    let currentLevel = '大区审批';
+    let currentTab = 'province';
+    let currentPageSize = 20;
+    const progExpandedSet = new Set();
+
+    // 调整明细上下文
+    let currentAdjustLeaves = [];
+    let currentAdjustTitle = '';
+    let currentAdjustDim = 'customer';
+    let currentAdjustReadonly = false;
+
+    /* ============ 工具 ============ */
+    function formatNum(n) {
+      return (n === 0 || n === undefined || isNaN(n)) ? '0' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+    }
+    function toNumber(value, fallback) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : (fallback || 0);
+    }
+    function toText(value, fallback) {
+      return value === undefined || value === null || value === '' ? fallback : String(value);
+    }
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[char]);
+    }
+    function jsArg(value) { return escapeHtml(JSON.stringify(value)); }
+    function domKey(value) { return encodeURIComponent(String(value)).replace(/%/g, '_').replace(/[^A-Za-z0-9_.-]/g, '_'); }
+
+    function normalizeSku(source, index) {
+      const raw = source && typeof source === 'object' ? source : {};
+      const base = toNumber(raw.base, 0);
+      const price = toNumber(raw.price, 0);
+      const qty = raw.qty === undefined ? base : toNumber(raw.qty, base);
+      const amtBase = raw.amtBase === undefined ? Math.round(base * price) : toNumber(raw.amtBase, 0);
+      const amt = raw.amt === undefined ? Math.round(qty * price) : toNumber(raw.amt, amtBase);
+      return {
+        sku: toText(raw.sku, `SKU编码占位-${index + 1}`),
+        name: toText(raw.name, `SKU名称占位-${index + 1}`),
+        base, price, qty, amtBase, amt,
+      };
+    }
+
+    function normalizeCustomer(source, index) {
+      const raw = source && typeof source === 'object' ? source : {};
+      const healthClass = ['healthy', 'warning', 'danger'].includes(raw.healthClass) ? raw.healthClass : 'healthy';
+      const healthLabel = { healthy: '健康', warning: '关注', danger: '预警' }[healthClass];
+      return {
+        id: toText(raw.id, `mcp-${index + 1}`),
+        code: toText(raw.code, `客户编号占位-${index + 1}`),
+        name: toText(raw.name, `客户名称占位-${index + 1}`),
+        area: toText(raw.area, '大区名称待填充'),
+        province: toText(raw.province, '省区名称待填充'),
+        region: toText(raw.region, '区域名称待填充'),
+        base: toText(raw.base, '基地名称待填充'),
+        stage: STAGES.includes(raw.stage) ? raw.stage : STAGES[0],
+        rejected: raw.rejected ? String(raw.rejected) : '',
+        target: toNumber(raw.target, 0),
+        thisShip: toNumber(raw.thisShip, 0),
+        nextShip: toNumber(raw.nextShip, 0),
+        health: toText(raw.health, healthLabel),
+        healthClass,
+        ai: toText(raw.ai, 'AI 审批意见待填充'),
+        skus: (Array.isArray(raw.skus) ? raw.skus : []).map(normalizeSku),
+      };
+    }
+
+    function setFilterOptions(id, field) {
+      const select = document.getElementById(id);
+      const options = ['全部', ...new Set(customers.map(customer => customer[field]).filter(Boolean))];
+      select.replaceChildren(...options.map(value => new Option(value, value)));
+    }
+
+    function setApprovalWorkbenchData(payload) {
+      if (!payload || typeof payload !== 'object') throw new TypeError('审批工作台数据必须是对象');
+      const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+      customers = (Array.isArray(payload.customers) ? payload.customers : []).map(normalizeCustomer);
+      const permissions = Array.isArray(payload.permissions) ? payload.permissions.filter(stage => STAGES.includes(stage)) : STAGES;
+      USER_PERM = permissions.length ? permissions : STAGES;
+
+      currentLevel = STAGES.includes(meta.currentLevel) && USER_PERM.includes(meta.currentLevel)
+        ? meta.currentLevel
+        : (USER_PERM.includes(currentLevel) ? currentLevel : USER_PERM[0]);
+      const allowedTabs = TAB_BY_LEVEL[currentLevel] || ['customer'];
+      currentTab = allowedTabs.includes(meta.currentTab) ? meta.currentTab : allowedTabs[allowedTabs.length - 1];
+
+      setFilterOptions('fArea', 'area');
+      setFilterOptions('fProv', 'province');
+      setFilterOptions('fRegion', 'region');
+      document.getElementById('fName').value = '';
+      document.getElementById('fStatus').value = 'all';
+
+      const period = toText(meta.period, '计划月份（待 MCP 填充）');
+      document.getElementById('periodSelect').replaceChildren(new Option(period, period));
+      document.getElementById('aiTag').textContent = toText(meta.aiTag, '待填充');
+      document.getElementById('aiTurnover').textContent = meta.averageTurnoverDays !== null
+        && meta.averageTurnoverDays !== undefined
+        && meta.averageTurnoverDays !== ''
+        && Number.isFinite(Number(meta.averageTurnoverDays))
+        ? `${Number(meta.averageTurnoverDays)} 天`
+        : '--';
+      document.getElementById('aiInventoryFocus').textContent = toText(meta.inventoryFocus, '待 MCP 填充');
+
+      progExpandedSet.clear();
+      closeAdjust();
+      closeProgressModal();
+      renderStageBar();
+      renderViewTabs();
+      renderQueue();
+      updateAiDesc();
+      saveWorkbenchPayload(payload);
+      return { customerCount: customers.length, currentLevel, currentTab };
+    }
+
+    // MCP 推荐入口：window.setApprovalWorkbenchData({ meta, permissions, customers })
+    window.setApprovalWorkbenchData = setApprovalWorkbenchData;
+    window.addEventListener('approval-workbench:data', event => setApprovalWorkbenchData(event.detail));
+
+    function sumQty(c) { return c.skus.reduce((a, s) => a + (s.qty || 0), 0); }
+    function sumAmt(c) { return c.skus.reduce((a, s) => a + (s.amt || 0), 0); }
+    function sumBase(c) { return c.skus.reduce((a, s) => a + (s.base || 0), 0); }
+    function getCustomerById(id) { return customers.find(c => String(c.id) === String(id)); }
+    function leavesOf(node) {
+      if (node.leaf || node.customer) return [node.customer];
+      return node.children.flatMap(leavesOf);
+    }
+
+    function getFilters() {
+      return {
+        area: document.getElementById('fArea').value,
+        prov: document.getElementById('fProv').value,
+        region: document.getElementById('fRegion').value,
+        name: (document.getElementById('fName').value || '').trim(),
+        status: document.getElementById('fStatus').value,
+      };
+    }
+    function applyFilterTo(list, f) {
+      const curRank = RANK[currentLevel] || 0;
+      return list.filter(c => {
+        // 不同意的记录默认不显示
+        if (c.rejected) return false;
+        if (f.area !== '全部' && c.area !== f.area) return false;
+        if (f.prov !== '全部' && c.province !== f.prov) return false;
+        if (f.region !== '全部' && c.region !== f.region) return false;
+        if (f.name !== '' && c.name.indexOf(f.name) < 0 && c.code.indexOf(f.name) < 0) return false;
+        const cr = RANK[c.stage] || 0;
+        if (f.status === 'pending' && cr !== curRank) return false;   // 正待审：恰好停在当前层级
+        if (f.status === 'approved' && cr <= curRank) return false;  // 已审批：已超过当前层级
+        return true;
+      });
+    }
+
+    function approvalCustomers() {
+      const f = getFilters();
+      const curRank = RANK[currentLevel] || 0;
+      // 已审批的节点也能看到数据：展示所有已到达（含通过）该层级的记录
+      return applyFilterTo(customers, f).filter(c => (RANK[c.stage] || 0) >= curRank);
+    }
+    // 本层级正待审（仍可修改）的记录
+    function pendingCustomers() {
+      return approvalCustomers().filter(c => c.stage === currentLevel);
+    }
+
+    function groupRecursive(dimPath, list, prefix) {
+      prefix = prefix || '';
+      if (dimPath.length === 0) {
+        return list.map(c => ({ type: 'customer', name: c.name, customer: c, leaf: true, path: prefix + '/' + c.code }));
+      }
+      const [dim, ...rest] = dimPath;
+      const map = {};
+      list.forEach(c => {
+        const k = c[dim];
+        if (!map[k]) map[k] = { type: dim, name: k, key: k, children: [], path: prefix + '/' + k };
+        map[k].children.push(c);
+      });
+      return Object.values(map).map(node => {
+        node.children = groupRecursive(rest, node.children, node.path);
+        return node;
+      });
+    }
+
+    function aggOfLeaves(leaves) {
+      let q = 0, a = 0, b = 0, t = 0, sh = 0, ns = 0, worst = 0, ai = '';
+      leaves.forEach(c => {
+        q += sumQty(c); a += sumAmt(c); b += sumBase(c); t += c.target; sh += c.thisShip; ns += c.nextShip;
+        const wr = { healthy: 0, warning: 1, danger: 2 }[c.healthClass] || 0;
+        if (wr > worst) worst = wr;
+        if (!ai) ai = c.ai;
+      });
+      return { qty: q, amt: a, base: b, target: t, thisShip: sh, nextShip: ns, healthClass: ['healthy','warning','danger'][worst], health: ['健康','关注','预警'][worst], ai };
+    }
+    function rateOf(agg) { return agg.target > 0 ? (agg.qty / agg.target * 100) : 0; }
+
+    /* ============ 顶部阶段条（颜色由数据状态决定） ============ */
+    // 计算权限范围内各阶段完成情况
+    function computeStageStatus() {
+      const scope = customers.filter(c => USER_PERM.includes(c.stage) || true); // 权限范围（原型取全部）
+      return STAGES.map(stage => {
+        const r = RANK[stage];
+        let entered = 0, passed = 0;
+        scope.forEach(c => {
+          const cr = RANK[c.stage] || 0;
+          if (cr >= r) entered++;
+          if (cr > r) passed++;
+        });
+        let state, rate;
+        if (entered === 0) { state = 'todo'; rate = 0; }
+        else if (passed === entered) { state = 'done'; rate = 100; }
+        else { state = 'active'; rate = Math.round(passed / entered * 100); }
+        return { stage, state, rate };
+      });
+    }
+
+    function renderStageBar() {
+      const stats = computeStageStatus();
+      const bar = document.getElementById('stageBar');
+      let html = '';
+      STAGES.forEach((stage, idx) => {
+        const st = stats[idx];
+        const hasPerm = USER_PERM.includes(stage);
+        const isCurrent = stage === currentLevel;
+        let cls = st.state;
+        if (!hasPerm) cls += ' disabled';
+        if (isCurrent) cls += ' current';
+        const fillColor = st.state === 'done' ? 'var(--success)' : 'var(--brand)';
+        const fillStyle = `--stage-progress:${st.state === 'todo' ? 0 : st.rate / 100}`;
+        const label = st.state === 'active' ? `${stage} ${st.rate}%` : stage;
+        const onclick = hasPerm ? `onclick="onStageChange('${stage}')"` : '';
+        html += `<span class="stage-node ${cls}" ${onclick}>
+          <span class="stage-fill" style="background:${fillColor};${fillStyle}"></span>
+          <span class="stage-label">${label}</span>
+        </span>`;
+        if (idx < STAGES.length - 1) html += `<span class="stage-arrow">→</span>`;
+      });
+      bar.innerHTML = html;
+    }
+
+    /* ============ 视图 tabs ============ */
+    function renderViewTabs() {
+      const allowed = TAB_BY_LEVEL[currentLevel] || ['customer'];
+      if (!allowed.includes(currentTab)) currentTab = allowed[allowed.length - 1];
+      const html = allowed.map(k => {
+        const t = TAB_DEFS.find(x => x.key === k);
+        return `<div class="view-tab ${k === currentTab ? 'active' : ''}" data-tab="${k}" onclick="switchView('${k}')">${t.label}</div>`;
+      }).join('');
+      document.getElementById('viewTabs').innerHTML = html;
+    }
+
+    /* ============ 审批队列 ============ */
+    function renderQueue() {
+      const list = approvalCustomers();
+      const nodes = groupRecursive(PATHS[currentTab], list);
+      const sliced = nodes.slice(0, currentPageSize);
+      const tbody = document.getElementById('queueBody');
+      let html = '';
+      sliced.forEach(n => { html += renderNode(n); });
+      tbody.innerHTML = html || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+      document.getElementById('pageTotal').textContent = `共 ${nodes.length} 个组织`;
+      document.getElementById('aiPending').textContent = pendingCustomers().length + ' 个';
+
+      // AI 卡片：整体金额达成率 = sum(amt) / sum(target) of approvalCustomers
+      const totAmt = list.reduce((a, c) => a + sumAmt(c), 0);
+      const totTarget = list.reduce((a, c) => a + (c.target || 0), 0);
+      const totR = totTarget > 0 ? (totAmt / totTarget * 100) : 0;
+      const rateEl = document.getElementById('aiAmtRate');
+      if (rateEl) {
+        rateEl.textContent = totR.toFixed(1) + '%';
+        rateEl.classList.remove('up', 'down');
+        rateEl.classList.add(totR >= 100 ? 'up' : 'down');
+      }
+    }
+
+    function renderNode(node) {
+      const leaves = leavesOf(node);
+      const agg = aggOfLeaves(leaves);
+      const diff = agg.qty - agg.base;
+      const rateQty = agg.base > 0 ? (agg.qty / agg.base * 100) : 0;
+      const rateAmt = rateOf(agg);
+      const rateQtyCls = rateQty > 100 ? 'pos' : rateQty < 95 ? 'neg' : '';
+      const rateAmtCls = rateAmt > 100 ? 'pos' : rateAmt < 95 ? 'neg' : '';
+      const isLeaf = !!node.leaf;
+      const customerCount = leaves.length;
+      const skuCount = leaves.reduce((a, c) => a + c.skus.length, 0);
+
+      const sub = isLeaf
+        ? `<div class="row-sub">${escapeHtml(node.customer.code)} · ${skuCount} 个 SKU</div>`
+        : `<div class="row-sub">包含 ${customerCount} 个客户 · ${skuCount} 个 SKU</div>`;
+      // 该分组下所有客户都停在当前层级（仍待审）才允许修改；否则视为已审批，只读
+      const editable = leaves.every(c => c.stage === currentLevel);
+      const editHint = editable
+        ? `<div class="edit-hint"><span class="link" onclick="openAdjust(${jsArg(node.path)})">调整明细 / 查看影响 ▸</span><span style="color:var(--text-tertiary)"> · 点击名称打开调整弹窗</span></div>`
+        : `<div class="edit-hint" style="color:var(--text-tertiary)">已审批 · 仅可查看，不可修改</div>`;
+      const nameCls = editable ? 'row-title editable-name' : 'row-title';
+      const nameCell = `<div style="display:flex;align-items:flex-start;gap:2px">
+        <span class="tree-arrow">▸</span>
+        <div>
+          <div class="${nameCls}" onclick="openAdjust(${jsArg(node.path)})">${escapeHtml(node.name)}</div>
+          ${sub}${editHint}
+        </div>
+      </div>`;
+
+      let html = `<tr class="parent-row" data-path="${node.path}">
+        <td class="center"><input type="checkbox" class="row-check" /></td>
+        <td>${nameCell}</td>
+        <td class="right plan-merged">
+          <div class="plan-qty">${formatNum(agg.qty)} 件</div>
+          <div class="plan-amt">¥${formatNum(agg.amt)}</div>
+        </td>
+        <td class="right plan-cell-derived">${formatNum(agg.qty)}<div class="sub">由 SKU 汇总</div></td>
+        <td>
+          <div class="metric-value ${rateAmtCls}">金额 ${rateAmt.toFixed(1)}%</div>
+          <div class="progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(rateAmt, 100)}%"></div></div>
+            <div class="progress-text">预算目标金额 ¥${formatNum(agg.target)}</div>
+          </div>
+          <div class="metric-value ${rateQtyCls}" style="margin-top:8px">数量 ${rateQty.toFixed(1)}%</div>
+          <div class="progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(rateQty, 100)}%;background:var(--orange)"></div></div>
+            <div class="progress-text">预算目标数量 ${formatNum(agg.base)} 件</div>
+          </div>
+        </td>
+        <td class="right">
+          <div>本月 ${formatNum(agg.thisShip)}</div>
+          <div class="row-sub">次月 ${formatNum(agg.nextShip)}</div>
+        </td>
+        <td class="right ${diff > 0 ? 'pos' : diff < 0 ? 'neg' : ''}">${diff > 0 ? '+' : ''}${formatNum(diff)}</td>
+        <td><span class="health-badge ${agg.healthClass}">${agg.health}</span></td>
+        <td><div class="opinion">${escapeHtml(agg.ai)}</div></td>
+      </tr>`;
+      return html;
+    }
+
+    /* ============ 调整明细 modal ============ */
+    function dimOptionsFor(type) {
+      const rankOf = { area: 0, province: 1, region: 2, base: 2, customer: 3 };
+      const order = ['area', 'province', 'region', 'base', 'customer'];
+      const start = rankOf[type];
+      return order.filter(d => rankOf[d] >= start);
+    }
+    function findNodeByPath(path) {
+      const list = approvalCustomers();
+      const nodes = groupRecursive(PATHS[currentTab], list);
+      return searchNode(nodes, path);
+    }
+    function searchNode(nodes, path) {
+      for (const n of nodes) {
+        if (n.path === path) return n;
+        if (n.children) { const r = searchNode(n.children, path); if (r) return r; }
+      }
+      return null;
+    }
+    function openAdjust(path) {
+      const node = findNodeByPath(path);
+      currentAdjustLeaves = node ? leavesOf(node) : [];
+      currentAdjustTitle = node ? node.name : '';
+      // 任一客户已审批通过（stage 不等于当前层级）→ 整窗只读
+      currentAdjustReadonly = currentAdjustLeaves.some(c => c.stage !== currentLevel);
+      let def = node ? node.type : 'customer';
+      currentAdjustDim = def;
+      renderAdjustTabs(def);
+      document.getElementById('adjustTitle').textContent = (currentAdjustReadonly ? '查看明细 · ' : '调整明细 · ') + currentAdjustTitle;
+      renderAdjust();
+      document.getElementById('adjustModal').classList.add('active');
+    }
+    function closeAdjust() { document.getElementById('adjustModal').classList.remove('active'); }
+    function renderAdjustTabs(type) {
+      const opts = dimOptionsFor(type);
+      document.getElementById('adjustTabs').innerHTML = opts.map(d =>
+        `<div class="dim-tab ${d === currentAdjustDim ? 'active' : ''}" data-dim="${d}" onclick="switchAdjustDim('${d}')">${DIM_LABEL[d]}</div>`
+      ).join('');
+    }
+    function switchAdjustDim(d) { currentAdjustDim = d; renderAdjustTabs(d); renderAdjust(); }
+
+    function groupLeavesByDim(leaves, dim) {
+      const map = {};
+      leaves.forEach(c => {
+        const key = c[dim];
+        if (!map[key]) map[key] = { key, name: key, customers: [] };
+        map[key].customers.push(c);
+      });
+      return Object.values(map).map(g => {
+        const skuMap = {};
+        g.customers.forEach(c => c.skus.forEach(s => {
+          if (!skuMap[s.sku]) skuMap[s.sku] = { sku: s.sku, name: s.name, price: s.price, base: 0, qty: 0, amtBase: 0, amt: 0 };
+          const a = skuMap[s.sku];
+          a.base += s.base; a.qty += s.qty; a.amtBase += s.amtBase; a.amt += s.amt;
+        }));
+        g.skus = Object.values(skuMap);
+        return g;
+      });
+    }
+
+    function renderAdjust() {
+      const dim = currentAdjustDim;
+      const leaves = currentAdjustLeaves;
+      const head = document.getElementById('adjustHead');
+      const body = document.getElementById('adjustBody');
+      reasonStore = [];
+      const cols = `<tr><th>${dim === 'customer' ? '客户' : DIM_LABEL[dim]}</th><th>SKU编码</th><th>SKU名称</th><th class="right">原计划量</th><th class="right">新计划量</th><th class="right">原计划金额</th><th class="right">新计划金额</th><th class="right">调整量</th><th class="right">调整金额</th><th>AI 建议</th></tr>`;
+      head.innerHTML = cols;
+
+      let rows = '';
+      if (dim === 'customer') {
+        leaves.forEach(c => {
+          const rowDisabled = currentAdjustReadonly || (c.stage !== currentLevel);
+          const dis = rowDisabled ? 'disabled' : '';
+          const customerDomKey = domKey(c.id);
+          c.skus.forEach((s, idx) => {
+            const dq = (s.qty || 0) - (s.base || 0);
+            const da = (s.amt || 0) - (s.amtBase || 0);
+            const ai = aiSuggestForCustSku(c, s);
+            rows += `<tr>
+              <td>${escapeHtml(c.name)}</td><td>${escapeHtml(s.sku)}</td><td>${escapeHtml(s.name)}</td>
+              <td class="right">${formatNum(s.base)}</td>
+              <td class="right"><input id="adj-${customerDomKey}-${idx}-qty" class="sku-input" type="number" value="${s.qty}" ${dis} oninput="onCustInput(${jsArg(c.id)},${idx},'qty',this.value)"></td>
+              <td class="right">${formatNum(s.amtBase)}</td>
+              <td class="right"><input id="adj-${customerDomKey}-${idx}-amt" class="sku-input amt" type="number" value="${s.amt}" ${dis} oninput="onCustInput(${jsArg(c.id)},${idx},'amt',this.value)"></td>
+              <td id="adj-dq-${customerDomKey}-${idx}" class="right ${dq > 0 ? 'val-pos' : dq < 0 ? 'val-neg' : ''}">${dq > 0 ? '+' : ''}${formatNum(dq)}</td>
+              <td id="adj-da-${customerDomKey}-${idx}" class="right ${da > 0 ? 'val-pos' : da < 0 ? 'val-neg' : ''}">${da > 0 ? '+' : ''}${formatNum(da)}</td>
+              <td>${renderAiTipCell(ai, dis, `adoptCustAi(${jsArg(c.id)},${idx})`)}</td>
+            </tr>`;
+          });
+        });
+      } else {
+        const groups = groupLeavesByDim(leaves, dim);
+        groups.forEach(g => {
+          const groupEditable = !currentAdjustReadonly && g.customers.every(c => c.stage === currentLevel);
+          const dis = groupEditable ? '' : 'disabled';
+          const groupDomKey = domKey(g.key);
+          rows += `<tr class="adj-group-row"><td rowspan="${g.skus.length}">${escapeHtml(g.name)}</td></tr>`;
+          g.skus.forEach(s => {
+            const dq = (s.qty || 0) - (s.base || 0);
+            const da = (s.amt || 0) - (s.amtBase || 0);
+            const ai = aiSuggestForAggSku(g, s);
+            const skuDomKey = domKey(s.sku);
+            rows += `<tr>
+              <td>${escapeHtml(s.sku)}</td><td>${escapeHtml(s.name)}</td>
+              <td class="right">${formatNum(s.base)}</td>
+              <td class="right"><input id="adj-${groupDomKey}-${skuDomKey}-qty" class="sku-input" type="number" value="${s.qty}" ${dis} oninput="onAggInput(${jsArg(dim)},${jsArg(g.key)},${jsArg(s.sku)},'qty',this.value)"></td>
+              <td class="right">${formatNum(s.amtBase)}</td>
+              <td class="right"><input id="adj-${groupDomKey}-${skuDomKey}-amt" class="sku-input amt" type="number" value="${s.amt}" ${dis} oninput="onAggInput(${jsArg(dim)},${jsArg(g.key)},${jsArg(s.sku)},'amt',this.value)"></td>
+              <td id="adj-dq-${groupDomKey}-${skuDomKey}" class="right ${dq > 0 ? 'val-pos' : dq < 0 ? 'val-neg' : ''}">${dq > 0 ? '+' : ''}${formatNum(dq)}</td>
+              <td id="adj-da-${groupDomKey}-${skuDomKey}" class="right ${da > 0 ? 'val-pos' : da < 0 ? 'val-neg' : ''}">${da > 0 ? '+' : ''}${formatNum(da)}</td>
+              <td>${renderAiTipCell(ai, dis, `adoptAggAi(${jsArg(dim)},${jsArg(g.key)},${jsArg(s.sku)})`)}</td>
+            </tr>`;
+          });
+        });
+      }
+      body.innerHTML = rows || `<tr><td colspan="10" class="empty">暂无 SKU 数据</td></tr>`;
+
+      const totalDiff = leaves.reduce((a, c) => a + sumQty(c) - sumBase(c), 0);
+      const summaryTail = currentAdjustReadonly
+        ? ` · 该记录已审批，仅可查看不可修改`
+        : ` · 当前按「${DIM_LABEL[dim]}」聚合，调整向下分摊至客户 + SKU`;
+      document.getElementById('adjustSummary').innerHTML =
+        `整体差异 <strong>${totalDiff > 0 ? '+' : ''}${formatNum(totalDiff)} 件</strong>${summaryTail}`;
+    }
+
+    // 客户维度逐条编辑（数量↔金额按单价联动）
+    function onCustInput(custId, idx, field, val) {
+      const c = getCustomerById(custId);
+      const s = c.skus[idx];
+      const num = parseFloat(val) || 0;
+      const price = s.price || 0;
+      if (field === 'qty') { s.qty = num; if (price > 0) s.amt = Math.round(num * price); }
+      else { s.amt = num; if (price > 0) s.qty = Math.round(num / price); }
+      renderQueue();
+      renderAdjust();
+      const fid = `adj-${domKey(custId)}-${idx}-${field}`;
+      const el = document.getElementById(fid);
+      if (el) { const v = el.value; el.focus(); el.value = ''; el.value = v; }
+    }
+
+    // 聚合维度编辑：按比例向下分摊到该分组下所有客户的对应 SKU
+    function onAggInput(dim, key, sku, field, val) {
+      const groupCusts = currentAdjustLeaves.filter(c => String(c[dim]) === String(key));
+      const records = [];
+      groupCusts.forEach(c => { const s = c.skus.find(x => x.sku === sku); if (s) records.push(s); });
+      const totalBase = records.reduce((a, s) => a + s.base, 0);
+      const price = records.length ? records[0].price : 0;
+      let newQty;
+      if (field === 'qty') newQty = parseFloat(val) || 0;
+      else { const newAmt = parseFloat(val) || 0; newQty = price > 0 ? newAmt / price : 0; }
+
+      if (totalBase > 0) {
+        let allocated = 0;
+        records.forEach((s, i) => {
+          const ratio = s.base / totalBase;
+          let q = (i === records.length - 1) ? newQty - allocated : Math.round(newQty * ratio);
+          allocated += q;
+          s.qty = q;
+          s.amt = Math.round(q * price);
+        });
+      }
+      renderQueue();
+      renderAdjust();
+      const fid = `adj-${domKey(key)}-${domKey(sku)}-${field}`;
+      const el = document.getElementById(fid);
+      if (el) { const v = el.value; el.focus(); el.value = ''; el.value = v; }
+    }
+
+    /* ============ AI 建议（每个 SKU） ============ */
+    // 类别识别：基于 SKU 名称返回品类与建议口径
+    function skuCategory(name) {
+      const n = name || '';
+      if (/水饺|灌汤/.test(n)) return { tag: '水饺', season: '主力' };
+      if (/汤圆/.test(n)) return { tag: '汤圆', season: '节令' };
+      if (/手抓饼|葱油饼/.test(n)) return { tag: '面点', season: '早餐' };
+      if (/馄饨/.test(n)) return { tag: '馄饨', season: '早餐' };
+      if (/贡丸|肉丸|小丸/.test(n)) return { tag: '丸子', season: '火锅' };
+      return { tag: '通用', season: '常态' };
+    }
+
+    // 客户维度：单个 SKU 的 AI 建议（基于该客户健康度 / 达成情况 / 品类）
+    function aiSuggestForCustSku(c, s) {
+      const cat = skuCategory(s.name);
+      const base = s.base || 0;
+      const reached = base > 0 ? (s.qty || 0) / base : 1;
+      const r2 = reached.toFixed(2);
+
+      // 健康度优先
+      if (c.healthClass === 'danger') {
+        const q = Math.round(base * 0.85);
+        return { tone: 'danger', qty: q, text: '拉货/库存严重偏离，建议下调 15% 规避滞销',
+          reason: `客户健康度=预警(danger)；该客户拉货/库存偏离模型阈值（thisShip=${c.thisShip||0}）。按保守策略下调 15% 规避滞销。建议量 = 原计划量 ${formatNum(base)} × 0.85 = ${formatNum(q)}。` };
+      }
+      if (c.healthClass === 'warning') {
+        if (reached > 1.05) {
+          const q = Math.round(base * 0.95);
+          return { tone: 'warning', qty: q, text: '达成偏高、库存周转偏慢，可适度下调',
+            reason: `客户健康度=关注(warning)；达成率=${r2}（>1.05）偏高且库存周转偏慢。建议下调至原量 95%。建议量 = ${formatNum(base)} × 0.95 = ${formatNum(q)}。` };
+        }
+        const q = Math.round(base * 1.05);
+        return { tone: 'warning', qty: q, text: '动销偏弱，建议小幅上调刺激拉货',
+          reason: `客户健康度=关注(warning)；动销偏弱。建议小幅上调 5% 刺激拉货。建议量 = ${formatNum(base)} × 1.05 = ${formatNum(q)}。` };
+      }
+      // 健康 → 按达成率 + 品类给建议
+      if (reached < 0.9) {
+        const q = Math.round(base * 1.1);
+        return { tone: 'healthy', qty: q, text: `${cat.tag}达成偏低，建议上调 10% 追平预算`,
+          reason: `客户健康度=健康；${cat.tag}品类达成率=${r2}（<0.9）偏低。建议上调 10% 追平预算。建议量 = ${formatNum(base)} × 1.1 = ${formatNum(q)}。` };
+      }
+      if (reached > 1.15) {
+        const q = Math.round(base * 0.95);
+        return { tone: 'healthy', qty: q, text: `${cat.tag}增速过快，建议维持原量或微调`,
+          reason: `客户健康度=健康；${cat.tag}品类达成率=${r2}（>1.15）增速过快。建议维持原量或微调（×0.95）。建议量 = ${formatNum(base)} × 0.95 = ${formatNum(q)}。` };
+      }
+      return { tone: 'healthy', qty: base, text: `${cat.tag}动销健康，建议维持当前计划量`,
+        reason: `客户健康度=健康；${cat.tag}品类动销健康（达成率=${r2}）。建议维持当前计划量（×1.0）。` };
+    }
+
+    // 聚合维度：分组下 SKU 的汇总建议
+    function aiSuggestForAggSku(g, s) {
+      const danger = g.customers.some(c => c.healthClass === 'danger');
+      const warning = g.customers.some(c => c.healthClass === 'warning');
+      const base = s.base || 0;
+      const cat = skuCategory(s.name);
+      const skuCount = g.customers.filter(c => c.skus.some(x => x.sku === s.sku)).length;
+      const custTxt = skuCount > 1 ? `（涉及 ${skuCount} 个客户）` : '';
+      if (danger)  return { tone: 'danger',  qty: Math.round(base * 0.85), text: `分组内存在严重偏离客户，建议整体下调 15% 拉平${custTxt}`,
+        reason: `聚合维度：分组内存在健康度=预警(danger)的客户；整体拉货/库存偏离显著。建议整体下调 15% 拉平风险。${custTxt}` };
+      if (warning) return { tone: 'warning', qty: Math.round(base * 1.05), text: `分组动销偏弱，建议整体上调 5% 刺激${custTxt}`,
+        reason: `聚合维度：分组内存在健康度=关注(warning)的客户；整体动销偏弱。建议整体上调 5% 刺激。${custTxt}` };
+      return { tone: 'healthy', qty: base, text: `${cat.tag}分组动销健康，可整体维持${custTxt}`,
+        reason: `聚合维度：分组内客户均健康；${cat.tag}品类动销稳健。建议整体维持。${custTxt}` };
+    }
+
+    // 渲染 td 内的建议标签 + 采纳按钮 + 悬浮逻辑注释
+    let reasonStore = [];
+    function renderAiTipCell(ai, dis, onClick) {
+      const tip = ai || { tone: 'healthy', text: '暂无建议', qty: 0 };
+      const btnDis = dis ? 'disabled' : '';
+      let reasonTrigger = '';
+      if (tip.reason) {
+        const ri = reasonStore.push(tip.reason) - 1;
+        reasonTrigger = `<span class="ai-reason-wrap"><span class="ai-reason-link" onmouseenter="showReasonPop(${ri}, this)" onmouseleave="hideReasonPop()">查看逻辑</span></span>`;
+      }
+      return `<div class="ai-tip tone-${tip.tone}">
+        <span class="ai-text">${escapeHtml(tip.text)}${tip.qty ? ` · <span class="ai-suggest-qty">建议 ${formatNum(tip.qty)}</span>` : ''}</span>
+        ${reasonTrigger}
+        <button class="ai-adopt tone-${tip.tone}" ${btnDis} onclick="${onClick}" title="将新计划量采纳为该建议值">采纳</button>
+      </div>`;
+    }
+    function showReasonPop(ri, el) {
+      const pop = document.getElementById('reasonPop');
+      pop.textContent = reasonStore[ri] || '';
+      const r = el.getBoundingClientRect();
+      let left = r.left;
+      const maxLeft = window.innerWidth - 330;
+      if (left > maxLeft) left = maxLeft;
+      pop.style.left = left + 'px';
+      pop.style.top = (r.bottom + 6) + 'px';
+      pop.style.display = 'block';
+    }
+    function hideReasonPop() {
+      document.getElementById('reasonPop').style.display = 'none';
+    }
+
+    // 客户维度采纳：直接把该客户的 SKU qty/amt 改成建议值
+    function adoptCustAi(custId, idx) {
+      const c = getCustomerById(custId);
+      const s = c.skus[idx];
+      if (!s || (c.stage !== currentLevel)) return;
+      const ai = aiSuggestForCustSku(c, s);
+      s.qty = ai.qty;
+      s.amt = Math.round(s.qty * (s.price || 0));
+      renderQueue();
+      renderAdjust();
+    }
+
+    // 聚合维度采纳：按分组下各客户该 SKU 原 base 占比分摊新建议量
+    function adoptAggAi(dim, key, sku) {
+      const groupCusts = currentAdjustLeaves.filter(c => String(c[dim]) === String(key));
+      if (!groupCusts.length) return;
+      if (!groupCusts.every(c => c.stage === currentLevel)) return;
+      const groupAgg = groupCusts[0].skus.find(x => x.sku === sku);
+      const ai = aiSuggestForAggSku({ customers: groupCusts }, { ...groupAgg, name: sku });
+      const newQty = ai.qty;
+      const totalBase = groupCusts.reduce((a, c) => {
+        const s = c.skus.find(x => x.sku === sku);
+        return a + (s ? s.base : 0);
+      }, 0);
+      const firstSku = groupCusts
+        .map(c => c.skus.find(x => x.sku === sku))
+        .filter(Boolean)[0];
+      const price = firstSku ? (firstSku.price || 18) : 18;
+      if (totalBase > 0) {
+        let allocated = 0;
+        groupCusts.forEach((c, i) => {
+          const s = c.skus.find(x => x.sku === sku);
+          if (!s) return;
+          const ratio = s.base / totalBase;
+          const q = (i === groupCusts.length - 1) ? newQty - allocated : Math.round(newQty * ratio);
+          allocated += q;
+          s.qty = q;
+          s.amt = Math.round(q * price);
+        });
+      }
+      renderQueue();
+      renderAdjust();
+    }
+
+    /* ============ 提报进度弹窗 ============ */
+    function isReached(c, level) {
+      return (RANK[c.stage] || 0) >= (RANK[level] || 0);
+    }
+    function collectProgLeaves(node) {
+      if (node.leaf || node.customer) return [node.customer];
+      return node.children.flatMap(collectProgLeaves);
+    }
+
+    function openProgressModal() {
+      document.getElementById('progModalLevel').textContent = currentLevel;
+      renderProgress();
+      document.getElementById('progModal').classList.add('active');
+    }
+    function closeProgressModal() { document.getElementById('progModal').classList.remove('active'); }
+
+    function renderProgress() {
+      const f = getFilters();
+      const list = applyFilterTo(customers, f);
+      const top = PROG_TOP[currentLevel];
+      const nodes = groupRecursive(PATHS[top], list);
+      const tree = document.getElementById('progTree');
+      let html = '';
+      nodes.forEach(n => { html += renderProgressNode(n, 0); });
+      tree.innerHTML = html || '<div class="empty">暂无下级提报数据</div>';
+    }
+
+    function renderProgressNode(node, depth) {
+      const leaves = collectProgLeaves(node);
+      const total = leaves.length;
+      const reached = leaves.filter(c => isReached(c, currentLevel)).length;
+      const pct = total ? Math.round(reached / total * 100) : 0;
+      const badge = pct === 100 ? '<span class="prog-badge done">已提交</span>'
+        : pct === 0 ? '<span class="prog-badge none">未提交</span>'
+        : `<span class="prog-badge doing">提交中</span>`;
+      const expandable = !!node.children && node.children.length > 0;
+      const expanded = progExpandedSet.has(node.path);
+      const arrow = expandable ? `<span class="prog-arrow" onclick="event.stopPropagation();toggleProg(${jsArg(node.path)})">${expanded ? '▾' : '▸'}</span>` : '<span class="prog-arrow"></span>';
+
+      let html = `<div class="prog-row" style="padding-left:${depth * 24}px" ${expandable ? `onclick="toggleProg(${jsArg(node.path)})"` : ''}>
+        ${arrow}
+        <span class="prog-name">${escapeHtml(node.name)}${node.leaf ? `<span class="sub">${escapeHtml(node.customer.code)}</span>` : ''}</span>
+        <span class="prog-bar-wrap">
+          <span class="prog-bar"><span class="prog-fill" style="width:${pct}%;background:${pct === 100 ? 'var(--success)' : pct === 0 ? 'var(--danger)' : 'var(--warning)'}"></span></span>
+          <span class="prog-pct">${pct}%</span>
+          <span class="prog-count">${reached}/${total}</span>
+          ${badge}
+        </span>
+        ${node.leaf ? `<span class="prog-leaf-detail">当前状态：${escapeHtml(node.customer.stage)}</span>` : ''}
+      </div>`;
+
+      if (expanded && expandable) {
+        node.children.forEach(ch => { html += renderProgressNode(ch, depth + 1); });
+      }
+      return html;
+    }
+    function toggleProg(path) {
+      if (progExpandedSet.has(path)) progExpandedSet.delete(path); else progExpandedSet.add(path);
+      renderProgress();
+    }
+
+    /* ============ 交互联动 ============ */
+    function onStageChange(level) {
+      currentLevel = level;
+      progExpandedSet.clear();
+      renderStageBar();
+      renderViewTabs();
+      renderQueue();
+      updateAiDesc();
+    }
+    function switchView(tab) {
+      currentTab = tab;
+      renderViewTabs();
+      renderQueue();
+    }
+    function applyFilters() { renderQueue(); }
+    function resetFilters() {
+      document.getElementById('fArea').value = '全部';
+      document.getElementById('fProv').value = '全部';
+      document.getElementById('fRegion').value = '全部';
+      document.getElementById('fName').value = '';
+      document.getElementById('fStatus').value = 'all';
+      renderQueue();
+    }
+    function onPageSizeChange(size) { currentPageSize = parseInt(size, 10) || 20; renderQueue(); }
+
+    const AI_DESC = {
+      '客户确认AI预测': '当前为 <strong>客户确认AI预测</strong>：经销商对 AI 给出的预测计划进行确认。尚未进入审批流程。',
+      '区域审批': '当前为 <strong>区域审批</strong>：展示待区域复核的记录。点击任意组织名称打开调整弹窗，可切换维度逐条调整 SKU。',
+      '省区审批': '当前为 <strong>省区审批</strong>：展示已通过区域审批、待省区复核的记录。',
+      '大区审批': '当前为 <strong>大区审批</strong>：展示已通过省区审批、待大区复核的记录。点击任意组织名称打开调整弹窗，默认可按大区 / 省区 / 区域 / 客户维度聚合调整。',
+      '品类计划审核': '当前为 <strong>品类计划审核</strong>：展示已通过大区审批、待平台（品类）复核的记录，可查看全部维度（大区 / 省区 / 区域 / 基地 / 客户）。',
+    };
+    function updateAiDesc() { document.getElementById('aiDesc').innerHTML = AI_DESC[currentLevel]; }
+
+    /* ============ 事件 ============ */
+    document.addEventListener('change', e => {
+      if (e.target.classList.contains('row-check')) {
+        e.target.closest('tr').classList.toggle('selected', e.target.checked);
+      }
+    });
+    document.getElementById('checkAll').addEventListener('change', e => {
+      document.querySelectorAll('#queueBody .row-check').forEach(cb => {
+        cb.checked = e.target.checked;
+        cb.closest('tr').classList.toggle('selected', e.target.checked);
+      });
+    });
+
+    // 刷新或浏览器重建时恢复 24 小时内最近一次真实注入；无有效数据时显示占位。
+    setApprovalWorkbenchData(loadWorkbenchPayload() || MCP_PLACEHOLDER_PAYLOAD);
+  </script>
+  <div id="reasonPop" class="reason-pop-fixed"></div>
+</body>
+</html>
