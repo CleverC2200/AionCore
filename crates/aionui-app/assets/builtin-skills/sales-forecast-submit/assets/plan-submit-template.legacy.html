@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 销售计划提报 - 模板页（MCP 数据驱动）</title>
+  <style>
+    :root{--red:#d5001c;--ink:#172033;--muted:#78869a;--line:#e4e8ef;--paper:#fff;--panel:#f7f8fa;--green:#16a475;--gold:#a76b11;--navy:#1b2638}
+    *{box-sizing:border-box}
+    body{margin:0;background:#f8f6f5;color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+    button,input,select{font:inherit}button{cursor:pointer}
+
+    /* ===== 工作台（无顶部平台栏，全宽） ===== */
+    .workspace{overflow:auto;background:#f6f7f9;min-height:100vh}
+    .btn{height:36px;padding:0 14px;border:1px solid #dce2ea;border-radius:8px;background:#fff;color:#263244;font-weight:650;white-space:nowrap}
+    .btn:hover{border-color:var(--red);color:var(--red)}
+    .btn-submit{border-color:var(--navy);background:var(--navy);color:#fff}
+    .btn-submit:hover{border-color:var(--navy);background:#263950;color:#fff}
+    .plan-switch{display:flex;overflow:hidden;border:1px solid #dce2ea;border-radius:8px;background:#fff}
+    .plan-switch button{height:38px;padding:0 15px;border:0;background:transparent;color:#a6afbd;font-weight:700;transition:.15s}
+    .plan-switch button:hover{color:#d5001c}
+    .plan-switch button.active{margin:3px;border-radius:6px;background:var(--red);color:#fff}
+    .query-row{display:flex;align-items:center;gap:16px;padding:14px 32px;flex-wrap:wrap;border-bottom:1px solid var(--line);background:#fff}
+    .query-row label{color:#5b6a80;font-weight:650;white-space:nowrap}
+    .q-item{display:flex;align-items:center;gap:8px}
+    .field{display:flex;gap:10px;flex-wrap:wrap}
+    .select{height:38px;padding:0 12px;border:1px solid #dde3eb;border-radius:8px;background:#fff;color:#263244;outline:0}
+    .select:focus{border-color:var(--red)}
+    .select.wide{min-width:230px}
+    .select.month{width:150px}
+
+    /* 顶部 4 步提报进度 */
+    .steps{display:flex;align-items:center;gap:0;padding:20px 32px;border-bottom:1px solid var(--line);background:#fff;overflow-x:auto}
+    .steps-title{margin-right:22px;padding-right:22px;border-right:1px solid var(--line);font-size:18px;font-weight:800;letter-spacing:-.4px;white-space:nowrap}
+    .step{display:flex;align-items:center;gap:9px;white-space:nowrap}
+    .step .dot{display:grid;width:26px;height:26px;place-items:center;border-radius:50%;font-size:13px;font-weight:800;font-style:normal;transition:.2s}
+    .step .name{font-weight:700;font-size:14px}
+    .step.todo .dot{background:#eef1f5;color:#98a2b3}
+    .step.todo .name{color:#98a2b3}
+    .step.done .dot{background:#2da77e;color:#fff}
+    .step.done .name{color:#2da77e}
+    .step.current .dot{background:var(--red);color:#fff;box-shadow:0 0 0 4px rgba(213,0,28,.13)}
+    .step.current .name{color:var(--red)}
+    .connector{width:34px;height:2px;margin:0 12px;border-radius:1px;background:#dde3ec;flex:none}
+    .connector.done{background:#2da77e}
+
+    .content{padding:20px 32px}
+    .sku-card{overflow:hidden;border:1px solid #dfe5ed;border-radius:11px;background:#fff}
+    .sku-toolbar{padding:12px;border-bottom:1px solid #e5eaf0;background:#f9fafb}
+    .sku-title-row{display:flex;align-items:center;gap:10px}
+    .sku-title-row h2{margin:0;font-size:16px}
+    .src-badge{padding:4px 9px;border:1px solid #bcd7f0;border-radius:7px;background:#f2f8fe;color:#2f6fbf;font-size:12px;font-weight:700}
+    .adjusted{padding:6px 10px;border:1px solid #e7a1a8;border-radius:7px;background:#fff7f7;color:#c14751;font-weight:700}
+    .filter-row{display:flex;gap:9px;flex-wrap:wrap;margin-top:11px}
+    .search{flex:1;min-width:200px;height:39px;padding:0 13px;border:1px solid #d9e0e9;border-radius:8px;outline:0}
+    .filter{height:39px;padding:0 10px;border:1px solid #d9e0e9;border-radius:8px;background:#fff;color:#263244}
+    .table-wrap{overflow:auto}
+    .sku-card table{width:100%;min-width:1050px;border-collapse:collapse}
+    .sku-card th{height:43px;color:#65748a;background:#f4f6f9;font-size:12px;font-weight:650;text-align:center}
+    .sku-card td{padding:12px;border-top:1px solid #e7ebf0;text-align:center}
+    .sku-card th:first-child,.sku-card td:first-child{min-width:280px;padding-left:14px;text-align:left}
+    .product{font-size:14px;font-weight:750}
+    .product small{display:block;margin-top:3px;color:#818d9e;font-weight:500}
+    .categ{display:inline-block;padding:3px 8px;border:1px solid #dde4ee;border-radius:6px;background:#f6f8fb;color:#516074;font-size:12px;font-weight:650}
+    .common{color:#4072bb;font-size:12px;font-weight:700}
+    .prob{font-weight:700}
+    .prob.high{color:#2f8a68}.prob.mid{color:#a76b11}.prob.low{color:#b52b31}.prob.na{color:#98a2b3}
+    .plan-number{font-weight:750}
+    .edit{width:98px;height:38px;border:1px solid #d4dce6;border-radius:8px;color:#ba3a43;text-align:center;font-weight:750}
+    .edit.dirty{border-color:#e7a1a8;background:#fff7f7}
+    .amount{display:block;margin-top:4px;color:#8a94a4;font-size:12px}
+    .pagination{display:flex;align-items:center;gap:10px;padding:12px;color:#69778b;font-size:12px}
+    .pagination select{height:34px;padding:0 9px;border:1px solid #d8dfe8;border-radius:8px;background:#fff}
+
+    .toast{position:fixed;right:20px;bottom:20px;display:none;padding:13px 15px;border:1px solid #cae5d9;border-radius:10px;background:#f2fbf6;color:#176546;box-shadow:0 8px 24px rgb(0 0 0 / 8%);max-width:360px}
+    .toast.show{display:block}
+    .toast.err{border-color:#e8c3c7;background:#fdf3f4;color:#a1333b}
+
+    @media(max-width:600px){.content{padding-top:14px}.query-row,.steps,.content{padding-left:18px;padding-right:18px}.query-row .field{margin-left:0}}
+  </style>
+</head>
+<body>
+  <main class="workspace" aria-label="AI 销售计划提报工作台">
+    <!-- 顶部：4 步提报进度 -->
+    <nav class="steps" aria-label="提报流程状态">
+      <span class="steps-title">AI 销售计划提报</span>
+      <span class="step done"><i class="dot">✓</i><span class="name">经销商数据获取</span></span>
+      <span class="connector done"></span>
+      <span class="step done"><i class="dot">✓</i><span class="name">AI 预测生成</span></span>
+      <span class="connector done"></span>
+      <span class="step current"><i class="dot">3</i><span class="name">计划提报</span></span>
+      <span class="connector"></span>
+      <span class="step todo"><i class="dot">4</i><span class="name">提交 DMS 草稿</span></span>
+    </nav>
+
+    <!-- 筛选区：计划类型 / 省区 / 经销商 / 月份（数据由 MCP 查询填充，不可手填） -->
+    <div class="query-row">
+      <div class="plan-switch" id="planSwitch">
+        <button data-plan="月初计划" class="active">月初计划</button>
+        <button data-plan="纠偏计划">纠偏计划</button>
+      </div>
+      <span class="q-item"><label for="provinceSelect">销售省区</label><select class="select wide" id="provinceSelect" aria-label="销售省区"></select></span>
+      <span class="q-item"><label for="dealerSelect">经销商</label><select class="select wide" id="dealerSelect" aria-label="经销商"></select></span>
+      <span class="q-item"><label for="monthSelect">计划月份</label><select class="select month" id="monthSelect" aria-label="计划月份"></select></span>
+      <div class="field" style="margin-left:auto">
+        <button class="btn" id="approval">☑　销售计划审批</button>
+        <button class="btn btn-submit" id="submit">提交</button>
+      </div>
+    </div>
+
+    <section class="content">
+      <section class="sku-card" aria-labelledby="sku-title">
+        <div class="sku-toolbar">
+          <div class="sku-title-row">
+            <h2 id="sku-title">SKU 预测明细</h2>
+            <span class="src-badge">MCP · agents_sales_forecast_detail</span>
+            <span class="adjusted" id="adjusted">已调整 0 条</span>
+          </div>
+          <div class="filter-row">
+            <input id="skuSearch" class="search" placeholder="⌕　搜索 SKU 编码或名称" />
+            <select id="category" class="filter"><option value="">全部品类</option></select>
+            <select id="confidence" class="filter"><option value="">全部置信度</option></select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>SKU / 产品</th><th>品类</th><th>命中把握</th><th>发货概率</th>
+                <th>AI预测金额</th><th>AI预测数量</th><th>确认计划数量</th><th>确认金额</th>
+              </tr>
+            </thead>
+            <tbody id="skuRows"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="pagination"></div>
+      </section>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+  /* =====================================================================
+   *  AI 销售计划提报 - 模板页（MCP 数据驱动）
+   *  ---------------------------------------------------------------------
+   *  说明：
+   *  1) 页面无左侧对话栏，只保留右侧「用户交互工作台」。
+   *  2) 数据禁止自由填写，全部由 MCP 查询后填充：
+   *      选省区 → MCP 查该省区经销商列表 → 填充经销商下拉
+   *      选经销商 → MCP 查该经销商 SKU 预测明细 → 填充表格
+   *  3) 唯一可人工介入的列是「确认计划数量」（默认 = AI 预测数量），
+   *     修改后实时重算确认金额。
+   *  4) 提报接口已预留（API_CONFIG.submitUrl），点击「提交」组装 payload。
+   *
+   *  ---------- MCP 语义模型字段映射（Cube: agents_sales_forecast_detail） ----------
+   *  省区        province_region_name / province_region_code   （豫南经销省区 / 豫北经销直管区 …）
+   *  经销商      dealer_code / dealer_name
+   *  SKU        sku_code / sku_name
+   *  品类        product_categ_name                             （饺子 / 馄饨 / 粽子 / 面点 …）
+   *  命中把握    hit_confidence                               （高/中/低，勿用发货概率阈值映射）
+   *  发货概率    delivery_probability                          （SKU 明细数值，0~1，可为 null）
+   *  预测金额    predicted_sales_amount                         （权威预测金额）
+   *  预测数量    predicted_quantity
+   *  计划月份    plan_month                                     （YYYYMM，如 202608）
+   *
+   *  ---------- 后端需封装的 MCP 查询（Cube JSON Query 示例） ----------
+   *  ① 查省区经销商列表：
+   *     { measures:["agents_sales_forecast_detail.predicted_sales_amount",
+   *                  "agents_sales_forecast_detail.predicted_quantity"],
+   *       dimensions:["agents_sales_forecast_detail.dealer_code",
+   *                   "agents_sales_forecast_detail.dealer_name"],
+   *       filters:[{member:"agents_sales_forecast_detail.province_region_name",
+   *                 operator:"equals", values:[省区名]}],
+   *       order:{ "agents_sales_forecast_detail.predicted_sales_amount":"desc" } }
+   *  ② 查经销商 SKU 明细：
+   *     在上例基础上再叠加
+   *     filters:[{member:"...dealer_code",operator:"equals",values:[经销商编码]},
+   *              {member:"...plan_month",operator:"equals",values:[YYYYMM]}],
+   *     dimensions 增加 sku_code / sku_name / product_categ_name / hit_confidence / delivery_probability
+   * ===================================================================== */
+
+  /* ---------- ① 接口预留配置 ---------- */
+  const API_CONFIG = {
+    // 后端接口（后端内部封装上方 MCP 查询），留空则回退内置快照数据
+    fetchProvinceDealersUrl: '',   // 例：'/api/forecast/province-dealers'
+    fetchDealerSkusUrl: '',        // 例：'/api/forecast/dealer-skus'
+    submitUrl: '',                 // 例：'/api/sales-plan/submit' 或外部 DMS 提报地址
+  };
+
+  /* ---------- ② 内置快照数据（真实 MCP 查询结果，接口未配置时兜底） ----------
+   *  数据来源：agents_sales_forecast_detail，plan_month=202608，河南三省区
+   *  豫南经销省区 112 家 + 豫北经销直管区 27 家 + 豫陕晋直营省区 1 家 = 140 家 */
+  const SNAPSHOT = {
+    provinces: [
+      { code:'HN-S', name:'豫南经销省区' },
+      { code:'HN-N', name:'豫北经销直管区' },
+      { code:'HN-Y', name:'豫陕晋直营省区' },
+    ],
+    months: ['202608', '202607'],
+    dealersByProvince: {
+      '豫南经销省区': [
+        { code:'10808663', name:'西安秦博润国际贸易有限公司', amount:2685003.75, qty:32934 },
+        { code:'10154909', name:'河南硕鸣供应链管理有限公司', amount:2322450.76, qty:31563 },
+        { code:'10020052', name:'郑州佳特商贸有限公司', amount:2014706.9, qty:23897 },
+        { code:'10154919', name:'河南安厨食品供应链有限公司', amount:1344769.7, qty:14705 },
+        { code:'10010179', name:'漯河市满福商贸有限公司', amount:941685.59, qty:12840 },
+        { code:'10011752', name:'许昌豫茂源食品有限公司', amount:940830.33, qty:13095 },
+        { code:'10020028', name:'郑州乾泰食品有限公司', amount:907412.49, qty:11620 },
+        { code:'10010124', name:'叶县跃彬商贸有限公司', amount:806434.16, qty:8742 },
+        { code:'10020012', name:'新郑市聚和润食品有限公司', amount:806050.92, qty:9635 },
+        { code:'10011411', name:'商丘市良辰美景商贸有限公司', amount:786436.9, qty:9074 },
+        { code:'10010199', name:'驻马店市茂益商贸有限公司', amount:774387.08, qty:9551 },
+        { code:'10020013', name:'郑州市骐宝商贸有限公司', amount:674850.59, qty:8186 },
+        { code:'10154223', name:'唐河县益粮商贸有限公司', amount:648547.06, qty:7015 },
+        { code:'10010189', name:'信阳市启航冷食有限公司', amount:553516.1, qty:6389 },
+        { code:'10010119', name:'汝州市聚优食业有限公司', amount:540091.81, qty:6093 },
+        { code:'10140027', name:'邓州市邦盛副食店', amount:539158.3, qty:5850 },
+        { code:'10154963', name:'郑州大润花商贸有限公司', amount:539019.09, qty:5979 },
+        { code:'10147001', name:'尉氏县金云通商贸有限公司', amount:537656.93, qty:7546 },
+        { code:'10151181', name:'周口鸿冠商贸有限公司', amount:484917.34, qty:5541 },
+        { code:'10140288', name:'息县金润食品有限公司', amount:472114.27, qty:5897 },
+        { code:'10805193', name:'上蔡县祥逢商贸有限公司', amount:472044.3, qty:5493 },
+        { code:'10154922', name:'洛阳市美誉家商贸有限公司', amount:470642.64, qty:6330 },
+        { code:'10141445', name:'郑州聚佰福食品有限公司', amount:469663.51, qty:3032 },
+        { code:'10010173', name:'禹州市禹有商贸有限公司', amount:438755.53, qty:5964 },
+        { code:'10146326', name:'长葛市兴冉商贸有限公司', amount:437322.95, qty:5785 },
+        { code:'10151501', name:'漯河亮泽商贸有限公司', amount:412646.28, qty:5529 },
+        { code:'10010158', name:'项城市雪安商贸有限公司', amount:410941.55, qty:5200 },
+        { code:'10020019', name:'巩义市城区冯云冷饮店', amount:403966.6, qty:4702 },
+        { code:'10153972', name:'登封市冰哥冷链食品店(个体工商户)', amount:403824.81, qty:4678 },
+        { code:'10146461', name:'平顶山晨势商贸有限公司', amount:403624.56, qty:4548 },
+        { code:'10011632', name:'驻马店市云浩商贸有限公司', amount:393888.35, qty:5185 },
+        { code:'10010153', name:'河南振东商贸有限公司', amount:390932.33, qty:4569 },
+        { code:'10010166', name:'太康县高峰冷饮冷食批发中心', amount:387459.29, qty:5019 },
+        { code:'10010104', name:'新野县铭洋供应链有限公司', amount:386863.27, qty:4783 },
+        { code:'10010161', name:'周口泓硕商贸有限公司', amount:386657.39, qty:4019 },
+        { code:'10146823', name:'新蔡县洋海商贸有限公司', amount:374185.23, qty:4500 },
+        { code:'10010160', name:'鹿邑县鑫悦商贸有限公司', amount:371850.43, qty:4265 },
+        { code:'10141403', name:'社旗县金硕丰商贸有限公司', amount:354870.92, qty:4189 },
+        { code:'10010191', name:'潢川鑫亿食品有限公司', amount:343505.32, qty:3893 },
+        { code:'10011745', name:'洛阳全惠商贸有限公司', amount:336769.09, qty:3195 },
+        { code:'10154578', name:'固始县泰和兴食品有限公司', amount:336454.32, qty:3728 },
+        { code:'10141408', name:'许昌进宝商贸有限公司', amount:336410.31, qty:4563 },
+        { code:'10153573', name:'开封梦园冷冻食品有限公司', amount:325488.91, qty:4193 },
+        { code:'10143681', name:'泌阳县大旺旺雪糕速冻商行', amount:323433.98, qty:3518 },
+        { code:'10010151', name:'虞城县小学路冷饮部', amount:319977.67, qty:2935 },
+        { code:'10010150', name:'夏邑县王直平冷饮批发部', amount:318951.26, qty:3631 },
+        { code:'10020004', name:'开封市超冠商贸有限公司', amount:317191.77, qty:4229 },
+        { code:'10155258', name:'周口禾思商贸有限公司', amount:303306.56, qty:3548 },
+        { code:'10153744', name:'洛阳市雪旺冷饮有限公司', amount:295315.23, qty:3852 },
+        { code:'10154962', name:'信阳喜润发食品有限公司', amount:289172.49, qty:3280 },
+        { code:'10155093', name:'南阳冰星商贸有限公司', amount:272666.79, qty:3265 },
+        { code:'10155113', name:'河南亚品商贸有限公司', amount:271377.26, qty:3646 },
+        { code:'10010195', name:'西平县丽辉食品门市部', amount:251835.02, qty:2629 },
+        { code:'10140442', name:'柘城县华伟食品店', amount:251574.55, qty:3167 },
+        { code:'10010198', name:'正阳县康诺冷饮门市部', amount:243822.98, qty:2305 },
+        { code:'10140241', name:'兰考县元贞食品有限公司', amount:237754.13, qty:3119 },
+        { code:'10154901', name:'河南省二斌商贸有限公司', amount:236967.08, qty:2852 },
+        { code:'10155223', name:'平舆县思虹食品销售有限公司', amount:236637.41, qty:2072 },
+        { code:'10155328', name:'河南东承食品有限公司', amount:236321.29, qty:2985 },
+        { code:'10149483', name:'舞阳县明莉冷藏食品店', amount:228163.67, qty:3207 },
+        { code:'10153829', name:'洛阳杰杰商贸有限公司', amount:227565.6, qty:2462 },
+        { code:'10151810', name:'襄城县莉珍冰行', amount:224197.9, qty:3016 },
+        { code:'10010107', name:'内乡县晟新商贸有限公司', amount:217163.56, qty:2516 },
+        { code:'10010144', name:'三门峡市帝康食品有限公司', amount:209336.09, qty:2879 },
+        { code:'10010159', name:'沈丘县泉鑫商贸有限公司', amount:205815.48, qty:2596 },
+        { code:'10808488', name:'驻马店市驿城区永秋冻品商行', amount:204986.12, qty:3053 },
+        { code:'10155002', name:'民权县领航速配食品销售部(个体工商户)', amount:204454.18, qty:2731 },
+        { code:'10154892', name:'中国邮政集团有限公司郑州市分公司', amount:203744.09, qty:1302 },
+        { code:'10151425', name:'淮滨县聚民生活超市马集店', amount:185806.82, qty:2069 },
+        { code:'10147940', name:'周口市雪川商贸有限公司', amount:184236.12, qty:1916 },
+        { code:'10804711', name:'BP光山县陈市伟商贸有限公司', amount:182822.84, qty:2513 },
+        { code:'10149715', name:'泌阳县福源速冻食品门市', amount:182470.3, qty:1992 },
+        { code:'10020002', name:'通许县老张冷冻食品批发部', amount:177423.99, qty:2470 },
+        { code:'10154984', name:'商丘市嘉绍商贸有限公司', amount:176960.58, qty:2355 },
+        { code:'10010203', name:'确山县唐明冷库', amount:176574.15, qty:1941 },
+        { code:'10803952', name:'郑州市好鲜升食品配送有限公司', amount:169245.61, qty:2650 },
+        { code:'10011839', name:'洛阳卓途商贸有限公司', amount:159627.46, qty:1870 },
+        { code:'10144601', name:'淮滨县涛韬商贸有限责任公司', amount:152372.47, qty:1913 },
+        { code:'10147466', name:'郑州好味品商贸有限公司', amount:151540.74, qty:1798 },
+        { code:'10155166', name:'睢县亚飞冷饮批发', amount:137746.04, qty:1464 },
+        { code:'10153919', name:'郑州金坤商贸有限公司', amount:137431.63, qty:1728 },
+        { code:'10155219', name:'西峡县锦航商贸有限公司', amount:136882.54, qty:1622 },
+        { code:'10804618', name:'BP睢县中冷商贸有限公司', amount:136560.5, qty:1741 },
+        { code:'10010165', name:'商水县高亮商贸有限公司', amount:135861.51, qty:1344 },
+        { code:'10155435', name:'洛阳浩航商贸有限公司', amount:129474.71, qty:1748 },
+        { code:'10155510', name:'河南谷养道供应链管理有限公司', amount:124781.78, qty:1482 },
+        { code:'10151988', name:'西华县海之帆商贸有限公司', amount:123602.24, qty:1195 },
+        { code:'10141473', name:'洛阳市偃师区博天水产品店', amount:121932.37, qty:1697 },
+        { code:'10140159', name:'汝南县建志冷库', amount:121737.19, qty:1384 },
+        { code:'10010106', name:'南召县康信冷鲜食业有限公司', amount:111166.53, qty:1147 },
+        { code:'10154960', name:'镇平县富强商贸有限公司', amount:109759.39, qty:1357 },
+        { code:'10155193', name:'鄢陵县零度冻品店', amount:106313.77, qty:1373 },
+        { code:'10154346', name:'洛阳市老城区富源冻品商行', amount:105889.66, qty:1106 },
+        { code:'10155039', name:'南阳市鸭河工区鑫魏氏冷鲜总汇食品店（个体工商户）', amount:104454.4, qty:1266 },
+        { code:'10155217', name:'宝丰县德发商贸有限公司', amount:103151.94, qty:1067 },
+        { code:'10155399', name:'罗山县斌诚食品销售部', amount:101021.94, qty:1194 },
+        { code:'10155353', name:'三门峡耕泉食品有限公司', amount:100201.83, qty:1294 },
+        { code:'10803412', name:'方城县杨金来冷食商贸有限公司', amount:89803.22, qty:960 },
+        { code:'10148043', name:'商城县诚信冻库', amount:87780.81, qty:1277 },
+        { code:'10011384', name:'新县任辉冷冻食品批发行', amount:81897.33, qty:1190 },
+        { code:'10010113', name:'桐柏县金隆诚嘉商贸有限公司', amount:74492.33, qty:857 },
+        { code:'10010112', name:'城镇天雪冷食批发部', amount:68590.44, qty:773 },
+        { code:'10155133', name:'汝阳县內埠镇大安村利芳商店', amount:67930.94, qty:987 },
+        { code:'10803194', name:'沈丘县百兴冷冻食品店', amount:67913.02, qty:815 },
+        { code:'10155068', name:'郑州王枣王商贸有限公司', amount:67823.11, qty:404 },
+        { code:'10155042', name:'信阳市瑞之丰实业有限公司', amount:67593.75, qty:826 },
+        { code:'10155407', name:'渑池县鑫启源商贸有限公司', amount:67498.88, qty:848 },
+        { code:'10155506', name:'洛阳赐椿堂商贸有限公司', amount:67488, qty:911 },
+        { code:'10154959', name:'商丘市城乡一体化示范区灏源冷冻食品销售部', amount:67263.37, qty:828 },
+        { code:'10155409', name:'洛宁县城区杨飞飞副食批发部', amount:66547.04, qty:815 },
+        { code:'10011631', name:'栾川县天元中孚商贸有限公司', amount:66399.16, qty:790 },
+        { code:'10155507', name:'卢氏县横涧全味副食商行', amount:66399.16, qty:790 },
+      ],
+      '豫北经销直管区': [
+        { code:'10144661', name:'安阳市优享商贸有限公司', amount:1066144.17, qty:13321 },
+        { code:'10010070', name:'濮阳市宋氏商贸有限公司', amount:920332.37, qty:11891 },
+        { code:'10010053', name:'滑县全赢食品销售有限公司', amount:546183.69, qty:7727 },
+        { code:'10010475', name:'聊城洪发共赢商贸有限公司', amount:478310.74, qty:5848 },
+        { code:'10011836', name:'新乡市德利金贸易有限公司', amount:436766.47, qty:5851 },
+        { code:'10011935', name:'长垣市宇翔食品商贸有限公司', amount:376534.4, qty:4614 },
+        { code:'10154628', name:'鹤壁市久贰商贸有限公司', amount:351376.92, qty:4321 },
+        { code:'10154398', name:'武陟县李氏商贸有限公司', amount:330485.01, qty:3984 },
+        { code:'10155077', name:'安阳云荣商贸有限公司', amount:287445.57, qty:3112 },
+        { code:'10155200', name:'焦作市明喜商贸有限公司', amount:271491.58, qty:2187 },
+        { code:'10154895', name:'林州铭昊商贸有限公司', amount:267733.43, qty:3135 },
+        { code:'10010082', name:'延津县聚旺冷饮批发部', amount:235093.19, qty:2588 },
+        { code:'10010083', name:'辉县市城关清真寺冷库', amount:223081.03, qty:2518 },
+        { code:'10010088', name:'温县昭凯冷饮食品经营部', amount:206860.86, qty:2446 },
+        { code:'10010089', name:'博爱县千味食品商行', amount:186113.16, qty:2076 },
+        { code:'10155454', name:'濮阳泓鑫众盟商贸有限公司', amount:167054.48, qty:2009 },
+        { code:'10010084', name:'获嘉县鑫鑫悦副食门市部（个体工商户）', amount:138212.39, qty:1809 },
+        { code:'10011863', name:'封丘县亚蓝商贸有限公司', amount:125064.2, qty:1428 },
+        { code:'10010067', name:'浚县千岩食品销售有限公司', amount:105827.79, qty:1265 },
+        { code:'10148483', name:'河南东方云赫供应链管理有限公司', amount:103932.93, qty:835 },
+        { code:'10147022', name:'济源市豪家商贸有限公司', amount:102395.55, qty:1222 },
+        { code:'10153885', name:'河南很好商贸有限责任公司', amount:88235.77, qty:883 },
+        { code:'10154985', name:'原阳县瑞航食品有限公司', amount:83353.6, qty:897 },
+        { code:'10010073', name:'卫辉市万家冷饮部', amount:63341.62, qty:730 },
+        { code:'10147783', name:'原阳县老陈冷冻食品经营行', amount:54278.21, qty:535 },
+        { code:'10155189', name:'辉县市巨鑫商贸有限公司', amount:49089.35, qty:703 },
+        { code:'10155076', name:'安阳餐美味商贸有限公司', amount:22241.64, qty:332 },
+      ],
+      '豫陕晋直营省区': [
+        { code:'10147743', name:'河南米海供应链管理有限公司', amount:692047.05, qty:8355 },
+      ],
+    },
+    skuByDealer: {
+      '10154909': [
+        { code:'10002581', name:'BP思念2.5kg灌汤水饺猪肉大葱（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:355502.84, qty:5996 },
+        { code:'10002582', name:'BP思念2.5kg素水饺鸡蛋韭菜（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:149470.09, qty:2521 },
+        { code:'10005063', name:'思念440G蜜枣粽（20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:126353.81, qty:649 },
+        { code:'10004655', name:'思念1kg玉米蔬菜肉蒸煎饺实惠装（10袋）', categ:'饺子', prob:0.875, confidence:'高', amount:125240.19, qty:1887 },
+        { code:'10002601', name:'BP思念288g猪肉灌汤小笼包（24袋）', categ:'面点', prob:0.875, confidence:'高', amount:100702.92, qty:1308 },
+        { code:'10002577', name:'BP思念2.5kg灌汤水饺猪肉香菇（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:92551.69, qty:1561 },
+        { code:'10003470', name:'BP思念2.5kg小金鱼造型猪肉馄饨（4袋）', categ:'馄饨', prob:0.875, confidence:'高', amount:53330.40, qty:648 },
+        { code:'10005064', name:'思念440G八宝粽（20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:52760.99, qty:271 },
+        { code:'10003456', name:'思念305g鲜美猪肉薄皮小云吞（20袋）', categ:'馄饨', prob:0.875, confidence:'高', amount:44046.45, qty:711 },
+        { code:'10005066', name:'思念440G紫糯花生粽(20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:43610.56, qty:224 },
+        { code:'10005302', name:'思念1kg超值装糯米烧麦（10袋）', categ:'休闲', prob:0.875, confidence:'高', amount:41945.84, qty:632 },
+        { code:'10005065', name:'思念440G豆沙粽（20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:41079.59, qty:211 },
+        { code:'10003457', name:'思念305g珍味三鲜薄皮小云吞（20袋）', categ:'馄饨', prob:0.875, confidence:'高', amount:39338.25, qty:635 },
+        { code:'10002580', name:'BP思念2.5kg灌汤水饺猪肉芹菜（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:36641.22, qty:618 },
+        { code:'10002578', name:'BP思念2.5kg灌汤水饺猪肉白菜（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:35277.55, qty:595 },
+        { code:'10005068', name:'思念440G猪肉粽（20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:33563.04, qty:147 },
+        { code:'10005067', name:'思念440G菠萝粽（20袋）', categ:'粽子', prob:0.5, confidence:'中', amount:32513.23, qty:167 },
+        { code:'10002632', name:'BP思念2.5kg灌汤水饺猪肉荠菜（4袋）', categ:'饺子', prob:0.875, confidence:'高', amount:31720.15, qty:535 },
+        { code:'10005298', name:'思念2.5kg鲜美猪肉馄饨（4袋）', categ:'馄饨', prob:0.875, confidence:'高', amount:29601.02, qty:446 },
+        { code:'10003432', name:'BP思念1kg玉米蔬菜猪肉蒸煎饺（10袋）', categ:'饺子', prob:0.875, confidence:'高', amount:25488.00, qty:320 },
+      ],
+    },
+  };
+
+  /* ---------- ③ 运行时状态 ---------- */
+  const state = {
+    planType: '月初计划',
+    province: SNAPSHOT.provinces[0].name,
+    dealerCode: null,
+    month: SNAPSHOT.months[0],
+    skus: [],           // 当前经销商 SKU 明细
+    dealer: null,       // 当前经销商
+  };
+
+  /* ---------- ④ DOM 引用 ---------- */
+  const $ = (id) => document.getElementById(id);
+
+  /* ---------- ⑤ 数据获取（MCP 接口预留） ---------- */
+  async function fetchProvinceDealers(province, month) {
+    if (API_CONFIG.fetchProvinceDealersUrl) {
+      const res = await fetch(API_CONFIG.fetchProvinceDealersUrl, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ province, month }),
+      });
+      if (!res.ok) throw new Error('经销商查询失败：' + res.status);
+      return res.json();   // 期望 [{code,name,amount,qty}]
+    }
+    return (SNAPSHOT.dealersByProvince[province] || []).map(d => ({ ...d }));
+  }
+
+  async function fetchDealerSkus(dealerCode, month) {
+    if (API_CONFIG.fetchDealerSkusUrl) {
+      const res = await fetch(API_CONFIG.fetchDealerSkusUrl, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ dealerCode, month }),
+      });
+      if (!res.ok) throw new Error('SKU 查询失败：' + res.status);
+      return res.json();   // 期望 [{code,name,categ,confidence,prob,amount,qty}]
+    }
+    const list = SNAPSHOT.skuByDealer[dealerCode];
+    if (!list || !list.length) {
+      throw new Error('快照中无该经销商 SKU 数据，请配置 fetchDealerSkusUrl 后经 MCP 查询。');
+    }
+    return list.map(s => ({ ...s, confirmQty: s.qty }));
+  }
+
+  /* ---------- ⑥ 渲染 ---------- */
+  function unitPriceOf(sku) { return sku.qty ? sku.amount / sku.qty : 0; }
+  function confirmAmountOf(sku) { return Math.round((sku.confirmQty ?? sku.qty) * unitPriceOf(sku)); }
+
+  function probClass(p) {
+    if (p == null) return 'na';
+    return '';   // 发货概率只展示数值，高/中/低配色交给命中把握
+  }
+  function probText(p) {
+    if (p == null) return '—';
+    return (p*100).toFixed(1) + '%';
+  }
+  function confClass(c) {
+    if (c === '高') return 'high';
+    if (c === '中') return 'mid';
+    if (c === '低') return 'low';
+    return 'na';
+  }
+  function confText(c) {
+    if (c === '高' || c === '中' || c === '低') return c;
+    return '未知';
+  }
+
+  function renderRows() {
+    const key = $('skuSearch').value.trim().toLowerCase();
+    const cat = $('category').value, conf = $('confidence').value;
+
+    const categs = [...new Set(state.skus.map(s => s.categ))];
+    $('category').innerHTML = '<option value="">全部品类</option>' + categs.map(c => `<option value="${c}">${c}</option>`).join('');
+    const confs = [...new Set(state.skus.map(s => confText(s.confidence)))];
+    $('confidence').innerHTML = '<option value="">全部置信度</option>' + confs.map(c => `<option value="${c}">${c}</option>`).join('');
+
+    const rows = state.skus.filter(s => {
+      const text = (s.name + s.code + s.categ).toLowerCase();
+      if (key && !text.includes(key)) return false;
+      if (cat && s.categ !== cat) return false;
+      if (conf && confText(s.confidence) !== conf) return false;
+      return true;
+    });
+
+    $('skuRows').innerHTML = rows.map(s => {
+      const cq = s.confirmQty ?? s.qty;
+      const ca = confirmAmountOf(s);
+      return `<tr data-code="${s.code}">
+        <td class="product">♨ ${s.name}<small>${s.code}</small></td>
+        <td><span class="categ">${s.categ}</span></td>
+        <td><span class="prob ${confClass(s.confidence)}">${confText(s.confidence)}</span></td>
+        <td><span class="prob ${probClass(s.prob)}">${probText(s.prob)}</span></td>
+        <td class="plan-number">¥${Math.round(s.amount).toLocaleString()}</td>
+        <td class="plan-number">${Math.round(s.qty).toLocaleString()}</td>
+        <td><input class="edit" value="${cq}" inputmode="numeric" data-code="${s.code}" /><small class="amount" data-code="${s.code}">按 AI预测，建议金额 ¥${Math.round(s.amount).toLocaleString()}</small></td>
+        <td class="plan-number">¥${ca.toLocaleString()}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="8" style="padding:28px;color:#98a2b3">暂无匹配的 SKU</td></tr>';
+
+    $('skuRows').querySelectorAll('.edit').forEach(inp => inp.addEventListener('input', () => onEdit(inp)));
+  }
+
+  function onEdit(input) {
+    const code = input.dataset.code;
+    const sku = state.skus.find(s => s.code === code);
+    const val = parseInt(input.value, 10);
+    sku.confirmQty = Number.isFinite(val) ? val : 0;
+    input.classList.toggle('dirty', sku.confirmQty !== sku.qty);
+    // 实时重算该行确认金额
+    const tr = input.closest('tr');
+    tr.cells[7].textContent = '¥' + confirmAmountOf(sku).toLocaleString();
+    refreshAdjusted();
+  }
+
+  function refreshAdjusted() {
+    const n = state.skus.filter(s => (s.confirmQty ?? s.qty) !== s.qty).length;
+    $('adjusted').textContent = `已调整 ${n} 条`;
+  }
+
+  function renderPagination() {
+    $('pagination').innerHTML = `第 1 / 1 页　显示 1–${state.skus.length} 条，共 ${state.skus.length} 个SKU　每页 <select><option>10 条</option></select>`;
+  }
+
+  /* ---------- ⑦ 交互 ---------- */
+  function initSelectors() {
+    // 省区
+    const p = $('provinceSelect');
+    p.innerHTML = SNAPSHOT.provinces.map(x => `<option value="${x.name}">${x.name}</option>`).join('');
+    p.value = state.province;
+    p.addEventListener('change', async () => {
+      state.province = p.value;
+      await reloadDealers();
+    });
+
+    // 月份
+    const m = $('monthSelect');
+    m.innerHTML = SNAPSHOT.months.map(x => `<option>${x}</option>`).join('');
+    m.value = state.month;
+    m.addEventListener('change', async () => { state.month = m.value; await reloadDealers(); });
+
+    // 经销商
+    $('dealerSelect').addEventListener('change', async () => {
+      state.dealerCode = $('dealerSelect').value;
+      await reloadSkus();
+    });
+
+    // 计划类型切换（复用同一数据链路，后续可区分版本）
+    document.querySelectorAll('#planSwitch button').forEach(b => {
+      b.addEventListener('click', () => {
+        document.querySelectorAll('#planSwitch button').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        state.planType = b.dataset.plan;
+        reloadDealers();
+      });
+    });
+
+    $('skuSearch').addEventListener('input', renderRows);
+    $('category').addEventListener('change', renderRows);
+    $('confidence').addEventListener('change', renderRows);
+  }
+
+  async function reloadDealers() {
+    try {
+      const dealers = await fetchProvinceDealers(state.province, state.month);
+      const sel = $('dealerSelect');
+      sel.innerHTML = dealers.map(d => `<option value="${d.code}">${d.name}（${d.code}）</option>`).join('')
+        || '<option value="">（该省区暂无经销商）</option>';
+      if (dealers.length) {
+        state.dealerCode = dealers[0].code;
+        state.dealer = dealers[0];
+      } else {
+        state.dealerCode = null; state.dealer = null; state.skus = [];
+        renderEmpty(); return;
+      }
+      await reloadSkus();
+    } catch (e) { toast(e.message, true); }
+  }
+
+  async function reloadSkus() {
+    try {
+      state.dealer = (SNAPSHOT.dealersByProvince[state.province] || []).find(d => d.code === state.dealerCode)
+        || (await fetchProvinceDealers(state.province, state.month)).find(d => d.code === state.dealerCode)
+        || { code: state.dealerCode, name: state.dealerCode };
+      state.skus = await fetchDealerSkus(state.dealerCode, state.month);
+      renderAll();
+    } catch (e) { toast(e.message, true); renderEmpty(); }
+  }
+
+  function renderAll() {
+    renderRows();
+    refreshAdjusted();
+    renderPagination();
+  }
+  function renderEmpty() {
+    state.skus = [];
+    $('skuRows').innerHTML = '<tr><td colspan="8" style="padding:28px;color:#98a2b3">暂无数据</td></tr>';
+    refreshAdjusted(); renderPagination();
+  }
+
+  /* ---------- ⑧ 提报（接口预留） ---------- */
+  function collectTableData() {
+    return {
+      planType: state.planType,
+      month: state.month,
+      province: state.province,
+      dealer: { code: state.dealerCode, name: state.dealer?.name },
+      skus: state.skus.map(s => ({
+        skuCode: s.code, skuName: s.name, category: s.categ,
+        hitConfidence: s.confidence,
+        deliveryProbability: s.prob,
+        aiAmount: s.amount, aiQty: s.qty,
+        confirmQty: s.confirmQty ?? s.qty,
+        confirmAmount: confirmAmountOf(s),
+      })),
+      submittedAt: new Date().toISOString(),
+    };
+  }
+
+  async function submitToSystem() {
+    const payload = collectTableData();
+    if (!API_CONFIG.submitUrl) {
+      console.log('[提报预留] 未配置 submitUrl，模拟提报 payload：', payload);
+      toast('接口未配置，已模拟提报（见控制台 payload）。');
+      return;
+    }
+    try {
+      const res = await fetch(API_CONFIG.submitUrl, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error('提报失败：' + res.status);
+      toast('提报成功，已提交至其他系统。');
+    } catch (e) { toast(e.message, true); }
+  }
+
+  /* ---------- ⑨ Agent 桥接（页面 ↔ Agent 通信协议） ----------
+   *  页面事件 → Agent 的通道，配合 chrome-devtools / aionui-browser MCP 使用。
+   *  页面侧职责：
+   *    1) 用 console.log 输出 `[bridge:event]` 前缀信号（Agent 用 get_console_message / list_console_messages 读）
+   *    2) 暴露 window.__bridge 供 Agent 用 evaluate_script 读写页面状态 / 写回查询结果
+   *  约定信号类型：
+   *    - province_changed / dealer_changed / month_changed  筛选变化（携带查询参数，Agent 据此查 MCP）
+   *    - skus_applied / dealers_applied                        Agent 写回后的回执
+   *    - submit_requested                                     用户点击提交（Agent 可监听提报）
+   */
+  const BRIDGE_PREFIX = '[bridge:event]';
+
+  function emit(type, payload) {
+    const msg = { type, payload, ts: Date.now() };
+    console.log(BRIDGE_PREFIX, JSON.stringify(msg));            // ① console 信号
+    document.dispatchEvent(new CustomEvent('agent-bridge', { detail: msg })); // ② DOM 事件
+    return msg;
+  }
+
+  window.__bridge = {
+    // Agent 读取当前页面筛选状态
+    getState() {
+      return {
+        planType: state.planType,
+        province: state.province,
+        dealerCode: state.dealerCode,
+        dealerName: state.dealer?.name || null,
+        month: state.month,
+        skuCount: state.skus.length,
+      };
+    },
+    // Agent 读当前表格（提报用）
+    collectTableData() { return collectTableData(); },
+    // Agent 写回经销商列表（结构同 fetchProvinceDealers 返回值 [{code,name,amount,qty}]）
+    applyDealers(dealers) {
+      const list = dealers || [];
+      const prev = state.dealerCode;
+      const sel = $('dealerSelect');
+      sel.innerHTML = list.map(d => `<option value="${d.code}">${d.name}（${d.code}）</option>`).join('')
+        || '<option value="">（该省区暂无经销商）</option>';
+      if (list.length) {
+        const keep = list.find(d => d.code === prev);
+        state.dealerCode = keep ? keep.code : list[0].code;
+        state.dealer = keep || list[0];
+        sel.value = state.dealerCode;
+      }
+      emit('dealers_applied', { province: state.province, count: list.length });
+      return { ok: true, count: list.length };
+    },
+    // Agent 写回 SKU 明细（结构同 fetchDealerSkus 返回值 [{code,name,categ,confidence,prob,amount,qty}]）
+    applySkus(skus) {
+      state.skus = (skus || []).map(s => ({ ...s, confirmQty: s.confirmQty ?? s.qty }));
+      renderAll();
+      emit('skus_applied', { dealerCode: state.dealerCode, count: state.skus.length });
+      return { ok: true, count: state.skus.length };
+    },
+    // 页面主动向 Agent 发信号
+    request(event, payload) { return emit(event, payload); },
+    // 握手，供 Agent 探测桥是否就绪
+    ping() { return { ok: true, ready: true, ts: Date.now() }; },
+  };
+
+  // 页面交互 → 自动发信号（在 initSelectors 之后调用，state 已更新）
+  function hookSignals() {
+    $('dealerSelect').addEventListener('change', () => {
+      emit('dealer_changed', { province: state.province, dealerCode: state.dealerCode, dealerName: state.dealer?.name, month: state.month });
+    });
+    $('provinceSelect').addEventListener('change', () => {
+      emit('province_changed', { province: state.province, month: state.month });
+    });
+    $('monthSelect').addEventListener('change', () => {
+      emit('month_changed', { month: state.month, province: state.province, dealerCode: state.dealerCode });
+    });
+  }
+
+  /* ---------- ⑩ 工具 ---------- */
+  let toastTimer;
+  function toast(msg, isErr) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.toggle('err', !!isErr);
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+  }
+
+  /* ---------- 启动 ---------- */
+  initSelectors();
+  hookSignals();
+  reloadDealers();
+
+  $('submit').addEventListener('click', () => {
+    emit('submit_requested', { ...state.dealer, month: state.month, skuCount: state.skus.length });
+    submitToSystem();
+  });
+  $('approval').addEventListener('click', () => toast('线上点击后进入独立的销售计划审批页。'));
+  </script>
+</body>
+</html>

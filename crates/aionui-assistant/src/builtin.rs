@@ -64,8 +64,7 @@ pub struct BuiltinAssistant {
     #[serde(default)]
     pub sort_order: i32,
     /// Whether this official assistant is enabled by default when a user has
-    /// no overlay for it. Only the butler ships enabled; others default off so
-    /// they don't crowd the user's selection lists. Defaults to false.
+    /// no overlay for it. Defaults to false.
     #[serde(default)]
     pub default_enabled: bool,
 }
@@ -301,6 +300,24 @@ mod tests {
         let butler = reg.get("aionui-assistant").expect("shipped GEA butler");
         assert_eq!(butler.name, "GEA Butler");
         assert_eq!(butler.name_i18n.get("zh-CN").map(String::as_str), Some("GEA管家"));
+        let forecast = reg
+            .get("sales-forecast-planning")
+            .expect("shipped sales forecast and submission assistant");
+        assert_eq!(
+            forecast.name_i18n.get("zh-CN").map(String::as_str),
+            Some("需求预测与计划提报助手")
+        );
+        assert!(forecast.default_enabled);
+        assert!(
+            forecast
+                .enabled_skills
+                .iter()
+                .any(|skill| skill == "sales-forecast-submit")
+        );
+        assert!(
+            reg.rule_bytes("sales-forecast-planning", "zh-CN")
+                .is_some_and(|bytes| !bytes.is_empty())
+        );
     }
 
     #[test]

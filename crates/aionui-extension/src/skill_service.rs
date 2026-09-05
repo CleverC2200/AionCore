@@ -3387,6 +3387,11 @@ mod tests {
         assert_embedded_skill_frontmatter(&BUILTIN_SKILLS, &mut checked, &mut failures);
 
         assert!(
+            BUILTIN_SKILLS.get_file("sales-forecast-submit/SKILL.md").is_some(),
+            "sales forecast assistant requires its workflow skill in the embedded corpus"
+        );
+
+        assert!(
             checked >= 20,
             "expected builtin skill corpus to contain many SKILL.md files, got {checked}"
         );

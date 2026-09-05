@@ -1087,6 +1087,47 @@
       "models": []
     },
     {
+      "id": "sales-forecast-planning",
+      "sort_order": 1,
+      "default_enabled": true,
+      "name": "Demand Forecast and Plan Submission Assistant",
+      "name_i18n": {
+        "en-US": "Demand Forecast and Plan Submission Assistant",
+        "zh-CN": "需求预测与计划提报助手"
+      },
+      "description": "Analyze dealer and SKU demand forecasts, budgets, confidence and historical attainment, then explain plan-submission requirements and blockers.",
+      "description_i18n": {
+        "en-US": "Analyze dealer and SKU demand forecasts, budgets, confidence and historical attainment, then explain plan-submission requirements and blockers.",
+        "zh-CN": "分析经销商与 SKU 需求预测、预算、把握度和历史达成，并判断计划提报条件与阻断项。"
+      },
+      "avatar": "🤖",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "sales-forecast-submit"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/sales-forecast-planning.md",
+      "prompts": [
+        "Review the current demand forecast and explain the main risks",
+        "Check whether the current plan is ready for submission",
+        "Explain the forecast confidence and historical attainment for this dealer"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Review the current demand forecast and explain the main risks",
+          "Check whether the current plan is ready for submission",
+          "Explain the forecast confidence and historical attainment for this dealer"
+        ],
+        "zh-CN": [
+          "检查当前需求预测并说明主要风险",
+          "检查当前计划是否满足提报条件",
+          "说明该经销商的预测把握度与历史达成情况"
+        ]
+      },
+      "models": []
+    },
+    {
       "id": "aionui-assistant",
       "sort_order": 0,
       "default_enabled": true,
