@@ -504,10 +504,30 @@ impl GeaService {
             let source_code = raw
                 .get("sourceCode")
                 .or_else(|| raw.get("mcpCode"))
+                .or_else(|| raw.pointer("/_meta/sourceCode"))
                 .or_else(|| raw.pointer("/_meta/mcpCode"))
                 .and_then(Value::as_str)
-                .and_then(non_empty)
-                .ok_or_else(|| invalid_upstream("GEA Tool 列表响应缺少 mcpCode"))?;
+                .and_then(non_empty);
+            let Some(source_code) = source_code else {
+                let fields = raw
+                    .as_object()
+                    .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let meta_fields = raw
+                    .get("_meta")
+                    .and_then(Value::as_object)
+                    .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    tool_name = name,
+                    ?fields,
+                    ?meta_fields,
+                    "GEA tool list item is missing its source routing code"
+                );
+                return Err(invalid_upstream("GEA Tool 列表响应缺少 mcpCode"));
+            };
             let input_schema = sanitize_tool_input_schema(
                 raw.get("inputSchema")
                     .cloned()
@@ -4114,7 +4134,10 @@ mod tests {
                         "name": "query_business_data",
                         "description": "Query business data",
                         "inputSchema": { "type": "object" },
-                        "_meta": { "mcpCode": "cube" }
+                        "_meta": {
+                            "sourceCode": "cube",
+                            "sourceType": "MCP"
+                        }
                     }]
                 }
             })))
