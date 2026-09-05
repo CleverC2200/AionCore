@@ -8,6 +8,11 @@ on:
         required: true
         default: "main"
         type: string
+      aionui_ref:
+        description: "Optional exact AionUi commit to build after this single-platform run succeeds"
+        required: false
+        type: string
+        default: ""
       platform:
         description: "Platform to build"
         required: true
@@ -45,9 +50,15 @@ jobs:
     steps:
       - name: Generate build matrix
         id: set-matrix
+        env:
+          AIONUI_REF: ${{ inputs.aionui_ref }}
         shell: bash
         run: |
           PLATFORM="${{ inputs.platform }}"
+          if [[ -n "$AIONUI_REF" ]] && { [[ ! "$AIONUI_REF" =~ ^[a-f0-9]{40}$ ]] || [[ "$PLATFORM" == "all" ]] || [[ "$PLATFORM" == linux-* ]]; }; then
+            echo "UI handoff requires one desktop platform and a pinned UI commit"
+            exit 1
+          fi
 
           MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64","use_cross":false}'
           MACOS_X64='{"platform":"macos-x64","os":"macos-latest","target":"x86_64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-x64","use_cross":false}'
@@ -97,6 +108,15 @@ jobs:
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "Commit: $SHORT"
 
+      - name: Verify handoff source checkout
+        if: inputs.aionui_ref != ''
+        shell: bash
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "Opted-in handoff requires workflow ref and build checkout to identify the same commit"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
@@ -108,8 +128,10 @@ jobs:
         run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
 
       - name: Cache cargo
+        id: cargo-cache
         uses: Swatinem/rust-cache@v2
         with:
+          cache-workspace-crates: true
           shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Verify pinned Linux ARM64 cross image is available
@@ -130,9 +152,9 @@ jobs:
           fi
 
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p aionui-app
+            cross build --locked --timings --release --target ${{ matrix.target }} -p aionui-app
           else
-            cargo build --release --target ${{ matrix.target }} -p aionui-app
+            cargo build --locked --timings --release --target ${{ matrix.target }} -p aionui-app
           fi
 
       - name: Verify Linux ARM64 GLIBC baseline
@@ -167,11 +189,37 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Record archive identity
+        shell: bash
+        env:
+          AIONUI_REF: ${{ inputs.aionui_ref }}
+        run: python scripts/aionui-handoff.py create "dist/${ARCHIVE}" "${{ matrix.platform }}"
+
+      - name: Upload opted-in handoff request
+        if: inputs.aionui_ref != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: aionui-handoff-request
+          path: dist/aioncore-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload cargo timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-${{ matrix.platform }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload manual build artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/${{ env.ARCHIVE }}
+          path: |
+            dist/${{ env.ARCHIVE }}
+            dist/aioncore-manifest.json
           if-no-files-found: error
           retention-days: 7
 
