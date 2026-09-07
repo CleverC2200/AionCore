@@ -31,7 +31,15 @@ def create(archive, platform, ui_ref):
               'runId': int(os.environ['GITHUB_RUN_ID']), 'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
               'headSha': commit, 'platform': platform, 'target': TARGETS.get(platform, {'linux-x64': 'x86_64-unknown-linux-gnu', 'linux-arm64': 'aarch64-unknown-linux-gnu'}.get(platform, platform)),
               'artifact': f'aioncore-manual-{platform}', 'archive': Path(archive).name,
-              'sha256': hashlib.sha256(Path(archive).read_bytes()).hexdigest(), 'uiRef': ui_ref}
+              'sha256': hashlib.sha256(Path(archive).read_bytes()).hexdigest(), 'uiRef': ui_ref,
+              'build': {
+                  'profile': 'release',
+                  'rustc': subprocess.check_output(['rustc', '-Vv'], text=True).strip(),
+                  'cargoLockSha256': hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),
+                  'toolchainSha256': hashlib.sha256(Path('rust-toolchain.toml').read_bytes()).hexdigest(),
+                  'workflowSha256': hashlib.sha256(Path('.github/workflows/build-manual.yml').read_bytes()).hexdigest(),
+                  'rustflags': os.environ.get('BUILD_RUSTFLAGS', ''),
+              }}
     Path(archive).with_name('aioncore-manifest.json').write_text(json.dumps(record), encoding='utf-8')
 
 def validate(run, artifact, record, archive, repository):

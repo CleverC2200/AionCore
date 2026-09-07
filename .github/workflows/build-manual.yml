@@ -193,6 +193,7 @@ jobs:
         shell: bash
         env:
           AIONUI_REF: ${{ inputs.aionui_ref }}
+          BUILD_RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: python scripts/aionui-handoff.py create "dist/${ARCHIVE}" "${{ matrix.platform }}"
 
       - name: Upload opted-in handoff request
@@ -221,7 +222,7 @@ jobs:
             dist/${{ env.ARCHIVE }}
             dist/aioncore-manifest.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   build-summary:
     name: Build Summary

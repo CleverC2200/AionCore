@@ -14,6 +14,28 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 class HandoffTest(unittest.TestCase):
+    def test_manifest_records_actual_compiler_and_build_input_identity(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'core.tar.gz'
+            archive.write_bytes(b'archive')
+            (root / 'Cargo.lock').write_text('locked inputs')
+            (root / 'rust-toolchain.toml').write_text('pinned toolchain')
+            (root / '.github/workflows').mkdir(parents=True)
+            (root / '.github/workflows/build-manual.yml').write_text('workflow inputs')
+            previous = m.os.getcwd()
+            try:
+                m.os.chdir(root)
+                with patch.dict(m.os.environ, {'GITHUB_REPOSITORY': 'owner/core', 'GITHUB_RUN_ID': '12', 'GITHUB_RUN_ATTEMPT': '1'}), patch.object(m.subprocess, 'check_output', side_effect=['a'*40, 'rustc 1.95.0\nhost: aarch64-apple-darwin\n']):
+                    m.create(str(archive), 'macos-arm64', '')
+                record = json.loads(archive.with_name('aioncore-manifest.json').read_text())
+                self.assertEqual(record['build']['profile'], 'release')
+                self.assertEqual(record['build']['cargoLockSha256'], hashlib.sha256(b'locked inputs').hexdigest())
+                self.assertIn('rustc 1.95.0', record['build']['rustc'])
+            finally:
+                m.os.chdir(previous)
+
     def fixture(self):
         repo = 'owner/core'
         run = dict(repository=dict(full_name=repo), head_repository=dict(full_name=repo), path='.github/workflows/build-manual.yml', event='workflow_dispatch', status='completed', conclusion='success', id=12, run_attempt=1, head_sha='a'*40)
