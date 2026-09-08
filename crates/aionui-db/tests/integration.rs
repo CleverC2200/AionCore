@@ -1,0 +1,46 @@
+// Register integration test modules here; Cargo auto-discovery is disabled.
+// Separate modules preserve helpers and test names without duplicate executables.
+
+mod acp_registry_contract_migration;
+mod adoption_coverage;
+mod agent_binding_resolver;
+mod aionrs_fork_capability_migration;
+mod antigravity_builtin_agent_migration;
+mod assistant_data_unification_schema;
+mod assistant_definition_field_removal_migration;
+mod channel_repository;
+mod client_preference_repository;
+mod codex_full_access_mode_migration;
+mod conversation_repository;
+mod conversation_schema;
+mod core_auth_session_migration;
+mod core_auth_session_repository;
+mod cron_assistant_first_migration;
+mod cron_repository;
+mod cross_session_migration_divergence;
+mod database_newer_than_app;
+mod db_lifecycle;
+mod external_core_user_migration;
+mod feedback_diagnostics_repository;
+mod gea_builtin_agent_brand_migration;
+mod legacy_handoff;
+mod mcp_server_repository;
+mod migration_45_divergence;
+mod notification_repository;
+mod oauth_token_repository;
+mod omp_direct_cli_migration;
+mod pi_acp_agent_migration;
+mod project_repository;
+mod provider_model_settings_migration;
+mod provider_repository;
+mod registry_binary_agents_migration;
+mod registry_npx_agents_migration;
+mod remote_agent_repository;
+mod settings_repository;
+mod sidebar_migration_divergence;
+mod skill_management_schema;
+mod team_capability_criteria_migration;
+mod team_repository;
+mod user_repository;
+mod user_scope_migration;
+mod user_scope_pre_migration_repair;
