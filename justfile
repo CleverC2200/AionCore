@@ -36,6 +36,10 @@ build-debug *FLAGS:
 install: build
     @{{install_script}} release
 
+# Test one crate without building the entire workspace test suite
+test-package PACKAGE:
+    @just _cargo nextest run -p {{PACKAGE}}
+
 # Run all tests
 test:
     @just _cargo nextest run --workspace

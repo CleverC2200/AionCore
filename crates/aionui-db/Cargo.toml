@@ -2,6 +2,8 @@
 name = "aionui-db"
 version.workspace = true
 edition.workspace = true
+# Integration tests share one executable to avoid repeated linking.
+autotests = false
 
 [dependencies]
 aionui-common.workspace = true
@@ -16,3 +18,7 @@ tracing.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tempfile = "3"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
