@@ -4,7 +4,6 @@
 
 mod common;
 
-use axum::body::to_bytes;
 use axum::http::StatusCode;
 use tower::ServiceExt;
 
@@ -39,8 +38,5 @@ async fn authenticated_user_can_read_the_gea_openapi_document() {
     assert!(document["components"]["securitySchemes"]["runtimeToken"].is_object());
 
     let response = app.oneshot(get_with_token("/swagger-ui/", &token)).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let html = std::str::from_utf8(&body).unwrap();
-    assert!(html.contains("Swagger UI"));
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

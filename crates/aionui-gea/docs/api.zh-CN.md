@@ -147,14 +147,13 @@ AionUi 不发送独立 subscribe 帧：共享 adapter 连接 `/ws`，`ipcBridge.
 
 GEA Gateway 调用使用用户级 GEA 登录凭证；conversation 相关调用还带有当前会话的 delegation token。生产 `GeaService::from_env` 的连接超时为 10 秒、单次请求总超时为 120 秒，二者均由同一 `reqwest::Client` 覆盖上述 Gateway 和 Resource Catalog 调用。发送失败（包括连接和请求超时）统一映射为可重试的 502 `GEA_NETWORK_ERROR`；上游非 2xx 或 `success=false` 尽量保留 code、category、retryable、retryAfterMs、requestId、traceId、auditId 和脱敏 details；JSON 或结构校验失败映射为 502 `GEA_INVALID_RESPONSE`。日志只记录低敏标识和状态，不应输出 token、请求体或工具结果。
 
-## 5. Swagger 暴露方案
+## 5. OpenAPI 暴露方案
 
-首批 Swagger 只覆盖本文接口，并遵守以下冻结方案：
+OpenAPI 描述本 crate 已登记的接口，并遵守以下约束：
 
 - 文档入口只在 debug build 中注册。
-- Swagger UI 和 OpenAPI JSON 仍经过现有 AionCore 认证中间件。
-- Swagger UI 禁用全部 Try-it-out submit methods，避免从文档页面误触发读写调用。
-- 禁用外部在线 validator，避免把接口规范发送给第三方服务。
+- OpenAPI JSON 仍经过现有 AionCore 认证中间件。
+- Swagger UI 页面和专用依赖已移除；OpenAPI JSON 由独立路由提供，不调用外部在线 validator。
 - OpenAPI Schema 只能增加描述元数据，不能改变 serde 字段名、必填性、默认值或业务行为。
 - 如 OpenAPI 工具无法无损描述当前接口，停止该项实现并记录提案，不调整接口迁就文档工具。
 
@@ -162,7 +161,7 @@ GEA Gateway 调用使用用户级 GEA 登录凭证；conversation 相关调用�
 
 ### 5.1 契约漂移检查
 
-`crates/aionui-gea/src/routes.rs` 的 OpenAPI 单测把当前确认的 10 条路径、12 个唯一 operationId，以及会话、工具、InteractionRequest、WebSocket 事件和客户端资源同步的关键 Schema 字段/枚举值写成显式基线。`crates/aionui-app/tests/gea_openapi_e2e.rs` 另外验证未认证访问被拒绝、认证后 OpenAPI JSON 可解析且 Swagger UI 可加载。
+`crates/aionui-gea/src/routes.rs` 的 OpenAPI 单测把当前登记的路径、唯一 operationId，以及会话、工具、InteractionRequest、WebSocket 事件和客户端资源同步的关键 Schema 字段/枚举值写成显式基线。`crates/aionui-app/tests/gea_openapi_e2e.rs` 另外验证未认证访问被拒绝、认证后 OpenAPI JSON 可解析且旧 Swagger UI 页面返回 404。
 
 这些测试只报告差异：路由、operationId、字段名或枚举值变化会直接失败，并指出发生漂移的路径或 Schema；没有快照自动接受或更新逻辑。确认差异是有意接口变更前，不得修改测试基线。Schema 基线验证的是文档与当前 Rust/serde 契约一致，不代表真实 GEA 环境已经验收。
 
@@ -170,7 +169,7 @@ GEA Gateway 调用使用用户级 GEA 登录凭证；conversation 相关调用�
 
 | 现状 | 影响 | 处理方式 |
 | --- | --- | --- |
-| 全局列表兼容接受 `status=pending`，校验错误信息却只写“当前只支持 status=active” | 调试时可能误解兼容范围 | Swagger 按真实行为记录两个值；接口和错误文案均不修改 |
+| 全局列表兼容接受 `status=pending`，校验错误信息却只写“当前只支持 status=active” | 调试时可能误解兼容范围 | OpenAPI 按真实行为记录两个值；接口和错误文案均不修改 |
 | AionUi 的 WebSocket adapter 只声明 `revision`，服务端事件还包含 `user_id` | TypeScript 调用方看不到完整载荷类型，但当前解析允许额外字段 | 文档记录真实载荷；不调整事件或前端类型 |
-| 客户端资源枚举包含 assistants 和 mcps，但实现只处理 skills | 容易把“请求可接收”误认为“能力已支持” | Swagger 与文档明确标为 skipped 行为；不新增同步能力 |
+| 客户端资源枚举包含 assistants 和 mcps，但实现只处理 skills | 容易把“请求可接收”误认为“能力已支持” | OpenAPI 与文档明确标为 skipped 行为；不新增同步能力 |
 | 当前证据主要来自代码和本地 mock/integration 测试 | 不能证明远端 GEA 当前部署与本文完全一致 | 保留真实 GEA 环境验收为独立待办，不提升验证状态 |

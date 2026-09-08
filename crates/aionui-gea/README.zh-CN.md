@@ -6,10 +6,9 @@
 
 debug build 启动后，在当前 AionCore 地址访问：
 
-- Swagger UI：`/swagger-ui/`
 - OpenAPI JSON：`/openapi.json`
 
-两个入口都经过现有 AionCore 认证。Swagger UI 禁用 Try-it-out，且不使用外部在线 validator；release build 不注册这两个入口。
+OpenAPI JSON 经过现有 AionCore 认证；release build 不注册该入口。Swagger UI 页面和专用依赖已移除，OpenAPI 契约生成保留。
 
 ## 当前接口资料
 

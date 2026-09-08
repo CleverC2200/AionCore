@@ -2,8 +2,8 @@
 #
 # All values are placeholders. Never commit real access tokens, delegation
 # tokens, cookies, tenant identifiers, or business payloads to this file.
-# Swagger UI is intentionally read-only; execute write requests only against
-# an explicitly authorized environment.
+# OpenAPI JSON remains available; the Swagger UI has been removed.
+# Execute write requests only against an explicitly authorized environment.
 
 @aioncoreBaseUrl = http://127.0.0.1:8012
 @aioncoreJwt = <AIONCORE_JWT>
