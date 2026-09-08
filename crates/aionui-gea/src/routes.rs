@@ -25,8 +25,6 @@ use utoipa::OpenApi;
 use utoipa::openapi::Components;
 #[cfg(debug_assertions)]
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
-#[cfg(debug_assertions)]
-use utoipa_swagger_ui::{Config as SwaggerConfig, SwaggerUi};
 
 use crate::error::GeaError;
 use crate::state::GeaRouterState;
@@ -345,18 +343,7 @@ fn required_sales_plan_header<'a>(headers: &'a HeaderMap, name: &str, max_len: u
 
 #[cfg(debug_assertions)]
 fn gea_api_docs_routes() -> Router {
-    Router::new().merge(
-        SwaggerUi::new("/swagger-ui")
-            .url("/openapi.json", GeaApiDoc::openapi())
-            .config(gea_swagger_config()),
-    )
-}
-
-#[cfg(debug_assertions)]
-fn gea_swagger_config() -> SwaggerConfig<'static> {
-    SwaggerConfig::new(["/openapi.json"])
-        .supported_submit_methods(std::iter::empty::<String>())
-        .validator_url("none")
+    Router::new().route("/openapi.json", get(|| async { Json(GeaApiDoc::openapi()) }))
 }
 
 #[utoipa::path(
@@ -1205,7 +1192,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GeaApiDoc, enforce_runtime_conversation_scope, gea_routes, gea_sales_plan_action_routes, gea_swagger_config,
+        GeaApiDoc, enforce_runtime_conversation_scope, gea_routes, gea_sales_plan_action_routes,
         reject_runtime_auth_session_access, require_runtime_conversation_scope,
     };
     use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
@@ -1782,12 +1769,5 @@ mod tests {
             "GeaClientResourceSyncStatus",
             &["completed", "notAuthenticated", "partial", "unavailable"],
         );
-    }
-
-    #[test]
-    fn swagger_ui_disables_requests_and_external_validation() {
-        let value = serde_json::to_value(gea_swagger_config()).unwrap();
-        assert_eq!(value["supportedSubmitMethods"], serde_json::json!([]));
-        assert_eq!(value["validatorUrl"], "none");
     }
 }
