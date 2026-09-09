@@ -629,8 +629,16 @@ async fn row_to_mcp_server_config(
                         .collect()
                 })
                 .unwrap_or_default();
-            let (resolved_command, args, env) =
-                ensure_stdio_launch(command, &args, &env_entries, user_id, conversation_id, broadcaster).await?;
+            let (resolved_command, args, env) = ensure_stdio_launch(
+                &row.name,
+                command,
+                &args,
+                &env_entries,
+                user_id,
+                conversation_id,
+                broadcaster,
+            )
+            .await?;
 
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
@@ -711,8 +719,16 @@ async fn session_server_to_mcp_server_config(
                 return Err("stdio: missing command".to_owned());
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            let (command, args, env) =
-                ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
+            let (command, args, env) = ensure_stdio_launch(
+                &server.name,
+                command,
+                args,
+                &entries,
+                user_id,
+                conversation_id,
+                broadcaster,
+            )
+            .await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
                 command: Some(command),
@@ -831,6 +847,7 @@ async fn merge_session_snapshot_mcp_servers(
 }
 
 async fn ensure_stdio_launch(
+    server_name: &str,
     command: &str,
     args: &[String],
     env: &[(String, String)],
@@ -839,6 +856,18 @@ async fn ensure_stdio_launch(
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<(String, Vec<String>, HashMap<String, String>), String> {
     let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
+    // The reserved gateway is part of this Core, not a user-pinned executable.
+    // Conversation snapshots can outlive an installation directory or product rename.
+    let current_core;
+    let command = if server_name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME) && args == ["mcp-gea-stdio"]
+    {
+        current_core = std::env::current_exe().map_err(|error| format!("current Core unavailable: {error}"))?;
+        current_core
+            .to_str()
+            .ok_or_else(|| "current Core path is not UTF-8".to_owned())?
+    } else {
+        command
+    };
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| error.to_string())?;
@@ -2187,6 +2216,40 @@ mod tests {
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
             Some(&"abc".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn internal_gea_snapshot_rebinds_a_removed_installation_to_current_core() {
+        let server = SessionMcpServer {
+            id: "internal-gea".into(),
+            name: INTERNAL_GEA_MCP_SERVER_NAME.into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "/removed/GEAUi.app/Contents/Resources/aioncore".into(),
+                args: vec!["mcp-gea-stdio".into()],
+                env: HashMap::from([("AIONUI_GEA_AGENT_CODE".into(), "sales_forecast".into())]),
+            },
+        };
+        let config = session_server_to_mcp_server_config(&server, TEST_USER_ID, "conv-renamed", test_broadcaster())
+            .await
+            .expect("internal gateway must survive a removed installation");
+        assert_eq!(config.command.as_deref(), std::env::current_exe().unwrap().to_str());
+        assert_eq!(config.args.unwrap(), vec!["mcp-gea-stdio"]);
+        assert_eq!(config.env.unwrap()["AIONUI_GEA_AGENT_CODE"], "sales_forecast");
+    }
+
+    #[tokio::test]
+    async fn internal_gea_catalog_rebinds_an_old_installation_to_current_core() {
+        let row = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "stdio",
+            r#"{"command":"/removed/GEAUi.exe","args":["mcp-gea-stdio"]}"#,
+            true,
+            true,
+        );
+        let config = row_to_mcp_server_config(&row, TEST_USER_ID, "conv-renamed", test_broadcaster())
+            .await
+            .expect("catalog gateway must use current Core");
+        assert_eq!(config.command.as_deref(), std::env::current_exe().unwrap().to_str());
     }
 
     #[tokio::test]
