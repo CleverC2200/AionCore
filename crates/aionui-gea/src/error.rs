@@ -15,6 +15,8 @@ pub struct GeaErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
@@ -58,6 +60,7 @@ impl GeaError {
                         | StatusCode::GATEWAY_TIMEOUT
                 ),
                 retry_after_ms: None,
+                suggested_action: None,
                 request_id: None,
                 trace_id: None,
                 audit_id: None,
@@ -135,6 +138,7 @@ impl IntoResponse for GeaError {
             "category": self.body.category,
             "retryable": self.body.retryable,
             "retryAfterMs": self.body.retry_after_ms,
+            "suggestedAction": self.body.suggested_action,
             "requestId": self.body.request_id,
             "traceId": self.body.trace_id,
             "auditId": self.body.audit_id,

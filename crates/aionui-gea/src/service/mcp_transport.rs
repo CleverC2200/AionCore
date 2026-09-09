@@ -246,7 +246,7 @@ async fn parse_json_rpc_response(response: reqwest::Response) -> Result<Value, G
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .unwrap_or("GEA MCP 请求失败");
-        return Err(mcp_business_error(code, message));
+        return Err(mcp_business_error(code, message, error.get("data")));
     }
     value
         .get("result")
@@ -272,8 +272,11 @@ fn http_error(status: reqwest::StatusCode) -> GeaError {
     GeaError::from_http_status(status_code, format!("GEA_MCP_HTTP_{status_code}"), "GEA MCP 请求失败")
 }
 
-fn mcp_business_error(code: &str, message: &str) -> GeaError {
+fn mcp_business_error(code: &str, message: &str, data: Option<&Value>) -> GeaError {
+    let category = data.and_then(|data| data.get("category")).and_then(Value::as_str);
     let status = match code {
+        "AI_SCHEMA_INVALID" => axum::http::StatusCode::BAD_REQUEST,
+        "AI_GATEWAY_DATA_PERMISSION_DENIED" => axum::http::StatusCode::FORBIDDEN,
         "AI_GATEWAY_RESOURCE_URI_INVALID" | "AI_GATEWAY_RESOURCE_TOO_LARGE" => axum::http::StatusCode::BAD_REQUEST,
         "AI_GATEWAY_RESOURCE_NOT_FOUND" | "AI_GATEWAY_RESOURCE_EXPIRED" => axum::http::StatusCode::NOT_FOUND,
         "AI_GATEWAY_RESOURCE_FORBIDDEN" | "AI_GATEWAY_POLICY_CHANGED" => axum::http::StatusCode::FORBIDDEN,
@@ -282,14 +285,91 @@ fn mcp_business_error(code: &str, message: &str) -> GeaError {
         | "AI_GATEWAY_SESSION_EXPIRED"
         | "AI_GATEWAY_SESSION_REVOKED" => axum::http::StatusCode::CONFLICT,
         "AI_GATEWAY_RESOURCE_STORAGE_UNAVAILABLE" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        _ => axum::http::StatusCode::BAD_GATEWAY,
+        _ => axum::http::StatusCode::from_u16(super::status_for_category(category))
+            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
     };
-    GeaError::new(status, code, message)
+    let mut error = GeaError::new(status, code, message);
+    // A JSON-RPC business error is not a transport failure. Only an explicit
+    // gateway retryable flag permits retry; HTTP 200/-32000 says nothing about it.
+    error.body.retryable = data.and_then(|data| data.get("retryable")).and_then(Value::as_bool) == Some(true);
+    if let Some(data) = data {
+        if let Some(category) = category.filter(|value| !value.is_empty()) {
+            error.body.category = category.to_owned();
+        }
+        error.body.retry_after_ms = data.get("retryAfterMs").and_then(Value::as_u64);
+        error.body.suggested_action = data.get("suggestedAction").and_then(Value::as_str).map(str::to_owned);
+        error.body.request_id = data.get("requestId").and_then(Value::as_str).map(str::to_owned);
+        error.body.trace_id = data.get("traceId").and_then(Value::as_str).map(str::to_owned);
+        error.body.audit_id = data.get("auditId").and_then(Value::as_str).map(str::to_owned);
+        error.body.details = data.get("details").cloned();
+    }
+    error
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sse_json;
+    use super::{parse_json_rpc_response, parse_sse_json};
+
+    #[tokio::test]
+    async fn deterministic_mcp_business_errors_are_not_retryable_upstream_failures() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (code, category, status) in [
+            ("AI_SCHEMA_INVALID", "VALIDATION", 400),
+            ("AI_GATEWAY_DATA_PERMISSION_DENIED", "AUTHORIZATION", 403),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "error": { "code": -32603, "message": "request rejected",
+                        "data": { "businessCode": code } }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let response = reqwest::Client::new().post(server.uri()).send().await.unwrap();
+            let error = parse_json_rpc_response(response).await.unwrap_err();
+            assert_eq!(error.body.code, code);
+            assert_eq!(error.status.as_u16(), status);
+            assert_eq!(error.body.category, category);
+            assert!(!error.body.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_business_error_preserves_gateway_recovery_and_correlation_fields() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32000, "message": "quota reached", "data": {
+                    "businessCode": "TEST_RATE_LIMIT", "category": "RATE_LIMIT", "retryable": true,
+                    "retryAfterMs": 1500, "suggestedAction": "RETRY_AFTER_DELAY",
+                    "requestId": "request-1", "traceId": "trace-1", "auditId": "audit-1",
+                    "details": { "dimension": "consumer" }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        let response = reqwest::Client::new().post(server.uri()).send().await.unwrap();
+        let error = parse_json_rpc_response(response).await.unwrap_err();
+        assert_eq!(error.status.as_u16(), 429);
+        let body = serde_json::to_value(&error.body).unwrap();
+        assert_eq!(body["code"], "TEST_RATE_LIMIT");
+        assert_eq!(body["category"], "RATE_LIMIT");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["retryAfterMs"], 1500);
+        assert_eq!(body["suggestedAction"], "RETRY_AFTER_DELAY");
+        assert_eq!(body["requestId"], "request-1");
+        assert_eq!(body["traceId"], "trace-1");
+        assert_eq!(body["auditId"], "audit-1");
+        assert_eq!(body["details"]["dimension"], "consumer");
+    }
 
     #[test]
     fn parses_json_rpc_sse_data() {
