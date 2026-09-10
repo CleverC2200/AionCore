@@ -63,7 +63,7 @@ pub(super) async fn build(
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
-        .await
+        .await?
         {
             extra_mcp_servers.entry(name).or_insert(config);
         }
@@ -545,39 +545,45 @@ async fn load_user_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) -> HashMap<String, McpServerConfig> {
+) -> Result<HashMap<String, McpServerConfig>, AgentError> {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
         None => repo.list(user_id).await,
     };
-    let rows = match rows_result {
-        Ok(r) => r,
-        Err(err) => {
-            warn!(
-                conversation_id,
-                error = %err,
-                "user_mcp: list() failed; skipping injection"
-            );
-            return HashMap::new();
-        }
-    };
+    let mut rows = rows_result.map_err(|error| {
+        warn!(conversation_id, error = %error, "Failed to load session MCP selection");
+        AgentError::bad_gateway("MCP_CATALOG_UNAVAILABLE: Unable to load session tools; retry the conversation.")
+    })?;
+    // The managed gateway is an application capability, not a frozen user MCP
+    // selection. Older conversations predate its ID and must bind it on resume.
+    if let Some(gateway) = repo
+        .find_by_name(user_id, INTERNAL_GEA_MCP_SERVER_NAME)
+        .await
+        .map_err(|error| {
+            warn!(conversation_id, error = %error, "Failed to load managed GEA gateway");
+            AgentError::bad_gateway("GEA_MCP_NOT_READY: Unable to load the managed gateway; retry the conversation.")
+        })?
+    {
+        rows.retain(|row| !row.name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME));
+        rows.push(gateway);
+    }
 
     let mut servers = HashMap::new();
     for row in rows {
-        let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| id == &row.id))
-            .unwrap_or(row.enabled);
         let is_internal_gea_gateway = row.name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME);
+        let managed_gateway = is_internal_gea_gateway && row.builtin && row.enabled && row.deleted_at.is_none();
+        let selected = if is_internal_gea_gateway {
+            managed_gateway
+        } else {
+            selected_ids
+                .map(|ids| ids.iter().any(|id| id == &row.id))
+                .unwrap_or(row.enabled)
+        };
         let is_legacy_gea = row.name.trim().eq_ignore_ascii_case(LEGACY_GEA_MCP_SERVER_NAME);
-        let explicitly_selected_internal_gea_gateway = is_internal_gea_gateway && selected_ids.is_some();
         // `aionui-team` is the reserved team coordination MCP name; a user row
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).
-        if !selected
-            || is_legacy_gea
-            || (row.builtin && !explicitly_selected_internal_gea_gateway)
-            || row.name == TEAM_MCP_SERVER_NAME
-        {
+        if !selected || is_legacy_gea || (row.builtin && !managed_gateway) || row.name == TEAM_MCP_SERVER_NAME {
             continue;
         }
 
@@ -586,6 +592,12 @@ async fn load_user_mcp_servers(
                 servers.insert(row.name.clone(), config);
             }
             Err(err) => {
+                if managed_gateway {
+                    warn!(conversation_id, error = %err, "Managed GEA gateway configuration is unavailable");
+                    return Err(AgentError::bad_gateway(
+                        "GEA_MCP_NOT_READY: The managed gateway configuration is unavailable; retry after restoring the gateway.",
+                    ));
+                }
                 warn!(
                     conversation_id,
                     server_id = %row.id,
@@ -597,7 +609,7 @@ async fn load_user_mcp_servers(
         }
     }
 
-    servers
+    Ok(servers)
 }
 
 async fn row_to_mcp_server_config(
@@ -790,6 +802,12 @@ async fn merge_session_snapshot_mcp_servers(
     }
 
     for server in session_mcp_servers {
+        if server.name.trim().eq_ignore_ascii_case(INTERNAL_GEA_MCP_SERVER_NAME) {
+            // App upgrades change the managed binary path. Only the live catalog
+            // owns this binding, including a deliberate global disable/delete.
+            continue;
+        }
+
         // Existing conversations can retain the retired GEA SSE server in their
         // frozen snapshot. The internal gateway replaces it and exposes the same
         // tools, so loading both makes the provider reject the entire request.
@@ -1119,7 +1137,8 @@ mod tests {
             "conv-frozen-mcp",
             test_broadcaster(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
@@ -1153,18 +1172,42 @@ mod tests {
             "conv-gea-migration",
             test_broadcaster(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(servers.keys().collect::<Vec<_>>(), vec![INTERNAL_GEA_MCP_SERVER_NAME]);
     }
 
     #[tokio::test]
-    async fn internal_gea_gateway_is_not_implicitly_injected_without_a_selection() {
+    async fn enabled_internal_gea_gateway_survives_old_conversation_selections() {
+        let gateway = make_row(
+            INTERNAL_GEA_MCP_SERVER_NAME,
+            "http",
+            r#"{"url":"http://current-gateway.example.test/mcp"}"#,
+            true,
+            true,
+        );
+        let repo = MockMcpRepo { rows: vec![gateway] };
+        let empty = vec![];
+        let stale = vec!["retired-gea-server-id".to_owned()];
+        for selected in [None, Some(empty.as_slice()), Some(stale.as_slice())] {
+            let servers = load_user_mcp_servers(&repo, selected, TEST_USER_ID, "old-conversation", test_broadcaster())
+                .await
+                .unwrap();
+            assert!(
+                servers.contains_key(INTERNAL_GEA_MCP_SERVER_NAME),
+                "enabled managed gateway must not depend on a new conversation selection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_internal_gea_gateway_is_not_implicitly_injected() {
         let gateway = make_row(
             INTERNAL_GEA_MCP_SERVER_NAME,
             "http",
             r#"{"url":"http://gea-gateway.example.test/mcp"}"#,
-            true,
+            false,
             true,
         );
         let repo = MockMcpRepo { rows: vec![gateway] };
@@ -1176,9 +1219,141 @@ mod tests {
             "conv-without-gea-selection",
             test_broadcaster(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_gea_binding_uses_live_database_and_respects_user_disable_and_delete() {
+        use aionui_db::{
+            CreateMcpServerParams, SqliteMcpServerRepository, UpdateMcpServerParams, init_database_memory,
+        };
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteMcpServerRepository::new(db.pool().clone());
+        let user = "system_default_user";
+        let row = repo
+            .create(CreateMcpServerParams {
+                user_id: user,
+                name: INTERNAL_GEA_MCP_SERVER_NAME,
+                description: None,
+                enabled: true,
+                builtin: true,
+                transport_type: "http",
+                transport_config: r#"{"url":"http://current-gateway.example.test/mcp"}"#,
+                tools: None,
+                original_json: None,
+            })
+            .await
+            .unwrap();
+        let selected = vec!["old-gateway-id".to_owned()];
+        let servers = load_user_mcp_servers(&repo, Some(&selected), user, "old", test_broadcaster())
+            .await
+            .unwrap();
+        assert_eq!(
+            servers[INTERNAL_GEA_MCP_SERVER_NAME].url.as_deref(),
+            Some("http://current-gateway.example.test/mcp")
+        );
+        assert!(
+            load_user_mcp_servers(&repo, Some(&selected), "different-user", "old", test_broadcaster())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.update(
+            user,
+            &row.id,
+            UpdateMcpServerParams {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let selected = vec![row.id.clone()];
+        assert!(
+            load_user_mcp_servers(&repo, Some(&selected), user, "old", test_broadcaster())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.update(
+            user,
+            &row.id,
+            UpdateMcpServerParams {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        repo.delete(user, &row.id).await.unwrap();
+        assert!(
+            load_user_mcp_servers(&repo, Some(&selected), user, "old", test_broadcaster())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.pool().close().await;
+        assert!(
+            matches!(load_user_mcp_servers(&repo, None, user, "old", test_broadcaster()).await,
+            Err(AgentError::BadGateway(message)) if message.starts_with("MCP_CATALOG_UNAVAILABLE:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_gea_snapshot_cannot_override_or_resurrect_managed_gateway() {
+        let repo = MockMcpRepo {
+            rows: vec![make_row(
+                INTERNAL_GEA_MCP_SERVER_NAME,
+                "http",
+                r#"{"url":"http://current-gateway.example.test/mcp"}"#,
+                true,
+                true,
+            )],
+        };
+        let mut servers = load_user_mcp_servers(&repo, None, TEST_USER_ID, "old", test_broadcaster())
+            .await
+            .unwrap();
+        let snapshot = vec![SessionMcpServer {
+            id: "old-id".into(),
+            name: INTERNAL_GEA_MCP_SERVER_NAME.into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "/old-installation/nonexistent-core".into(),
+                args: vec!["mcp-gea-stdio".into()],
+                env: HashMap::new(),
+            },
+        }];
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, TEST_USER_ID, "old", test_broadcaster()).await;
+        assert_eq!(
+            servers[INTERNAL_GEA_MCP_SERVER_NAME].url.as_deref(),
+            Some("http://current-gateway.example.test/mcp")
+        );
+        servers.clear();
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, TEST_USER_ID, "old", test_broadcaster()).await;
+        assert!(
+            servers.is_empty(),
+            "a retired snapshot must not resurrect a disabled gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_managed_gea_configuration_is_not_silently_skipped() {
+        let repo = MockMcpRepo {
+            rows: vec![make_row(
+                INTERNAL_GEA_MCP_SERVER_NAME,
+                "http",
+                r#"{"headers":{"Authorization":"private-fixture"}}"#,
+                true,
+                true,
+            )],
+        };
+        let error = load_user_mcp_servers(&repo, None, TEST_USER_ID, "old", test_broadcaster())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::BadGateway(ref message) if message.starts_with("GEA_MCP_NOT_READY:")));
+        assert!(!error.to_string().contains("private-fixture"));
     }
 
     #[cfg(unix)]
@@ -2085,8 +2260,9 @@ mod tests {
             ..Default::default()
         };
         let mut assembled = resolve_mcp_servers(&overrides);
-        for (name, config) in
-            load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster()).await
+        for (name, config) in load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster())
+            .await
+            .unwrap()
         {
             assembled.entry(name).or_insert(config);
         }

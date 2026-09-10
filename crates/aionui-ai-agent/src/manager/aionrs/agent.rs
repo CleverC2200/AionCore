@@ -141,9 +141,21 @@ impl AionrsAgentManager {
     pub async fn new(
         conversation_id: String,
         workspace: String,
-        config_extra: AionrsResolvedConfig,
+        mut config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
+        if config_extra.extra_mcp_servers.contains_key("gea-gateway") {
+            let guidance = "[GEA tool availability]\nUse the tools supplied in the current request. \
+                A missing tool, an empty ToolSearch result, plan-mode filtering, or a gateway connection \
+                failure is not evidence of a server permission denial. Only report server permission \
+                denial when an actual server response contains HTTP 403 or an explicit FORBIDDEN \
+                authorization error. Otherwise describe the observed tool-loading or connection \
+                failure and its retry path; do not claim that the user lacks database permissions.";
+            config_extra.system_prompt = Some(match config_extra.system_prompt.take() {
+                Some(prompt) => format!("{prompt}\n\n{guidance}"),
+                None => guidance.to_owned(),
+            });
+        }
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
@@ -242,6 +254,21 @@ impl AionrsAgentManager {
             .build()
             .await
             .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
+
+        if config_extra.extra_mcp_servers.contains_key("gea-gateway")
+            && !result
+                .mcp_managers
+                .iter()
+                .any(|manager| manager.all_tools().iter().any(|(server, _)| *server == "gea-gateway"))
+        {
+            warn!(conversation_id = %conversation_id, "Managed GEA gateway has no loaded tools; blocking model startup");
+            for manager in &result.mcp_managers {
+                manager.shutdown().await;
+            }
+            return Err(AgentError::bad_gateway(
+                "GEA_MCP_NOT_READY: GEA tools are not loaded. Restore the gateway connection and retry.",
+            ));
+        }
 
         let mut engine = result.engine;
         if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {

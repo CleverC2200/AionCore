@@ -344,3 +344,116 @@ async fn runtime_can_emit_error_and_finish() {
         other => panic!("Expected Finish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn required_gea_gateway_connection_failure_blocks_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.session_directory = dir.path().join("sessions");
+    config.extra_mcp_servers.insert(
+        "gea-gateway".into(),
+        McpServerConfig {
+            transport: TransportType::Stdio,
+            command: Some(dir.path().join("nonexistent-gateway").display().to_string()),
+            args: None,
+            env: None,
+            url: None,
+            headers: None,
+            deferred: Some(false),
+            startup_timeout_ms: Some(100),
+        },
+    );
+    let result = AionrsAgentManager::new(
+        "gateway-unavailable".into(),
+        dir.path().display().to_string(),
+        config,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(AgentError::BadGateway(ref message))
+        if message.contains("GEA_MCP_NOT_READY")),
+        "a missing managed gateway must not create a builtin-only agent"
+    );
+}
+
+#[tokio::test]
+async fn managed_gateway_bootstrap_checks_real_discovery_on_fresh_and_resumed_sessions() {
+    use aion_agent::session::SessionManager;
+    use axum::response::IntoResponse;
+    use axum::{Json, Router, routing::post};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    for empty_tools in [false, true] {
+        let app = Router::new().route("/mcp", post(move |Json(body): Json<Value>| async move {
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                "notifications/initialized" => return axum::http::StatusCode::ACCEPTED.into_response(),
+                "tools/list" => if empty_tools { json!({"tools":[]}) } else {
+                    json!({"tools":[{"name":"query_business_data","description":"fixture query","inputSchema":{"type":"object","properties":{}}}]})
+                },
+                method => panic!("unexpected fixture method: {method}"),
+            };
+            Json(json!({"jsonrpc":"2.0","id":body["id"],"result":result})).into_response()
+        }));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        for resume in [false, true] {
+            let mut config = make_test_config();
+            config.session_directory = dir.path().join(if resume { "resumed" } else { "fresh" });
+            config.extra_mcp_servers.insert(
+                "gea-gateway".into(),
+                McpServerConfig {
+                    transport: TransportType::StreamableHttp,
+                    command: None,
+                    args: None,
+                    env: None,
+                    url: Some(format!("http://{address}/mcp")),
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: Some(1000),
+                },
+            );
+            let session = resume.then(|| {
+                SessionManager::new(config.session_directory.clone(), 10)
+                    .create(
+                        "anthropic",
+                        "test-model",
+                        &dir.path().display().to_string(),
+                        Some("old-conversation"),
+                    )
+                    .unwrap()
+            });
+            let result = AionrsAgentManager::new(
+                "old-conversation".into(),
+                dir.path().display().to_string(),
+                config,
+                session,
+            )
+            .await;
+            if empty_tools {
+                assert!(
+                    matches!(result, Err(AgentError::BadGateway(ref message)) if message.starts_with("GEA_MCP_NOT_READY:"))
+                );
+            } else {
+                let agent = result.unwrap();
+                assert!(
+                    agent
+                        .engine
+                        .lock()
+                        .await
+                        .tool_names()
+                        .contains(&"query_business_data".to_owned())
+                );
+                for manager in &agent.mcp_managers {
+                    manager.shutdown().await;
+                }
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
