@@ -1,10 +1,11 @@
 use aionui_api_types::{
-    ApiResponse, CreateGeaSessionRequest, ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult,
-    GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot,
-    GeaResourceContents, GeaResourceList, GeaResourceTemplateList, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
-    InteractionRequestReceipt, NotificationActionCommand, NotificationList, NotificationReceipt, NotificationView,
-    ReadGeaResourceRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    AcknowledgeClientNavigationRequest, ApiResponse, ClientNavigationResolveResponse, CreateGeaSessionRequest,
+    ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult, GeaInteractionRequestActionCommand,
+    GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaResourceContents, GeaResourceList,
+    GeaResourceTemplateList, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
+    InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt, NotificationActionCommand,
+    NotificationList, NotificationReceipt, NotificationView, ReadGeaResourceRequest, ResolveClientNavigationRequest,
+    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 #[cfg(debug_assertions)]
 use aionui_api_types::{
@@ -35,6 +36,8 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
             "/api/gea/auth/session",
             get(auth_status).put(set_auth_session).delete(clear_auth_session),
         )
+        .route("/api/deep-links/resolve", post(resolve_client_navigation))
+        .route("/api/deep-links/ack", post(acknowledge_client_navigation))
         .route("/api/gea/conversations/{conversation_id}/session", post(create_session))
         .route("/api/gea/conversations/{conversation_id}/tools", get(list_tools))
         .route(
@@ -105,6 +108,73 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
     {
         router
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/deep-links/resolve",
+    operation_id = "resolveClientNavigation",
+    tag = "Client Navigation",
+    request_body = ResolveClientNavigationRequest,
+    responses(
+        (status = 200, description = "Resolved local V1 conversation target", body = ApiResponse<ClientNavigationResolveResponse>),
+        (status = 400, description = "Invalid local request", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "GEA denied the current user", body = ErrorResponse),
+        (status = 410, description = "Reference expired", body = ErrorResponse),
+        (status = 422, description = "Unsupported schema or unavailable target", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn resolve_client_navigation(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ResolveClientNavigationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ClientNavigationResolveResponse>>, GeaError> {
+    let Json(request) = body.map_err(|_| {
+        GeaError::new(
+            StatusCode::BAD_REQUEST,
+            "NAVIGATION_REQUEST_INVALID",
+            "客户端导航请求参数无效",
+        )
+    })?;
+    let resolved = state.service.resolve_client_navigation(&user.id, request).await?;
+    Ok(Json(ApiResponse::ok(resolved)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/deep-links/ack",
+    operation_id = "acknowledgeClientNavigation",
+    tag = "Client Navigation",
+    request_body = AcknowledgeClientNavigationRequest,
+    responses(
+        (status = 200, description = "GEA accepted TARGET_VISIBLE/SUCCESS", body = ApiResponse<utoipa::TupleUnit>),
+        (status = 400, description = "Invalid ACK request", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 409, description = "GEA intent state conflict", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn acknowledge_client_navigation(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<AcknowledgeClientNavigationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, GeaError> {
+    let Json(request) = body.map_err(|_| {
+        GeaError::new(
+            StatusCode::BAD_REQUEST,
+            "NAVIGATION_REQUEST_INVALID",
+            "客户端导航 ACK 参数无效",
+        )
+    })?;
+    state
+        .service
+        .acknowledge_client_navigation(&user.id, &request.navigation_intent_id, &request.idempotency_key)
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
 }
 
 pub fn gea_sales_plan_action_routes(state: GeaRouterState) -> Router {
@@ -1086,6 +1156,8 @@ impl utoipa::Modify for SecuritySchemes {
         description = "Current AionCore interfaces used by AionUi and the conversation runtime. This document describes existing behavior and does not redefine the business contract."
     ),
     paths(
+        resolve_client_navigation,
+        acknowledge_client_navigation,
         auth_status,
         set_auth_session,
         clear_auth_session,
@@ -1556,6 +1628,8 @@ mod tests {
         let value = openapi_value();
         let paths = value["paths"].as_object().unwrap();
         let expected = [
+            "/api/deep-links/resolve",
+            "/api/deep-links/ack",
             "/api/gea/auth/session",
             "/api/gea/conversations/{conversation_id}/session",
             "/api/gea/conversations/{conversation_id}/tools",
@@ -1600,7 +1674,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_ids.len(), 27);
+        assert_eq!(operation_ids.len(), 29);
     }
 
     #[test]
@@ -1613,6 +1687,16 @@ mod tests {
             &["authenticated", "reauthRequired", "tenantId"],
         );
         assert_schema_properties(&document, "CreateGeaSessionRequest", &["consumerCode", "preparationId"]);
+        assert_schema_properties(
+            &document,
+            "ResolveClientNavigationRequest",
+            &["navigation_reference", "schema_version"],
+        );
+        assert_schema_properties(
+            &document,
+            "AcknowledgeClientNavigationRequest",
+            &["idempotency_key", "navigation_intent_id"],
+        );
         assert_schema_properties(
             &document,
             "GeaSessionResponse",

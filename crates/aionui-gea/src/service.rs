@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aionui_api_types::{
-    CreateGeaSessionRequest, GeaAuthSessionStatus, GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt,
-    GeaInteractionRequestReceiptStatus, GeaInteractionRequestSnapshot, GeaNotificationSnapshot, GeaResourceContents,
-    GeaResourceDescriptor, GeaResourceList, GeaResourceTemplate, GeaResourceTemplateList, GeaSessionResponse,
-    GeaToolCallResponse, GeaToolContent, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
-    InteractionRequestReceipt, InteractionRequestSyncState, NotificationActionCommand, NotificationList,
-    NotificationReceipt, NotificationStatus, NotificationSyncState, SetGeaAuthSessionRequest,
+    ClientNavigationResolveResponse, ClientNavigationTarget, CreateGeaSessionRequest, GeaAuthSessionStatus,
+    GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestReceiptStatus,
+    GeaInteractionRequestSnapshot, GeaNotificationSnapshot, GeaResourceContents, GeaResourceDescriptor,
+    GeaResourceList, GeaResourceTemplate, GeaResourceTemplateList, GeaSessionResponse, GeaToolCallResponse,
+    GeaToolContent, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt,
+    InteractionRequestSyncState, NotificationActionCommand, NotificationList, NotificationReceipt, NotificationStatus,
+    NotificationSyncState, ResolveClientNavigationRequest, SetGeaAuthSessionRequest,
 };
 use aionui_db::{
     IConversationRepository, IGeaResourceRepository, IInteractionRequestRepository, INotificationRepository,
@@ -41,7 +42,10 @@ mod sales_plan_service;
 use self::mcp_transport::{McpTransportClient, McpTransportSession};
 use self::notification_service::NotificationProjection;
 use self::projection_service::{InteractionRequestProjection, RESUME_CLAIM_LEASE_MS};
-use crate::{InteractionTurnResolver, InteractionTurnResumer};
+use crate::{
+    ClientNavigationConversationProvisioner, ClientNavigationConversationRemover, InteractionTurnResolver,
+    InteractionTurnResumer,
+};
 
 const DEFAULT_GEA_BASE_URL: &str = "https://gea.synear.cn/gea-boot";
 const GEA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,9 +119,12 @@ pub struct GeaService {
     reauth_required: Arc<RwLock<HashSet<String>>>,
     sessions: Arc<RwLock<HashMap<(String, String), GeaConversationSession>>>,
     interaction_locks: InteractionLockMap,
+    client_navigation_locks: InteractionLockMap,
     projection: Option<InteractionRequestProjection>,
     notification_projection: Option<NotificationProjection>,
     turn_resumer: Option<InteractionTurnResumer>,
+    client_navigation_conversation_provisioner: Option<ClientNavigationConversationProvisioner>,
+    client_navigation_conversation_remover: Option<ClientNavigationConversationRemover>,
     resume_claim_owner: Arc<str>,
     interaction_poll_interval: Option<Duration>,
     interaction_pollers: InteractionPollRegistry,
@@ -154,15 +161,28 @@ impl GeaService {
             reauth_required: Arc::new(RwLock::new(HashSet::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             interaction_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            client_navigation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             projection: None,
             notification_projection: None,
             turn_resumer: None,
+            client_navigation_conversation_provisioner: None,
+            client_navigation_conversation_remover: None,
             resume_claim_owner: Arc::from(Uuid::now_v7().to_string()),
             interaction_poll_interval: None,
             interaction_pollers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             resource_repo: None,
             managed_skill_root: None,
         })
+    }
+
+    pub fn with_client_navigation_conversation_lifecycle(
+        mut self,
+        provisioner: ClientNavigationConversationProvisioner,
+        remover: ClientNavigationConversationRemover,
+    ) -> Self {
+        self.client_navigation_conversation_provisioner = Some(provisioner);
+        self.client_navigation_conversation_remover = Some(remover);
+        self
     }
 
     pub fn with_resource_catalog(
@@ -294,6 +314,168 @@ impl GeaService {
         self.create_session_inner(user_id, conversation_id, request, true).await
     }
 
+    pub async fn resolve_client_navigation(
+        &self,
+        user_id: &str,
+        request: ResolveClientNavigationRequest,
+    ) -> Result<ClientNavigationResolveResponse, GeaError> {
+        if request.schema_version != 1 {
+            return Err(navigation_error(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "NAVIGATION_SCHEMA_UNSUPPORTED",
+                "当前客户端仅支持 Client Navigation V1",
+            ));
+        }
+        let reference = request.navigation_reference.trim();
+        if reference.is_empty()
+            || reference.len() > 512
+            || !reference
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(navigation_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                "NAVIGATION_REQUEST_INVALID",
+                "客户端导航 Reference 格式无效",
+            ));
+        }
+
+        let credential = self.credential(user_id).await?;
+        let value = self
+            .post_for_user(
+                user_id,
+                &credential,
+                "/ai/gateway/client-navigation-intents/resolve",
+                &json!({
+                    "schemaVersion": request.schema_version,
+                    "navigationReference": reference,
+                }),
+            )
+            .await?;
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_upstream("GEA Client Navigation 响应缺少 result"))?;
+        let schema_version = result.get("schemaVersion").and_then(Value::as_u64).unwrap_or_default();
+        if schema_version != 1 {
+            return Err(invalid_upstream("GEA Client Navigation 返回了不支持的 schemaVersion"));
+        }
+        let target = result
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_upstream("GEA Client Navigation 响应缺少 target"))?;
+        if target.len() != 2
+            || target.get("type").and_then(Value::as_str) != Some("AGENT")
+            || !target.contains_key("agentCode")
+        {
+            return Err(invalid_upstream("GEA Client Navigation V1 target 与契约不匹配"));
+        }
+        let agent_code = target
+            .get("agentCode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_upstream("GEA Client Navigation target 缺少 agentCode"))?;
+        if !is_safe_gea_agent_code(agent_code) {
+            return Err(invalid_upstream("GEA Client Navigation agentCode 格式无效"));
+        }
+        let navigation_intent_id = required_string(&Value::Object(result.clone()), "navigationIntentId")?;
+        if !is_safe_navigation_identifier(&navigation_intent_id, 36) {
+            return Err(invalid_upstream("GEA Client Navigation navigationIntentId 格式无效"));
+        }
+        let expires_at = required_string(&Value::Object(result.clone()), "expiresAt")?;
+        let trace_id = required_string(&Value::Object(result.clone()), "traceId")?;
+        let expires_at_value = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|_| invalid_upstream("GEA Client Navigation expiresAt 格式无效"))?;
+        if expires_at_value <= chrono::Utc::now() {
+            return Err(navigation_error(
+                axum::http::StatusCode::GONE,
+                "NAVIGATION_REFERENCE_EXPIRED",
+                "客户端导航链接已过期",
+            ));
+        }
+
+        let navigation_lock = self.client_navigation_lock(user_id, agent_code).await;
+        let _navigation_guard = navigation_lock.lock().await;
+        let provisioner = self
+            .client_navigation_conversation_provisioner
+            .as_ref()
+            .ok_or_else(|| {
+                GeaError::server_error("NAVIGATION_CLIENT_NOT_READY", "AionCore 尚未配置客户端导航会话提供器")
+            })?
+            .clone();
+        let provisioned = provisioner(user_id.to_owned(), agent_code.to_owned())
+            .await
+            .map_err(|_| {
+                navigation_error(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "NAVIGATION_TARGET_UNAVAILABLE",
+                    "无法准备目标 Agent 会话",
+                )
+            })?;
+        let session = self
+            .create_session(
+                user_id,
+                &provisioned.conversation_id,
+                CreateGeaSessionRequest {
+                    consumer_code: agent_code.to_owned(),
+                    preparation_id: None,
+                },
+            )
+            .await;
+        if let Err(error) = session {
+            if provisioned.created
+                && let Some(remover) = self.client_navigation_conversation_remover.as_ref()
+                && remover(user_id.to_owned(), provisioned.conversation_id.clone())
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("failed to roll back a Client Navigation conversation");
+            }
+            return Err(error);
+        }
+
+        Ok(ClientNavigationResolveResponse {
+            navigation_intent_id,
+            schema_version: 1,
+            target: ClientNavigationTarget::Conversation {
+                conversation_id: provisioned.conversation_id,
+            },
+            expires_at,
+            trace_id,
+        })
+    }
+
+    pub async fn acknowledge_client_navigation(
+        &self,
+        user_id: &str,
+        intent_id: &str,
+        idempotency_key: &str,
+    ) -> Result<(), GeaError> {
+        let intent_id = intent_id.trim();
+        let idempotency_key = idempotency_key.trim();
+        if !is_safe_navigation_identifier(intent_id, 36) || !is_safe_navigation_identifier(idempotency_key, 256) {
+            return Err(navigation_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                "NAVIGATION_REQUEST_INVALID",
+                "客户端导航 ACK 参数无效",
+            ));
+        }
+        let credential = self.credential(user_id).await?;
+        self.post_for_user(
+            user_id,
+            &credential,
+            &format!("/ai/gateway/client-navigation-intents/{intent_id}/ack"),
+            &json!({
+                "stage": "TARGET_VISIBLE",
+                "result": "SUCCESS",
+                "idempotencyKey": idempotency_key,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn create_session_inner(
         &self,
         user_id: &str,
@@ -326,9 +508,6 @@ impl GeaService {
             Ok(value) => (value, false),
             Err(error) if error.body.code == "404" => {
                 tracing::warn!(
-                    user_id,
-                    conversation_id,
-                    consumer_code,
                     "GEA unified session endpoint is unavailable; falling back to the deployed agent session endpoint"
                 );
                 let legacy_body = json!({
@@ -399,13 +578,7 @@ impl GeaService {
         if persist_for_conversation {
             self.ensure_interaction_request_poll(user_id);
         }
-        tracing::info!(
-            user_id,
-            conversation_id,
-            consumer_code,
-            request_id,
-            "GEA gateway session created"
-        );
+        tracing::info!("GEA gateway session created");
         Ok(GeaSessionResponse {
             session_id,
             conversation_id: returned_conversation_id,
@@ -1830,6 +2003,15 @@ impl GeaService {
             .clone()
     }
 
+    async fn client_navigation_lock(&self, user_id: &str, agent_code: &str) -> InteractionMutex {
+        let key = (user_id.to_owned(), agent_code.to_owned());
+        let mut locks = self.client_navigation_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn projection(&self) -> Result<&InteractionRequestProjection, GeaError> {
         self.projection
             .as_ref()
@@ -2381,6 +2563,26 @@ fn is_gea_context_field(name: &str) -> bool {
 
 fn invalid_upstream(message: impl Into<String>) -> GeaError {
     GeaError::bad_gateway("GEA_INVALID_RESPONSE", message)
+}
+
+fn navigation_error(status: axum::http::StatusCode, code: &str, message: &str) -> GeaError {
+    GeaError::new(status, code, message)
+}
+
+fn is_safe_navigation_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn is_safe_gea_agent_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn should_fallback_to_legacy_mcp(error: &GeaError) -> bool {

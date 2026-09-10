@@ -27,3 +27,25 @@ pub type InteractionTurnResumer = std::sync::Arc<
         + Send
         + Sync,
 >;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedClientNavigationConversation {
+    pub conversation_id: String,
+    pub created: bool,
+}
+
+pub type ClientNavigationConversationProvisioner = std::sync::Arc<
+    dyn Fn(
+            String,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ProvisionedClientNavigationConversation, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+pub type ClientNavigationConversationRemover = std::sync::Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;

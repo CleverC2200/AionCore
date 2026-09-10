@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
-use aionui_api_types::ReportGeaSkillExecutionRequest;
+use aionui_api_types::{
+    CreateConversationRequest, ReportGeaSkillExecutionRequest, SessionMcpServer, SessionMcpTransport,
+};
 use aionui_approval::ApprovalRouterState;
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
@@ -18,7 +20,7 @@ use aionui_conversation::skill_resolver::{ManagedSkillExecutionReport, ManagedSk
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    ConversationFilters, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
     IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
@@ -32,7 +34,10 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
-use aionui_gea::{GeaRouterState, GeaService};
+use aionui_gea::{
+    ClientNavigationConversationProvisioner, ClientNavigationConversationRemover, GeaRouterState, GeaService,
+    ProvisionedClientNavigationConversation,
+};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -62,6 +67,110 @@ use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
+
+const CLIENT_NAVIGATION_AGENT_CODE_POINTER: &str = "/client_navigation/agent_code";
+
+pub fn build_client_navigation_conversation_provisioner(
+    services: &AppServices,
+) -> ClientNavigationConversationProvisioner {
+    let conversation_repo = services.conversation_repo.clone();
+    let conversation_service = services.conversation_service.clone();
+    Arc::new(move |user_id, agent_code| {
+        let conversation_repo = conversation_repo.clone();
+        let conversation_service = conversation_service.clone();
+        Box::pin(async move {
+            let mut cursor = None;
+            loop {
+                let page = conversation_repo
+                    .list_paginated(
+                        &user_id,
+                        &ConversationFilters {
+                            cursor: cursor.clone(),
+                            limit: 100,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(existing) = page.items.iter().find(|conversation| {
+                    serde_json::from_str::<serde_json::Value>(&conversation.extra)
+                        .ok()
+                        .and_then(|extra| {
+                            extra
+                                .pointer(CLIENT_NAVIGATION_AGENT_CODE_POINTER)
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some(agent_code.as_str())
+                }) {
+                    return Ok(ProvisionedClientNavigationConversation {
+                        conversation_id: existing.id.clone(),
+                        created: false,
+                    });
+                }
+                if !page.has_more {
+                    break;
+                }
+                cursor = page.items.last().map(|conversation| conversation.id.clone());
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            let command = std::env::current_exe()
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            let conversation = conversation_service
+                .create(
+                    &user_id,
+                    CreateConversationRequest {
+                        r#type: Some(aionui_common::AgentType::Aionrs),
+                        name: Some(format!("GEA · {agent_code}")),
+                        model: None,
+                        assistant: None,
+                        source: Some(aionui_common::ConversationSource::Aionui),
+                        channel_chat_id: None,
+                        extra: serde_json::json!({
+                            "client_navigation": {"agent_code": agent_code},
+                            "selected_session_mcp_servers": [SessionMcpServer {
+                                id: "gea-client-navigation".to_owned(),
+                                name: "gea-gateway".to_owned(),
+                                transport: SessionMcpTransport::Stdio {
+                                    command,
+                                    args: vec!["mcp-gea-stdio".to_owned()],
+                                    env: std::collections::HashMap::from([(
+                                        "AIONUI_GEA_AGENT_CODE".to_owned(),
+                                        agent_code.clone(),
+                                    )]),
+                                },
+                            }],
+                        }),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(ProvisionedClientNavigationConversation {
+                conversation_id: conversation.id,
+                created: true,
+            })
+        })
+    })
+}
+
+pub fn build_client_navigation_conversation_remover(services: &AppServices) -> ClientNavigationConversationRemover {
+    let conversation_service = services.conversation_service.clone();
+    Arc::new(move |user_id, conversation_id| {
+        let conversation_service = conversation_service.clone();
+        Box::pin(async move {
+            conversation_service
+                .delete(&user_id, &conversation_id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+}
 
 struct GeaSkillExecutionReporter {
     service: Arc<GeaService>,
@@ -383,6 +492,10 @@ pub async fn build_module_states(
         gea: build_module_state_phase(&boot, "gea", GeaService::from_env)
             .map(|service| {
                 service
+                    .with_client_navigation_conversation_lifecycle(
+                        build_client_navigation_conversation_provisioner(services),
+                        build_client_navigation_conversation_remover(services),
+                    )
                     .with_resource_catalog(
                         services.gea_resource_repo.clone(),
                         services.data_dir.join("managed-skills"),

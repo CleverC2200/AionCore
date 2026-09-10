@@ -138,6 +138,7 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use gea::{
+    AcknowledgeClientNavigationRequest, ClientNavigationResolveResponse, ClientNavigationTarget,
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaCatalogSkill, GeaClientResourceKind, GeaClientResourceSyncResult,
     GeaClientResourceSyncStatus, GeaInteractionPermissionOption, GeaInteractionPresentation, GeaInteractionQuestion,
     GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
@@ -151,7 +152,7 @@ pub use gea::{
     NotificationActionCommand, NotificationChangedPayload, NotificationChangedReason, NotificationKind,
     NotificationList, NotificationReceipt, NotificationSeverity, NotificationStatus, NotificationSyncState,
     NotificationTarget, NotificationView, ReadGeaResourceRequest, ReportGeaSkillExecutionRequest,
-    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    ResolveClientNavigationRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
