@@ -2724,6 +2724,7 @@ fn upstream_business_error(value: &Value, fallback_status: u16) -> GeaError {
         .and_then(Value::as_bool)
         .unwrap_or(error.body.retryable);
     error.body.retry_after_ms = value.get("retryAfterMs").and_then(Value::as_u64);
+    error.body.suggested_action = value.get("suggestedAction").and_then(Value::as_str).and_then(non_empty);
     error.body.request_id = value.get("requestId").and_then(Value::as_str).and_then(non_empty);
     error.body.trace_id = value.get("traceId").and_then(Value::as_str).and_then(non_empty);
     error.body.audit_id = value.get("auditId").and_then(Value::as_str).and_then(non_empty);

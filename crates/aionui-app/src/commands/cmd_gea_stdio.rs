@@ -138,6 +138,8 @@ struct ApiErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_id: Option<String>,
@@ -247,149 +249,6 @@ struct BusinessDataArtifact {
     url: reqwest::Url,
     size: usize,
     sha256: String,
-}
-
-fn uses_legacy_business_data_arguments(tool: &ToolInfo) -> bool {
-    tool.name == BUSINESS_DATA_TOOL_NAME
-        && tool
-            .input_schema
-            .get("properties")
-            .and_then(|properties| properties.get("queries"))
-            .and_then(|queries| queries.get("type"))
-            .and_then(Value::as_str)
-            == Some("string")
-}
-
-fn exposed_input_schema(tool: &ToolInfo) -> Value {
-    if tool.name != BUSINESS_DATA_TOOL_NAME {
-        return tool.input_schema.clone();
-    }
-    business_data_input_schema()
-}
-
-fn business_data_input_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["inspect", "query"],
-                "description": "inspect reads the semantic-model catalog; query executes one to eight named Cube queries."
-            },
-            "queries": {
-                "type": "array",
-                "maxItems": 8,
-                "description": "Use an empty array for inspect. For query, provide one to eight named query objects.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["name", "query"],
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Stable name for this query in the returned result."
-                        },
-                        "query": {
-                            "type": "object",
-                            "additionalProperties": true,
-                            "description": "Cube JSON Query. Put all query fields inside this object.",
-                            "properties": {
-                                "measures": { "type": "array", "items": { "type": "string" } },
-                                "dimensions": { "type": "array", "items": { "type": "string" } },
-                                "filters": { "type": "array", "items": { "type": "object" } },
-                                "timeDimensions": { "type": "array", "items": { "type": "object" } },
-                                "segments": { "type": "array", "items": { "type": "string" } },
-                                "limit": { "type": "integer", "minimum": 0 },
-                                "order": {
-                                    "oneOf": [
-                                        { "type": "object", "additionalProperties": { "type": "string", "enum": ["asc", "desc"] } },
-                                        { "type": "array", "items": { "type": "object" } }
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "model": {
-                "type": "string",
-                "minLength": 1,
-                "description": "For inspect, omit this field to list the complete model catalog, then set it to one exact model name to retrieve that model schema. Ignored for query."
-            }
-        },
-        "required": ["action", "queries"]
-    })
-}
-
-fn gateway_arguments(tool: &ToolInfo, mut arguments: Value) -> Value {
-    if tool.name != BUSINESS_DATA_TOOL_NAME {
-        return arguments;
-    }
-    if let Some(arguments) = arguments.as_object_mut() {
-        arguments.remove("model");
-    }
-    normalize_business_data_queries(&mut arguments);
-    if !uses_legacy_business_data_arguments(tool) {
-        return arguments;
-    }
-    let Some(queries) = arguments.get("queries").filter(|queries| queries.is_array()) else {
-        return arguments;
-    };
-    let Ok(serialized) = serde_json::to_string(queries) else {
-        return arguments;
-    };
-    if let Some(arguments) = arguments.as_object_mut() {
-        arguments.insert("queries".to_owned(), Value::String(serialized));
-    }
-    arguments
-}
-
-fn normalize_business_data_queries(arguments: &mut Value) {
-    let Some(queries) = arguments.get_mut("queries").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let mut used_names = queries
-        .iter()
-        .filter_map(|item| item.get("query").and_then(|_| item.get("name")))
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect::<HashSet<_>>();
-
-    for (index, item) in queries.iter_mut().enumerate() {
-        let is_named = item.get("query").is_some();
-        let has_name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| !name.trim().is_empty());
-        if is_named && has_name {
-            continue;
-        }
-        let name = unique_query_name(index, &used_names);
-        used_names.insert(name.clone());
-        if is_named {
-            if let Some(object) = item.as_object_mut() {
-                object.insert("name".to_owned(), Value::String(name));
-            }
-        } else if item.is_object() {
-            let query = std::mem::take(item);
-            *item = json!({ "name": name, "query": query });
-        }
-    }
-}
-
-fn unique_query_name(index: usize, used_names: &HashSet<String>) -> String {
-    let mut suffix = index + 1;
-    loop {
-        let candidate = format!("query_{suffix}");
-        if !used_names.contains(&candidate) {
-            return candidate;
-        }
-        suffix += 1;
-    }
 }
 
 fn adapt_business_data_result(tool: &ToolInfo, arguments: &Value, result: Value) -> Result<Value, McpError> {
@@ -537,6 +396,10 @@ fn backend_mcp_error(status: reqwest::StatusCode, body: &[u8]) -> McpError {
                     .to_owned(),
                 retryable: details.get("retryable").and_then(Value::as_bool).unwrap_or(false),
                 retry_after_ms: details.get("retryAfterMs").and_then(Value::as_u64),
+                suggested_action: details
+                    .get("suggestedAction")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 request_id: details.get("requestId").and_then(Value::as_str).map(str::to_owned),
                 trace_id: details.get("traceId").and_then(Value::as_str).map(str::to_owned),
                 audit_id: details.get("auditId").and_then(Value::as_str).map(str::to_owned),
@@ -547,10 +410,26 @@ fn backend_mcp_error(status: reqwest::StatusCode, body: &[u8]) -> McpError {
     let Ok(error) = error else {
         return McpError::internal_error(format!("GEA_MCP_BACKEND_HTTP_{}", status.as_u16()), None);
     };
-    let message = format!(
-        "{}: {} [category={} retryable={}]",
-        error.code, error.message, error.category, error.retryable
-    );
+    // Some agent transports render only the JSON-RPC message. Keep recovery
+    // guidance and correlation IDs visible without copying arbitrary details.
+    let mut context = vec![
+        format!("category={}", error.category),
+        format!("retryable={}", error.retryable),
+    ];
+    if let Some(delay) = error.retry_after_ms {
+        context.push(format!("retryAfterMs={delay}"));
+    }
+    for (name, value) in [
+        ("suggestedAction", error.suggested_action.as_deref()),
+        ("requestId", error.request_id.as_deref()),
+        ("traceId", error.trace_id.as_deref()),
+        ("auditId", error.audit_id.as_deref()),
+    ] {
+        if let Some(value) = value {
+            context.push(format!("{name}={value}"));
+        }
+    }
+    let message = format!("{}: {} [{}]", error.code, error.message, context.join(" "));
     let retryable = error.retryable;
     let mut data = serde_json::to_value(error).ok();
     if retryable && let Some(data) = data.as_mut().and_then(Value::as_object_mut) {
@@ -583,7 +462,10 @@ fn session_retry_delay(error: &McpError, failed_attempt: usize) -> Option<Durati
         .and_then(Value::as_u64)
         .map(Duration::from_millis);
     let exponential = Duration::from_millis(250 * (1_u64 << (failed_attempt - 1)));
-    Some(retry_after.unwrap_or(exponential).min(SESSION_RETRY_MAX_DELAY))
+    let delay = retry_after.unwrap_or(exponential);
+    // Return the gateway error when its minimum delay exceeds our retry budget;
+    // never retry sooner than the gateway permits.
+    (delay <= SESSION_RETRY_MAX_DELAY).then_some(delay)
 }
 
 fn tool_call_retry_delay(
@@ -602,7 +484,13 @@ fn tool_call_retry_delay(
         return None;
     }
     let category = error_field(error, "category");
-    if matches!(category, Some("AUTHENTICATION" | "AUTHORIZATION" | "VALIDATION")) {
+    if matches!(
+        category,
+        Some("AUTHENTICATION" | "AUTHORIZATION" | "VALIDATION" | "SESSION")
+    ) || matches!(
+        error_field(error, "code"),
+        Some("AI_SCHEMA_INVALID" | "AI_GATEWAY_DATA_PERMISSION_DENIED")
+    ) {
         return None;
     }
     let gateway_retryable = error
@@ -611,8 +499,7 @@ fn tool_call_retry_delay(
         .and_then(|data| data.get("retryable"))
         .and_then(Value::as_bool)
         == Some(true);
-    let safe_read_retry = matches!(category, Some("UPSTREAM" | "RATE_LIMIT" | "SESSION"));
-    if !gateway_retryable && !safe_read_retry {
+    if !gateway_retryable {
         return None;
     }
     let retry_after = error
@@ -622,7 +509,10 @@ fn tool_call_retry_delay(
         .and_then(Value::as_u64)
         .map(Duration::from_millis);
     let exponential = Duration::from_millis(250 * (1_u64 << (failed_attempt - 1)));
-    Some(retry_after.unwrap_or(exponential).min(SESSION_RETRY_MAX_DELAY))
+    let delay = retry_after.unwrap_or(exponential);
+    // Return the gateway error when its minimum delay exceeds our retry budget;
+    // never retry sooner than the gateway permits.
+    (delay <= SESSION_RETRY_MAX_DELAY).then_some(delay)
 }
 
 fn retryable_artifact_error(code: &'static str) -> McpError {
@@ -636,6 +526,29 @@ fn retryable_artifact_error(code: &'static str) -> McpError {
     )
 }
 
+// Reject JSON-encoded containers using the published property type. This is a
+// narrow model-input check, not a second JSON Schema validator or a coercion.
+fn encoded_container_error(schema: &Value, arguments: &Value) -> Option<CallToolResult> {
+    let properties = schema.get("properties")?.as_object()?;
+    for (name, value) in arguments.as_object()? {
+        let kind = properties
+            .get(name)
+            .and_then(|property| property.get("type"))
+            .and_then(Value::as_str);
+        if let Some(kind @ ("array" | "object")) = kind
+            && value.is_string()
+        {
+            return Some(CallToolResult::error(vec![Content::text(format!(
+                "GEA_MCP_ARGUMENT_TYPE_INVALID: $.{name} must be a JSON {}, not a JSON-encoded string. \
+                 Correct the arguments according to the tool inputSchema and call again. \
+                 Do not repeat the unchanged arguments. No upstream tool call was made.",
+                kind
+            ))]));
+        }
+    }
+    None
+}
+
 impl ServerHandler for GeaStdioServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
@@ -647,22 +560,22 @@ impl ServerHandler for GeaStdioServer {
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self
-            .load_tools()
-            .await?
-            .into_iter()
-            .map(|(exposed_name, tool)| {
-                let input_schema = exposed_input_schema(&tool)
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_else(|| Map::from_iter([("type".to_owned(), Value::String("object".to_owned()))]));
-                Tool::new_with_raw(
-                    exposed_name,
-                    (!tool.description.is_empty()).then_some(Cow::Owned(tool.description)),
-                    Arc::new(input_schema),
-                )
-            })
-            .collect();
+        let tools =
+            self.load_tools()
+                .await?
+                .into_iter()
+                .map(|(exposed_name, tool)| {
+                    let input_schema =
+                        tool.input_schema.as_object().cloned().unwrap_or_else(|| {
+                            Map::from_iter([("type".to_owned(), Value::String("object".to_owned()))])
+                        });
+                    Tool::new_with_raw(
+                        exposed_name,
+                        (!tool.description.is_empty()).then_some(Cow::Owned(tool.description)),
+                        Arc::new(input_schema),
+                    )
+                })
+                .collect();
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -685,14 +598,16 @@ impl ServerHandler for GeaStdioServer {
             encode_path_segment(&tool.name)
         );
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let gateway_arguments = gateway_arguments(&tool, arguments.clone());
+        if let Some(error) = encoded_container_error(&tool.input_schema, &arguments) {
+            return Ok(error);
+        }
         let mut failed_attempt = 0;
         let response = loop {
             let attempt_result = match self
                 .request::<ToolCallResponse>(
                     reqwest::Method::POST,
                     &path,
-                    Some(json!({ "arguments": gateway_arguments.clone() })),
+                    Some(json!({ "arguments": arguments.clone() })),
                 )
                 .await
             {
@@ -1075,26 +990,10 @@ mod tests {
 
     use super::{
         GEA_MCP_INSTRUCTIONS, GEA_RETRYABLE_RECOVERY_HINT, GeaStdioEnv, GeaStdioServer, SESSION_START_MAX_RETRIES,
-        TOOL_CALL_MAX_RETRIES, ToolInfo, backend_mcp_error, compatible_tool_name, exposed_input_schema,
-        gateway_arguments, parse_business_data_artifact, session_retry_delay, should_expose_tool_to_agent,
+        TOOL_CALL_MAX_RETRIES, ToolInfo, backend_mcp_error, compatible_tool_name, encoded_container_error,
+        parse_business_data_artifact, session_retry_delay, should_expose_tool_to_agent,
         should_reset_session_after_error, tool_call_retry_delay, validate_business_data_artifact,
     };
-
-    fn legacy_business_data_tool() -> ToolInfo {
-        ToolInfo {
-            name: "query_business_data".to_owned(),
-            source_code: "cube".to_owned(),
-            description: "Query business data".to_owned(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" },
-                    "queries": { "type": "string" }
-                },
-                "required": ["action", "queries"]
-            }),
-        }
-    }
 
     fn current_business_data_tool() -> ToolInfo {
         ToolInfo {
@@ -1112,95 +1011,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn legacy_business_data_tool_exposes_named_query_schema() {
-        let schema = exposed_input_schema(&legacy_business_data_tool());
+    #[tokio::test]
+    async fn business_data_mcp_preserves_management_schema_and_flat_arguments() {
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use wiremock::matchers::body_json;
 
-        assert_eq!(schema["properties"]["action"]["enum"], json!(["inspect", "query"]));
-        assert_eq!(schema["properties"]["queries"]["type"], "array");
-        assert_eq!(schema["properties"]["queries"]["maxItems"], 8);
-        assert_eq!(schema["properties"]["model"]["type"], "string");
-        assert_eq!(
-            schema["properties"]["queries"]["items"]["required"],
-            json!(["name", "query"])
-        );
-    }
-
-    #[test]
-    fn legacy_business_data_tool_serializes_named_queries_for_gea() {
-        let queries = json!([{
-            "name": "sales_forecast_probe",
-            "query": {
+        let upstream = MockServer::start().await;
+        let schema = current_business_data_tool().input_schema;
+        Mock::given(method("GET"))
+            .and(path("/api/gea/conversations/conversation-1/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{
+                "name": "query_business_data", "sourceCode": "cube",
+                "description": "Use flat Cube JSON Query objects", "inputSchema": schema
+            }] })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let arguments = json!({
+            "action": "query",
+            "queries": [{
                 "measures": ["agents_sales_forecast_detail.row_count"],
-                "limit": 1
+                "dimensions": [], "filters": [],
+                "order": { "agents_sales_forecast_detail.row_count": "desc" }, "limit": 1
+            }]
+        });
+        let inspect = json!({ "action": "inspect", "queries": [] });
+        for input in [&arguments, &inspect] {
+            Mock::given(method("POST"))
+                .and(path("/api/gea/conversations/conversation-1/tools/query_business_data"))
+                .and(body_json(json!({ "arguments": input })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {
+                    "result": { "status": "completed" },
+                    "content": [{ "type": "text", "text": "completed" }], "isError": false
+                } })))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+        }
+        let server = GeaStdioServer {
+            client: reqwest::Client::new(),
+            env: GeaStdioEnv {
+                base_url: upstream.uri(),
+                conversation_id: "conversation-1".to_owned(),
+                user_id: "user-1".to_owned(),
+                runtime_token: "runtime-token".to_owned(),
+                agent_code: "sales_forecast".to_owned(),
+            },
+            session_ready: Arc::new(Mutex::new(true)),
+            tools: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let (server_io, client_io) = tokio::io::duplex(16_384);
+        let task = tokio::spawn(async move {
+            let service = server.serve(server_io).await.expect("MCP server starts");
+            let _ = service.waiting().await;
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(reader);
+        let requests = [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "contract-test", "version": "1" }
+            }}),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "query_business_data", "arguments": arguments
+            }}),
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "query_business_data", "arguments": inspect
+            }}),
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                "name": "query_business_data", "arguments": { "action": "inspect", "queries": "[]" }
+            }}),
+        ];
+        for request in requests {
+            writer.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+            if request.get("id").is_none() {
+                continue;
             }
-        }]);
-
-        let adapted = gateway_arguments(
-            &legacy_business_data_tool(),
-            json!({ "action": "query", "queries": queries, "model": "ignored-for-query" }),
-        );
-
-        assert_eq!(adapted["action"], "query");
-        assert_eq!(
-            adapted["queries"],
-            serde_json::to_string(&queries).expect("serialize named queries")
-        );
-        assert!(adapted.get("model").is_none());
-    }
-
-    #[test]
-    fn current_business_data_tool_exposes_named_query_schema() {
-        let schema = exposed_input_schema(&current_business_data_tool());
-
-        assert_eq!(
-            schema["properties"]["queries"]["items"]["required"],
-            json!(["name", "query"])
-        );
-    }
-
-    #[test]
-    fn current_business_data_tool_wraps_flat_queries_for_gea() {
-        let adapted = gateway_arguments(
-            &current_business_data_tool(),
-            json!({
-                "action": "query",
-                "queries": [
-                    {
-                        "measures": ["agents_sales_forecast_detail.row_count"],
-                        "limit": 1
-                    },
-                    {
-                        "name": "already_named",
-                        "query": { "measures": ["agents_sales_forecast_detail.dealer_count"] }
-                    }
-                ]
-            }),
-        );
-
-        assert_eq!(adapted["queries"][0]["name"], "query_1");
-        assert_eq!(
-            adapted["queries"][0]["query"]["measures"],
-            json!(["agents_sales_forecast_detail.row_count"])
-        );
-        assert_eq!(adapted["queries"][1]["name"], "already_named");
-    }
-
-    #[test]
-    fn generated_query_names_do_not_collide_with_explicit_names() {
-        let adapted = gateway_arguments(
-            &current_business_data_tool(),
-            json!({
-                "action": "query",
-                "queries": [
-                    { "name": "query_1", "query": { "limit": 1 } },
-                    { "measures": ["agents_sales_forecast_detail.row_count"] }
-                ]
-            }),
-        );
-
-        assert_eq!(adapted["queries"][0]["name"], "query_1");
-        assert_eq!(adapted["queries"][1]["name"], "query_2");
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .expect("MCP response deadline")
+                .expect("MCP response");
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], request["id"]);
+            assert!(response.get("error").is_none(), "MCP response: {response}");
+            if request["id"] == 2 {
+                assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(response["result"]["tools"][0]["inputSchema"], schema);
+            } else if request["id"] == 5 {
+                assert_eq!(response["result"]["isError"], true);
+                let text = response["result"]["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains("$.queries"), "{text}");
+                assert!(text.contains("array"), "{text}");
+                assert!(text.contains("not a JSON-encoded string"), "{text}");
+            } else if request["id"] == 3 || request["id"] == 4 {
+                assert_ne!(response["result"]["isError"], true);
+                assert_eq!(response["result"]["structuredContent"]["status"], "completed");
+            }
+        }
+        drop(writer);
+        drop(reader);
+        task.await.expect("MCP server finishes");
     }
 
     #[test]
@@ -1237,14 +1151,14 @@ mod tests {
     }
 
     #[test]
-    fn read_only_business_query_retries_upstream_resource_failures_at_most_five_times() {
+    fn read_only_business_query_retries_explicitly_retryable_resource_failures_at_most_five_times() {
         let error = backend_mcp_error(
             reqwest::StatusCode::BAD_GATEWAY,
             r#"{
                 "code":"MCP_RESOURCE_INCOMPLETE",
                 "message":"query_business_data Resource 分页读取失败",
                 "category":"UPSTREAM",
-                "retryable":false
+                "retryable":true
             }"#
             .as_bytes(),
         );
@@ -1281,6 +1195,41 @@ mod tests {
             tool_call_retry_delay(&current_business_data_tool(), &arguments, &authorization_error, 1),
             None
         );
+    }
+
+    #[test]
+    fn tool_retries_require_explicit_permission_and_never_repeat_deterministic_errors() {
+        let arguments = json!({ "action": "inspect", "queries": [] });
+        for (code, category, retryable) in [
+            ("MCP_RESOURCE_INCOMPLETE", "UPSTREAM", false),
+            ("AI_SCHEMA_INVALID", "UPSTREAM", true),
+            ("AI_GATEWAY_DATA_PERMISSION_DENIED", "UPSTREAM", true),
+            ("AI_GATEWAY_SESSION_INVALID", "SESSION", true),
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "code": code, "message": "rejected", "category": category, "retryable": retryable
+            }))
+            .unwrap();
+            let error = backend_mcp_error(reqwest::StatusCode::BAD_GATEWAY, &body);
+            assert_eq!(
+                tool_call_retry_delay(&current_business_data_tool(), &arguments, &error, 1),
+                None,
+                "must not retry {code} with category {category} and retryable={retryable}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_container_guard_respects_published_types_without_coercion() {
+        let schema = json!({ "type": "object", "properties": {
+            "queries": { "type": "array" }, "options": { "type": "object" },
+            "text": { "type": "string" }, "union": { "type": ["string", "array"] }
+        } });
+        let valid = json!({ "queries": [], "options": {}, "text": "[]", "union": "[]" });
+        assert!(encoded_container_error(&schema, &valid).is_none());
+        assert!(encoded_container_error(&schema, &json!({ "options": "{}" })).is_some());
+        assert!(encoded_container_error(&schema, &json!({ "queries": "not json" })).is_some());
+        assert!(encoded_container_error(&schema, &json!({ "unknown": "[]" })).is_none());
     }
 
     #[test]
@@ -1517,12 +1466,69 @@ mod tests {
 
         assert_eq!(
             value["message"],
-            "AI_GATEWAY_DATA_PERMISSION_DENIED: 能力未完成数据治理分类 [category=AUTHORIZATION retryable=false]"
+            "AI_GATEWAY_DATA_PERMISSION_DENIED: 能力未完成数据治理分类 [category=AUTHORIZATION retryable=false requestId=request-1 traceId=trace-1]"
         );
         assert_eq!(value["data"]["code"], "AI_GATEWAY_DATA_PERMISSION_DENIED");
         assert_eq!(value["data"]["retryable"], false);
         assert_eq!(value["data"]["requestId"], "request-1");
         assert_eq!(value["data"]["traceId"], "trace-1");
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_metadata_survives_the_http_to_mcp_boundary() {
+        use axum::response::IntoResponse;
+
+        let mut error = aionui_gea::GeaError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "AI_GATEWAY_RATE_LIMITED",
+            "quota reached",
+        );
+        error.body.retry_after_ms = Some(1500);
+        error.body.suggested_action = Some("RETRY_AFTER_DELAY".to_owned());
+        error.body.request_id = Some("request-1".to_owned());
+        error.body.trace_id = Some("trace-1".to_owned());
+        error.body.audit_id = Some("audit-1".to_owned());
+        error.body.details = Some(json!({ "dimension": "consumer" }));
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+        let error = backend_mcp_error(status, &bytes);
+        // The current agent transport renders JSON-RPC code/message and ignores
+        // data, so operational guidance must remain visible in its text too.
+        assert!(error.message.contains("retryAfterMs=1500"));
+        assert!(error.message.contains("suggestedAction=RETRY_AFTER_DELAY"));
+        assert!(error.message.contains("requestId=request-1"));
+        assert!(error.message.contains("traceId=trace-1"));
+        let data = error.data.unwrap();
+        assert_eq!(data["category"], "RATE_LIMIT");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["retryAfterMs"], 1500);
+        assert_eq!(data["suggestedAction"], "RETRY_AFTER_DELAY");
+        assert_eq!(data["requestId"], "request-1");
+        assert_eq!(data["traceId"], "trace-1");
+        assert_eq!(data["auditId"], "audit-1");
+        assert_eq!(data["details"]["dimension"], "consumer");
+    }
+
+    #[test]
+    fn gateway_retry_after_is_never_shortened_to_the_local_delay_budget() {
+        let error = backend_mcp_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            br#"{
+            "code":"AI_GATEWAY_RATE_LIMITED", "message":"quota reached", "category":"RATE_LIMIT",
+            "retryable":true, "retryAfterMs":20000
+        }"#,
+        );
+        assert_eq!(session_retry_delay(&error, 1), None);
+        assert_eq!(
+            tool_call_retry_delay(
+                &current_business_data_tool(),
+                &json!({ "action": "inspect", "queries": [] }),
+                &error,
+                1
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1546,7 +1552,7 @@ mod tests {
 
         assert_eq!(
             value["message"],
-            "GEA_SESSION_UPSTREAM_FAILED: GEA 会话创建失败 [category=UPSTREAM retryable=true]"
+            "GEA_SESSION_UPSTREAM_FAILED: GEA 会话创建失败 [category=UPSTREAM retryable=true requestId=request-2 traceId=trace-2]"
         );
         assert_eq!(value["data"]["code"], "GEA_SESSION_UPSTREAM_FAILED");
         assert_eq!(value["data"]["requestId"], "request-2");

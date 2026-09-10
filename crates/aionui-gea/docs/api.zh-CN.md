@@ -92,6 +92,8 @@ GEA 相关调用按下面的顺序追踪：
 
 `GeaToolCallRequest.arguments` 必须是 JSON object 或 `null`。返回数据包含 `result` 和可选 `auditId`。
 
+2026-09-10 补充：stdio bridge 原样发布管理端工具 `inputSchema` 并透传参数，不为业务查询添加本地嵌套包装或 JSON 字符串化。JSON-RPC 业务错误保留 `suggestedAction`、重试提示和关联标识；只读工具只有收到明确的 `retryable=true` 才进入本地重试，参数、权限和会话错误不重复调用。上游要求的等待时间超出本地预算时，直接返回错误，不能提前重试。
+
 ### 3.3 InteractionRequest
 
 | 方法与路径 | 请求 → 成功数据 | 当前调用入口 | AionCore 实现 | 鉴权与错误语义 | 验证状态 |

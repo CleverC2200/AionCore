@@ -121,7 +121,10 @@ impl GeaService {
                     refreshed_after_unauthorized = true;
                 }
                 Err(error) if should_retry_submit(&error, attempt) => {
-                    tokio::time::sleep(submit_retry_delay(&error, attempt)).await;
+                    let Some(delay) = submit_retry_delay(&error, attempt) else {
+                        return Err(error);
+                    };
+                    tokio::time::sleep(delay).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -466,12 +469,15 @@ fn should_retry_submit(error: &GeaError, attempt: usize) -> bool {
             || error.body.code == "GEA_NETWORK_ERROR")
 }
 
-fn submit_retry_delay(error: &GeaError, attempt: usize) -> Duration {
+fn submit_retry_delay(error: &GeaError, attempt: usize) -> Option<Duration> {
     if let Some(retry_after_ms) = error.body.retry_after_ms {
-        return Duration::from_millis(retry_after_ms).min(MAX_SUBMIT_RETRY_DELAY);
+        let delay = Duration::from_millis(retry_after_ms);
+        // Return the upstream error when its minimum wait exceeds our budget;
+        // shortening Retry-After would submit before the server permits it.
+        return (delay <= MAX_SUBMIT_RETRY_DELAY).then_some(delay);
     }
     let exponent = attempt.saturating_sub(1).min(3) as u32;
-    Duration::from_millis(250_u64.saturating_mul(2_u64.pow(exponent)))
+    Some(Duration::from_millis(250_u64.saturating_mul(2_u64.pow(exponent))))
 }
 
 #[cfg(test)]
@@ -764,19 +770,49 @@ mod tests {
     }
 
     #[test]
-    fn submit_retry_wait_is_bounded_even_for_maximum_upstream_hint() {
+    fn submit_retry_never_shortens_the_upstream_minimum_wait() {
         let mut error =
             crate::error::GeaError::new(axum::http::StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Retry later");
-        for retry_after_ms in [5_000, 3_600_000, u64::MAX] {
+        for retry_after_ms in [5_001, 3_600_000, u64::MAX] {
             error.body.retry_after_ms = Some(retry_after_ms);
-            assert_eq!(super::submit_retry_delay(&error, 1), Duration::from_secs(5));
-            assert_eq!(super::submit_retry_delay(&error, 2), Duration::from_secs(5));
+            assert_eq!(super::submit_retry_delay(&error, 1), None);
+            assert_eq!(super::submit_retry_delay(&error, 2), None);
         }
+        error.body.retry_after_ms = Some(5_000);
+        assert_eq!(super::submit_retry_delay(&error, 1), Some(Duration::from_secs(5)));
         error.body.retry_after_ms = Some(1_000);
-        assert_eq!(super::submit_retry_delay(&error, 1), Duration::from_secs(1));
+        assert_eq!(super::submit_retry_delay(&error, 1), Some(Duration::from_secs(1)));
         error.body.retry_after_ms = None;
-        assert_eq!(super::submit_retry_delay(&error, 1), Duration::from_millis(250));
-        assert_eq!(super::submit_retry_delay(&error, 2), Duration::from_millis(500));
+        assert_eq!(super::submit_retry_delay(&error, 1), Some(Duration::from_millis(250)));
+        assert_eq!(super::submit_retry_delay(&error, 2), Some(Duration::from_millis(500)));
+    }
+
+    #[tokio::test]
+    async fn submit_returns_long_retry_after_without_repeating_the_write() {
+        let server = MockServer::start().await;
+        mount_token(&server, "service-token").await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/internal/sales-plans"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "60")
+                    .set_body_json(json!({
+                        "success": false, "errorCode": "rate_limited", "retryable": true
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let service = service_identity(&server);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.sales_plan_submit("submit-key-1", "request-1", &submit_request()),
+        )
+        .await
+        .expect("long Retry-After must return without sleeping")
+        .unwrap_err();
+        assert_eq!(error.body.retry_after_ms, Some(60_000));
+        assert_eq!(submit_requests(&server).await.len(), 1);
     }
 
     #[tokio::test]
