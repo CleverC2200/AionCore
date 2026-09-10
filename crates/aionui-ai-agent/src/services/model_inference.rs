@@ -38,7 +38,8 @@ pub struct ProviderModelInference {
     providers: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
     data_dir: PathBuf,
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
+    inference_timeout: Duration,
 }
 
 impl ProviderModelInference {
@@ -84,7 +85,8 @@ impl ProviderModelInference {
             providers,
             encryption_key,
             data_dir,
-            slots: Semaphore::new(4),
+            slots: Arc::new(Semaphore::new(4)),
+            inference_timeout: INFERENCE_TIMEOUT,
         }
     }
 
@@ -147,7 +149,11 @@ impl ModelInferencePort for ProviderModelInference {
         question: String,
     ) -> Result<ModelInferenceResponse, AgentError> {
         validate_question(&question)?;
-        let _slot = self.slots.try_acquire().map_err(|_| AgentError::RateLimited)?;
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AgentError::RateLimited)?;
         let model = selected
             .use_model
             .as_deref()
@@ -172,9 +178,15 @@ impl ModelInferencePort for ProviderModelInference {
             return Err(AgentError::forbidden("MODEL_DISABLED"));
         }
         let config = self.config(&row, &model)?;
-        let provider = create_provider(&config);
-        let result = tokio::time::timeout(INFERENCE_TIMEOUT, infer_text(provider, &model, question)).await;
-        let (status, answer) = result.unwrap_or((ModelInferenceStatus::Timeout, None));
+        let worker_model = model.clone();
+        let timeout = self.inference_timeout;
+        let (status, answer) = tokio::task::spawn_blocking(move || {
+            // Caller cancellation must not release capacity before the provider runtime is destroyed.
+            let _slot = slot;
+            infer_in_runtime(config, worker_model, question, timeout)
+        })
+        .await
+        .unwrap_or((ModelInferenceStatus::Failed, None));
         // Do not log prompt, output, credentials or raw provider errors.
         tracing::info!(provider_id = %row.id, model = %model, status = ?status, "Model inference completed");
         Ok(ModelInferenceResponse {
@@ -184,6 +196,29 @@ impl ModelInferencePort for ProviderModelInference {
             model,
         })
     }
+}
+
+fn infer_in_runtime(
+    config: Config,
+    model: String,
+    question: String,
+    timeout: Duration,
+) -> (ModelInferenceStatus, Option<String>) {
+    // Provider retries can log raw vendor errors. Suppress them only on this
+    // dedicated thread; the caller records the safe final status outside it.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        // Aionrs detaches its stream producer. Owning the runtime also owns those
+        // tasks and their sockets, including a producer stalled after HTTP headers.
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return (ModelInferenceStatus::Failed, None);
+        };
+        runtime.block_on(async {
+            let provider = create_provider(&config);
+            tokio::time::timeout(timeout, infer_text(provider, &model, question))
+                .await
+                .unwrap_or((ModelInferenceStatus::Timeout, None))
+        })
+    })
 }
 
 pub fn validate_question(question: &str) -> Result<(), AgentError> {
