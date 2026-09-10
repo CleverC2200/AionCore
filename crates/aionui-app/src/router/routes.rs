@@ -309,6 +309,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     };
 
     // System routes protected by auth middleware
+    let model_inference_authenticated =
+        aionui_ai_agent::routes::model_inference::model_inference_routes(states.model_inference)
+            .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let system_authenticated =
         system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
@@ -470,6 +473,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
+        .merge(model_inference_authenticated)
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)

@@ -16,6 +16,7 @@ use axum::routing::{get, post, put};
 /// responsible for wrapping this with the auth middleware).
 pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
     Router::new()
+        .route("/api/conversations/{id}/model-inference", post(model_inference))
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
@@ -28,6 +29,22 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Route handlers ─────────────────────────────────────────────────
+
+async fn model_inference(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::ModelInferenceRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::ModelInferenceResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .infer_model(&user.id, &id, request)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
 
 async fn set_config_option(
     State(state): State<ConversationRouterState>,

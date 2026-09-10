@@ -160,6 +160,7 @@ impl std::error::Error for RouterBuildError {
 /// Reduces parameter bloat on router constructors and makes it easy for
 /// tests to override individual modules.
 pub struct ModuleStates {
+    pub model_inference: Arc<aionui_ai_agent::ProviderModelInference>,
     pub system: SystemRouterState,
     pub conversation: ConversationRouterState,
     pub remote_agent: RemoteAgentRouterState,
@@ -315,6 +316,14 @@ pub async fn build_module_states(
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let model_inference = Arc::new(aionui_ai_agent::ProviderModelInference::new(
+        provider_repo.clone(),
+        encryption_key,
+        services.data_dir.clone(),
+    ));
+    services
+        .conversation_service
+        .with_model_inference(model_inference.clone());
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -332,6 +341,7 @@ pub async fn build_module_states(
         "startup: module states bundle started"
     );
     let states = ModuleStates {
+        model_inference,
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
