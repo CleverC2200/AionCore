@@ -1657,6 +1657,29 @@ mod tests {
         );
         assert_schema_properties(
             &document,
+            "InteractionRequestView",
+            &[
+                "allowed_actions",
+                "conversation_id",
+                "expires_at",
+                "id",
+                "kind",
+                "message_id",
+                "presentation",
+                "slot_id",
+                "source",
+                "stale",
+                "status",
+                "summary",
+                "team_id",
+                "title",
+                "turn_id",
+                "updated_at",
+                "version",
+            ],
+        );
+        assert_schema_properties(
+            &document,
             "InteractionRequestActionCommand",
             &["action_id", "expected_version", "idempotency_key", "payload"],
         );

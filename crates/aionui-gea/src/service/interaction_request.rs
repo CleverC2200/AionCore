@@ -200,7 +200,11 @@ impl InteractionRequestProjection {
             .list_active(user_id)
             .await
             .map_err(storage_error)?;
-        let items = rows.iter().map(row_to_view).collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let (team_id, slot_id) = self.navigation_anchors(user_id, &row.conversation_id).await?;
+            items.push(row_to_view(row, team_id, slot_id)?);
+        }
         let revision = revision_for(&items)?;
         Ok(InteractionRequestList {
             revision,
@@ -213,7 +217,28 @@ impl InteractionRequestProjection {
 
     pub(super) async fn find(&self, user_id: &str, request_id: &str) -> Result<InteractionRequestView, GeaError> {
         let row = self.find_row(user_id, request_id).await?;
-        row_to_view(&row)
+        let (team_id, slot_id) = self.navigation_anchors(user_id, &row.conversation_id).await?;
+        row_to_view(&row, team_id, slot_id)
+    }
+
+    async fn navigation_anchors(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(Option<String>, Option<String>), GeaError> {
+        let Some(conversation) = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await
+            .map_err(storage_error)?
+        else {
+            return Ok((None, None));
+        };
+        let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap_or(serde_json::Value::Null);
+        Ok((
+            extra_string(&extra, &["team_id", "teamId"]),
+            extra_string(&extra, &["slot_id", "slotId"]),
+        ))
     }
 
     pub(super) async fn load_receipt(
@@ -621,7 +646,11 @@ fn message_row(
     })
 }
 
-fn row_to_view(row: &StoredInteractionRequest) -> Result<InteractionRequestView, GeaError> {
+fn row_to_view(
+    row: &StoredInteractionRequest,
+    team_id: Option<String>,
+    slot_id: Option<String>,
+) -> Result<InteractionRequestView, GeaError> {
     let request = row_to_request(row)?;
     Ok(InteractionRequestView {
         id: request.id,
@@ -634,15 +663,27 @@ fn row_to_view(row: &StoredInteractionRequest) -> Result<InteractionRequestView,
             r#type: "business_system".to_owned(),
             label: request.source_label,
         },
+        presentation: request.presentation,
         conversation_id: row.conversation_id.clone(),
-        team_id: None,
-        slot_id: None,
+        team_id,
+        slot_id,
         turn_id: row.turn_id.clone(),
         message_id: Some(row.message_id.clone()),
         expires_at: request.expires_at,
         allowed_actions: request.allowed_actions,
         updated_at: (!request.updated_at.is_empty()).then_some(request.updated_at),
         stale: false,
+    })
+}
+
+fn extra_string(extra: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        extra
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     })
 }
 
@@ -844,6 +885,39 @@ mod tests {
             events.try_recv().is_err(),
             "self-healing must not emit a duplicate event"
         );
+    }
+
+    #[tokio::test]
+    async fn active_list_projects_team_navigation_anchors_from_conversation_extra() {
+        let (projection, database, _bus) = fixture().await;
+        sqlx::query(
+            "UPDATE conversations SET extra = '{\"teamId\":\"team-1\",\"slot_id\":\"worker-slot\"}' \
+             WHERE id = 'conversation-1'",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        projection
+            .reconcile_snapshot(
+                "system_default_user",
+                "conversation-1",
+                &GeaInteractionRequestSnapshot {
+                    revision: "r1".to_owned(),
+                    items: vec![question("v1")],
+                },
+            )
+            .await
+            .unwrap();
+
+        let list = projection.list_active("system_default_user").await.unwrap();
+
+        assert_eq!(list.items[0].team_id.as_deref(), Some("team-1"));
+        assert_eq!(list.items[0].slot_id.as_deref(), Some("worker-slot"));
+        assert!(matches!(
+            &list.items[0].presentation,
+            GeaInteractionPresentation::Question { questions }
+                if questions[0].question == "Which cost center?" && questions[0].options[0].label == "CC-100"
+        ));
     }
 
     #[tokio::test]

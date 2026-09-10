@@ -464,6 +464,7 @@ pub struct InteractionRequestView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub source: InteractionRequestSource,
+    pub presentation: GeaInteractionPresentation,
     pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
