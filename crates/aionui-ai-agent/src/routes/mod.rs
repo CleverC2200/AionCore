@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub(crate) mod error_mapping;
+pub mod model_inference;
 pub mod remote;
 pub mod state;
 

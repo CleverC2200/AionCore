@@ -23,6 +23,7 @@ mod file;
 mod gea;
 mod lifecycle;
 mod mcp;
+mod model_inference;
 mod office;
 mod project;
 mod provider;
@@ -159,6 +160,7 @@ pub use mcp::{
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
+pub use model_inference::{ModelInferenceRequest, ModelInferenceResponse, ModelInferenceStatus};
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod availability;
 pub mod custom;
+pub mod model_inference;
 pub mod provider_health;
 pub mod remote;
 

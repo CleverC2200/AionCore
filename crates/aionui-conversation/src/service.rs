@@ -333,6 +333,7 @@ pub struct ConversationService {
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
+    model_inference: Arc<RwLock<Option<Arc<dyn aionui_ai_agent::ModelInferencePort>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
@@ -524,6 +525,7 @@ impl ConversationService {
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
+            model_inference: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
@@ -734,6 +736,55 @@ impl ConversationService {
         if let Ok(mut guard) = self.assistant_preference_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    pub fn with_model_inference(&self, port: Arc<dyn aionui_ai_agent::ModelInferencePort>) {
+        if let Ok(mut guard) = self.model_inference.write() {
+            *guard = Some(port);
+        }
+    }
+
+    /// Reads the current persisted selection without starting a runtime or chat turn.
+    pub async fn infer_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: aionui_api_types::ModelInferenceRequest,
+    ) -> Result<aionui_api_types::ModelInferenceResponse, ConversationError> {
+        aionui_ai_agent::validate_model_inference_question(&request.question)?;
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let selected = crate::task_options::provider_model_from_conversation_row(&row);
+        if selected.provider_id.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "MODEL_NOT_SELECTED".into(),
+            });
+        }
+        let port = self
+            .model_inference
+            .read()
+            .ok()
+            .and_then(|value| value.clone())
+            .ok_or_else(|| ConversationError::internal("MODEL_INFERENCE_UNAVAILABLE"))?;
+        let result = port.infer(user_id, selected, request.question).await?;
+        let current = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if current.model != row.model {
+            return Err(ConversationError::Busy {
+                reason: "MODEL_SELECTION_CHANGED".into(),
+            });
+        }
+        Ok(result)
     }
 
     pub fn with_assistant_dispatcher(&self, dispatcher: Arc<dyn AssistantRuleDispatcher>) {

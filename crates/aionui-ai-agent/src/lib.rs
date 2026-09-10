@@ -70,6 +70,9 @@ pub use runtime_token::{
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
 pub use services::RemoteAgentService;
+pub use services::model_inference::{
+    ModelInferencePort, ProviderModelInference, validate_question as validate_model_inference_question,
+};
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
     WorkspaceContext,
