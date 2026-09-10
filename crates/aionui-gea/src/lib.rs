@@ -38,6 +38,7 @@ pub type ClientNavigationConversationProvisioner = std::sync::Arc<
     dyn Fn(
             String,
             String,
+            String,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ProvisionedClientNavigationConversation, String>> + Send>,
         > + Send

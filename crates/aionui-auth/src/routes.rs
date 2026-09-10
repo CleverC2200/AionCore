@@ -41,7 +41,7 @@ use crate::service::{AuthProvisionService, ProvisionError};
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService, SessionLifecycle, SessionLifecycleError};
 
-const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
+pub const BOOTSTRAP_SECRET_HEADER: &str = "x-aioncore-bootstrap-secret";
 const REFRESH_IDEMPOTENCY_HEADER: &str = "x-aioncore-refresh-idempotency-key";
 
 pub type SessionRevokedHook = dyn Fn(&str) + Send + Sync;
@@ -162,7 +162,7 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     ))
 }
 
-fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+pub fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
     let Some(expected) = expected else {
         return Err(ApiError::coded(
             StatusCode::UNAUTHORIZED,

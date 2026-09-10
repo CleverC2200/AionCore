@@ -407,12 +407,13 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     gea_action_limiter.start_cleanup_task(Duration::from_secs(60));
     let gea_authenticated =
         gea_routes(states.gea.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-    let gea_sales_plan_action_authenticated = gea_sales_plan_action_routes(states.gea)
-        .route_layer(from_fn_with_state(
-            gea_action_limiter,
-            authenticated_action_rate_limit_middleware,
-        ))
-        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let gea_sales_plan_action_authenticated =
+        gea_sales_plan_action_routes(states.gea.with_trusted_submit_secret(services.bootstrap_secret.clone()))
+            .route_layer(from_fn_with_state(
+                gea_action_limiter,
+                authenticated_action_rate_limit_middleware,
+            ))
+            .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Voice configuration health checks and session creation reach metered
     // upstream APIs, so rate-limit the authenticated voice surface.
@@ -563,6 +564,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 header::CONTENT_TYPE,
                 header::AUTHORIZATION,
                 HeaderName::from_static("x-csrf-token"),
+                HeaderName::from_static("idempotency-key"),
+                HeaderName::from_static("x-request-id"),
+                HeaderName::from_static("x-trace-id"),
             ]);
         router.layer(cors)
     }

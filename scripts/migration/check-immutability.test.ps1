@@ -157,8 +157,12 @@ try {
     Invoke-InRepo $auxiliaryRepo 1 "Existing migration files from main must not be modified or deleted" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $addedRepo = New-CaseRepo "added"
-    Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- 003 new migration"
+    Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/20260825120000_new_change.sql") -Value "-- timestamped new migration"
     Invoke-InRepo $addedRepo 0 "Migration immutability check passed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
+
+    $sequentialAddedRepo = New-CaseRepo "sequential-added"
+    Set-Content -LiteralPath (Join-Path $sequentialAddedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- sequential new migration"
+    Invoke-InRepo $sequentialAddedRepo 1 "New database migrations must use a 14-digit UTC timestamp prefix" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $duplicateRepo = New-CaseRepo "duplicate"
     Set-Content -LiteralPath (Join-Path $duplicateRepo "crates/aionui-db/migrations/002_duplicate_change.sql") -Value "-- duplicate 002 migration"

@@ -270,3 +270,8 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub mod gea_sales_plan_submit;
+pub use gea_sales_plan_submit::{
+    GeaSalesPlanDecimal, GeaSalesPlanId, GeaSalesPlanSubmitItem, GeaSalesPlanSubmitReceipt, GeaSalesPlanSubmitRequest,
+};

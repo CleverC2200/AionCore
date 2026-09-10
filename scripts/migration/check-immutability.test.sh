@@ -101,8 +101,13 @@ run_in_repo "$auxiliary_repo" 1 "Existing migration files from main must not be 
     env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 added_repo="$(init_case_repo added)"
-printf '%s\n' '-- 003 new migration' > "$added_repo/crates/aionui-db/migrations/003_new_change.sql"
+printf '%s\n' '-- timestamped new migration' > "$added_repo/crates/aionui-db/migrations/20260825120000_new_change.sql"
 run_in_repo "$added_repo" 0 "Migration immutability check passed" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
+
+sequential_added_repo="$(init_case_repo sequential-added)"
+printf '%s\n' '-- sequential new migration' > "$sequential_added_repo/crates/aionui-db/migrations/003_new_change.sql"
+run_in_repo "$sequential_added_repo" 1 "New database migrations must use a 14-digit UTC timestamp prefix" \
     env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 duplicate_repo="$(init_case_repo duplicate)"

@@ -16,7 +16,7 @@
 - `aionui_common::ApiError` 只用于 API 边界；领域服务使用本 crate 错误类型，在路由映射。错误响应不得泄露内部细节。
 - 新 WebSocket 事件使用 `domain.camelCaseAction` 和 `WebSocketMessage<T>`，经 `event_bus.broadcast()` 发出；旧格式不作为新增事件的范例。
 - 仓储 trait 位于 `aionui-db`、以 `I` 开头，实现以 `Sqlite` 开头；模型放在 `models/`，参数类型与仓储共置；服务依赖 trait。
-- 数据库变更通过顺序编号的 `NNN_descriptive_name.sql` 迁移；按现有规范使用 `IF NOT EXISTS`，不直接修改业务数据库或已交付迁移。
+- 已交付的 `NNN_descriptive_name.sql` 迁移保持不可变；新增迁移使用 UTC 时间戳 `YYYYMMDDHHMMSS_descriptive_name.sql`，按现有规范使用 `IF NOT EXISTS`，不直接修改业务数据库。
 - `AppServices` 统一构建服务；领域 crate 只定义 RouterState，组装放在 `aionui-app` 的 `build_*_state()`。
 - 新子进程使用 `aionui_runtime` 的 spawn Builder，不直接调用 `tokio::process::Command`。
 - 新端点评估认证中间件；状态变更要求 CSRF 保护，敏感操作需要限流；禁止硬编码密钥。

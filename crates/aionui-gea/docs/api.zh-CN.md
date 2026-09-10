@@ -127,6 +127,14 @@ AionUi 不发送独立 subscribe 帧：共享 adapter 连接 `/ws`，`ipcBridge.
 
 `resources` 接受 `assistants`、`skills`、`mcps`。当前实现只处理 `skills`：请求中不包含 `skills` 时返回 completed，并把所请求类型计入 skipped；这不代表 assistants 或 mcps 已完成同步。
 
+### 3.5 客户端导航与服务身份提报（2026-09-10 补充）
+
+`POST /api/deep-links/resolve` 与 `POST /api/deep-links/ack` 要求当前用户认证、CSRF 和 GEA 登录态。resolve 校验 V1 目标后，按当前用户、GEA 地址和租户范围复用或建立本地会话，再建立 Gateway Session；不会发送 Agent 消息。处理中切换登录态返回冲突，失败时回滚本次新建的本地会话。GEA 标准 `Result` 包装的已知元数据会被丢弃，未知目标字段会被拒绝；GEA 的 GMT+8 日期格式统一转换为 RFC3339。
+
+`POST /api/gea/sales-plan/submissions` 是受信宿主的服务身份提报入口。除用户认证、CSRF 和动作限流外，还必须提供 `x-aioncore-bootstrap-secret`、`idempotency-key` 与 `x-request-id`；runtime token 无权调用。Core 使用进程内配置的服务身份换取短期 Token，禁止跟随重定向，最多提交三次且重试保持相同请求体和幂等键。服务凭据与宿主能力密钥不传给 Agent 子进程或系统打开器，也不进入回执。目标量/额与 SKU 合计分别表达独立业务值，不强制相等；已有用户查询和动作代理保留原始 JSON 字段。
+
+实现入口为 `routes.rs`、`service.rs`、`service/sales_plan_submit.rs` 与应用层路由装配。对应本地验收覆盖 `client_navigation_e2e.rs`、`gea_sales_plan_security_e2e.rs` 和服务单测；这些 Mock 测试不代表真实 GEA 环境已经验收。
+
 ## 4. AionCore → GEA
 
 以下路径来自当前 AionCore 实现。GEA 官方接口规范仍是远端契约的最终权威；本地 wiremock 测试只能证明 AionCore 对这些形状的本地处理。

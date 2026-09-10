@@ -4,6 +4,7 @@
 
 mod agent_env;
 mod cache;
+mod core_env;
 mod http_client;
 pub mod managed_resources;
 pub mod managed_resources_contract;
@@ -12,9 +13,11 @@ pub mod node_runtime;
 mod registry_npx_lock;
 mod resolver;
 mod shell_env;
+mod system_opener;
 
 pub use agent_env::agent_process_env;
 pub use cache::init;
+pub use core_env::{CORE_ONLY_ENV_KEYS, scrub_core_only_env};
 pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
@@ -26,6 +29,7 @@ pub use node_runtime::{
 pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
 pub use resolver::{resolve_command_in, resolve_command_path};
 pub use shell_env::{ShellProbeReport, ShellProbeStatus, enhance_process_path, login_shell_probe_report};
+pub use system_opener::{open_path, open_path_detached};
 mod spawn;
 pub use spawn::{Builder, kill_process_tree};
 

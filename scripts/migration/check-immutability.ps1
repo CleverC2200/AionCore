@@ -69,11 +69,30 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+$addedMigrations = @(
+    git diff --name-only --diff-filter=A $baseCommit -- "crates/aionui-db/migrations/*.sql"
+    git ls-files --others --exclude-standard -- "crates/aionui-db/migrations/*.sql"
+) | Sort-Object -Unique
+$invalidNewMigrations = @(
+    $addedMigrations |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Where-Object { [System.IO.Path]::GetFileName($_) -notmatch '^20[0-9]{12}_[a-z0-9]+(_[a-z0-9]+)*[.]sql$' }
+)
+if ($invalidNewMigrations.Count -gt 0) {
+    [Console]::Error.WriteLine("New database migrations must use a 14-digit UTC timestamp prefix.")
+    [Console]::Error.WriteLine("")
+    [Console]::Error.WriteLine("Create new files as YYYYMMDDHHMMSS_descriptive_name.sql. Existing shipped migrations keep their original names.")
+    [Console]::Error.WriteLine("")
+    [Console]::Error.WriteLine("Invalid new migrations:")
+    [Console]::Error.WriteLine(($invalidNewMigrations -join "`n"))
+    exit 1
+}
+
 $changed = git diff --name-status --diff-filter=DMR $baseCommit -- "crates/aionui-db/migrations/*.sql"
 if (-not [string]::IsNullOrWhiteSpace(($changed -join "`n"))) {
     [Console]::Error.WriteLine("Existing migration files from main must not be modified or deleted.")
     [Console]::Error.WriteLine("")
-    [Console]::Error.WriteLine("Fix this by reverting changes to existing migration files and adding a new next-numbered migration instead.")
+    [Console]::Error.WriteLine("Fix this by reverting changes to existing migration files and adding a new UTC timestamp-prefixed migration instead.")
     [Console]::Error.WriteLine("If this is an intentional high-risk exception, rerun with AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1.")
     [Console]::Error.WriteLine("")
     [Console]::Error.WriteLine("Changed existing migrations:")

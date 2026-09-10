@@ -65,10 +65,12 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
         "NODE_INSPECT",
         "NODE_DEBUG",
         "CLAUDECODE",
-        "AIONCORE_BOOTSTRAP_SECRET",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     ] {
+        remove_env_key(env, key);
+    }
+    for key in crate::CORE_ONLY_ENV_KEYS {
         remove_env_key(env, key);
     }
     env.retain(|key, _| !env_key_starts_with(key, "npm_"));
@@ -299,6 +301,8 @@ printf '%s\n' \
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
                 .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_ID", "sales-plan-client")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET", "sales-plan-secret")
                 .env("SSL_CERT_FILE", "/tmp/current-cert.pem")
                 .env("SSL_CERT_DIR", "/tmp/current-certs")
                 .env("NODE_EXTRA_CA_CERTS", "/tmp/current-node-extra.pem")
@@ -314,6 +318,14 @@ printf '%s\n' \
             return;
         }
 
+        assert_eq!(
+            std::env::var("AIONUI_GEA_SALES_PLAN_CLIENT_ID").unwrap(),
+            "sales-plan-client"
+        );
+        assert_eq!(
+            std::env::var("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET").unwrap(),
+            "sales-plan-secret"
+        );
         let env = agent_process_env().await;
         let value = |key: &str| {
             env.iter()
@@ -327,6 +339,8 @@ printf '%s\n' \
         assert_eq!(value("NODE_OPTIONS"), None);
         assert_eq!(value("CLAUDECODE"), None);
         assert_eq!(value("AIONCORE_BOOTSTRAP_SECRET"), None);
+        assert_eq!(value("AIONUI_GEA_SALES_PLAN_CLIENT_ID"), None);
+        assert_eq!(value("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET"), None);
         assert_eq!(value("SSL_CERT_FILE"), None);
         assert_eq!(value("SSL_CERT_DIR"), None);
         assert_eq!(

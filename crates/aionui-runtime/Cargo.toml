@@ -16,6 +16,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
 semver.workspace = true
 reqwest.workspace = true
+open.workspace = true
 zip.workspace = true
 flate2 = "1"
 tar = "0.4"

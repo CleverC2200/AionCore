@@ -98,7 +98,8 @@ fn collect_corpus_files(dir: &Dir<'static>, root: &Path, files: &mut Vec<(String
 /// Resolved base directories for skill and rule management.
 ///
 /// `builtin_skills_dir` always points at a real on-disk directory.
-/// In production it resolves to `{data_dir}/builtin-skills/`, populated
+/// In production it resolves to the active `{data_dir}/.builtin-skills.objects/`
+/// content object (or the legacy `{data_dir}/builtin-skills/` fallback), populated
 /// at startup by [`crate::startup_materialize::materialize_if_needed`].
 /// In dev/test it can be redirected via [`BUILTIN_SKILLS_ENV_VAR`].
 #[derive(Debug, Clone)]
@@ -110,7 +111,7 @@ pub struct SkillPaths {
     /// Per-job cron skills directory (~/.aionui/cron/skills/).
     pub cron_skills_dir: PathBuf,
     /// Built-in skills directory on disk. Always set.
-    /// Points to `{data_dir}/builtin-skills/` in production (populated at
+    /// Points to the active content object in production (populated at
     /// startup by `startup_materialize::materialize_if_needed`) or
     /// wherever [`BUILTIN_SKILLS_ENV_VAR`] points in dev mode.
     pub builtin_skills_dir: PathBuf,

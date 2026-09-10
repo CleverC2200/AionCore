@@ -256,9 +256,8 @@ fn login_shell_path() -> (Option<String>, ShellProbeReport) {
     }
 
     let mut command = std::process::Command::new(&shell);
-    command
-        .args(["-l", "-i", "-c", "printf %s \"$PATH\""])
-        .env_remove("AIONCORE_BOOTSTRAP_SECRET");
+    command.args(["-l", "-i", "-c", "printf %s \"$PATH\""]);
+    crate::scrub_core_only_env(&mut command);
 
     let (path, status) = probe_path_with_command(command, LOGIN_SHELL_PROBE_BUDGET);
     (path, report(status))
@@ -598,23 +597,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn login_shell_path_does_not_inherit_bootstrap_secret() {
+    fn login_shell_path_does_not_inherit_core_only_credentials() {
         if std::env::var_os("AIONUI_RUNTIME_SHELL_ENV_SECRET_CHILD").is_none() {
             let temp = tempfile::tempdir().unwrap();
             let shell = temp.path().join("fake-shell");
             std::fs::write(
                 &shell,
-                "#!/bin/sh\nif [ -n \"${AIONCORE_BOOTSTRAP_SECRET+x}\" ]; then printf leaked; else printf clean; fi\n",
+                "#!/bin/sh\nif [ -n \"${AIONCORE_BOOTSTRAP_SECRET+x}${AIONUI_GEA_SALES_PLAN_CLIENT_ID+x}${AIONUI_GEA_SALES_PLAN_CLIENT_SECRET+x}\" ]; then printf leaked; else printf clean; fi\n",
             )
             .unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("shell_env::tests::login_shell_path_does_not_inherit_bootstrap_secret")
+                .arg("shell_env::tests::login_shell_path_does_not_inherit_core_only_credentials")
                 .arg("--nocapture")
                 .env("AIONUI_RUNTIME_SHELL_ENV_SECRET_CHILD", "1")
                 .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_ID", "sales-plan-client")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET", "sales-plan-secret")
                 .env("SHELL", shell)
                 .output()
                 .unwrap();

@@ -33,6 +33,45 @@ async fn test_local_mode_skips_auth() {
 }
 
 #[tokio::test]
+async fn test_local_mode_sales_plan_submit_fails_closed_without_trusted_client_capability() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("build router");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/gea/sales-plan/submissions")
+                .header("origin", "https://untrusted.example")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "submit-key-1")
+                .header("x-request-id", "request-1")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "GEA_SALES_PLAN_SUBMIT_CAPABILITY_REQUIRED");
+
+    services.database.close().await;
+}
+
+#[tokio::test]
 async fn test_non_local_mode_requires_auth() {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())

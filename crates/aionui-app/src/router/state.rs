@@ -69,13 +69,14 @@ use crate::router::voice_conversation_adapter::ConversationVoiceAgent;
 use crate::services::AppServices;
 
 const CLIENT_NAVIGATION_AGENT_CODE_POINTER: &str = "/client_navigation/agent_code";
+const CLIENT_NAVIGATION_SCOPE_POINTER: &str = "/client_navigation/scope";
 
 pub fn build_client_navigation_conversation_provisioner(
     services: &AppServices,
 ) -> ClientNavigationConversationProvisioner {
     let conversation_repo = services.conversation_repo.clone();
     let conversation_service = services.conversation_service.clone();
-    Arc::new(move |user_id, agent_code| {
+    Arc::new(move |user_id, agent_code, scope| {
         let conversation_repo = conversation_repo.clone();
         let conversation_service = conversation_service.clone();
         Box::pin(async move {
@@ -95,14 +96,16 @@ pub fn build_client_navigation_conversation_provisioner(
                 if let Some(existing) = page.items.iter().find(|conversation| {
                     serde_json::from_str::<serde_json::Value>(&conversation.extra)
                         .ok()
-                        .and_then(|extra| {
+                        .is_some_and(|extra| {
                             extra
                                 .pointer(CLIENT_NAVIGATION_AGENT_CODE_POINTER)
                                 .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned)
+                                == Some(agent_code.as_str())
+                                && extra
+                                    .pointer(CLIENT_NAVIGATION_SCOPE_POINTER)
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(scope.as_str())
                         })
-                        .as_deref()
-                        == Some(agent_code.as_str())
                 }) {
                     return Ok(ProvisionedClientNavigationConversation {
                         conversation_id: existing.id.clone(),
@@ -133,7 +136,7 @@ pub fn build_client_navigation_conversation_provisioner(
                         source: Some(aionui_common::ConversationSource::Aionui),
                         channel_chat_id: None,
                         extra: serde_json::json!({
-                            "client_navigation": {"agent_code": agent_code},
+                            "client_navigation": {"agent_code": agent_code, "scope": scope},
                             "selected_session_mcp_servers": [SessionMcpServer {
                                 id: "gea-client-navigation".to_owned(),
                                 name: "gea-gateway".to_owned(),
