@@ -20,7 +20,7 @@ pub struct DefaultSystemOpener;
 #[async_trait::async_trait]
 impl ISystemOpener for DefaultSystemOpener {
     fn open_detached(&self, target: &str) -> Result<(), ShellError> {
-        open::that_detached(target).map_err(|e| ShellError::CommandFailed(format!("open: {e}")))?;
+        aionui_runtime::open_path_detached(target).map_err(|e| ShellError::CommandFailed(format!("open: {e}")))?;
         Ok(())
     }
 

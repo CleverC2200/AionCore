@@ -16,7 +16,7 @@
 //! * set `kill_on_drop(true)` so a panicking / erroring caller cannot
 //!   leave orphaned children;
 //! * remove `NODE_OPTIONS`, `NODE_INSPECT`, `NODE_DEBUG`, `CLAUDECODE`, and
-//!   the trusted Core bootstrap secret
+//!   trusted Core-only credentials
 //!   so the child doesn't inherit debug/agent state that belongs to the
 //!   parent (matches v1 `acpConnectors.ts::getCleanAgentEnv`).
 //!
@@ -288,8 +288,10 @@ fn strip_pollution(cmd: &mut Command) {
     cmd.env_remove("NODE_OPTIONS")
         .env_remove("NODE_INSPECT")
         .env_remove("NODE_DEBUG")
-        .env_remove("CLAUDECODE")
-        .env_remove("AIONCORE_BOOTSTRAP_SECRET");
+        .env_remove("CLAUDECODE");
+    for key in crate::CORE_ONLY_ENV_KEYS {
+        cmd.env_remove(key);
+    }
 }
 
 #[cfg(unix)]
@@ -382,7 +384,9 @@ mod tests {
                 command
                     .env("NODE_OPTIONS", "--inspect=9229")
                     .env("CLAUDECODE", "1")
-                    .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret");
+                    .env("AIONCORE_BOOTSTRAP_SECRET", "trusted-secret")
+                    .env("AIONUI_GEA_SALES_PLAN_CLIENT_ID", "sales-plan-client")
+                    .env("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET", "sales-plan-secret");
             },
         ) {
             return;
@@ -392,14 +396,23 @@ mod tests {
         // have removed them.
         let mut b = Builder::clean_cli("sh");
         b.env("AIONCORE_BOOTSTRAP_SECRET", "forwarded-secret")
+            .env("AIONUI_GEA_SALES_PLAN_CLIENT_ID", "forwarded-client")
+            .env("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET", "forwarded-client-secret")
             .arg("-c")
-            .arg("echo \"NO:${NODE_OPTIONS:-unset} CC:${CLAUDECODE:-unset} BS:${AIONCORE_BOOTSTRAP_SECRET:-unset}\"");
+            .arg(
+                "echo \"NO:${NODE_OPTIONS:-unset} CC:${CLAUDECODE:-unset} \
+                 BS:${AIONCORE_BOOTSTRAP_SECRET:-unset} \
+                 GI:${AIONUI_GEA_SALES_PLAN_CLIENT_ID:-unset} \
+                 GS:${AIONUI_GEA_SALES_PLAN_CLIENT_SECRET:-unset}\"",
+            );
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("NO:unset"), "got: {stdout}");
         assert!(stdout.contains("CC:unset"), "got: {stdout}");
         assert!(stdout.contains("BS:unset"), "got: {stdout}");
+        assert!(stdout.contains("GI:unset"), "got: {stdout}");
+        assert!(stdout.contains("GS:unset"), "got: {stdout}");
         assert!(output.status.success());
     }
 
@@ -496,6 +509,14 @@ mod tests {
         assert!(
             preview.contains("-u AIONCORE_BOOTSTRAP_SECRET"),
             "missing bootstrap-secret removal: {preview}"
+        );
+        assert!(
+            preview.contains("-u AIONUI_GEA_SALES_PLAN_CLIENT_ID"),
+            "missing sales-plan client-id removal: {preview}"
+        );
+        assert!(
+            preview.contains("-u AIONUI_GEA_SALES_PLAN_CLIENT_SECRET"),
+            "missing sales-plan client-secret removal: {preview}"
         );
         assert!(
             preview.contains(r#""/usr/local/bin/node""#),

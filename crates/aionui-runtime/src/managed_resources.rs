@@ -1,7 +1,10 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +22,12 @@ pub enum ManagedResourceSourceKind {
 pub struct ManagedResourceSource {
     pub kind: ManagedResourceSourceKind,
     pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedDirectory {
+    pub root: PathBuf,
+    pub content_sha256: String,
 }
 
 const BUNDLED_RESOURCES_ENV: &str = "AIONUI_BUNDLED_MANAGED_RESOURCES";
@@ -112,10 +121,9 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
         return Ok(());
     }
 
-    if target_root.exists() {
-        fs::remove_dir_all(target_root)?;
-    }
     fs::create_dir_all(target_root)?;
+
+    let mut expected = std::collections::HashSet::new();
 
     for entry in WalkDir::new(source_root) {
         let entry = entry?;
@@ -127,6 +135,7 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
         if relative.as_os_str().is_empty() {
             continue;
         }
+        expected.insert(relative.to_path_buf());
 
         let target_path = target_root.join(relative);
         if entry.file_type().is_dir() {
@@ -139,18 +148,36 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            copy_symlink(entry.path(), &target_path)?;
+            converge_symlink(entry.path(), &target_path)?;
             continue;
         }
 
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(entry.path(), &target_path)?;
-        copy_permissions(entry.path(), &target_path)?;
+        converge_file(entry.path(), &target_path)?;
     }
 
+    prune_unexpected_entries(target_root, &expected)?;
+
     Ok(())
+}
+
+pub fn materialize_content_addressed_directory(
+    source_root: &Path,
+    objects_root: &Path,
+) -> std::io::Result<MaterializedDirectory> {
+    let content_sha256 = hash_directory(source_root)?;
+    let identity = format!("sha256-{content_sha256}");
+    let root = objects_root.join(&identity);
+    let complete = root.join(".complete");
+
+    if !matches!(fs::read_to_string(&complete), Ok(marker) if marker == identity) {
+        materialize_directory(source_root, &root)?;
+        atomic_write(&complete, identity.as_bytes())?;
+    }
+
+    Ok(MaterializedDirectory { root, content_sha256 })
 }
 
 fn resource_roots() -> Vec<ManagedResourceSource> {
@@ -203,13 +230,191 @@ fn copy_permissions(source: &Path, target: &Path) -> std::io::Result<()> {
     fs::set_permissions(target, metadata.permissions())
 }
 
-fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
-    let link_target = fs::read_link(source)?;
-    if target.exists() {
-        fs::remove_file(target)?;
+fn converge_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    if files_match(source, target)? {
+        return Ok(());
     }
-    create_symlink(&link_target, target, source)
+    if target.is_dir() {
+        fs::remove_dir_all(target)?;
+    }
+    let temp = temp_path(target);
+    fs::copy(source, &temp)?;
+    copy_permissions(source, &temp)?;
+    replace_file(&temp, target).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
+
+fn files_match(source: &Path, target: &Path) -> std::io::Result<bool> {
+    if !target.is_file() {
+        return Ok(false);
+    }
+    let source_metadata = fs::metadata(source)?;
+    let target_metadata = fs::metadata(target)?;
+    if source_metadata.len() != target_metadata.len() || source_metadata.permissions() != target_metadata.permissions()
+    {
+        return Ok(false);
+    }
+    Ok(fs::read(source)? == fs::read(target)?)
+}
+
+fn converge_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let link_target = fs::read_link(source)?;
+    if matches!(fs::read_link(target), Ok(existing) if existing == link_target) {
+        return Ok(());
+    }
+    remove_path_if_exists(target)?;
+    let temp = temp_path(target);
+    create_symlink(&link_target, &temp, source)?;
+    replace_file(&temp, target).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
+}
+
+fn prune_unexpected_entries(target_root: &Path, expected: &std::collections::HashSet<PathBuf>) -> std::io::Result<()> {
+    let mut entries = WalkDir::new(target_root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(std::io::Error::other)?;
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.depth()));
+    for entry in entries {
+        let relative = entry
+            .path()
+            .strip_prefix(target_root)
+            .expect("walkdir path should stay under target root");
+        let is_in_flight_temp = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"));
+        if expected.contains(relative) || is_in_flight_temp {
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            match fs::remove_dir(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_directory(root: &Path) -> std::io::Result<String> {
+    if !root.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("managed resource source missing: {}", root.display()),
+        ));
+    }
+    let mut entries = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(std::io::Error::other)?;
+    entries.sort_by_key(|entry| entry.path().strip_prefix(root).unwrap_or(entry.path()).to_path_buf());
+
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .expect("walkdir path should stay under root");
+        hasher.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0]);
+        if entry.file_type().is_dir() {
+            hasher.update(b"dir");
+        } else if entry.file_type().is_symlink() {
+            hasher.update(b"symlink");
+            hasher.update(fs::read_link(entry.path())?.to_string_lossy().as_bytes());
+        } else {
+            hasher.update(b"file");
+            let bytes = fs::read(entry.path())?;
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+            hash_permissions(&mut hasher, &fs::metadata(entry.path())?.permissions());
+        }
+        hasher.update([0xff]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn hash_permissions(hasher: &mut Sha256, permissions: &fs::Permissions) {
+    use std::os::unix::fs::PermissionsExt;
+    hasher.update((permissions.mode() & 0o777).to_le_bytes());
+}
+
+#[cfg(not(unix))]
+fn hash_permissions(hasher: &mut Sha256, permissions: &fs::Permissions) {
+    hasher.update([u8::from(permissions.readonly())]);
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("managed resource path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temp = temp_path(path);
+    {
+        let mut writer = fs::File::create(&temp)?;
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        writer.sync_all()?;
+    }
+    replace_file(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
+}
+
+fn temp_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().and_then(|name| name.to_str()).unwrap_or("resource");
+    let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence))
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source = temp.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let destination = target.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 fn create_symlink(link_target: &Path, target: &Path, _source: &Path) -> std::io::Result<()> {
@@ -350,5 +555,52 @@ mod tests {
             fs::read_link(&copied_link).expect("read link"),
             PathBuf::from("../lib/node_modules/npm/bin/npm-cli.js")
         );
+    }
+
+    #[test]
+    fn content_addressed_materialization_resumes_and_changes_identity_with_content() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let objects = temp.path().join("objects");
+        fs::create_dir_all(source.join("bin")).expect("create source");
+        fs::write(source.join("bin/node"), b"node-v1").expect("write node");
+
+        let first = materialize_content_addressed_directory(&source, &objects).expect("first materialize");
+        assert_eq!(first.content_sha256.len(), 64);
+        assert_eq!(fs::read(first.root.join("bin/node")).unwrap(), b"node-v1");
+
+        fs::remove_file(first.root.join(".complete")).expect("remove completion marker");
+        fs::remove_file(first.root.join("bin/node")).expect("remove materialized file");
+        fs::write(first.root.join("stale"), b"stale").expect("write stale file");
+        let resumed = materialize_content_addressed_directory(&source, &objects).expect("resume materialize");
+        assert_eq!(resumed, first);
+        assert_eq!(fs::read(resumed.root.join("bin/node")).unwrap(), b"node-v1");
+        assert!(!resumed.root.join("stale").exists());
+
+        fs::write(source.join("bin/node"), b"node-v2").expect("update node");
+        let changed = materialize_content_addressed_directory(&source, &objects).expect("changed materialize");
+        assert_ne!(changed.root, first.root);
+        assert!(
+            first.root.is_dir(),
+            "old immutable object remains available for bounded GC"
+        );
+        assert_eq!(fs::read(changed.root.join("bin/node")).unwrap(), b"node-v2");
+    }
+
+    #[test]
+    fn materialize_directory_prunes_stale_entries_without_replacing_the_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(source.join("keep"), b"same").expect("write source");
+        fs::write(target.join("keep"), b"same").expect("write target");
+        fs::write(target.join("stale"), b"remove").expect("write stale");
+
+        materialize_directory(&source, &target).expect("materialize");
+
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"same");
+        assert!(!target.join("stale").exists());
     }
 }

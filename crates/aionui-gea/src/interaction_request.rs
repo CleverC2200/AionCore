@@ -240,7 +240,7 @@ fn normalize_timestamp_field(
     Ok(())
 }
 
-fn normalize_timestamp(field: &str, value: &str) -> Result<String, GeaError> {
+pub(crate) fn normalize_timestamp(field: &str, value: &str) -> Result<String, GeaError> {
     if value.trim().is_empty() || chrono::DateTime::parse_from_rfc3339(value).is_ok() {
         return Ok(value.to_owned());
     }

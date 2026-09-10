@@ -126,8 +126,8 @@ pub use custom_agent::{
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
-    GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
-    InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
+    GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubInstallReceipt, HubOperationResponse,
+    HubUpdateInfo, InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
@@ -138,6 +138,7 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use gea::{
+    AcknowledgeClientNavigationRequest, ClientNavigationResolveResponse, ClientNavigationTarget,
     CreateGeaSessionRequest, GeaAuthSessionStatus, GeaCatalogSkill, GeaClientResourceKind, GeaClientResourceSyncResult,
     GeaClientResourceSyncStatus, GeaInteractionPermissionOption, GeaInteractionPresentation, GeaInteractionQuestion,
     GeaInteractionQuestionOption, GeaInteractionRequest, GeaInteractionRequestActionCommand, GeaInteractionRequestKind,
@@ -151,7 +152,7 @@ pub use gea::{
     NotificationActionCommand, NotificationChangedPayload, NotificationChangedReason, NotificationKind,
     NotificationList, NotificationReceipt, NotificationSeverity, NotificationStatus, NotificationSyncState,
     NotificationTarget, NotificationView, ReadGeaResourceRequest, ReportGeaSkillExecutionRequest,
-    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    ResolveClientNavigationRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
@@ -269,3 +270,8 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub mod gea_sales_plan_submit;
+pub use gea_sales_plan_submit::{
+    GeaSalesPlanDecimal, GeaSalesPlanId, GeaSalesPlanSubmitItem, GeaSalesPlanSubmitReceipt, GeaSalesPlanSubmitRequest,
+};

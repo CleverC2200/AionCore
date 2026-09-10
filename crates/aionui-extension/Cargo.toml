@@ -36,6 +36,7 @@ walkdir.workspace = true
 # only on Windows targets to avoid building it on Linux/macOS.
 [target.'cfg(windows)'.dependencies]
 junction = "1"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 async-trait.workspace = true

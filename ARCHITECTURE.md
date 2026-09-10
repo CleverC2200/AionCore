@@ -326,7 +326,8 @@ Handlers do not make business decisions, Services do not handle HTTP concerns.
 
 Using sqlx's embedded migrations (`sqlx::migrate!()`):
 - Migration files are located in `crates/aionui-db/migrations/`
-- Naming format: `NNN_descriptive_name.sql` (sequential numbering)
+- Existing naming format: `NNN_descriptive_name.sql` (immutable legacy sequence)
+- New naming format: `YYYYMMDDHHMMSS_descriptive_name.sql` (UTC timestamp prefix to avoid parallel-branch collisions)
 - Migrations run automatically on application startup
 - New tables or schema changes must go through migration files — manual database modifications are forbidden
 - Use `IF NOT EXISTS` to ensure idempotency
@@ -643,7 +644,7 @@ crates/aionui-my-feature/
 
 1. Add Row model in `models/`
 2. Define Repository trait (`I` prefix) and Sqlite implementation in `repository/`
-3. Add migration file in `migrations/` (`NNN_descriptive_name.sql`)
+3. Add a migration file in `migrations/` (`YYYYMMDDHHMMSS_descriptive_name.sql`, UTC)
 
 **Step 4: If API types are needed, add to aionui-api-types**
 

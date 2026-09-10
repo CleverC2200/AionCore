@@ -88,6 +88,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::McpGeaStdio) => Ok(commands::run_gea_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
+        Some(Command::Maintenance(ref args)) => Ok(commands::run_maintenance(args.clone(), &cli).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
 
@@ -145,6 +146,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
             };
 
             let listener = commands::bind_http_listener(&mut env.config).await?;
+            commands::run_automatic_maintenance(&env.config.data_dir);
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {
                 bootstrap::BootstrapError::new(

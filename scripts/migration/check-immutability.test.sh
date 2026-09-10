@@ -53,6 +53,38 @@ init_case_repo() {
     printf '%s\n' "$dir"
 }
 
+init_fork_upstream_case_repo() {
+    local name="$1"
+    local dir="$tmpdir/$name"
+
+    mkdir -p "$dir/crates/aionui-db/migrations"
+    (
+        cd "$dir"
+        git init -q -b main
+        git config user.email test@example.com
+        git config user.name "Migration Test"
+        printf '%s\n' '-- 001 initial' > crates/aionui-db/migrations/001_initial_schema.sql
+        printf '%s\n' '-- 002 official migration' > crates/aionui-db/migrations/002_official.sql
+        git add crates/aionui-db/migrations
+        git commit -q -m "seed official migrations"
+        official_main="$(git rev-parse HEAD)"
+
+        git mv crates/aionui-db/migrations/002_official.sql crates/aionui-db/migrations/003_personal.sql
+        git commit -q -m "move personal migration"
+        personal_main="$(git rev-parse HEAD)"
+
+        git remote add origin "$dir/origin.git"
+        git remote add personal "$dir/personal.git"
+        git update-ref refs/remotes/origin/main "$official_main"
+        git update-ref refs/remotes/personal/main "$personal_main"
+        git config branch.main.remote personal
+        git config branch.main.merge refs/heads/main
+        git checkout -q -b feature
+    )
+
+    printf '%s\n' "$dir"
+}
+
 modified_repo="$(init_case_repo modified)"
 printf '%s\n' '-- modified' >> "$modified_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$modified_repo" 1 "Existing migration files from main must not be modified or deleted" \
@@ -69,8 +101,13 @@ run_in_repo "$auxiliary_repo" 1 "Existing migration files from main must not be 
     env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 added_repo="$(init_case_repo added)"
-printf '%s\n' '-- 003 new migration' > "$added_repo/crates/aionui-db/migrations/003_new_change.sql"
+printf '%s\n' '-- timestamped new migration' > "$added_repo/crates/aionui-db/migrations/20260825120000_new_change.sql"
 run_in_repo "$added_repo" 0 "Migration immutability check passed" \
+    env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
+
+sequential_added_repo="$(init_case_repo sequential-added)"
+printf '%s\n' '-- sequential new migration' > "$sequential_added_repo/crates/aionui-db/migrations/003_new_change.sql"
+run_in_repo "$sequential_added_repo" 1 "New database migrations must use a 14-digit UTC timestamp prefix" \
     env AIONCORE_MIGRATION_BASE_REF=main bash "$script"
 
 duplicate_repo="$(init_case_repo duplicate)"
@@ -82,5 +119,8 @@ override_repo="$(init_case_repo override)"
 printf '%s\n' '-- modified with explicit override' >> "$override_repo/crates/aionui-db/migrations/001_initial_schema.sql"
 run_in_repo "$override_repo" 0 "skipping migration immutability check" \
     env AIONCORE_MIGRATION_BASE_REF=main AIONCORE_ALLOW_MAIN_MIGRATION_EDIT=1 bash "$script"
+
+fork_upstream_repo="$(init_fork_upstream_case_repo fork-upstream)"
+run_in_repo "$fork_upstream_repo" 0 "Migration immutability check passed" bash "$script"
 
 echo "Migration immutability script tests passed"

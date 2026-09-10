@@ -22,7 +22,7 @@ async fn second_start_with_same_version_is_noop() {
 }
 
 #[tokio::test]
-async fn version_bump_triggers_rewrite() {
+async fn content_identity_change_activates_a_new_object() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path();
 
@@ -36,8 +36,9 @@ async fn version_bump_triggers_rewrite() {
         aionui_extension::materialize_if_needed(data_dir, aionui_extension::builtin_skills_corpus(), "test-2.0.0")
             .await
             .unwrap();
-    assert!(second, "version change should trigger a fresh materialize");
+    assert!(second, "content identity change should activate a new object");
 
-    let version = std::fs::read_to_string(data_dir.join("builtin-skills").join(".version")).unwrap();
-    assert_eq!(version, "test-2.0.0");
+    let active = aionui_extension::startup_materialize::resolve_materialized_builtin_skills_dir(data_dir);
+    let identity = std::fs::read_to_string(active.join(".complete")).unwrap();
+    assert_eq!(identity, "test-2.0.0");
 }

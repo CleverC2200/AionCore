@@ -8,7 +8,10 @@ use tower::ServiceExt;
 use wiremock::MockServer;
 
 use aionui_ai_agent::{AgentInstance, IAgentTask, IMockAgent, WorkerTaskManagerImpl};
-use aionui_app::{AppConfig, AppServices, build_module_states, create_router, create_router_with_states};
+use aionui_app::{
+    AppConfig, AppServices, build_client_navigation_conversation_provisioner,
+    build_client_navigation_conversation_remover, build_module_states, create_router, create_router_with_states,
+};
 use aionui_extension::{ExternalPathsManager, SkillPaths, SkillRouterState};
 use aionui_file::FileService;
 use aionui_system::VersionCheckService;
@@ -26,6 +29,10 @@ pub async fn build_app_with_gea_base_url(base_url: String) -> (axum::Router, App
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     let gea = aionui_gea::GeaService::new(reqwest::Client::new(), base_url)
         .unwrap()
+        .with_client_navigation_conversation_lifecycle(
+            build_client_navigation_conversation_provisioner(&services),
+            build_client_navigation_conversation_remover(&services),
+        )
         .with_resource_catalog(
             services.gea_resource_repo.clone(),
             services.data_dir.join("managed-skills"),

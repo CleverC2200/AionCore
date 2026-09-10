@@ -92,6 +92,8 @@ GEA 相关调用按下面的顺序追踪：
 
 `GeaToolCallRequest.arguments` 必须是 JSON object 或 `null`。返回数据包含 `result` 和可选 `auditId`。
 
+2026-09-10 补充：stdio bridge 原样发布管理端工具 `inputSchema` 并透传参数，不为业务查询添加本地嵌套包装或 JSON 字符串化。JSON-RPC 业务错误保留 `suggestedAction`、重试提示和关联标识；只读工具只有收到明确的 `retryable=true` 才进入本地重试，参数、权限和会话错误不重复调用。上游要求的等待时间超出本地预算时，直接返回错误，不能提前重试。
+
 ### 3.3 InteractionRequest
 
 | 方法与路径 | 请求 → 成功数据 | 当前调用入口 | AionCore 实现 | 鉴权与错误语义 | 验证状态 |
@@ -126,6 +128,14 @@ AionUi 不发送独立 subscribe 帧：共享 adapter 连接 `/ws`，`ipcBridge.
 | `POST /api/client-resources/sync` | `SyncGeaClientResourcesRequest` → `GeaClientResourceSyncResult` | `ipcBridge.ts::clientResources.syncFromGea` | `routes.rs::sync_client_resources` → `service/resource_catalog.rs::sync_client_resources` | 400 resources 为空；401 未认证；403 runtime/CSRF；409 Artifact 校验冲突；500 本地存储错误；502 GEA 网络或响应错误 | 当前代码；本地 mock/integration 测试；未验真实 GEA |
 
 `resources` 接受 `assistants`、`skills`、`mcps`。当前实现只处理 `skills`：请求中不包含 `skills` 时返回 completed，并把所请求类型计入 skipped；这不代表 assistants 或 mcps 已完成同步。
+
+### 3.5 客户端导航与服务身份提报（2026-09-10 补充）
+
+`POST /api/deep-links/resolve` 与 `POST /api/deep-links/ack` 要求当前用户认证、CSRF 和 GEA 登录态。resolve 校验 V1 目标后，按当前用户、GEA 地址和租户范围复用或建立本地会话，再建立 Gateway Session；不会发送 Agent 消息。处理中切换登录态返回冲突，失败时回滚本次新建的本地会话。GEA 标准 `Result` 包装的已知元数据会被丢弃，未知目标字段会被拒绝；GEA 的 GMT+8 日期格式统一转换为 RFC3339。
+
+`POST /api/gea/sales-plan/submissions` 是受信宿主的服务身份提报入口。除用户认证、CSRF 和动作限流外，还必须提供 `x-aioncore-bootstrap-secret`、`idempotency-key` 与 `x-request-id`；runtime token 无权调用。Core 使用进程内配置的服务身份换取短期 Token，禁止跟随重定向，最多提交三次且重试保持相同请求体和幂等键。服务凭据与宿主能力密钥不传给 Agent 子进程或系统打开器，也不进入回执。目标量/额与 SKU 合计分别表达独立业务值，不强制相等；已有用户查询和动作代理保留原始 JSON 字段。
+
+实现入口为 `routes.rs`、`service.rs`、`service/sales_plan_submit.rs` 与应用层路由装配。对应本地验收覆盖 `client_navigation_e2e.rs`、`gea_sales_plan_security_e2e.rs` 和服务单测；这些 Mock 测试不代表真实 GEA 环境已经验收。
 
 ## 4. AionCore → GEA
 

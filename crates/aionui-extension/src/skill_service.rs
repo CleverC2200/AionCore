@@ -53,16 +53,12 @@ pub fn builtin_skills_corpus() -> &'static Dir<'static> {
 
 /// Build the startup materialization marker for a built-in skill corpus.
 ///
-/// The package version alone is not enough: built-in skills can change
-/// without a crate version bump during development or prerelease packaging.
-/// Include a deterministic content fingerprint so startup refreshes the
-/// materialized `{data_dir}/builtin-skills` tree whenever embedded skill
-/// files change.
-pub fn builtin_skills_materialize_marker(corpus: &Dir<'static>, package_version: &str) -> String {
-    format!(
-        "{package_version}+builtin-skills.{}",
-        builtin_skills_corpus_fingerprint(corpus)
-    )
+/// Package versions and build runs are execution provenance, not persistent
+/// resource identity. The marker therefore contains only the corpus content
+/// digest; the relative paths remain part of the digest because they are part
+/// of the skill corpus's observable content.
+pub fn builtin_skills_materialize_marker(corpus: &Dir<'static>, _package_version: &str) -> String {
+    format!("sha256-{}", builtin_skills_corpus_fingerprint(corpus))
 }
 
 fn builtin_skills_corpus_fingerprint(corpus: &Dir<'static>) -> String {
@@ -81,7 +77,7 @@ fn builtin_skills_corpus_fingerprint(corpus: &Dir<'static>) -> String {
     }
 
     let digest = hasher.finalize();
-    hex::encode(&digest[..12])
+    hex::encode(digest)
 }
 
 fn collect_corpus_files(dir: &Dir<'static>, root: &Path, files: &mut Vec<(String, &'static [u8])>) {
@@ -102,7 +98,8 @@ fn collect_corpus_files(dir: &Dir<'static>, root: &Path, files: &mut Vec<(String
 /// Resolved base directories for skill and rule management.
 ///
 /// `builtin_skills_dir` always points at a real on-disk directory.
-/// In production it resolves to `{data_dir}/builtin-skills/`, populated
+/// In production it resolves to the active `{data_dir}/.builtin-skills.objects/`
+/// content object (or the legacy `{data_dir}/builtin-skills/` fallback), populated
 /// at startup by [`crate::startup_materialize::materialize_if_needed`].
 /// In dev/test it can be redirected via [`BUILTIN_SKILLS_ENV_VAR`].
 #[derive(Debug, Clone)]
@@ -114,7 +111,7 @@ pub struct SkillPaths {
     /// Per-job cron skills directory (~/.aionui/cron/skills/).
     pub cron_skills_dir: PathBuf,
     /// Built-in skills directory on disk. Always set.
-    /// Points to `{data_dir}/builtin-skills/` in production (populated at
+    /// Points to the active content object in production (populated at
     /// startup by `startup_materialize::materialize_if_needed`) or
     /// wherever [`BUILTIN_SKILLS_ENV_VAR`] points in dev mode.
     pub builtin_skills_dir: PathBuf,
@@ -144,7 +141,7 @@ pub fn resolve_skill_paths(app_resource_dir: &Path, data_dir: &Path) -> SkillPat
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join(crate::constants::BUILTIN_SKILLS_DIR_NAME));
+        .unwrap_or_else(|| crate::startup_materialize::resolve_materialized_builtin_skills_dir(data_dir));
 
     SkillPaths {
         data_dir: data_dir.to_path_buf(),
@@ -3312,7 +3309,9 @@ mod tests {
         crate::startup_materialize::materialize_embedded_builtin_skills(base, &BUILTIN_SKILLS, "test-version")
             .await
             .expect("failed to materialize embedded corpus for test");
-        make_test_paths(base)
+        let mut paths = make_test_paths(base);
+        paths.builtin_skills_dir = crate::startup_materialize::resolve_materialized_builtin_skills_dir(base);
+        paths
     }
 
     /// Return a `SkillPaths` rooted at `base` with an on-disk

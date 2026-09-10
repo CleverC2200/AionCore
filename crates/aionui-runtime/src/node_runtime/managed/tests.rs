@@ -293,7 +293,7 @@ async fn activation_copy_persistent_transient_exhausts_to_transient() {
     let calls = Cell::new(0);
     let result = activate_copy_with_retry(|| {
         calls.set(calls.get() + 1);
-        Err(IoError::from(ErrorKind::Interrupted))
+        Err::<(), _>(IoError::from(ErrorKind::Interrupted))
     })
     .await;
     assert!(matches!(result, Err(ActivationCopyError::Transient(_))));
@@ -305,7 +305,7 @@ async fn activation_copy_non_whitelisted_is_not_retried() {
     let calls = Cell::new(0);
     let result = activate_copy_with_retry(|| {
         calls.set(calls.get() + 1);
-        Err(IoError::from(ErrorKind::PermissionDenied))
+        Err::<(), _>(IoError::from(ErrorKind::PermissionDenied))
     })
     .await;
     assert!(matches!(result, Err(ActivationCopyError::NonTransient(_))));
@@ -458,7 +458,7 @@ fn managed_runtime_checksum_verification_detects_mismatch() {
 }
 
 #[test]
-fn managed_runtime_injects_npm_state_under_runtime_root() {
+fn managed_runtime_keeps_npm_state_outside_immutable_runtime_root() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("node-v24.11.0-test");
     let bin = root.join("bin");
@@ -468,6 +468,7 @@ fn managed_runtime_injects_npm_state_under_runtime_root() {
     std::fs::write(bin.join("npx"), b"").unwrap();
 
     let runtime = runtime_from_root(&root, ResolvedNodeSource::Managed).expect("runtime");
+    let state_root = root.parent().unwrap().join(".state").join(root.file_name().unwrap());
     let env: std::collections::HashMap<_, _> = runtime
         .npm_command()
         .env
@@ -477,20 +478,22 @@ fn managed_runtime_injects_npm_state_under_runtime_root() {
 
     assert_eq!(
         env.get("npm_config_cache"),
-        Some(&root.join("cache").display().to_string())
+        Some(&state_root.join("cache").display().to_string())
     );
     assert_eq!(
         env.get("npm_config_userconfig"),
-        Some(&root.join("blank_user_npmrc").display().to_string())
+        Some(&state_root.join("blank_user_npmrc").display().to_string())
     );
     assert_eq!(
         env.get("npm_config_globalconfig"),
-        Some(&root.join("blank_global_npmrc").display().to_string())
+        Some(&state_root.join("blank_global_npmrc").display().to_string())
     );
     assert_eq!(
         env.get("npm_config_prefix"),
-        Some(&root.join("tools").join("global").display().to_string())
+        Some(&state_root.join("tools").join("global").display().to_string())
     );
+    assert!(!root.join("cache").exists());
+    assert!(!root.join("tools").exists());
 }
 
 #[tokio::test]

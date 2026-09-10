@@ -106,6 +106,43 @@ function New-CaseRepo {
     return $dir
 }
 
+function New-ForkUpstreamCaseRepo {
+    param([string] $Name)
+
+    $dir = Join-Path $tmpdir $Name
+    New-Item -ItemType Directory -Force -Path (Join-Path $dir "crates/aionui-db/migrations") | Out-Null
+
+    Push-Location $dir
+    try {
+        Invoke-Native git init -q -b main
+        Invoke-Native git config user.email test@example.com
+        Invoke-Native git config user.name "Migration Test"
+        Set-Content -LiteralPath "crates/aionui-db/migrations/001_initial_schema.sql" -Value "-- 001 initial"
+        Set-Content -LiteralPath "crates/aionui-db/migrations/002_official.sql" -Value "-- 002 official migration"
+        Invoke-Native git add crates/aionui-db/migrations
+        Invoke-Native git commit -q -m "seed official migrations"
+        $officialMain = (git rev-parse HEAD)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        Invoke-Native git mv crates/aionui-db/migrations/002_official.sql crates/aionui-db/migrations/003_personal.sql
+        Invoke-Native git commit -q -m "move personal migration"
+        $personalMain = (git rev-parse HEAD)
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        Invoke-Native git remote add origin (Join-Path $dir "origin.git")
+        Invoke-Native git remote add personal (Join-Path $dir "personal.git")
+        Invoke-Native git update-ref refs/remotes/origin/main $officialMain
+        Invoke-Native git update-ref refs/remotes/personal/main $personalMain
+        Invoke-Native git config branch.main.remote personal
+        Invoke-Native git config branch.main.merge refs/heads/main
+        Invoke-Native git checkout -q -b feature
+    } finally {
+        Pop-Location
+    }
+
+    return $dir
+}
+
 try {
     $modifiedRepo = New-CaseRepo "modified"
     Add-Content -LiteralPath (Join-Path $modifiedRepo "crates/aionui-db/migrations/001_initial_schema.sql") -Value "-- modified"
@@ -120,8 +157,12 @@ try {
     Invoke-InRepo $auxiliaryRepo 1 "Existing migration files from main must not be modified or deleted" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $addedRepo = New-CaseRepo "added"
-    Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- 003 new migration"
+    Set-Content -LiteralPath (Join-Path $addedRepo "crates/aionui-db/migrations/20260825120000_new_change.sql") -Value "-- timestamped new migration"
     Invoke-InRepo $addedRepo 0 "Migration immutability check passed" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
+
+    $sequentialAddedRepo = New-CaseRepo "sequential-added"
+    Set-Content -LiteralPath (Join-Path $sequentialAddedRepo "crates/aionui-db/migrations/003_new_change.sql") -Value "-- sequential new migration"
+    Invoke-InRepo $sequentialAddedRepo 1 "New database migrations must use a 14-digit UTC timestamp prefix" @{ AIONCORE_MIGRATION_BASE_REF = "main" }
 
     $duplicateRepo = New-CaseRepo "duplicate"
     Set-Content -LiteralPath (Join-Path $duplicateRepo "crates/aionui-db/migrations/002_duplicate_change.sql") -Value "-- duplicate 002 migration"
@@ -133,6 +174,9 @@ try {
         AIONCORE_MIGRATION_BASE_REF = "main"
         AIONCORE_ALLOW_MAIN_MIGRATION_EDIT = "1"
     }
+
+    $forkUpstreamRepo = New-ForkUpstreamCaseRepo "fork-upstream"
+    Invoke-InRepo $forkUpstreamRepo 0 "Migration immutability check passed" @{}
 
     Write-Output "Migration immutability script tests passed"
 } finally {

@@ -436,6 +436,7 @@ dependencies = [
  "clap",
  "dirs",
  "dunce",
+ "fs2",
  "futures-util",
  "git2",
  "http-body-util",
@@ -456,6 +457,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
  "windows-sys 0.61.2",
  "wiremock",
 ]
@@ -704,6 +706,7 @@ dependencies = [
  "tower",
  "tracing",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 
@@ -782,7 +785,6 @@ dependencies = [
  "dashmap",
  "dirs",
  "oauth2",
- "open",
  "reqwest",
  "serde",
  "serde_json",
@@ -893,6 +895,7 @@ dependencies = [
  "fs2",
  "hex",
  "libc",
+ "open",
  "reqwest",
  "semver",
  "serde",
@@ -907,6 +910,7 @@ dependencies = [
  "wait-timeout",
  "walkdir",
  "which 7.0.3",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 
@@ -969,7 +973,6 @@ dependencies = [
  "base64",
  "futures-util",
  "http-body-util",
- "open",
  "reqwest",
  "rustls",
  "rustls-native-certs",

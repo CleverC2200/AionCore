@@ -1,16 +1,18 @@
 use aionui_api_types::{
-    ApiResponse, CreateGeaSessionRequest, ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult,
-    GeaInteractionRequestActionCommand, GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot,
-    GeaResourceContents, GeaResourceList, GeaResourceTemplateList, GeaSessionResponse, GeaToolCallRequest,
-    GeaToolCallResponse, GeaToolInfo, InteractionRequestActionCommand, InteractionRequestList,
-    InteractionRequestReceipt, NotificationActionCommand, NotificationList, NotificationReceipt, NotificationView,
-    ReadGeaResourceRequest, SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
+    AcknowledgeClientNavigationRequest, ApiResponse, ClientNavigationResolveResponse, CreateGeaSessionRequest,
+    ErrorResponse, GeaAuthSessionStatus, GeaClientResourceSyncResult, GeaInteractionRequestActionCommand,
+    GeaInteractionRequestReceipt, GeaInteractionRequestSnapshot, GeaResourceContents, GeaResourceList,
+    GeaResourceTemplateList, GeaSessionResponse, GeaToolCallRequest, GeaToolCallResponse, GeaToolInfo,
+    InteractionRequestActionCommand, InteractionRequestList, InteractionRequestReceipt, NotificationActionCommand,
+    NotificationList, NotificationReceipt, NotificationView, ReadGeaResourceRequest, ResolveClientNavigationRequest,
+    SetGeaAuthSessionRequest, SyncGeaClientResourcesRequest,
 };
 #[cfg(debug_assertions)]
 use aionui_api_types::{
     GeaNotification, GeaNotificationReceipt, GeaNotificationSnapshot, InteractionRequestChangedPayload,
     NotificationChangedPayload, NotificationTarget, WebSocketMessage,
 };
+use aionui_api_types::{GeaSalesPlanSubmitReceipt, GeaSalesPlanSubmitRequest};
 use aionui_auth::{CurrentUser, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER};
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -35,6 +37,8 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
             "/api/gea/auth/session",
             get(auth_status).put(set_auth_session).delete(clear_auth_session),
         )
+        .route("/api/deep-links/resolve", post(resolve_client_navigation))
+        .route("/api/deep-links/ack", post(acknowledge_client_navigation))
         .route("/api/gea/conversations/{conversation_id}/session", post(create_session))
         .route("/api/gea/conversations/{conversation_id}/tools", get(list_tools))
         .route(
@@ -107,8 +111,122 @@ pub fn gea_routes(state: GeaRouterState) -> Router {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/deep-links/resolve",
+    operation_id = "resolveClientNavigation",
+    tag = "Client Navigation",
+    request_body = ResolveClientNavigationRequest,
+    responses(
+        (status = 200, description = "Resolved local V1 conversation target", body = ApiResponse<ClientNavigationResolveResponse>),
+        (status = 400, description = "Invalid local request", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 403, description = "GEA denied the current user", body = ErrorResponse),
+        (status = 410, description = "Reference expired", body = ErrorResponse),
+        (status = 422, description = "Unsupported schema or unavailable target", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn resolve_client_navigation(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ResolveClientNavigationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ClientNavigationResolveResponse>>, GeaError> {
+    let Json(request) = body.map_err(|_| {
+        GeaError::new(
+            StatusCode::BAD_REQUEST,
+            "NAVIGATION_REQUEST_INVALID",
+            "客户端导航请求参数无效",
+        )
+    })?;
+    let resolved = state.service.resolve_client_navigation(&user.id, request).await?;
+    Ok(Json(ApiResponse::ok(resolved)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/deep-links/ack",
+    operation_id = "acknowledgeClientNavigation",
+    tag = "Client Navigation",
+    request_body = AcknowledgeClientNavigationRequest,
+    responses(
+        (status = 200, description = "GEA accepted TARGET_VISIBLE/SUCCESS", body = ApiResponse<utoipa::TupleUnit>),
+        (status = 400, description = "Invalid ACK request", body = ErrorResponse),
+        (status = 401, description = "AionCore or GEA authentication required", body = ErrorResponse),
+        (status = 409, description = "GEA intent state conflict", body = ErrorResponse),
+        (status = 502, description = "GEA returned an invalid or failed response", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn acknowledge_client_navigation(
+    State(state): State<GeaRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<AcknowledgeClientNavigationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, GeaError> {
+    let Json(request) = body.map_err(|_| {
+        GeaError::new(
+            StatusCode::BAD_REQUEST,
+            "NAVIGATION_REQUEST_INVALID",
+            "客户端导航 ACK 参数无效",
+        )
+    })?;
+    state
+        .service
+        .acknowledge_client_navigation(&user.id, &request.navigation_intent_id, &request.idempotency_key)
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/gea/sales-plan/submissions",
+    operation_id = "submitGeaSalesPlan",
+    tag = "Sales plan",
+    params(
+        ("Idempotency-Key" = String, Header),
+        ("X-Request-Id" = String, Header),
+        ("X-AionCore-Bootstrap-Secret" = String, Header, description = "Trusted AionCore host capability; never expose this value to Renderer code")
+    ),
+    request_body = GeaSalesPlanSubmitRequest,
+    responses(
+        (status = 200, body = ApiResponse<GeaSalesPlanSubmitReceipt>),
+        (status = 400, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 409, body = ErrorResponse),
+        (status = 503, body = ErrorResponse),
+        (status = 502, body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("sessionCookie" = []))
+)]
+async fn sales_plan_submit(
+    State(state): State<GeaRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<GeaSalesPlanSubmitRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<GeaSalesPlanSubmitReceipt>>, GeaError> {
+    reject_runtime_auth_session_access(&headers)?;
+    aionui_auth::require_bootstrap_secret(&headers, state.trusted_submit_secret.as_deref().map(AsRef::as_ref))
+        .map_err(|_| {
+            GeaError::new(
+                StatusCode::FORBIDDEN,
+                "GEA_SALES_PLAN_SUBMIT_CAPABILITY_REQUIRED",
+                "销售计划服务提交需要受信客户端能力",
+            )
+        })?;
+    let idempotency_key = required_sales_plan_header(&headers, "idempotency-key", 160)?;
+    let request_id = required_sales_plan_header(&headers, "x-request-id", 64)?;
+    let Json(request) = body.map_err(|_| GeaError::invalid_request("销售计划提交参数无效"))?;
+    let result = state
+        .service
+        .sales_plan_submit(idempotency_key, request_id, &request)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
 pub fn gea_sales_plan_action_routes(state: GeaRouterState) -> Router {
     Router::new()
+        .route("/api/gea/sales-plan/submissions", post(sales_plan_submit))
         .route(
             "/api/gea/sales-plan/plans/versions/{version_id}/actions",
             post(act_on_sales_plan_version),
@@ -1086,6 +1204,8 @@ impl utoipa::Modify for SecuritySchemes {
         description = "Current AionCore interfaces used by AionUi and the conversation runtime. This document describes existing behavior and does not redefine the business contract."
     ),
     paths(
+        resolve_client_navigation,
+        acknowledge_client_navigation,
         auth_status,
         set_auth_session,
         clear_auth_session,
@@ -1112,7 +1232,8 @@ impl utoipa::Modify for SecuritySchemes {
         list_sales_plan_logs,
         list_sales_plan_version_skus,
         compare_sales_plan_versions,
-        act_on_sales_plan_version
+        act_on_sales_plan_version,
+        sales_plan_submit
     ),
     components(schemas(
         InteractionRequestChangedPayload,
@@ -1131,7 +1252,8 @@ impl utoipa::Modify for SecuritySchemes {
         (name = "InteractionRequest", description = "GEA-owned requests and AionCore's recoverable user projection"),
         (name = "Notification", description = "GEA-owned user notifications and AionCore's tenant-scoped recoverable projection"),
         (name = "Client resources", description = "GEA Resource Catalog synchronization; current implementation materializes skills only"),
-        (name = "Sales plan", description = "User-session proxy for the GEA sales-plan read and approval APIs")
+        (name = "Sales plan", description = "User-session reads and approvals plus trusted service-identity submissions"),
+        (name = "Client Navigation", description = "Current-user V1 resolve and target-visible ACK proxy for GEAUi")
     )
 )]
 struct GeaApiDoc;
@@ -1556,6 +1678,8 @@ mod tests {
         let value = openapi_value();
         let paths = value["paths"].as_object().unwrap();
         let expected = [
+            "/api/deep-links/resolve",
+            "/api/deep-links/ack",
             "/api/gea/auth/session",
             "/api/gea/conversations/{conversation_id}/session",
             "/api/gea/conversations/{conversation_id}/tools",
@@ -1573,6 +1697,7 @@ mod tests {
             "/api/notifications/{notification_id}/read",
             "/api/notifications/{notification_id}/dismiss",
             "/api/client-resources/sync",
+            "/api/gea/sales-plan/submissions",
             "/api/gea/sales-plan/periods",
             "/api/gea/sales-plan/plans",
             "/api/gea/sales-plan/plans/{plan_id}",
@@ -1600,7 +1725,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(operation_ids.len(), 27);
+        assert_eq!(operation_ids.len(), 30);
     }
 
     #[test]
@@ -1613,6 +1738,16 @@ mod tests {
             &["authenticated", "reauthRequired", "tenantId"],
         );
         assert_schema_properties(&document, "CreateGeaSessionRequest", &["consumerCode", "preparationId"]);
+        assert_schema_properties(
+            &document,
+            "ResolveClientNavigationRequest",
+            &["navigation_reference", "schema_version"],
+        );
+        assert_schema_properties(
+            &document,
+            "AcknowledgeClientNavigationRequest",
+            &["idempotency_key", "navigation_intent_id"],
+        );
         assert_schema_properties(
             &document,
             "GeaSessionResponse",
@@ -1653,6 +1788,29 @@ mod tests {
                 "items",
                 "revision",
                 "sync_state",
+            ],
+        );
+        assert_schema_properties(
+            &document,
+            "InteractionRequestView",
+            &[
+                "allowed_actions",
+                "conversation_id",
+                "expires_at",
+                "id",
+                "kind",
+                "message_id",
+                "presentation",
+                "slot_id",
+                "source",
+                "stale",
+                "status",
+                "summary",
+                "team_id",
+                "title",
+                "turn_id",
+                "updated_at",
+                "version",
             ],
         );
         assert_schema_properties(

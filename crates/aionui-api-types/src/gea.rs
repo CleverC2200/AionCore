@@ -185,6 +185,38 @@ pub struct GeaSessionResponse {
     pub effective_capability_codes: Vec<String>,
 }
 
+/// Trusted local request from GEAUi. AionCore maps this snake_case boundary to
+/// the GEA Gateway camelCase wire contract and never returns the opaque
+/// reference to the renderer.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveClientNavigationRequest {
+    pub schema_version: u32,
+    pub navigation_reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientNavigationTarget {
+    Conversation { conversation_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClientNavigationResolveResponse {
+    pub navigation_intent_id: String,
+    pub schema_version: u32,
+    pub target: ClientNavigationTarget,
+    pub expires_at: String,
+    pub trace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeClientNavigationRequest {
+    pub navigation_intent_id: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeaToolInfo {
@@ -464,6 +496,7 @@ pub struct InteractionRequestView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub source: InteractionRequestSource,
+    pub presentation: GeaInteractionPresentation,
     pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,

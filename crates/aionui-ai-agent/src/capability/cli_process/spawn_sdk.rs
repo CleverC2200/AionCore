@@ -165,6 +165,8 @@ printf '%s\n' \
                 .env("SHELL", &shell)
                 .env("PATH", "/bin:/usr/bin")
                 .env("NODE_OPTIONS", "--require parent")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_ID", "sales-plan-client")
+                .env("AIONUI_GEA_SALES_PLAN_CLIENT_SECRET", "sales-plan-secret")
                 .env("npm_config_cache", "/tmp/parent-cache")
                 .output()
                 .unwrap();
@@ -178,12 +180,14 @@ printf '%s\n' \
         }
 
         let mut config = simple_script_config(
-            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\n' \
+            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\ngea_id=%s\ngea_secret=%s\n' \
              \"${AIONUI_SHELL_ONLY:-unset}\" \
              \"${AIONUI_CONFIG_ONLY:-unset}\" \
              \"${AIONUI_OVERLAY:-unset}\" \
              \"${npm_lifecycle_event:-unset}\" \
-             \"${NODE_OPTIONS:-unset}\"",
+             \"${NODE_OPTIONS:-unset}\" \
+             \"${AIONUI_GEA_SALES_PLAN_CLIENT_ID:-unset}\" \
+             \"${AIONUI_GEA_SALES_PLAN_CLIENT_SECRET:-unset}\"",
         );
         config.env.push(EnvVar {
             name: "AIONUI_CONFIG_ONLY".into(),
@@ -192,6 +196,14 @@ printf '%s\n' \
         config.env.push(EnvVar {
             name: "AIONUI_OVERLAY".into(),
             value: "from-config".into(),
+        });
+        config.env.push(EnvVar {
+            name: "AIONUI_GEA_SALES_PLAN_CLIENT_ID".into(),
+            value: "forwarded-client".into(),
+        });
+        config.env.push(EnvVar {
+            name: "AIONUI_GEA_SALES_PLAN_CLIENT_SECRET".into(),
+            value: "forwarded-secret".into(),
         });
 
         let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
@@ -205,6 +217,8 @@ printf '%s\n' \
         assert!(output.contains("overlay=from-config"), "{output}");
         assert!(output.contains("npm=unset"), "{output}");
         assert!(output.contains("node=unset"), "{output}");
+        assert!(output.contains("gea_id=unset"), "{output}");
+        assert!(output.contains("gea_secret=unset"), "{output}");
     }
 
     #[cfg(unix)]

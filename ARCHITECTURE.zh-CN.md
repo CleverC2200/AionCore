@@ -325,7 +325,8 @@ Handler 不做业务判断，Service 不做 HTTP 处理。
 
 使用 sqlx 的内嵌迁移（`sqlx::migrate!()`）：
 - 迁移文件位于 `crates/aionui-db/migrations/`
-- 命名格式：`NNN_descriptive_name.sql`（序号递增）
+- 既有命名格式：`NNN_descriptive_name.sql`（已交付序号保持不可变）
+- 新增命名格式：`YYYYMMDDHHMMSS_descriptive_name.sql`（UTC 时间戳，避免并行分支冲突）
 - 迁移在应用启动时自动执行
 - 新增表或字段变更必须通过迁移文件，禁止手动修改数据库
 - 使用 `IF NOT EXISTS` 保证幂等性
@@ -642,7 +643,7 @@ crates/aionui-my-feature/
 
 1. 在 `models/` 添加 Row 模型
 2. 在 `repository/` 定义 Repository trait（`I` 前缀）和 Sqlite 实现
-3. 在 `migrations/` 添加迁移文件（`NNN_descriptive_name.sql`）
+3. 在 `migrations/` 添加迁移文件（`YYYYMMDDHHMMSS_descriptive_name.sql`，UTC）
 
 **第四步：如需 API 类型，在 aionui-api-types 中添加**
 

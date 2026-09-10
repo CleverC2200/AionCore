@@ -67,7 +67,7 @@ async fn fixture_embedded() -> Fixture {
         data_dir: data_dir.clone(),
         user_skills_dir: data_dir.join("skills"),
         cron_skills_dir: data_dir.join("cron").join("skills"),
-        builtin_skills_dir: data_dir.join("builtin-skills"),
+        builtin_skills_dir: aionui_extension::startup_materialize::resolve_materialized_builtin_skills_dir(&data_dir),
         builtin_rules_dir: data_dir.join("builtin-rules"),
         assistant_rules_dir: data_dir.join("assistant-rules"),
         assistant_skills_dir: data_dir.join("assistant-skills"),
