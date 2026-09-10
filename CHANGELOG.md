@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.73-aionui.1](https://github.com/CleverC2200/AionCore/compare/v0.1.72-aionui.1...v0.1.73-aionui.1) (2026-09-10)
+
+
+### Features
+
+* **core:** integrate GEA navigation and managed resource lifecycle ([#36](https://github.com/CleverC2200/AionCore/issues/36)) ([e25705f](https://github.com/CleverC2200/AionCore/commit/e25705f39795f9471fb5b646c31c5dbf785e8702))
+* **gea:** support MCP resource links ([#28](https://github.com/CleverC2200/AionCore/issues/28)) ([31d6599](https://github.com/CleverC2200/AionCore/commit/31d6599d7ff4de050bdb12b9661a530dfbfd3b0a))
+* **models:** add bounded stateless provider inference ([#35](https://github.com/CleverC2200/AionCore/issues/35)) ([b77318f](https://github.com/CleverC2200/AionCore/commit/b77318f522131eb5e65eb65a43de3e75db149e3e))
+
+
+### Bug Fixes
+
+* **approval:** preserve external task identifiers ([#29](https://github.com/CleverC2200/AionCore/issues/29)) ([e086b6e](https://github.com/CleverC2200/AionCore/commit/e086b6e492e530db0a401c06aa006312bd25ab60))
+* **deps:** pin runtime with durable MCP tool discovery ([ded2b27](https://github.com/CleverC2200/AionCore/commit/ded2b2727136691396dfb75aab58bfb74ac388a5))
+* **gea:** adapt notification API contract ([#27](https://github.com/CleverC2200/AionCore/issues/27)) ([a88b395](https://github.com/CleverC2200/AionCore/commit/a88b3951dc65a75cf0a230395545e1b8f4fde5dc))
+* **gea:** harden business data client recovery ([#25](https://github.com/CleverC2200/AionCore/issues/25)) ([31f93f4](https://github.com/CleverC2200/AionCore/commit/31f93f4928a234d55b206d2b27711aed87cdb021))
+* **gea:** integrate verified runtime and forecast workflow for desktop ([#30](https://github.com/CleverC2200/AionCore/issues/30)) ([819de8a](https://github.com/CleverC2200/AionCore/commit/819de8a92515dc7129726ac7c0a46965d665a7a3))
+* **gea:** normalize legacy interaction timestamps ([#26](https://github.com/CleverC2200/AionCore/issues/26)) ([8fe5f5f](https://github.com/CleverC2200/AionCore/commit/8fe5f5fca1759ffaa85291dddbd3a0732d804074))
+* **gea:** restore managed MCP tools for existing sessions ([661be77](https://github.com/CleverC2200/AionCore/commit/661be77a16a46dc4f3e305b2ef6405fb409b00e4))
+* **gea:** retain managed MCP tools across session recovery ([b0644d1](https://github.com/CleverC2200/AionCore/commit/b0644d1fe614dcba946bdab40e1770ad2bb3fc6b))
+* **gea:** retain managed MCP tools across session recovery ([#34](https://github.com/CleverC2200/AionCore/issues/34)) ([b0644d1](https://github.com/CleverC2200/AionCore/commit/b0644d1fe614dcba946bdab40e1770ad2bb3fc6b))
+
+
+### Code Refactoring
+
+* **gea:** remove Swagger UI while preserving OpenAPI ([#32](https://github.com/CleverC2200/AionCore/issues/32)) ([b981595](https://github.com/CleverC2200/AionCore/commit/b9815950d22f0ef0c3163e767d6c3e882bfcb476))
+
 ## 0.1.71 (2026-08-22)
 
 
